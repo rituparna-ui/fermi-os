@@ -52,3 +52,41 @@ void uart_println(const char *str) {
   uart_puts(str);
   uart_puts("\n");
 }
+
+void uart_puthex(uint64_t value) {
+  const char hex[] = "0123456789ABCDEF";
+
+  uart_puts("0x");
+
+  for (int i = 60; i >= 0; i -= 4) {
+    uint8_t digit = (value >> i) & 0xF;
+    uart_putc(hex[digit]);
+  }
+}
+
+void uart_putdec(uint64_t value) {
+  char buf[21]; // enough for uint64
+  int i = 0;
+
+  if (value == 0) {
+    uart_putc('0');
+    return;
+  }
+
+  while (value > 0) {
+    buf[i++] = '0' + (value % 10);
+    value /= 10;
+  }
+
+  while (i--) {
+    uart_putc(buf[i]);
+  }
+}
+
+void uart_putbin(uint64_t value) {
+  uart_puts("0b");
+
+  for (int i = 63; i >= 0; i--) {
+    uart_putc((value & (1ULL << i)) ? '1' : '0');
+  }
+}

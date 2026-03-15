@@ -32,7 +32,10 @@ LDFLAGS = -nostdlib -g -T $(LINKER)
 # QEMU Config
 RAM_SIZE := 8G
 QEMU_CPU := cortex-a72
-QEMU_MACHINE := virt
+QEMU_MACHINE := virt,gic-version=3
+# QEMU_MACHINE := virt,gic-version=3,virtualization=on
+# QEMU_MACHINE := virt,gic-version=3,virtualization=on,secure=on
+# QEMU_MACHINE := virt,gic-version=3,secure=on
 QEMU_BASE := qemu-system-aarch64 -machine $(QEMU_MACHINE) -nographic -cpu $(QEMU_CPU) -m $(RAM_SIZE)
 
 QEMU_FLAGS_RUN := -kernel $(TARGET)

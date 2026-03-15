@@ -1,5 +1,5 @@
 #include "uart.h"
-#include "./../mmio/mmio.h"
+#include "mmio/mmio.h"
 
 void uart_init(void) {
   // disable uart

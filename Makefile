@@ -25,7 +25,8 @@ OBJECTS := $(S_OBJECTS) $(C_OBJECTS)
 # Flags
 ASFLAGS = -g
 CFLAGS  = -g -ffreestanding -nostdlib -nostartfiles \
-          -Wall -Wextra -O0 -mstrict-align
+          -Wall -Wextra -O0 -mstrict-align \
+          -I $(SRC_DIR)/lib
 LDFLAGS = -nostdlib -g -T $(LINKER)
 
 # QEMU Config
@@ -97,6 +98,20 @@ $(DTS): $(DTB)
 # Convenience target
 dts: $(DTS)
 	@echo "Device tree source generated at $(DTS)"
+
+compile_commands.json: $(C_SOURCES)
+	@echo "Generating compile_commands.json..."
+	@echo "[" > $@
+	@first=true; \
+	for src in $(C_SOURCES); do \
+		if [ "$$first" = true ]; then first=false; else echo "," >> $@; fi; \
+		echo " {" >> $@; \
+		echo "   \"directory\": \"$(shell pwd)\"," >> $@; \
+		echo "   \"file\": \"$(shell pwd)/$$src\"," >> $@; \
+		echo "   \"command\": \"$(CC) $(CFLAGS) -c $(shell pwd)/$$src -o $(shell pwd)/$(BUILD_DIR)/$$(basename $$src .c).o\"" >> $@; \
+		echo " }" >> $@; \
+	done; \
+	echo "]" >> $@
 
 clean:
 	@echo "Cleaning up..."

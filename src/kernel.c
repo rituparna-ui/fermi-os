@@ -1,4 +1,4 @@
-#include "lib/uart/uart.h"
+#include "uart/uart.h"
 
 void kernel_main() {
   uart_init();

@@ -29,9 +29,10 @@ CFLAGS  = -g -ffreestanding -nostdlib -nostartfiles \
 LDFLAGS = -nostdlib -g -T $(LINKER)
 
 # QEMU Config
+RAM_SIZE := 8G
 QEMU_CPU := cortex-a72
 QEMU_MACHINE := virt
-QEMU_BASE := qemu-system-aarch64 -machine $(QEMU_MACHINE) -nographic -cpu $(QEMU_CPU)
+QEMU_BASE := qemu-system-aarch64 -machine $(QEMU_MACHINE) -nographic -cpu $(QEMU_CPU) -m $(RAM_SIZE)
 
 QEMU_FLAGS_RUN := -kernel $(TARGET)
 QEMU_FLAGS_DEBUG := -kernel $(TARGET) -s -S
@@ -76,6 +77,26 @@ tmux:
 		"$(QEMU_BASE) $(QEMU_FLAGS_DEBUG)" \; \
 		split-window -h '$(GDB_CMD)' \; \
 		attach
+
+
+# Device Tree rules
+DTB := $(BUILD_DIR)/virt.dtb
+DTS := $(BUILD_DIR)/virt.dts
+
+# Dump device tree from QEMU
+$(DTB):
+	@echo "Dumping device tree from QEMU..."
+	@mkdir -p $(BUILD_DIR)
+	@qemu-system-aarch64 -machine $(QEMU_MACHINE),dumpdtb=$(DTB) -nographic -cpu $(QEMU_CPU) -m $(RAM_SIZE)
+
+# Convert DTB -> DTS
+$(DTS): $(DTB)
+	@echo "Converting DTB to DTS..."
+	@dtc -I dtb -O dts $(DTB) -o $(DTS)
+
+# Convenience target
+dts: $(DTS)
+	@echo "Device tree source generated at $(DTS)"
 
 clean:
 	@echo "Cleaning up..."

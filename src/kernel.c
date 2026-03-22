@@ -1,10 +1,11 @@
 #include "uart/uart.h"
 
 void kernel_main() {
-  char *str = "FermiOS - Booting Up...";
+  uart_init();
 
-  uart_puts(str);
+  uart_println("Fermi OS - Booting Up...");
 
   while (1) {
+    uart_putc(uart_getc());
   }
 }

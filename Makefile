@@ -92,9 +92,9 @@ compile_commands.json: $(C_SOURCES)
 	@echo "]" >> $@
 
 dump_dts:
-	$(QEMU_BASE) $(QEMU_FLAGS_RUN) -machine dumpdtb=qemu-virt.dtb
-	@dtc -I dtb -O dts -o qemu-virt.dts qemu-virt.dtb
-	@rm qemu-virt.dtb
+	$(QEMU_BASE) $(QEMU_FLAGS_RUN) -machine dumpdtb=$(BUILD_DIR)/qemu-virt.dtb
+	@dtc -I dtb -O dts -o $(BUILD_DIR)/qemu-virt.dts $(BUILD_DIR)/qemu-virt.dtb
+	@rm $(BUILD_DIR)/qemu-virt.dtb
 
 clean:
 	@echo "Cleaning up..."

@@ -6,5 +6,6 @@ _start:
 	mov sp, x0
 
 	b kernel_main
+	// TODO: add panic handler
 	// bl kernel_main
 	// b kernel_panic

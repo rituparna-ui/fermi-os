@@ -1,13 +1,9 @@
-#include <stdint.h>
-
-#define UART_BASE 0x09000000UL
+#include "uart/uart.h"
 
 void kernel_main() {
-  char *str = "Hello !";
+  char *str = "FermiOS - Booting Up...";
 
-  while (*str) {
-    *(volatile uint32_t *)UART_BASE = *str++;
-  }
+  uart_puts(str);
 
   while (1) {
   }

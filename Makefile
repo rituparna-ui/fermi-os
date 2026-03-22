@@ -22,16 +22,23 @@ C_OBJECTS := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(C_SOURCES))
 OBJECTS := $(S_OBJECTS) $(C_OBJECTS)
 
 # Flags
-CFLAGS := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 -mstrict-align -I $(SRC_DIR)/lib -I $(SRC_DIR)
+CFLAGS := -g -ffreestanding -nostdlib \
+	-nostartfiles -Wall -Wextra \
+	-O0 -mstrict-align \
+	-I $(SRC_DIR)/pci/virtio \
+	-I $(SRC_DIR)/lib \
+	-I $(SRC_DIR) \
+	-c
 ASFLAGS := -g
-LDFLAGS := -nostdlib -g -T linker.ld
+LDFLAGS := -g -nostdlib -T linker.ld
 
 # QEMU Config
 QEMU_CPU := cortex-a72
 QEMU_MACHINE := virt,gic-version=3 -m 8G
-QEMU_DEVICES := -device virtio-rng-pci,disable-legacy=on
 # QEMU_MACHINE := virt,gic-version=3,virtualization=on -m 8G
 # QEMU_MACHINE := virt,gic-version=3,virtualization=on,secure=on -m 8G
+# QEMU_MACHINE := virt,gic-version=3,secure=on -m 8G
+QEMU_DEVICES := -device virtio-rng-pci,disable-legacy=on
 QEMU_BASE := qemu-system-aarch64 -machine $(QEMU_MACHINE) -nographic -cpu $(QEMU_CPU) $(QEMU_DEVICES)
 
 QEMU_FLAGS_RUN   := -kernel $(TARGET)

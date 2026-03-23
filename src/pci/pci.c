@@ -150,6 +150,10 @@ static uint32_t pci_get_bar_size(uint8_t bus, uint8_t slot, uint8_t func,
 
   // mask lower 4 bits (control bits)
   size_mask &= ~0xF;
+  if (size_mask == 0) {
+    // unimplemented BAR
+    return 0;
+  }
   uint32_t size = ~size_mask + 1;
 
   return size;
@@ -248,8 +252,8 @@ static const char *virtio_cfg_type_name(uint8_t type) {
 }
 
 static void virtio_populate_capabilities(struct pci_device *pci_dev,
-                                  struct virtio_pci_caps *pci_caps,
-                                  uint8_t cap_ptr) {
+                                         struct virtio_pci_caps *pci_caps,
+                                         uint8_t cap_ptr) {
   uint8_t b = pci_dev->bus;
   uint8_t d = pci_dev->slot;
   uint8_t f = pci_dev->func;

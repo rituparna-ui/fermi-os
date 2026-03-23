@@ -5,5 +5,6 @@
 #define EERROR 0
 
 void print_current_el(void);
+void dsb_sy(void);
 
 #endif

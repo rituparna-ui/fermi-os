@@ -3,15 +3,20 @@
 #include "uart/uart.h"
 #include "utils/utils.h"
 
-struct pci_device pci_devices[MAX_PCI_DEVICES];
-uint16_t pci_device_count = 0;
+static struct pci_device pci_devices[MAX_PCI_DEVICES];
+static uint16_t pci_device_count = 0;
 
-uintptr_t mmio32_next = PCI_MMIO32_BASE;
-uintptr_t mmio64_next = PCI_MMIO64_BASE;
+static uintptr_t mmio32_next = PCI_MMIO32_BASE;
+static uintptr_t mmio64_next = PCI_MMIO64_BASE;
 
-uintptr_t alloc_mmio32(uint32_t size) {
-  if (mmio32_next & (size - 1)) {
-    mmio32_next = (mmio32_next + size) & ~(size - 1);
+static uintptr_t alloc_mmio32(uint32_t size) {
+  /* Align up to the BAR's natural alignment */
+  uintptr_t mask = (uintptr_t)size - 1;
+  mmio32_next = (mmio32_next + mask) & ~mask;
+
+  if (mmio32_next + size > PCI_MMIO32_LIMIT) {
+    uart_errorln("[PCI] 32-bit MMIO space exhausted");
+    return 0;
   }
 
   uintptr_t addr = mmio32_next;
@@ -19,9 +24,14 @@ uintptr_t alloc_mmio32(uint32_t size) {
   return addr;
 }
 
-uintptr_t alloc_mmio64(uint64_t size) {
-  if (mmio64_next & (size - 1)) {
-    mmio64_next = (mmio64_next + size) & ~(size - 1);
+static uintptr_t alloc_mmio64(uint64_t size) {
+  /* Align up to the BAR's natural alignment */
+  uintptr_t mask = (uintptr_t)size - 1;
+  mmio64_next = (mmio64_next + mask) & ~mask;
+
+  if (mmio64_next + size > PCI_MMIO64_LIMIT) {
+    uart_errorln("[PCI] 64-bit MMIO space exhausted");
+    return 0;
   }
 
   uintptr_t addr = mmio64_next;
@@ -29,8 +39,8 @@ uintptr_t alloc_mmio64(uint64_t size) {
   return addr;
 }
 
-uintptr_t pci_make_ecam_addr(uint16_t bus, uint8_t slot, uint8_t func,
-                             uint16_t offset) {
+static uintptr_t pci_make_ecam_addr(uint16_t bus, uint8_t slot, uint8_t func,
+                                    uint16_t offset) {
   return PCI_ECAM_BASE | ((uintptr_t)bus << 20) | ((uintptr_t)slot << 15) |
          ((uintptr_t)func << 12) | (uintptr_t)offset;
 }
@@ -52,20 +62,21 @@ uint8_t pci_config_read8(uint16_t bus, uint8_t slot, uint8_t func,
 
 void pci_config_write32(uint16_t bus, uint8_t slot, uint8_t func,
                         uint16_t offset, uint32_t val) {
-  return mmio_write32(pci_make_ecam_addr(bus, slot, func, offset), val);
+  mmio_write32(pci_make_ecam_addr(bus, slot, func, offset), val);
 }
 
 void pci_config_write16(uint16_t bus, uint8_t slot, uint8_t func,
                         uint16_t offset, uint16_t val) {
-  return mmio_write16(pci_make_ecam_addr(bus, slot, func, offset), val);
-}
-void pci_config_write8(uint16_t bus, uint8_t slot, uint8_t func,
-                       uint16_t offset, uint8_t val) {
-  return mmio_write8(pci_make_ecam_addr(bus, slot, func, offset), val);
+  mmio_write16(pci_make_ecam_addr(bus, slot, func, offset), val);
 }
 
-void pci_log_device_found(uint16_t bus, uint8_t slot, uint8_t func,
-                          uint16_t vendor_id, uint16_t device_id) {
+void pci_config_write8(uint16_t bus, uint8_t slot, uint8_t func,
+                       uint16_t offset, uint8_t val) {
+  mmio_write8(pci_make_ecam_addr(bus, slot, func, offset), val);
+}
+
+static void pci_log_device_found(uint16_t bus, uint8_t slot, uint8_t func,
+                                 uint16_t vendor_id, uint16_t device_id) {
   uart_puts("[PCI] Device found at ");
   uart_putdec(bus);
   uart_puts(":");
@@ -114,12 +125,10 @@ void pci_enumerate_bus() {
 
 int pci_find_device(uint16_t vendor_id, uint16_t device_id,
                     struct pci_device *pci_device) {
-  for (uint64_t i = 0; i < pci_device_count; i++) {
-    struct pci_device current_dev = pci_devices[i];
-
-    if (current_dev.vendor_id == vendor_id &&
-        current_dev.device_id == device_id) {
-      *pci_device = current_dev;
+  for (uint16_t i = 0; i < pci_device_count; i++) {
+    if (pci_devices[i].vendor_id == vendor_id &&
+        pci_devices[i].device_id == device_id) {
+      *pci_device = pci_devices[i];
       return ESUCCESS;
     }
   }
@@ -132,8 +141,8 @@ uint8_t pci_get_header_type(struct pci_device *dev) {
   return header_type;
 }
 
-uint32_t pci_get_bar_size(uint8_t bus, uint8_t slot, uint8_t func,
-                          uint16_t offset) {
+static uint32_t pci_get_bar_size(uint8_t bus, uint8_t slot, uint8_t func,
+                                 uint16_t offset) {
   uint32_t original = pci_config_read32(bus, slot, func, offset);
   pci_config_write32(bus, slot, func, offset, 0xFFFFFFFF);
   uint32_t size_mask = pci_config_read32(bus, slot, func, offset);
@@ -238,7 +247,7 @@ static const char *virtio_cfg_type_name(uint8_t type) {
   }
 }
 
-void virtio_populate_capabilities(struct pci_device *pci_dev,
+static void virtio_populate_capabilities(struct pci_device *pci_dev,
                                   struct virtio_pci_caps *pci_caps,
                                   uint8_t cap_ptr) {
   uint8_t b = pci_dev->bus;
@@ -314,7 +323,7 @@ void pci_parse_capabilities(struct pci_device *dev,
     return;
   }
 
-  int cap_ptr = pci_config_read8(bus, slot, func, PCI_CAP_PTR);
+  uint8_t cap_ptr = pci_config_read8(bus, slot, func, PCI_CAP_PTR);
 
   while (cap_ptr) {
     uint8_t cap_id = pci_config_read8(bus, slot, func, cap_ptr);

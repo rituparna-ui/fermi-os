@@ -11,12 +11,12 @@ BUILD_DIR := build
 TARGET := $(BUILD_DIR)/kernel.elf
 
 # File discovery - find all .c and .S files in src
-S_SOURCES := $(shell find $(SRC_DIR) -name *.S)
-C_SOURCES := $(shell find $(SRC_DIR) -name *.c)
+S_SOURCES := $(shell find $(SRC_DIR) -name '*.S')
+C_SOURCES := $(shell find $(SRC_DIR) -name '*.c')
 
 # Object File Mapping
 # src/boot.S      -> build/boot.o
-# src/kernel.c  	-> build/kernel.c
+# src/kernel.c  	-> build/kernel.o
 S_OBJECTS := $(patsubst $(SRC_DIR)/%.S, $(BUILD_DIR)/%.o, $(S_SOURCES))
 C_OBJECTS := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(C_SOURCES))
 OBJECTS := $(S_OBJECTS) $(C_OBJECTS)

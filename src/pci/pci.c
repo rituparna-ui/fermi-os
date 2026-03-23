@@ -208,3 +208,15 @@ void pci_assign_bars(struct pci_device *dev) {
 
   uart_println("[PCI] BARs Assigned");
 }
+
+void pci_enable_device(struct pci_device *dev) {
+  uart_println("[PCI] Enabling device");
+
+  /* https://wiki.osdev.org/PCI#Command_Register */
+  uint16_t cmd = pci_config_read16(dev->bus, dev->slot, dev->func, PCI_COMMAND);
+  cmd |= (1 << 1); // Memory Space Enable
+  cmd |= (1 << 2); // Bus Master Enable (DMA)
+
+  pci_config_write16(dev->bus, dev->slot, dev->func, PCI_COMMAND, cmd);
+  uart_println("[PCI] Device Enabled");
+}

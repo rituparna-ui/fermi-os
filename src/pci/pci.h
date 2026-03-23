@@ -66,5 +66,6 @@ int pci_find_device(uint16_t vendor_id, uint16_t device_id,
 uint8_t pci_get_header_type(struct pci_device *dev);
 
 void pci_assign_bars(struct pci_device *dev);
+void pci_enable_device(struct pci_device *dev);
 
 #endif

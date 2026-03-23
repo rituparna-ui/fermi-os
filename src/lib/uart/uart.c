@@ -4,33 +4,28 @@
 // PL011
 void uart_init() {
   // disable uart
-  mmio_write32(UART_CR, 0x00000000);
+  mmio_write32(UART_CR, UART_DISABLE);
 
   // clear pending interrupts
-  mmio_write32(UART_ICR, 0x7FF);
+  mmio_write32(UART_ICR, UART_CLR_PENDING_INT);
 
   // setup baudrate
-  // divisor = clk/(16 * baud)
-  // clk = 24000000/(16 * 115200) = 13.02083333
-  // integer = 13
-  // fraction = 0.02083333
-  // fraction register = round(0.02083333 * 2^6) = 2
-  // FBRD is a 6 bit number
-  mmio_write32(UART_IBRD, 13);
-  mmio_write32(UART_FBRD, 2);
+  // uart.h for calculation
+  mmio_write32(UART_IBRD, UART_BAUD_INT);
+  mmio_write32(UART_FBRD, UART_BAUD_FRAC);
 
   // enable FIFO, 8bit data transmission - 1 stop bit, no parity
-  mmio_write32(UART_LCRH, (1 << 4) | (1 << 5) | (1 << 6));
+  mmio_write32(UART_LCRH, UART_ENABLE_FIFO | UART_8_BIT_DATA);
 
   // enable UART, RX, TX
-  mmio_write32(UART_CR, (1 << 0) | (1 << 8) | (1 << 9));
+  mmio_write32(UART_CR, UART_ENABLE | UART_TX_ENABLE | UART_RX_ENABLE);
 
   uart_println("UART Initialized !");
 }
 
 void uart_putc(const char c) {
   // check if transmit fifo is full - TXFF
-  while (mmio_read32(UART_FR) & (1 << 5)) {
+  while (mmio_read32(UART_FR) & UART_TXFF) {
   }
 
   mmio_write32(UART_DR, c);
@@ -39,7 +34,7 @@ void uart_putc(const char c) {
 
 uint8_t uart_getc() {
   // check if receive fifo is empty - RXFE
-  while (mmio_read32(UART_FR) & (1 << 4)) {
+  while (mmio_read32(UART_FR) & UART_RXFE) {
   }
 
   uint8_t value = (uint8_t)mmio_read32(UART_DR);

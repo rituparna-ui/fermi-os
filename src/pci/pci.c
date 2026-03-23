@@ -98,7 +98,7 @@ void pci_enumerate_bus() {
       for (uint8_t func = 0; func < MAX_PCI_FUNC; func++) {
         uint16_t vendor_id = pci_config_read16(bus, slot, func, PCI_VENDOR_ID);
 
-        if (vendor_id == 0xFFFF) {
+        if (vendor_id == PCI_VENDOR_NOT_FOUND) {
           continue;
         }
 

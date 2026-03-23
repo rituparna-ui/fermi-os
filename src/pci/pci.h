@@ -33,6 +33,8 @@
 
 #define PCI_ENDPOINT_DEV_TYPE 0x00
 
+#define PCI_VENDOR_NOT_FOUND 0xFFFF
+
 struct pci_device {
   uint8_t bus;
   uint8_t slot;

@@ -107,5 +107,12 @@ void pci_virtio_rng_init() {
   uart_puthex(common->device_status);
   uart_println("");
 
+  if (!(common->device_status & VIRTIO_STATUS_FEATURES_OK)) {
+    uart_errorln("[RNG] FEATURE_NOT_OK");
+    return;
+  } else {
+    uart_println("[RNG] FEATURE_OK !");
+  }
+
   return;
 }

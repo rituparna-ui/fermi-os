@@ -6,6 +6,29 @@
 struct pci_device pci_devices[MAX_PCI_DEVICES];
 uint16_t pci_device_count = 0;
 
+uintptr_t mmio32_next = PCI_MMIO32_BASE;
+uintptr_t mmio64_next = PCI_MMIO64_BASE;
+
+uintptr_t alloc_mmio32(uint32_t size) {
+  if (mmio32_next & (size - 1)) {
+    mmio32_next = (mmio32_next + size) & ~(size - 1);
+  }
+
+  uintptr_t addr = mmio32_next;
+  mmio32_next += size;
+  return addr;
+}
+
+uintptr_t alloc_mmio64(uint64_t size) {
+  if (mmio64_next & (size - 1)) {
+    mmio64_next = (mmio64_next + size) & ~(size - 1);
+  }
+
+  uintptr_t addr = mmio64_next;
+  mmio64_next += size;
+  return addr;
+}
+
 uintptr_t pci_make_ecam_addr(uint16_t bus, uint8_t slot, uint8_t func,
                              uint16_t offset) {
   return PCI_ECAM_BASE | ((uintptr_t)bus << 20) | ((uintptr_t)slot << 15) |
@@ -101,4 +124,87 @@ int pci_find_device(uint16_t vendor_id, uint16_t device_id,
     }
   }
   return EERROR;
+}
+
+uint8_t pci_get_header_type(struct pci_device *dev) {
+  uint8_t header_type =
+      pci_config_read8(dev->bus, dev->slot, dev->func, PCI_HEADER_TYPE);
+  return header_type;
+}
+
+uint32_t pci_get_bar_size(uint8_t bus, uint8_t slot, uint8_t func,
+                          uint16_t offset) {
+  uint32_t original = pci_config_read32(bus, slot, func, offset);
+  pci_config_write32(bus, slot, func, offset, 0xFFFFFFFF);
+  uint32_t size_mask = pci_config_read32(bus, slot, func, offset);
+  pci_config_write32(bus, slot, func, offset, original);
+
+  // mask lower 4 bits (control bits)
+  size_mask &= ~0xF;
+  uint32_t size = ~size_mask + 1;
+
+  return size;
+}
+
+void pci_assign_bars(struct pci_device *dev) {
+  uart_println("[PCI] Assigning BARs");
+
+  uint8_t b = dev->bus;
+  uint8_t d = dev->slot;
+  uint8_t f = dev->func;
+
+  for (uint8_t i = 0; i < 6; i++) {
+    uint32_t bar_offset = PCI_BAR0 + i * 4;
+    uint32_t bar = pci_config_read32(b, d, f, bar_offset);
+
+    /* https://wiki.osdev.org/PCI */
+    /* I/O Space BAR Layout */
+    if (bar & 0x01) {
+      uart_errorln("[PCI] IO BAR Type, Ignoring");
+      continue;
+    }
+
+    /* Memory Space BAR Layout */
+    uint8_t type = (bar >> 1) & 0x03;
+    /* Amount of memory the device needs for its registers to be memory mapped
+     */
+    uint32_t size = pci_get_bar_size(b, d, f, bar_offset);
+
+    if (size == 0 || size == 0xFFFFFFFF) {
+      // unused bar
+      dev->bar_addr[i] = 0;
+      continue;
+    }
+
+    if (type == 0x00) {
+      uart_println("[PCI][32 Bit Memory Space]");
+      uart_puts(" BAR");
+      uart_putdec(i);
+      uart_puts(" has size: ");
+      uart_puthex(size);
+      uart_println("");
+      uintptr_t addr = alloc_mmio32(size);
+
+      pci_config_write32(b, d, f, bar_offset, (uint32_t)addr);
+      dev->bar_addr[i] = addr;
+    } else if (type == 0x02) {
+      uart_println("[PCI][64 Bit Memory Space]");
+      uart_puts(" BAR");
+      uart_putdec(i);
+      uart_puts(" has size: ");
+      uart_puthex(size);
+      uart_println("");
+      uintptr_t addr = alloc_mmio64(size);
+      // lower 32 bit
+      pci_config_write32(b, d, f, bar_offset, (uint32_t)(addr & 0xFFFFFFFF));
+      // upper 32 bit
+      pci_config_write32(b, d, f, bar_offset + 4, (uint32_t)(addr >> 32));
+      dev->bar_addr[i] = addr;
+      i++;
+    } else {
+      uart_errorln("[PCI][Memory Space Type] Huh ?");
+    }
+  }
+
+  uart_println("[PCI] BARs Assigned");
 }

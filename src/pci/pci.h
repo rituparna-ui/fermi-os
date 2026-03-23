@@ -25,6 +25,13 @@
 /* PCI Config Space Offsets */
 #define PCI_VENDOR_ID 0x00
 #define PCI_DEVICE_ID 0x02
+#define PCI_COMMAND 0x04
+#define PCI_STATUS 0x06
+#define PCI_HEADER_TYPE 0x0E
+#define PCI_BAR0 0x10
+#define PCI_CAP_PTR 0x34
+
+#define PCI_ENDPOINT_DEV_TYPE 0x00
 
 struct pci_device {
   uint8_t bus;
@@ -33,6 +40,8 @@ struct pci_device {
 
   uint16_t vendor_id;
   uint16_t device_id;
+
+  uintptr_t bar_addr[6];
 };
 
 void pci_enumerate_bus(void);
@@ -53,5 +62,9 @@ void pci_config_write8(uint16_t bus, uint8_t slot, uint8_t func,
 
 int pci_find_device(uint16_t vendor_id, uint16_t device_id,
                     struct pci_device *pci_device);
+
+uint8_t pci_get_header_type(struct pci_device *dev);
+
+void pci_assign_bars(struct pci_device *dev);
 
 #endif

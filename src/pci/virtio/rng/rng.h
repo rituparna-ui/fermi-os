@@ -8,6 +8,7 @@
 
 struct virtio_rng {
   struct pci_device pci;
+  struct virtio_pci_caps pci_caps;
 };
 
 void pci_virtio_rng_init(void);

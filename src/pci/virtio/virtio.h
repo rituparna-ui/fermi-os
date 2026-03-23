@@ -46,7 +46,7 @@ struct virtio_pci_common_cfg {
   uint64_t queue_desc;       // 0x20 - write: physical addr of descriptor table
   uint64_t queue_driver;     // 0x28 - write: physical addr of available ring
   uint64_t queue_device;     // 0x30 - write: physical addr of used ring
-} __attribute__((packed));
+};
 
 void virtio_parse_pci_capabilities(struct pci_device *dev,
                                    struct virtio_pci_caps *caps);

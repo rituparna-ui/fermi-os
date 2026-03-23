@@ -44,18 +44,6 @@ struct pci_device {
   uintptr_t bar_addr[6];
 };
 
-struct virtio_pci_caps {
-  uintptr_t common_cfg;  // cfg type 1
-  uintptr_t notify_base; // cfg type 2
-  uintptr_t isr_cfg;     // cfg type 3
-  uintptr_t device_cfg;  // cfg type 4
-
-  /* notify cap extra field (virtio spec §4.1.4.4)
-   * notify address for queue i =
-   *   notify_base + queue_notify_off[i] * notify_off_multiplier */
-  uint32_t notify_off_multiplier;
-};
-
 void pci_enumerate_bus(void);
 
 uint32_t pci_config_read32(uint16_t bus, uint8_t slot, uint8_t func,
@@ -79,7 +67,5 @@ uint8_t pci_get_header_type(struct pci_device *dev);
 
 void pci_assign_bars(struct pci_device *dev);
 void pci_enable_device(struct pci_device *dev);
-void pci_parse_capabilities(struct pci_device *dev,
-                            struct virtio_pci_caps *caps);
 
 #endif

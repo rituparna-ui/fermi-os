@@ -25,7 +25,7 @@ void pci_virtio_rng_init() {
 
   pci_assign_bars(&rng_dev.pci);
   pci_enable_device(&rng_dev.pci);
-  pci_parse_capabilities(&rng_dev.pci, &rng_dev.pci_caps);
+  virtio_parse_pci_capabilities(&rng_dev.pci, &rng_dev.pci_caps);
 
   // Virtio Device Init Sequence
   volatile struct virtio_pci_common_cfg *common =

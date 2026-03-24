@@ -25,5 +25,9 @@ SECTIONS
 	}
 
 	. = ALIGN(4096);
-	__stack_top = . + 0x10000;
+	. = . + 0x10000;		/* 64 KiB kernel stack */
+	__stack_top = .;		/* Stack grows downward */
+
+	. = ALIGN(4096);
+	__kernel_end = .;		/* Everything after this is free for PMM */
 }

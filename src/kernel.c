@@ -10,16 +10,6 @@ void kernel_main() {
   print_current_el();
 
   pmm_init(MEM_START, MEM_SIZE);
-
-  pmm_print_info();
-
-  uintptr_t addr1 = pmm_allocate_page();
-  uintptr_t addr2 = pmm_allocate_page();
-
-  pmm_print_info();
-  pmm_free_page(addr2);
-  pmm_print_info();
-  pmm_free_page(addr1);
   pmm_print_info();
 
   while (1) {

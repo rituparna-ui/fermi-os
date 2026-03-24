@@ -38,7 +38,7 @@ void pmm_print_info() {
   uart_puts("[PMM][INFO] Memory Size: ");
   uart_puthex(mem_size);
   uart_puts(" | ");
-  uart_putdec(mem_size/1024/1024);
+  uart_putdec(mem_size / 1024 / 1024);
   uart_println(" mbytes");
 
   uart_puts("[PMM][INFO] Total Pages: ");
@@ -51,6 +51,10 @@ void pmm_print_info() {
 
   uart_puts("[PMM][INFO] Used Pages: ");
   uart_putdec(used_pages);
+  uart_println("");
+
+  uart_puts("[PMM][INFO] Free Pages: ");
+  uart_putdec(total_pages - used_pages);
   uart_println("");
 }
 

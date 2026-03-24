@@ -13,6 +13,10 @@
 #define PAGE_ALIGN_UP(addr) (((addr) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1))
 #define PAGE_ALIGN_DOWN(addr) ((addr) & ~(PAGE_SIZE - 1))
 
+// each uint64_t holds 64 page bits
+#define BITMAP_INDEX(pfn) ((pfn) / 64)
+#define BITMAP_BIT(pfn) ((pfn) % 64)
+
 void pmm_init(uintptr_t mem_start, uint64_t mem_size);
 
 #endif

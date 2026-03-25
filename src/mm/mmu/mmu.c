@@ -1,7 +1,19 @@
 #include "mmu.h"
 #include "mm/pmm/pmm.h"
-#include "strings/strings.h"
+#include "strings/strings.h" // IWYU pragma: keep
 #include "uart/uart.h"
+
+static uint64_t *l0_table;
+
+static uint64_t *alloc_table() {
+  uint64_t *table = (uint64_t *)pmm_allocate_page();
+  if (!table) {
+    uart_errorln("[MMU] Failed to allocate table");
+    return 0;
+  }
+  memset(table, 0, PAGE_SIZE);
+  return table;
+}
 
 uint64_t *mmu_init() {
   // reference manual - section D8.3
@@ -14,20 +26,15 @@ uint64_t *mmu_init() {
   // [11:0]  → offset
   // Each level has 512 entries (2^9)
 
-  uint64_t *l0_table = (uint64_t *)pmm_allocate_page();
+  l0_table = alloc_table();
   if (!l0_table) {
-    uart_errorln("[MMU] Failed to allocate L0 table");
     return 0;
   }
 
-  uint64_t *l1_table = (uint64_t *)pmm_allocate_page();
+  uint64_t *l1_table = alloc_table();
   if (!l1_table) {
-    uart_errorln("[MMU] Failed to allocate L1 table");
     return 0;
   }
-
-  memset((void *)l0_table, 0, PAGE_SIZE);
-  memset((void *)l1_table, 0, PAGE_SIZE);
 
   // VA range 0 → 512GB uses this L1 table
   l0_table[0] = (uint64_t)l1_table | PTE_VALID | PTE_TABLE;
@@ -43,8 +50,10 @@ uint64_t *mmu_init() {
 
   // Identity map using L2 tables with 2MB blocks
   for (uint64_t l1i = 0; l1i < 8; l1i++) {
-    uint64_t *l2_table = (uint64_t *)pmm_allocate_page();
-    memset(l2_table, 0, PAGE_SIZE);
+    uint64_t *l2_table = alloc_table();
+    if (!l2_table) {
+      return 0;
+    }
 
     l1_table[l1i] = (uint64_t)l2_table | PTE_VALID | PTE_TABLE;
 
@@ -89,6 +98,49 @@ uint64_t *mmu_init() {
 
   uart_println("[MMU] Enabled");
   return l1_table;
+}
+
+// Walk L0 → L1 → L2
+// Return a pointer to L2 entry
+uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc) {
+  uint64_t l0i = L0_INDEX(va);
+  uint64_t l1i = L1_INDEX(va);
+  uint64_t l2i = L2_INDEX(va);
+
+  // L0 Table
+  uint64_t *l1_table;
+
+  if (!pte_valid(l0_table[l0i])) {
+    if (!alloc)
+      return 0;
+
+    l1_table = alloc_table();
+    if (!l1_table)
+      return 0;
+
+    l0_table[l0i] = (uint64_t)l1_table | PTE_VALID | PTE_TABLE;
+  } else {
+    l1_table = pte_next_table(l0_table[l0i]);
+  }
+
+  // L1 Table
+  uint64_t *l2_table;
+
+  if (!pte_valid(l1_table[l1i])) {
+    if (!alloc)
+      return 0;
+
+    l2_table = alloc_table();
+    if (!l2_table)
+      return 0;
+
+    l1_table[l1i] = (uint64_t)l2_table | PTE_VALID | PTE_TABLE;
+  } else {
+    l2_table = pte_next_table(l1_table[l1i]);
+  }
+
+  // L2 Table
+  return &l2_table[l2i];
 }
 
 static void print_result(const char *name, int pass) {
@@ -205,8 +257,35 @@ int test_remap_l2(uint64_t *l1_table) {
   return pass;
 }
 
+int test_walk(uint64_t *l0) {
+  uart_println("[MMU WALK TEST]");
+
+  uint64_t va = 0x50000000;
+
+  uint64_t pa = pmm_allocate_page();
+  uint64_t aligned_pa = pa & 0xFFFFFFE00000ULL;
+
+  uint64_t *pte = walk_page_table(l0, va, 1);
+
+  *pte = aligned_pa | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER |
+         PTE_AP_RW | PTE_ATTRIDX(1);
+
+  __asm__ __volatile__("tlbi vmalle1");
+  __asm__ __volatile__("dsb ish");
+  __asm__ __volatile__("isb");
+
+  uint64_t *ptr = (uint64_t *)va;
+
+  *ptr = 0x12345678;
+
+  uint64_t *check = (uint64_t *)(aligned_pa + (va & 0x1FFFFF));
+
+  return *check == 0x12345678;
+}
+
 void mmu_run_tests(uint64_t *l1_table) {
   print_result("MMU Enabled", test_mmu_enabled());
   print_result("Identity Mapping", test_identity_mapping());
   print_result("Remap Test L2", test_remap_l2(l1_table));
+  print_result("MMU Table Walk", test_walk(l0_table));
 }

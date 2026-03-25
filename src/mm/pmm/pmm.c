@@ -1,5 +1,5 @@
 #include "pmm.h"
-#include "strings/strings.h"
+#include "strings/strings.h" // IWYU pragma: keep
 #include "uart/uart.h"
 #include <stdint.h>
 

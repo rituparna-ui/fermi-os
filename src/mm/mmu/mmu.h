@@ -28,7 +28,25 @@
 #define _1GB 0x40000000ULL
 #define _2MB 0x200000ULL
 
+#define L0_INDEX(va) (((va) >> 39) & 0x1FF)
+#define L1_INDEX(va) (((va) >> 30) & 0x1FF)
+#define L2_INDEX(va) (((va) >> 21) & 0x1FF)
+
+// 4KB granule 48-bit OA
+#define PTE_ADDR_MASK 0x0000FFFFFFFFF000ULL
+// static inline function is
+// A small function defined in a header that is
+// safe to include everywhere
+// optimized to avoid function calls
+// private to each source file
+static inline uint64_t *pte_next_table(uint64_t entry) {
+  return (uint64_t *)(entry & PTE_ADDR_MASK);
+}
+
+static inline int pte_valid(uint64_t entry) { return entry & PTE_VALID; }
+
 uint64_t *mmu_init(void);
+uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc);
 void mmu_run_tests(uint64_t *l1_table);
 
 #endif

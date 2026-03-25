@@ -41,19 +41,20 @@ uint64_t *mmu_init() {
 
   __asm__ __volatile__("msr mair_el1, %0" ::"r"(mair));
 
-  // Identity map L1 blocks - 8 * 1GB blocks
-  for (uint64_t i = 0; i < 8; i++) {
-    uint64_t phys = i * 0x40000000ULL;
-    uint64_t attr;
+  // Identity map using L2 tables with 2MB blocks
+  for (uint64_t l1i = 0; l1i < 8; l1i++) {
+    uint64_t *l2_table = (uint64_t *)pmm_allocate_page();
+    memset(l2_table, 0, PAGE_SIZE);
 
-    if (phys < 0x40000000ULL) {
-      attr = 0; // device memory
-    } else {
-      attr = 1; // normal memory
+    l1_table[l1i] = (uint64_t)l2_table | PTE_VALID | PTE_TABLE;
+
+    for (uint64_t l2i = 0; l2i < 512; l2i++) {
+      uint64_t phys_addr = l1i * _1GB + l2i * _2MB;
+      uint64_t attr = (phys_addr < MEM_START) ? 0 : 1; // 0=device, 1=normal
+
+      l2_table[l2i] = phys_addr | PTE_VALID | PTE_BLOCK | PTE_AF |
+                      PTE_SH_INNER | PTE_AP_RW | PTE_ATTRIDX(attr);
     }
-
-    l1_table[i] = phys | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER |
-                  PTE_AP_RW | PTE_ATTRIDX(attr);
   }
   // https://developer.arm.com/documentation/100095/0002/system-control/aarch64-register-descriptions/translation-control-register--el1
   uint64_t tcr =
@@ -106,7 +107,8 @@ int test_mmu_enabled() {
 int test_identity_mapping() {
   uintptr_t page = pmm_allocate_page();
   if (!page) {
-    uart_errorln("[MMU TEST] Failed to allocate page for identity mapping test");
+    uart_errorln(
+        "[MMU TEST] Failed to allocate page for identity mapping test");
     return 0;
   }
 
@@ -165,8 +167,46 @@ int test_remap(uint64_t *l1_table) {
   return pass;
 }
 
+int test_remap_l2(uint64_t *l1_table) {
+  uart_println("[MMU TEST] L2 remap test");
+
+  uint64_t l1_idx = 1;  // safe RAM region
+  uint64_t l2_idx = 10; // arbitrary 2MB chunk
+
+  uint64_t *l2_table = (uint64_t *)(l1_table[l1_idx] & ~0xFFFULL);
+
+  uint64_t old = l2_table[l2_idx];
+
+  uint64_t new_phys = ((l1_idx * 0x40000000ULL) + ((l2_idx + 1) * 0x200000ULL));
+
+  l2_table[l2_idx] = new_phys | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER |
+                     PTE_AP_RW | PTE_ATTRIDX(1);
+
+  __asm__ __volatile__("tlbi vmalle1");
+  __asm__ __volatile__("dsb ish");
+  __asm__ __volatile__("isb");
+
+  uint64_t va = (l1_idx * 0x40000000ULL) + (l2_idx * 0x200000ULL);
+
+  uint64_t *ptr = (uint64_t *)va;
+  uint64_t *phys_ptr = (uint64_t *)new_phys;
+
+  *ptr = 0xCAFEBABE;
+
+  int pass = (*phys_ptr == 0xCAFEBABE);
+
+  // restore
+  l2_table[l2_idx] = old;
+
+  __asm__ __volatile__("tlbi vmalle1");
+  __asm__ __volatile__("dsb ish");
+  __asm__ __volatile__("isb");
+
+  return pass;
+}
+
 void mmu_run_tests(uint64_t *l1_table) {
   print_result("MMU Enabled", test_mmu_enabled());
   print_result("Identity Mapping", test_identity_mapping());
-  print_result("Remap Test", test_remap(l1_table));
+  print_result("Remap Test L2", test_remap_l2(l1_table));
 }

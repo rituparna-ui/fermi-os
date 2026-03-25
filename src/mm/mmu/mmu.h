@@ -25,6 +25,9 @@
 // memory type from MAIR_EL1
 #define PTE_ATTRIDX(idx) ((idx) << 2)
 
+#define _1GB 0x40000000ULL
+#define _2MB 0x200000ULL
+
 uint64_t *mmu_init(void);
 void mmu_run_tests(uint64_t *l1_table);
 

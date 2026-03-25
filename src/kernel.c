@@ -1,4 +1,5 @@
-#include "pmm/pmm.h"
+#include "mm/mmu/mmu.h"
+#include "mm/pmm/pmm.h"
 #include "uart/uart.h"
 #include "utils/utils.h"
 #include <stdint.h>
@@ -11,6 +12,8 @@ void kernel_main() {
 
   pmm_init(MEM_START, MEM_SIZE);
   pmm_print_info();
+
+  mmu_init();
 
   while (1) {
     uart_putc(uart_getc());

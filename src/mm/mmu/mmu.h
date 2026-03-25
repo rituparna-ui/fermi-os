@@ -1,6 +1,8 @@
 #ifndef MM_MMU_H
 #define MM_MMU_H
 
+#include <stdint.h>
+
 #define PTE_VALID (1ULL << 0)
 #define PTE_TABLE (1ULL << 1)
 #define PTE_BLOCK (0ULL << 1)
@@ -23,6 +25,7 @@
 // memory type from MAIR_EL1
 #define PTE_ATTRIDX(idx) ((idx) << 2)
 
-void mmu_init(void);
+uint64_t *mmu_init(void);
+void mmu_run_tests(uint64_t *l1_table);
 
 #endif

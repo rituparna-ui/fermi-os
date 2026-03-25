@@ -14,6 +14,7 @@ void kernel_main() {
   pmm_print_info();
 
   mmu_init();
+  // mmu_run_tests(l1);
 
   while (1) {
     uart_putc(uart_getc());

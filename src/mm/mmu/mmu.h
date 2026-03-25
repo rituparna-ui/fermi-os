@@ -32,6 +32,11 @@
 #define L1_INDEX(va) (((va) >> 30) & 0x1FF)
 #define L2_INDEX(va) (((va) >> 21) & 0x1FF)
 
+// User cannot execute
+#define PTE_UXN (1ULL << 54)
+// kernel cannot execute
+#define PTE_PXN (1ULL << 53)
+
 // 4KB granule 48-bit OA
 #define PTE_ADDR_MASK 0x0000FFFFFFFFF000ULL
 // static inline function is

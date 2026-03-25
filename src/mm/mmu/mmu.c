@@ -59,10 +59,15 @@ uint64_t *mmu_init() {
 
     for (uint64_t l2i = 0; l2i < 512; l2i++) {
       uint64_t phys_addr = l1i * _1GB + l2i * _2MB;
+      if (phys_addr == 0) {
+        // NULL pointer deref should fault
+        continue;
+      }
       uint64_t attr = (phys_addr < MEM_START) ? 0 : 1; // 0=device, 1=normal
 
       l2_table[l2i] = phys_addr | PTE_VALID | PTE_BLOCK | PTE_AF |
                       PTE_SH_INNER | PTE_AP_RW | PTE_ATTRIDX(attr);
+      // conditionally set PXN and UXN on kernel text section
     }
   }
   // https://developer.arm.com/documentation/100095/0002/system-control/aarch64-register-descriptions/translation-control-register--el1
@@ -76,6 +81,7 @@ uint64_t *mmu_init() {
 
   __asm__ __volatile__("msr tcr_el1, %0" ::"r"(tcr));
 
+  __asm__ __volatile__("dsb ishst");
   __asm__ __volatile__("msr ttbr0_el1, %0" ::"r"(l0_table));
   __asm__ __volatile__("dsb ish");
   __asm__ __volatile__("isb");

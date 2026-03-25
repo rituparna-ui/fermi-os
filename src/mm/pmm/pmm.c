@@ -80,6 +80,7 @@ void pmm_init(uintptr_t mem_start, uint64_t mem_size) {
 
   // Place bitmap at the first page-aligned address after the kernel
   uint64_t kernel_end = (uint64_t)&__kernel_end;
+  // assert(bitmap + bitmap_bytes < mem_region_end);
   bitmap = (uint64_t *)PAGE_ALIGN_UP(kernel_end);
 
   // uart_puts("[PMM] Bitmap address: ");

@@ -1,12 +1,23 @@
 #include "mm/mmu/mmu.h"
 #include "mm/pmm/pmm.h"
 #include "mmio/mmio.h"
+#include "panic/panic.h"
+#include "strings/strings.h" // IWYU pragma: keep
 #include "uart/uart.h"
 #include "utils/utils.h"
 #include <stdint.h>
 
+extern uint8_t __bss_start;
+extern uint8_t __bss_end;
+
+static void zero_bss(void) {
+  memset(&__bss_start, 0, (size_t)(&__bss_end - &__bss_start));
+}
+
 // running in PAS
 void early_init() {
+  zero_bss();
+
   uart_init();
 
   uart_println("Fermi OS - Booting Up...");
@@ -44,4 +55,8 @@ void kernel_main() {
   while (1) {
     uart_putc(uart_getc());
   }
+}
+
+void kernel_panic_return(void) {
+  kernel_panic("kernel_main returned unexpectedly");
 }

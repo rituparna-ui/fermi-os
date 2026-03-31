@@ -1,7 +1,7 @@
 #include "mmio.h"
 #include "mm/mmu/mmu.h"
 
-uintptr_t mmio_va_offset = 0;
+volatile uintptr_t mmio_va_offset = 0;
 
 void mmio_switch_to_upper() {
   mmio_va_offset = KERNEL_VA_OFFSET;

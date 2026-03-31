@@ -55,7 +55,7 @@ static uint64_t *build_identity_tables(uint64_t **out_l1) {
         continue;
       }
       // 0 = device, 1 = normal
-      uint64_t attr = (phys_addr < MEM_SIZE) ? 0 : 1;
+      uint64_t attr = (phys_addr < MEM_START) ? 0 : 1;
 
       l2[l2i] = phys_addr | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER |
                 PTE_AP_RW | PTE_ATTRIDX(attr);
@@ -111,7 +111,7 @@ uint64_t *mmu_init() {
       (0b01ULL << 24) | // IRGN1 = Write-Back, Write-Allocate
       (0b01ULL << 26) | // ORGN1 = Write-Back, Write-Allocate
       (0b11ULL << 28) | // SH1 = inner shareable
-      (0b00ULL << 30) | // TG1 = 4KB granule
+      (0b10ULL << 30) | // TG1 = 4KB granule
                         // TG1 and TG0 have different encodings
                         // TG1[31:30] - bit[31]=RES1, bit[30]=0
       // Common

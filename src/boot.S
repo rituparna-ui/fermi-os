@@ -24,6 +24,9 @@ _start:
 	ldr x1, =kernel_main
 	add x1, x1, x0
 	br x1
-	// TODO: add panic handler
-	// bl kernel_main
-	// b kernel_panic
+
+	// panic if kernel_main returns
+	ldr x0, =KERNEL_VA_OFFSET
+	ldr x1, =kernel_panic_return
+	add x1, x1, x0
+	br x1

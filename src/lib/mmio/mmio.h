@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+void mmio_switch_to_upper(void);
+
 void mmio_write32(uintptr_t addr, uint32_t value);
 uint32_t mmio_read32(uintptr_t addr);
 

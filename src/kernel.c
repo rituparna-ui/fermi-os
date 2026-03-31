@@ -1,5 +1,6 @@
 #include "mm/mmu/mmu.h"
 #include "mm/pmm/pmm.h"
+#include "mmio/mmio.h"
 #include "uart/uart.h"
 #include "utils/utils.h"
 #include <stdint.h>
@@ -23,6 +24,9 @@ void early_init() {
 // runs in VAS Upper Half after boot.S relocates program counter and stack
 // pointer
 void kernel_main() {
+  // all device access through TTBR1
+  mmio_switch_to_upper();
+
   // Verify if the kernel is running in upper half
   uart_puts("[KERNEL] kernel_main address: ");
   uart_puthex((uint64_t)(uintptr_t)kernel_main);

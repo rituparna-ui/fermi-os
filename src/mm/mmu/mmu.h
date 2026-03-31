@@ -3,6 +3,12 @@
 
 #include <stdint.h>
 
+// table descriptor - bit[1:0]
+/*
+00/10 -> invalid
+01 -> block
+11 -> table/page
+*/
 #define PTE_VALID (1ULL << 0)
 #define PTE_TABLE (1ULL << 1)
 #define PTE_BLOCK (0ULL << 1)
@@ -27,6 +33,10 @@
 
 #define _1GB 0x40000000ULL
 #define _2MB 0x200000ULL
+
+#define KERNEL_VA_OFFSET 0xFFFF000000000000ULL
+#define PHYS_TO_VIRT(pa) ((pa) + KERNEL_VA_OFFSET)
+#define VIRT_TO_PHYS(va) ((va) - KERNEL_VA_OFFSET)
 
 #define L0_INDEX(va) (((va) >> 39) & 0x1FF)
 #define L1_INDEX(va) (((va) >> 30) & 0x1FF)

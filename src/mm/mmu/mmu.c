@@ -3,7 +3,8 @@
 #include "strings/strings.h" // IWYU pragma: keep
 #include "uart/uart.h"
 
-static uint64_t *l0_table;
+static uint64_t *l0_table_lo;
+static uint64_t *l0_table_hi;
 
 static uint64_t *alloc_table() {
   uint64_t *table = (uint64_t *)pmm_allocate_page();
@@ -15,74 +16,113 @@ static uint64_t *alloc_table() {
   return table;
 }
 
+// Build L0 -> L1 -> L2 page table hierarchy
+// maps the first 8GB of physical address space using 2MB blocks
+
+// VA layout:
+// [47:39] → L0 (9 bits)
+// [38:30] → L1 (9 bits)
+// [29:21] → L2 (9 bits)
+// [20:12] → L3 (9 bits)
+// [11:0]  → offset
+// Each level has 512 entries (2^9)
+static uint64_t *build_identity_tables(uint64_t **out_l1) {
+  uint64_t *l0 = alloc_table();
+  if (!l0) {
+    return 0;
+  }
+
+  uint64_t *l1 = alloc_table();
+  if (!l1) {
+    return 0;
+  }
+  // L0[0] -> L1 covers first 512GB of the virtual address space
+  l0[0] = (uint64_t)l1 | PTE_VALID | PTE_TABLE;
+
+  // 8 L1 entries * 512 L2 entries * 2MB = 8GB
+  for (uint64_t l1i = 0; l1i < 8; l1i++) {
+    uint64_t *l2 = alloc_table();
+    if (!l2) {
+      return 0;
+    }
+
+    l1[l1i] = (uint64_t)l2 | PTE_VALID | PTE_TABLE;
+
+    for (uint64_t l2i = 0; l2i < 512; l2i++) {
+      uint64_t phys_addr = l1i * _1GB + l2i * _2MB;
+      if (phys_addr == 0) {
+        // null ptr deref should fault
+        continue;
+      }
+      // 0 = device, 1 = normal
+      uint64_t attr = (phys_addr < MEM_SIZE) ? 0 : 1;
+
+      l2[l2i] = phys_addr | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER |
+                PTE_AP_RW | PTE_ATTRIDX(attr);
+    }
+  }
+
+  if (out_l1) {
+    *out_l1 = l1;
+  }
+
+  return l0;
+}
+
 uint64_t *mmu_init() {
   // reference manual - section D8.3
   uart_println("[MMU] Initializing MMU (48 bit VAS, 4kb granule)");
-  // VA layout:
-  // [47:39] → L0 (9 bits)
-  // [38:30] → L1 (9 bits)
-  // [29:21] → L2 (9 bits)
-  // [20:12] → L3 (9 bits)
-  // [11:0]  → offset
-  // Each level has 512 entries (2^9)
-
-  l0_table = alloc_table();
-  if (!l0_table) {
-    return 0;
-  }
-
-  uint64_t *l1_table = alloc_table();
-  if (!l1_table) {
-    return 0;
-  }
-
-  // VA range 0 → 512GB uses this L1 table
-  l0_table[0] = (uint64_t)l1_table | PTE_VALID | PTE_TABLE;
-  // table descriptor - bit[1:0]
-  // 00/10 → invalid
-  // 01 → block
-  // 11 → table/page
 
   uint64_t mair = (0x00 << 0) | // AttrIdx 0 = Device memory
                   (0xff << 8);  // AttrIdx 1 = Normal memory
 
   __asm__ __volatile__("msr mair_el1, %0" ::"r"(mair));
 
-  // Identity map using L2 tables with 2MB blocks
-  for (uint64_t l1i = 0; l1i < 8; l1i++) {
-    uint64_t *l2_table = alloc_table();
-    if (!l2_table) {
-      return 0;
-    }
-
-    l1_table[l1i] = (uint64_t)l2_table | PTE_VALID | PTE_TABLE;
-
-    for (uint64_t l2i = 0; l2i < 512; l2i++) {
-      uint64_t phys_addr = l1i * _1GB + l2i * _2MB;
-      if (phys_addr == 0) {
-        // NULL pointer deref should fault
-        continue;
-      }
-      uint64_t attr = (phys_addr < MEM_START) ? 0 : 1; // 0=device, 1=normal
-
-      l2_table[l2i] = phys_addr | PTE_VALID | PTE_BLOCK | PTE_AF |
-                      PTE_SH_INNER | PTE_AP_RW | PTE_ATTRIDX(attr);
-      // conditionally set PXN and UXN on kernel text section
-    }
+  // TTBR0 (UserSpace)
+  // Identity map first 8GB
+  uint64_t *l1_table = 0;
+  l0_table_lo = build_identity_tables(&l1_table);
+  if (!l0_table_lo) {
+    uart_errorln("[MMU] Failed to build TTBR0 tables");
+    return 0;
   }
+  uart_println("[MMU] TTBR0 lower half tables build");
+
+  // TTBR1 (KernelSpace)
+  // Map VA 0xFFFF_0000_0000_0000+ -> PA 0x0000+
+  // Hardware strips off the upper bits for TTBR1 lookups automatically
+  l0_table_hi = build_identity_tables(0);
+  if (!l0_table_hi) {
+    uart_errorln("[MMU] Failed to build TTBR1 tables");
+    return 0;
+  }
+  uart_println("[MMU] TTBR1 upper half tables build");
+
   // https://developer.arm.com/documentation/100095/0002/system-control/aarch64-register-descriptions/translation-control-register--el1
   uint64_t tcr =
+      // TTBR0
       (16ULL << 0) |    // T0SZ = 16 → 48-bit VA
       (0b01ULL << 8) |  // IRGN0 = Write-Back, Write-Allocate
       (0b01ULL << 10) | // ORGN0 = Write-Back, Write-Allocate
       (0b11ULL << 12) | // SH0 = inner shareable
       (0b00ULL << 14) | // TG0 = 4KB granule
+      // TTBR1
+      (16ULL << 16) |   // T1SZ = 16 → 48-bit VA
+      (0b01ULL << 24) | // IRGN1 = Write-Back, Write-Allocate
+      (0b01ULL << 26) | // ORGN1 = Write-Back, Write-Allocate
+      (0b11ULL << 28) | // SH1 = inner shareable
+      (0b00ULL << 30) | // TG1 = 4KB granule
+                        // TG1 and TG0 have different encodings
+                        // TG1[31:30] - bit[31]=RES1, bit[30]=0
+      // Common
       (0b010ULL << 32); // IPS = 40-bit PA (1TB) (needed for >4GB RAM)
 
   __asm__ __volatile__("msr tcr_el1, %0" ::"r"(tcr));
-
   __asm__ __volatile__("dsb ishst");
-  __asm__ __volatile__("msr ttbr0_el1, %0" ::"r"(l0_table));
+
+  __asm__ __volatile__("msr ttbr0_el1, %0" ::"r"(l0_table_lo));
+  __asm__ __volatile__("msr ttbr1_el1, %0" ::"r"(l0_table_hi));
+
   __asm__ __volatile__("dsb ish");
   __asm__ __volatile__("isb");
 
@@ -289,9 +329,44 @@ int test_walk(uint64_t *l0) {
   return *check == 0x12345678;
 }
 
+int test_ttbr1_upper_half() {
+  uart_println("[MMU TEST] TTBR1 upper half access test");
+
+  uintptr_t pa = pmm_allocate_page();
+  if (!pa) {
+    uart_errorln("[MMU TEST] Failed to allocate page for TTBR1 test");
+    return 0;
+  }
+
+  // Write value to lower half identity mapped address
+  volatile uint64_t *lo_ptr = (volatile uint64_t *)pa;
+  *lo_ptr = 0xABCDEFAD;
+  __asm__ __volatile__("dsb ish");
+
+  // Read back from the upper half address
+  volatile uint64_t *hi_ptr = (volatile uint64_t *)PHYS_TO_VIRT(pa);
+
+  uart_puts("[MMU TEST] lo_ptr=");
+  uart_puthex((uint64_t)lo_ptr);
+  uart_puts(" hi_ptr=");
+  uart_puthex((uint64_t)hi_ptr);
+  uart_println("");
+
+  int pass = (*hi_ptr == 0xABCDEFAD);
+
+  // also test writing to upper half and reading from lower half
+  *hi_ptr = 0xABBCCCDD;
+  __asm__ __volatile__("dsb ish");
+  pass &= (*lo_ptr == 0xABBCCCDD);
+
+  pmm_free_page(pa);
+  return pass;
+}
+
 void mmu_run_tests(uint64_t *l1_table) {
   print_result("MMU Enabled", test_mmu_enabled());
   print_result("Identity Mapping", test_identity_mapping());
   print_result("Remap Test L2", test_remap_l2(l1_table));
-  print_result("MMU Table Walk", test_walk(l0_table));
+  print_result("MMU Table Walk", test_walk(l0_table_lo));
+  print_result("TTBR1 Upper Half", test_ttbr1_upper_half());
 }

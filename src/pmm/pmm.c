@@ -144,6 +144,54 @@ uintptr_t pmm_allocate_page(void) {
   return 0;
 }
 
+uintptr_t pmm_allocate_pages(uint64_t count) {
+  if (count == 0) {
+    return 0;
+  }
+  if (count == 1) {
+    return pmm_allocate_page();
+  }
+
+  uart_puts("[PMM] allocating ");
+  uart_putdec(count);
+  uart_puts(" contiguous pages... ");
+
+  uint64_t run_start = 0;
+  uint64_t run_length = 0;
+
+  for (uint64_t pfn = reserved_pages; pfn < total_pages; pfn++) {
+    if (!bitmap_test(pfn)) {
+      if (run_length == 0) {
+        run_start = pfn;
+      }
+      run_length++;
+
+      if (run_length == count) {
+        for (uint64_t i = 0; i < count; i++) {
+          bitmap_set(run_start + i);
+        }
+        used_pages += count;
+        uintptr_t phys_addr = mem_region_start + PFN_TO_PHYS(run_start);
+        uart_puts("at ");
+        uart_puthex(phys_addr);
+        uart_println("");
+        return phys_addr;
+      }
+    } else {
+      run_length = 0;
+    }
+  }
+
+  uart_errorln("[PMM] No contiguous block found!");
+  return 0;
+}
+
+void pmm_free_pages(uintptr_t phys_addr, uint64_t count) {
+  for (uint64_t i = 0; i < count; i++) {
+    pmm_free_page(phys_addr + (i * PAGE_SIZE));
+  }
+}
+
 void pmm_free_page(uintptr_t phys_addr) {
   uart_puts("[PMM] attempting to free address ");
   uart_puthex(phys_addr);

@@ -28,7 +28,9 @@
 
 void pmm_init(uintptr_t mem_start, uint64_t mem_size);
 uintptr_t pmm_allocate_page(void);
+uintptr_t pmm_allocate_pages(uint64_t count);
 void pmm_free_page(uintptr_t phys_addr);
+void pmm_free_pages(uintptr_t phys_addr, uint64_t count);
 void pmm_print_info(void);
 
 #endif

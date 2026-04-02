@@ -1,3 +1,4 @@
+#include "mm/heap/heap.h"
 #include "mm/mmu/mmu.h"
 #include "mm/pmm/pmm.h"
 #include "mmio/mmio.h"
@@ -49,6 +50,8 @@ void kernel_main() {
   uart_puts("[KERNEL] Stack Pointer: ");
   uart_puthex(sp);
   uart_println("");
+
+  heap_init();
 
   uart_println("[KERNEL] Ready ! Entering echo loop");
 

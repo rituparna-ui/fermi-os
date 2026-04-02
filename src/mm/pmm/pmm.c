@@ -114,7 +114,7 @@ void pmm_init(uintptr_t mem_start, uint64_t mem_size) {
 }
 
 uintptr_t pmm_allocate_page(void) {
-  uart_puts("[PMM] allocating 1 page at ");
+  // uart_puts("[PMM] allocating 1 page at ");
 
   for (uint64_t i = 0; i < bitmap_size; i++) {
     if (bitmap[i] == ~0ULL) {
@@ -134,8 +134,8 @@ uintptr_t pmm_allocate_page(void) {
         bitmap_set(page_frame_number);
         used_pages++;
         uintptr_t phys_addr = mem_region_start + PFN_TO_PHYS(page_frame_number);
-        uart_puthex(phys_addr);
-        uart_println("");
+        // uart_puthex(phys_addr);
+        // uart_println("");
         return phys_addr;
       }
     }

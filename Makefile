@@ -22,7 +22,7 @@ C_OBJECTS := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(C_SOURCES))
 OBJECTS := $(S_OBJECTS) $(C_OBJECTS)
 
 # Flags
-CFLAGS := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 -mstrict-align -I $(SRC_DIR)/lib -I $(SRC_DIR) -I $(SRC_DIR)/pci/virtio
+CFLAGS := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 -mstrict-align -I $(SRC_DIR)/lib -I $(SRC_DIR) -I $(SRC_DIR)/exception -I $(SRC_DIR)/pci/virtio
 ASFLAGS := -g
 LDFLAGS := -nostdlib -g -T linker.ld
 

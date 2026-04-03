@@ -1,3 +1,4 @@
+#include "exception.h"
 #include "mm/heap/heap.h"
 #include "mm/mmu/mmu.h"
 #include "mm/pmm/pmm.h"
@@ -24,6 +25,8 @@ void early_init() {
   uart_println("Fermi OS - Booting Up...");
   print_current_el();
 
+  exceptions_init();
+
   pmm_init(MEM_START, MEM_SIZE);
   pmm_print_info();
 
@@ -38,6 +41,9 @@ void early_init() {
 void kernel_main() {
   // all device access through TTBR1
   mmio_switch_to_upper();
+
+  // relocate VBAR_EL1 to upper half
+  exceptions_init_upper();
 
   // Verify if the kernel is running in upper half
   uart_puts("[KERNEL] kernel_main address: ");

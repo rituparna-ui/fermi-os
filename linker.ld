@@ -6,6 +6,8 @@ SECTIONS
 
 	.text ALIGN(4096) : {
 		*(.text.boot)
+		. = ALIGN(2048);
+		*(.text.vectors)
 		*(.text*)
 	}
 

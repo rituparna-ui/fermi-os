@@ -1,4 +1,5 @@
 #include "exception.h"
+#include "gic/gic.h"
 #include "mm/mmu/mmu.h"
 #include "panic/panic.h"
 #include "uart/uart.h"
@@ -136,10 +137,29 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
     }
     break;
 
-  case EXCEPTION_IRQ:
+  case EXCEPTION_IRQ: {
     // GIC interrupt
-    uart_println("[EXCEPTION] IRQ received (not implemented)");
+    uint32_t intid = gic_ack_irq();
+
+    if (intid == GIC_INTID_NO_PENDING) {
+      break;
+    }
+
+    if (intid == 30) {
+      // re-arm timer for next tick
+      uint64_t freq;
+      __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
+      __asm__ __volatile__("msr cntp_tval_el0, %0" ::"r"(freq));
+      uart_println("[TIMER] tick");
+    } else {
+      uart_puts("[IRQ] INTID ");
+      uart_putdec(intid);
+      uart_println(" (not implemented)");
+    }
+
+    gic_end_irq(intid);
     break;
+  }
 
   case EXCEPTION_FIQ:
     dump_trap_frame(type, frame);

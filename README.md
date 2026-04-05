@@ -79,4 +79,5 @@ make dump_dts
 - **Higher-Half Kernel** — Dual address space with TTBR0 (identity map) and TTBR1 (`0xFFFF_0000_0000_0000+` → PA `0x0+`)
 - **Kernel Heap** — First-fit allocator with block splitting, coalescing, double-free detection, and bounds checking
 - **Exception Handling** — Full ARMv8-A vector table, trap frame save/restore, ESR decoding, register dump on fault
+- **GICv3 Interrupt Controller** — Minimal GICv3 bringup with Distributor/Redistributor initialization, affinity routing, system register interface, IRQ acknowledge/EOI, and ARM Generic Timer firing every 1-second tick
 - **Kernel Panic Handler** — System register dump and CPU halt on unrecoverable errors

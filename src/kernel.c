@@ -1,4 +1,5 @@
 #include "exception.h"
+#include "gic/gic.h"
 #include "mm/heap/heap.h"
 #include "mm/mmu/mmu.h"
 #include "mm/pmm/pmm.h"
@@ -58,6 +59,19 @@ void kernel_main() {
   uart_println("");
 
   heap_init();
+
+  gic_init();
+
+  {
+    // Enable timer, fire every ~1 second
+    uint64_t freq;
+    __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
+    __asm__ __volatile__("msr cntp_tval_el0, %0" ::"r"(freq));
+    __asm__ __volatile__("msr cntp_ctl_el0, %0" ::"r"(1ULL)); // enable
+
+    // PPI 30 = physical timer
+    gic_enable_irq(30);
+  }
 
   uart_println("[KERNEL] Ready ! Entering echo loop");
 

@@ -1,5 +1,6 @@
 #include "uart.h"
 #include "mmio/mmio.h"
+#include <stdarg.h>
 
 // PL011
 void uart_init() {
@@ -101,4 +102,89 @@ void uart_putbin(uint64_t value) {
       started = 1;
     }
   }
+}
+
+// Supported format specifiers:
+//   %s  - const char *
+//   %d  - int64_t
+//   %u  - uint64_t
+//   %x  - hex with 0x prefix (uint64_t)
+//   %p  - pointer (void *), same as %x
+//   %b  - binary with 0b prefix (uint64_t)
+//   %c  - char
+//   %%  - literal '%'
+void uart_printf(const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+
+  while (*fmt) {
+    if (*fmt != '%') {
+      uart_putc(*fmt++);
+      continue;
+    }
+
+    fmt++;
+
+    switch (*fmt) {
+    case 's': {
+      const char *s = va_arg(args, const char *);
+      uart_puts(s ? s : "(null)");
+      break;
+    }
+    case 'd': {
+      int64_t val = va_arg(args, int64_t);
+      if (val < 0) {
+        uart_putc('-');
+        uart_putdec((uint64_t)(-val));
+      } else {
+        uart_putdec((uint64_t)val);
+      }
+      break;
+    }
+    case 'u': {
+      uint64_t val = va_arg(args, uint64_t);
+      uart_putdec(val);
+      break;
+    }
+    case 'x': {
+      uint64_t val = va_arg(args, uint64_t);
+      uart_puthex(val);
+      break;
+    }
+    case 'p': {
+      void *ptr = va_arg(args, void *);
+      uart_puthex((uint64_t)ptr);
+      break;
+    }
+    case 'b': {
+      uint64_t val = va_arg(args, uint64_t);
+      uart_putbin(val);
+      break;
+    }
+    case 'c': {
+      char c = (char)va_arg(args, int);
+      uart_putc(c);
+      break;
+    }
+    case '%': {
+      uart_putc('%');
+      break;
+    }
+    case '\0': {
+      // format string ended with a lone '%'
+      goto done;
+    }
+    default: {
+      // unknown specifier, print as-is
+      uart_putc('%');
+      uart_putc(*fmt);
+      break;
+    }
+    }
+
+    fmt++;
+  }
+
+done:
+  va_end(args);
 }

@@ -73,7 +73,7 @@ make dump_dts
 
 ## Features
 
-- **PL011 UART Driver** — Full serial I/O, hex/decimal/binary output
+- **PL011 UART Driver** — Full serial I/O, hex/decimal/binary output and fromatted print with `%s %d %u %x %p %b %c %%` format specifiers
 - **Physical Memory Manager (PMM)** — Bitmap-based page allocator managing 8 GB of RAM, with single and contiguous multi-page allocation
 - **MMU (Memory Management Unit)** — 3-level page tables (L0→L1→L2) with 2 MB blocks, 48-bit virtual address space, 4 KB granule
 - **Higher-Half Kernel** — Dual address space with TTBR0 (identity map) and TTBR1 (`0xFFFF_0000_0000_0000+` → PA `0x0+`)

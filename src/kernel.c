@@ -71,6 +71,7 @@ void kernel_main() {
 
   gic_init();
 
+  /*
   {
     // Enable timer, fire every ~1 second
     uint64_t freq;
@@ -81,6 +82,7 @@ void kernel_main() {
     // PPI 30 = physical timer
     gic_enable_irq(30);
   }
+  */
 
   uart_println("[KERNEL] Ready ! Entering echo loop");
 

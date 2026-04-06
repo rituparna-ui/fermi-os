@@ -17,9 +17,7 @@ static void enable_distributor_affinity_routing() {
 
   mmio_write32(GICD_CTLR, GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_G1NS);
 
-  uart_puts("[GIC] GICD_CTLR = ");
-  uart_puthex(mmio_read32(GICD_CTLR));
-  uart_println("");
+  uart_printf("[GIC] GICD_CTLR = %x\n", (uint64_t)mmio_read32(GICD_CTLR));
 }
 
 static void redistributor_wakeup() {
@@ -75,9 +73,7 @@ void gic_enable_irq(uint32_t intid) {
     mmio_write32(reg, val);
   }
 
-  uart_puts("[GIC] Enabled IRQ ");
-  uart_putdec(intid);
-  uart_println("");
+  uart_printf("[GIC] Enabled IRQ %d\n", (uint64_t)intid);
 }
 
 uint64_t gic_ack_irq() {

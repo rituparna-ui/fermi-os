@@ -60,39 +60,18 @@ static void dump_trap_frame(uint64_t type, trap_frame_t *frame) {
   uart_println("");
   uart_println("========== EXCEPTION ==========");
 
-  uart_puts("  Type : ");
-  uart_println(exception_type_str(type));
+  uart_printf("  Type : %s\n", exception_type_str(type));
 
   uint64_t ec = ESR_EC(frame->esr);
-  uart_puts("  Class: ");
-  uart_puts(esr_class_str(ec));
-  uart_puts(" (EC=0x");
-  uart_puthex(ec);
-  uart_println(")");
-
-  uart_puts("  ESR_EL1 : ");
-  uart_puthex(frame->esr);
-  uart_println("");
-
-  uart_puts("  ELR_EL1 : ");
-  uart_puthex(frame->elr);
-  uart_println("");
-
-  uart_puts("  FAR_EL1 : ");
-  uart_puthex(frame->far);
-  uart_println("");
-
-  uart_puts("  SPSR_EL1: ");
-  uart_puthex(frame->spsr);
-  uart_println("");
+  uart_printf("  Class: %s (EC=%x)\n", esr_class_str(ec), ec);
+  uart_printf("  ESR_EL1 : %x\n", frame->esr);
+  uart_printf("  ELR_EL1 : %x\n", frame->elr);
+  uart_printf("  FAR_EL1 : %x\n", frame->far);
+  uart_printf("  SPSR_EL1 : %x\n", frame->spsr);
 
   uart_println("  Registers:");
   for (int i = 0; i < 31; i++) {
-    uart_puts("    x");
-    uart_putdec((uint64_t)i);
-    uart_puts(" = ");
-    uart_puthex(frame->regs[i]);
-    uart_println("");
+    uart_printf("    x%d = %x\n", (uint64_t)i, frame->regs[i]);
   }
 
   uart_println("===============================");
@@ -152,9 +131,7 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
       __asm__ __volatile__("msr cntp_tval_el0, %0" ::"r"(freq));
       uart_println("[TIMER] tick");
     } else {
-      uart_puts("[IRQ] INTID ");
-      uart_putdec(intid);
-      uart_println(" (not implemented)");
+      uart_printf("[IRQ] INTID %d (not implemented)\n", (uint64_t)intid);
     }
 
     gic_end_irq(intid);
@@ -182,9 +159,7 @@ void exceptions_init(void) {
   uart_println("[EXCEPTION] Installing vector table (physical)");
 
   uint64_t vbar = (uint64_t)vector_table;
-  uart_puts("[EXCEPTION] VBAR_EL1 = ");
-  uart_puthex(vbar);
-  uart_println("");
+  uart_printf("[EXCEPTION] VBAR_EL1 = %x\n", vbar);
 
   __asm__ __volatile__("msr vbar_el1, %0" ::"r"(vbar));
   __asm__ __volatile__("isb");
@@ -196,9 +171,7 @@ void exceptions_init_upper(void) {
   uart_println("[EXCEPTION] Relocating vector table to upper half");
 
   uint64_t vbar = PHYS_TO_VIRT((uint64_t)vector_table);
-  uart_puts("[EXCEPTION] VBAR_EL1 = ");
-  uart_puthex(vbar);
-  uart_println("");
+  uart_printf("[EXCEPTION] VBAR_EL1 = %x\n", vbar);
 
   __asm__ __volatile__("msr vbar_el1, %0" ::"r"(vbar));
   __asm__ __volatile__("isb");

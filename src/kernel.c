@@ -59,16 +59,13 @@ void kernel_main() {
   exceptions_init_upper();
 
   // Verify if the kernel is running in upper half
-  uart_puts("[KERNEL] kernel_main address: ");
-  uart_puthex((uint64_t)(uintptr_t)kernel_main);
-  uart_println("");
+  uart_printf("[KERNEL] kernel_main address: %x\n",
+              (uint64_t)(uintptr_t)kernel_main);
 
   // verify stack pointer in upper half
   uint64_t sp;
   __asm__ __volatile__("mov %0, sp" : "=r"(sp));
-  uart_puts("[KERNEL] Stack Pointer: ");
-  uart_puthex(sp);
-  uart_println("");
+  uart_printf("[KERNEL] Stack Pointer: %x\n", sp);
 
   heap_init();
 
@@ -84,10 +81,6 @@ void kernel_main() {
     // PPI 30 = physical timer
     gic_enable_irq(30);
   }
-
-  uart_printf("[PRINTF TEST] s=%s d=%d u=%u x=%x p=%p b=%b c=%c %%=%%\n", "hello",
-              (int64_t)-42, (uint64_t)1024, (uint64_t)0xCAFE,
-              (void *)kernel_main, (uint64_t)0b1010, (int)'Z');
 
   uart_println("[KERNEL] Ready ! Entering echo loop");
 

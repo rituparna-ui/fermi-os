@@ -34,20 +34,9 @@ void heap_init(void) {
   heap_head->is_free = 1;
   heap_head->next = 0;
 
-  uart_puts("[HEAP] Heap VA: ");
-  uart_puthex(va);
-  uart_puts(" - ");
-  uart_puthex(va + heap_size);
-  uart_println("");
-
-  uart_puts("[HEAP] Usable: ");
-  uart_putdec(heap_head->size / 1024);
-  uart_puts(" KiB (");
-  uart_putdec(heap_head->size);
-  uart_puts(" bytes) | Header: ");
-  uart_putdec(BLOCK_HEADER_SIZE);
-  uart_puts(" bytes");
-  uart_println("");
+  uart_printf("[HEAP] Heap VA: %x - %x\n", va, va + heap_size);
+  uart_printf("[HEAP] Usable: %d KiB (%d bytes) | Header: %d bytes\n",
+              heap_head->size / 1024, heap_head->size, BLOCK_HEADER_SIZE);
 
   uart_println("[HEAP] Initialized!");
 }
@@ -147,15 +136,9 @@ void heap_print_info(void) {
   uint64_t block_count = 0;
 
   while (current) {
-    uart_puts("  [");
-    uart_putdec(block_count);
-    uart_puts("] addr=");
-    uart_puthex((uint64_t)(uintptr_t)current);
-    uart_puts(" size=");
-    uart_putdec(current->size);
-    uart_puts(" ");
-    uart_puts(current->is_free ? "FREE" : "USED");
-    uart_println("");
+    uart_printf("  [%d] addr=%x size=%d %s\n", block_count,
+                (uint64_t)(uintptr_t)current, current->size,
+                current->is_free ? "FREE" : "USED");
 
     if (current->is_free) {
       total_free += current->size;
@@ -167,21 +150,12 @@ void heap_print_info(void) {
     current = current->next;
   }
 
-  uart_puts("[HEAP][INFO] Blocks: ");
-  uart_putdec(block_count);
-  uart_puts(" | Used: ");
-  uart_putdec(total_used);
-  uart_puts(" bytes | Free: ");
-  uart_putdec(total_free);
-  uart_puts(" bytes");
-  uart_println("");
+  uart_printf("[HEAP][INFO] Blocks: %d | Used: %d bytes | Free: %d bytes\n",
+              block_count, total_used, total_free);
 }
 
 static void test_result(const char *name, int pass) {
-  uart_puts("[HEAP TEST] ");
-  uart_puts(name);
-  uart_puts(": ");
-  uart_println(pass ? "PASS" : "FAIL");
+  uart_printf("[HEAP TEST] %s: %s\n", name, pass ? "PASS" : "FAIL");
 }
 
 void heap_run_tests(void) {

@@ -29,33 +29,16 @@ static inline int bitmap_test(uint64_t pfn) {
 void pmm_print_info() {
   uint64_t mem_size = mem_region_end - mem_region_start;
 
-  uart_puts("[PMM][INFO] Memory region: ");
-  uart_puthex(mem_region_start);
-  uart_puts(" - ");
-  uart_puthex(mem_region_end);
-  uart_println("");
+  uart_printf("[PMM][INFO] Memory region: %x - %x\n", mem_region_start,
+              mem_region_end);
 
-  uart_puts("[PMM][INFO] Memory Size: ");
-  uart_puthex(mem_size);
-  uart_puts(" | ");
-  uart_putdec(mem_size / 1024 / 1024);
-  uart_println(" mbytes");
+  uart_printf("[PMM][INFO] Memory Size: %x | %d mbytes\n", mem_size,
+              mem_size / 1024 / 1024);
 
-  uart_puts("[PMM][INFO] Total Pages: ");
-  uart_putdec(total_pages);
-  uart_println("");
-
-  uart_puts("[PMM][INFO] Reserved Pages: ");
-  uart_putdec(reserved_pages);
-  uart_println("");
-
-  uart_puts("[PMM][INFO] Used Pages: ");
-  uart_putdec(used_pages);
-  uart_println("");
-
-  uart_puts("[PMM][INFO] Free Pages: ");
-  uart_putdec(total_pages - used_pages);
-  uart_println("");
+  uart_printf("[PMM][INFO] Total Pages: %d\n", total_pages);
+  uart_printf("[PMM][INFO] Reserved Pages: %d\n", reserved_pages);
+  uart_printf("[PMM][INFO] Used Pages: %d\n", used_pages);
+  uart_printf("[PMM][INFO] Free Pages: %d\n", total_pages - used_pages);
 }
 
 void pmm_init(uintptr_t mem_start, uint64_t mem_size) {
@@ -70,26 +53,16 @@ void pmm_init(uintptr_t mem_start, uint64_t mem_size) {
   bitmap_size = (total_pages + 63) / 64;
   uint64_t bitmap_bytes = bitmap_size * sizeof(uint64_t);
 
-  // uart_puts("[PMM] Bitmap Length: ");
-  // uart_putdec(bitmap_size);
-  // uart_println("");
-
-  // uart_puts("[PMM] Bitmap Bytes: ");
-  // uart_putdec(bitmap_bytes);
-  // uart_println("");
+  uart_printf("[PMM] Bitmap Length: %d\n", bitmap_size);
+  uart_printf("[PMM] Bitmap Bytes: %d\n", bitmap_bytes);
 
   // Place bitmap at the first page-aligned address after the kernel
   uint64_t kernel_end = (uint64_t)&__kernel_end;
   // assert(bitmap + bitmap_bytes < mem_region_end);
   bitmap = (uint64_t *)PAGE_ALIGN_UP(kernel_end);
 
-  // uart_puts("[PMM] Bitmap address: ");
-  // uart_puthex((uintptr_t)bitmap);
-  // uart_println("");
-
-  // uart_puts("[PMM] Kernel End: ");
-  // uart_puthex(kernel_end);
-  // uart_println("");
+  uart_printf("[PMM] Bitmap address: %x\n", (uintptr_t)bitmap);
+  uart_printf("[PMM] Kernel End: %x\n", kernel_end);
 
   uart_println("[PMM] Zeroing Bitmap");
   memset(bitmap, 0, bitmap_bytes);
@@ -100,9 +73,7 @@ void pmm_init(uintptr_t mem_start, uint64_t mem_size) {
   uint64_t reserved_end = PAGE_ALIGN_UP(bitmap_end);
   reserved_pages = (reserved_end - mem_region_start) / PAGE_SIZE;
 
-  // uart_puts("[PMM] Bitmap End: ");
-  // uart_puthex(reserved_end);
-  // uart_println("");
+  uart_printf("[PMM] Bitmap End: %x\n", reserved_end);
 
   // mark reserverd pages
   for (uint64_t pfn = 0; pfn < reserved_pages; pfn++) {
@@ -114,7 +85,7 @@ void pmm_init(uintptr_t mem_start, uint64_t mem_size) {
 }
 
 uintptr_t pmm_allocate_page(void) {
-  // uart_puts("[PMM] allocating 1 page at ");
+  // uart_printf("[PMM] allocating 1 page at ");
 
   for (uint64_t i = 0; i < bitmap_size; i++) {
     if (bitmap[i] == ~0ULL) {
@@ -134,8 +105,7 @@ uintptr_t pmm_allocate_page(void) {
         bitmap_set(page_frame_number);
         used_pages++;
         uintptr_t phys_addr = mem_region_start + PFN_TO_PHYS(page_frame_number);
-        // uart_puthex(phys_addr);
-        // uart_println("");
+        // uart_printf("%x\n",phys_addr);
         return phys_addr;
       }
     }
@@ -153,9 +123,7 @@ uintptr_t pmm_allocate_pages(uint64_t count) {
     return pmm_allocate_page();
   }
 
-  uart_puts("[PMM] allocating ");
-  uart_putdec(count);
-  uart_puts(" contiguous pages... ");
+  uart_printf("[PMM] allocating %d contiguous pages... ", count);
 
   uint64_t run_start = 0;
   uint64_t run_length = 0;
@@ -173,9 +141,7 @@ uintptr_t pmm_allocate_pages(uint64_t count) {
         }
         used_pages += count;
         uintptr_t phys_addr = mem_region_start + PFN_TO_PHYS(run_start);
-        uart_puts("at ");
-        uart_puthex(phys_addr);
-        uart_println("");
+        uart_printf("at %x\n", phys_addr);
         return phys_addr;
       }
     } else {
@@ -194,9 +160,7 @@ void pmm_free_pages(uintptr_t phys_addr, uint64_t count) {
 }
 
 void pmm_free_page(uintptr_t phys_addr) {
-  uart_puts("[PMM] attempting to free address ");
-  uart_puthex(phys_addr);
-  uart_println("");
+  uart_printf("[PMM] attempting to free address %x\n", phys_addr);
 
   if (phys_addr < mem_region_start || phys_addr >= mem_region_end) {
     uart_errorln("[PMM] address outside managed region");

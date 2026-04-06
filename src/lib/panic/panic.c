@@ -10,8 +10,7 @@ __attribute__((noreturn)) void kernel_panic(const char *msg) {
   uart_println("");
 
   if (msg) {
-    uart_puts("  Reason: ");
-    uart_println(msg);
+    uart_printf("  Reason: %s\n", msg);
   }
 
   // Dump system registers
@@ -23,25 +22,12 @@ __attribute__((noreturn)) void kernel_panic(const char *msg) {
   __asm__ __volatile__("mov %0, sp" : "=r"(sp));
 
   uart_println("");
-  uart_puts("  ELR_EL1 (return addr) : ");
-  uart_puthex(elr);
-  uart_println("");
 
-  uart_puts("  ESR_EL1 (syndrome)    : ");
-  uart_puthex(esr);
-  uart_println("");
-
-  uart_puts("  FAR_EL1 (fault addr)  : ");
-  uart_puthex(far_reg);
-  uart_println("");
-
-  uart_puts("  SP      (stack ptr)   : ");
-  uart_puthex(sp);
-  uart_println("");
-
-  uart_println("");
-  uart_println("  System halted. Reset to continue.");
-  uart_println("");
+  uart_printf("  ELR_EL1 (return addr) : %x\n", elr);
+  uart_printf("  ESR_EL1 (syndrome)    : %x\n", esr);
+  uart_printf("  FAR_EL1 (fault addr)  : %x\n", far_reg);
+  uart_printf("  SP      (stack ptr)   : %x\n", sp);
+  uart_printf("\n  System halted. Reset to continue.\n");
 
   // Halt CPU
   while (1) {

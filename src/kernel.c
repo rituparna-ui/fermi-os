@@ -17,9 +17,21 @@ static void zero_bss(void) {
   memset(&__bss_start, 0, (size_t)(&__bss_end - &__bss_start));
 }
 
+void enable_fp_simd() {
+  // CPACR_EL1.FPEN = 0b11
+  // GCC uses SIMD registers for varargs
+  // got ESR_EL1 : 0x1FE00000 while building uart_printf
+  uint64_t cpacr;
+  __asm__ __volatile__("mrs %0, cpacr_el1" : "=r"(cpacr));
+  cpacr |= (3ULL << 20);
+  __asm__ __volatile__("msr cpacr_el1, %0" ::"r"(cpacr));
+  __asm__ __volatile__("isb");
+}
+
 // running in PAS
 void early_init() {
   zero_bss();
+  enable_fp_simd();
 
   uart_init();
 
@@ -47,16 +59,13 @@ void kernel_main() {
   exceptions_init_upper();
 
   // Verify if the kernel is running in upper half
-  uart_puts("[KERNEL] kernel_main address: ");
-  uart_puthex((uint64_t)(uintptr_t)kernel_main);
-  uart_println("");
+  uart_printf("[KERNEL] kernel_main address: %x\n",
+              (uint64_t)(uintptr_t)kernel_main);
 
   // verify stack pointer in upper half
   uint64_t sp;
   __asm__ __volatile__("mov %0, sp" : "=r"(sp));
-  uart_puts("[KERNEL] Stack Pointer: ");
-  uart_puthex(sp);
-  uart_println("");
+  uart_printf("[KERNEL] Stack Pointer: %x\n", sp);
 
   heap_init();
 

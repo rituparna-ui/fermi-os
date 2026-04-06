@@ -32,7 +32,6 @@ void print_current_el() {
   uint8_t el = get_current_el_number();
   char *el_name = get_el_name(el);
 
-  uart_puts("Current Exception Level: ");
-  uart_println(el_name);
+  uart_printf("Current Exception Level: %s\n", el_name);
   return;
 }

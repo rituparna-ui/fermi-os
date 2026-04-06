@@ -190,10 +190,7 @@ uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc) {
 }
 
 static void print_result(const char *name, int pass) {
-  uart_puts("[MMU TEST] ");
-  uart_puts(name);
-  uart_puts(": ");
-  uart_println(pass ? "PASS" : "FAIL");
+  uart_printf("[MMU TEST] %s: %s\n", name, pass ? "PASS" : "FAIL");
 }
 
 int test_mmu_enabled() {
@@ -246,11 +243,7 @@ int test_remap(uint64_t *l1_table) {
 
   // After swap, va1 should now point to PA 0x1C0000000
   // which contains 0xABABAABB
-  uart_puts("[MMU TEST] va1=");
-  uart_puthex((uint64_t)va1);
-  uart_puts(" va2=");
-  uart_puthex((uint64_t)va2);
-  uart_println("");
+  uart_printf("[MMU TEST] va1=%x va2=%x\n", (uint64_t)va1, (uint64_t)va2);
 
   int pass = (*va1 == 0xABABAABB);
 
@@ -346,11 +339,8 @@ int test_ttbr1_upper_half() {
   // Read back from the upper half address
   volatile uint64_t *hi_ptr = (volatile uint64_t *)PHYS_TO_VIRT(pa);
 
-  uart_puts("[MMU TEST] lo_ptr=");
-  uart_puthex((uint64_t)lo_ptr);
-  uart_puts(" hi_ptr=");
-  uart_puthex((uint64_t)hi_ptr);
-  uart_println("");
+  uart_printf("[MMU TEST] lo_ptr=%x hi_ptr=%x\n", (uint64_t)lo_ptr,
+              (uint64_t)hi_ptr);
 
   int pass = (*hi_ptr == 0xABCDEFAD);
 

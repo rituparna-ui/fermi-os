@@ -6,6 +6,7 @@
 #include "mmio/mmio.h"
 #include "panic/panic.h"
 #include "strings/strings.h" // IWYU pragma: keep
+#include "timer/timer.h"
 #include "uart/uart.h"
 #include "utils/utils.h"
 #include <stdint.h>
@@ -71,18 +72,8 @@ void kernel_main() {
 
   gic_init();
 
-  /*
-  {
-    // Enable timer, fire every ~1 second
-    uint64_t freq;
-    __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
-    __asm__ __volatile__("msr cntp_tval_el0, %0" ::"r"(freq));
-    __asm__ __volatile__("msr cntp_ctl_el0, %0" ::"r"(1ULL)); // enable
-
-    // PPI 30 = physical timer
-    gic_enable_irq(30);
-  }
-  */
+  timer_init();
+  timer_start(1000);
 
   uart_println("[KERNEL] Ready ! Entering echo loop");
 

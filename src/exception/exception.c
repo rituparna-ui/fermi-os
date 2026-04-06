@@ -2,6 +2,7 @@
 #include "gic/gic.h"
 #include "mm/mmu/mmu.h"
 #include "panic/panic.h"
+#include "timer/timer.h"
 #include "uart/uart.h"
 
 extern char vector_table[];
@@ -125,11 +126,7 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
     }
 
     if (intid == 30) {
-      // re-arm timer for next tick
-      uint64_t freq;
-      __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
-      __asm__ __volatile__("msr cntp_tval_el0, %0" ::"r"(freq));
-      uart_println("[TIMER] tick");
+      timer_handle_irq();
     } else {
       uart_printf("[IRQ] INTID %d (not implemented)\n", (uint64_t)intid);
     }

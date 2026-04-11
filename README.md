@@ -73,11 +73,14 @@ make dump_dts
 
 ## Features
 
-- **PL011 UART Driver** — Full serial I/O, hex/decimal/binary output and fromatted print with `%s %d %u %x %p %b %c %%` format specifiers
+- **PL011 UART Driver** — Full serial I/O, hex/decimal/binary output and formatted print with `%s %d %u %x %p %b %c %%` format specifiers
 - **Physical Memory Manager (PMM)** — Bitmap-based page allocator managing 8 GB of RAM, with single and contiguous multi-page allocation
 - **MMU (Memory Management Unit)** — 3-level page tables (L0→L1→L2) with 2 MB blocks, 48-bit virtual address space, 4 KB granule
 - **Higher-Half Kernel** — Dual address space with TTBR0 (identity map) and TTBR1 (`0xFFFF_0000_0000_0000+` → PA `0x0+`)
-- **Kernel Heap** — First-fit allocator with block splitting, coalescing, double-free detection, and bounds checking
+- **Kernel Heap** — First-fit allocator with block splitting, coalescing, double-free detection, and bounds checking (`kmalloc`/`kfree`)
 - **Exception Handling** — Full ARMv8-A vector table, trap frame save/restore, ESR decoding, register dump on fault
-- **GICv3 Interrupt Controller** — Minimal GICv3 bringup with Distributor/Redistributor initialization, affinity routing, system register interface, IRQ acknowledge/EOI, and ARM Generic Timer firing every 1-second tick
+- **GICv3 Interrupt Controller** — Minimal GICv3 bringup with Distributor/Redistributor initialization, affinity routing, system register interface, IRQ acknowledge/EOI
+- **ARM Generic Timer** — Configurable periodic tick (default 1 s) driving the scheduler, routed through GICv3 PPI
+- **Preemptive Scheduler** — Round-robin task scheduler with timer-driven preemption, per-task kernel stacks, context switching via callee-saved register save/restore, task creation/exit/reaping lifecycle, and a circular run queue
+- **Task Sleep** — Tick-based voluntary sleep via `sleep_ms(ms)`, with per-task deadlines and automatic wakeup on timer IRQ (`sched_wake_sleepers`)
 - **Kernel Panic Handler** — System register dump and CPU halt on unrecoverable errors

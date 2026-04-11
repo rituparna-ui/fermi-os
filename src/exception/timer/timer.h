@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #define TIMER_PPI_INTID 30
+#define TIMER_INTERVAL_MS 10 // 10ms tick for fine-grained sleep
 
 // timer tick handler callback
 typedef void (*timer_callback_t)(void);

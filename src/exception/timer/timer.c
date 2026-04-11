@@ -1,5 +1,6 @@
 #include "timer.h"
 #include "gic/gic.h"
+#include "sched/sched.h"
 #include "uart/uart.h"
 
 static uint64_t timer_freq = 0;
@@ -51,10 +52,16 @@ void timer_handle_irq() {
   // Re-arm the timer for the next tick
   __asm__ __volatile__("msr cntp_tval_el0, %0" ::"r"(timer_interval));
 
+  // Wake any tasks whose sleep deadline has passed
+  sched_wake_sleepers();
+
   if (tick_callback) {
     tick_callback();
   } else {
-    uart_printf("[TIMER] fire %u\n", tick_count);
+    // Only log every 100 ticks (1 second at 10ms interval) to avoid spam
+    if (tick_count % 100 == 0) {
+      uart_printf("[TIMER] tick %u\n", tick_count);
+    }
   }
 }
 

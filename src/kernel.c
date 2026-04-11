@@ -5,6 +5,7 @@
 #include "mm/pmm/pmm.h"
 #include "mmio/mmio.h"
 #include "panic/panic.h"
+#include "sched/sched.h"
 #include "strings/strings.h" // IWYU pragma: keep
 #include "timer/timer.h"
 #include "uart/uart.h"
@@ -50,6 +51,21 @@ void early_init() {
   uart_println("[BOOT] MMU Enabled. Jumping to Upper Half");
 }
 
+static void task_a(void) {
+  for (int i = 0; i < 5; i++) {
+    uart_printf("[Task A] iteration %d\n", (uint64_t)i);
+    sleep_ms(200);
+  }
+  uart_println("[Task A] done! exiting");
+}
+
+static void task_b(void) {
+  while (1) {
+    uart_println("[Task B] running");
+    sleep_ms(500);
+  }
+}
+
 // runs in VAS Upper Half after boot.S relocates program counter and stack
 // pointer
 void kernel_main() {
@@ -72,13 +88,17 @@ void kernel_main() {
 
   gic_init();
 
-  timer_init();
-  timer_start(1000);
+  sched_init();
+  sched_create_task("task_a", task_a);
+  sched_create_task("task_b", task_b);
 
-  uart_println("[KERNEL] Ready ! Entering echo loop");
+  timer_init();
+  timer_start(TIMER_INTERVAL_MS);
+
+  uart_println("[KERNEL] Ready! running idle task...");
 
   while (1) {
-    uart_putc(uart_getc());
+    __asm__ __volatile__("wfi");
   }
 }
 

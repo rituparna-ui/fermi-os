@@ -54,7 +54,7 @@ void early_init() {
 static void task_a(void) {
   for (int i = 0; i < 5; i++) {
     uart_printf("[Task A] iteration %d\n", (uint64_t)i);
-    yield();
+    sleep_ms(200);
   }
   uart_println("[Task A] done! exiting");
 }
@@ -62,8 +62,7 @@ static void task_a(void) {
 static void task_b(void) {
   while (1) {
     uart_println("[Task B] running");
-    for (volatile int i = 0; i < 1000000; i++) {
-    }
+    sleep_ms(500);
   }
 }
 
@@ -94,7 +93,7 @@ void kernel_main() {
   sched_create_task("task_b", task_b);
 
   timer_init();
-  timer_start(1000);
+  timer_start(TIMER_INTERVAL_MS);
 
   uart_println("[KERNEL] Ready! running idle task...");
 

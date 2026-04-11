@@ -3,6 +3,7 @@
 #include "mm/mmu/mmu.h"
 #include "mm/pmm/pmm.h"
 #include "strings/strings.h" // IWYU pragma: keep
+#include "timer/timer.h"
 #include "uart/uart.h"
 
 // switch.S: unmasks IRQs, calls x19, then calls task_exit
@@ -155,6 +156,35 @@ void task_exit(void) {
   // Switch away permanently, the current task is still on the dying task's stack,
   // so it cannot freed here. The idle loop calls sched_reap().
   schedule();
+}
+
+void sleep_ms(uint64_t ms) {
+  uint64_t interval_ms = TIMER_INTERVAL_MS;
+  uint64_t ticks_needed = ms / interval_ms;
+  if (ticks_needed == 0) {
+    ticks_needed = 1;
+  }
+
+  current->sleep_until = timer_get_ticks() + ticks_needed;
+  current->state = TASK_SLEEPING;
+
+  uart_printf("[SCHED] Task %d '%s' sleeping for %u ms (%u ticks)\n",
+              current->pid, current->name, ms, ticks_needed);
+
+  schedule();
+}
+
+void sched_wake_sleepers(void) {
+  uint64_t now = timer_get_ticks();
+  task_t *t = idle_task.next;
+
+  while (t != &idle_task) {
+    if (t->state == TASK_SLEEPING && now >= t->sleep_until) {
+      t->state = TASK_READY;
+      t->sleep_until = 0;
+    }
+    t = t->next;
+  }
 }
 
 void sched_reap(void) {

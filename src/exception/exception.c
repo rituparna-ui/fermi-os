@@ -2,6 +2,7 @@
 #include "gic/gic.h"
 #include "mm/mmu/mmu.h"
 #include "panic/panic.h"
+#include "sched/sched.h"
 #include "timer/timer.h"
 #include "uart/uart.h"
 
@@ -132,6 +133,9 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
     }
 
     gic_end_irq(intid);
+
+    // schedule after EOI so GIC can deliver future IRQs
+    schedule();
     break;
   }
 

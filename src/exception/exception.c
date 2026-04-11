@@ -3,6 +3,7 @@
 #include "mm/mmu/mmu.h"
 #include "panic/panic.h"
 #include "sched/sched.h"
+#include "syscall/syscall.h"
 #include "timer/timer.h"
 #include "uart/uart.h"
 
@@ -86,10 +87,7 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
   case EXCEPTION_SYNC:
     switch (ec) {
     case EC_SVC_AARCH64:
-      // syscall handling
-      // svc number in ESR_EL1 bits [15:0]
-      uart_println("[EXCEPTION] SVC call (not implemented)");
-      dump_trap_frame(type, frame);
+      syscall_dispatch(frame);
       break;
 
     case EC_DATA_ABORT_CUR:

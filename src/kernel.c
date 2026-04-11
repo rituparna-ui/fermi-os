@@ -52,10 +52,18 @@ void early_init() {
 }
 
 static void task_a(void) {
-  for (int i = 0; i < 5; i++) {
-    uart_printf("[Task A] iteration %d\n", (uint64_t)i);
-    sleep_ms(200);
-  }
+  // Test SVC syscall: SYS_WRITE via svc #0
+  const char msg[] = "[Task A] Hello from SVC!\n";
+  uint64_t len = sizeof(msg) - 1;
+
+  // x0 = buf, x1 = len, x8 = SYS_WRITE (0)
+  register const char *x0 __asm__("x0") = msg;
+  register uint64_t x1 __asm__("x1") = len;
+  register uint64_t x8 __asm__("x8") = 0;
+
+  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory");
+
+  uart_printf("[Task A] SVC returned, bytes written: %d\n", (uint64_t)x0);
   uart_println("[Task A] done! exiting");
 }
 

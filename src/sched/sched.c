@@ -90,18 +90,33 @@ int sched_create_task(const char *name, task_entry_t entry) {
 }
 
 void schedule(void) {
+  sched_reap();
+
   task_t *prev = current;
   task_t *next = prev->next;
+  task_t *fallback = (void *)0; // idle fallback
 
   while (next != prev) {
     if (next->state == TASK_READY) {
+      if (next == &idle_task) {
+        if (!fallback) {
+          fallback = next;
+        }
+        next = next->next;
+        continue;
+      }
       break;
     }
     next = next->next;
   }
 
   if (next == prev) {
-    return;
+    // prev is still runnable — no point switching to idle, let it keep its timeslice
+    if (!fallback || prev->state == TASK_RUNNING) {
+      return;
+    }
+    // prev is dead/blocked — must switch to idle
+    next = fallback;
   }
 
   if (prev->state == TASK_RUNNING) {

@@ -99,7 +99,6 @@ void kernel_main() {
   uart_println("[KERNEL] Ready! running idle task...");
 
   while (1) {
-    sched_reap(); // free dead tasks
     __asm__ __volatile__("wfi");
   }
 }

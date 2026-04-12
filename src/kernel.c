@@ -51,18 +51,39 @@ void early_init() {
   uart_println("[BOOT] MMU Enabled. Jumping to Upper Half");
 }
 
+static inline uint64_t sys_write(const char *buf, uint64_t len) {
+  register const char *x0 __asm__("x0") = buf;
+  register uint64_t x1 __asm__("x1") = len;
+  register uint64_t x8 __asm__("x8") = 0;
+  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory");
+  return (uint64_t)x0;
+}
+
+static inline void sys_exit(void) {
+  register uint64_t x8 __asm__("x8") = 1;
+  __asm__ __volatile__("svc #0" ::"r"(x8) : "memory");
+}
+
+static inline void sys_sleep(uint64_t ms) {
+  register uint64_t x0 __asm__("x0") = ms;
+  register uint64_t x8 __asm__("x8") = 3;
+  __asm__ __volatile__("svc #0" ::"r"(x0), "r"(x8) : "memory");
+}
+
 static void task_a(void) {
-  for (int i = 0; i < 5; i++) {
-    uart_printf("[Task A] iteration %d\n", (uint64_t)i);
-    sleep_ms(200);
-  }
-  uart_println("[Task A] done! exiting");
+  const char msg[] = "[Task A] Hello from EL0 via SVC!\n";
+  sys_write(msg, sizeof(msg) - 1);
+
+  const char done[] = "[Task A] exiting\n";
+  sys_write(done, sizeof(done) - 1);
+  sys_exit();
 }
 
 static void task_b(void) {
   while (1) {
-    uart_println("[Task B] running");
-    sleep_ms(500);
+    const char msg[] = "[Task B] running at EL0\n";
+    sys_write(msg, sizeof(msg) - 1);
+    sys_sleep(500);
   }
 }
 
@@ -74,6 +95,9 @@ void kernel_main() {
 
   // relocate VBAR_EL1 to upper half
   exceptions_init_upper();
+
+  // relocate PMM bitmap to upper half so it's accessible via TTBR1
+  pmm_relocate_upper();
 
   // Verify if the kernel is running in upper half
   uart_printf("[KERNEL] kernel_main address: %x\n",

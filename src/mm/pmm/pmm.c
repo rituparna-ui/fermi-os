@@ -1,4 +1,5 @@
 #include "pmm.h"
+#include "mm/mmu/mmu.h"
 #include "strings/strings.h" // IWYU pragma: keep
 #include "uart/uart.h"
 #include <stdint.h>
@@ -82,6 +83,11 @@ void pmm_init(uintptr_t mem_start, uint64_t mem_size) {
 
   used_pages = reserved_pages;
   uart_println("[PMM] Initialized!");
+}
+
+void pmm_relocate_upper(void) {
+  bitmap = (uint64_t *)PHYS_TO_VIRT((uint64_t)bitmap);
+  uart_printf("[PMM] Bitmap relocated to upper half: %x\n", (uintptr_t)bitmap);
 }
 
 uintptr_t pmm_allocate_page(void) {

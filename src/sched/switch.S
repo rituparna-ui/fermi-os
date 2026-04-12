@@ -4,8 +4,9 @@
 // Saves callee-saved registers (x19-x30) + sp onto prev's stack.
 // Stores updated sp into prev->sp (offset 0).
 // Loads next->sp, restores registers, returns into next task.
+// Also swaps TTBR0_EL1 for per-task user page tables.
 //
-// Stack frame layout (14 registers × 8 bytes = 112, aligned to 16 → 112):
+// Stack frame layout (12 registers × 8 bytes = 96):
 //   [sp + 0]   x19
 //   [sp + 8]   x20
 //   [sp + 16]  x21
@@ -19,16 +20,26 @@
 //   [sp + 80]  x29 (frame pointer)
 //   [sp + 88]  x30 (link register / return address)
 
+// task_t field offsets — must match sched.h
+.equ TASK_SP,       0
+.equ TASK_TTBR0,    40   // offsetof(task_t, ttbr0)
+
 // Task trampoline: first code a new task executes after context_switch ret's here.
-// x19 = real entry point (set up in sched_create_task's stack frame)
+// x19 = user entry point (VA in user address space)
+// x20 = user stack pointer (SP_EL0)
 // IRQs are masked (we were switched-in from inside timer IRQ), so unmask first.
+// Then drop to EL0 via eret.
 .global task_trampoline
 task_trampoline:
 	msr daifclr, #2		// unmask IRQs
-	blr x19			// call the real task entry function
-	bl task_exit			// if entry returns, clean up and schedule away
-1:	wfi				// safety net (should never reach here)
-	b 1b
+
+	// Set up for eret to EL0
+	msr sp_el0, x20			// user stack pointer
+	msr elr_el1, x19		// user entry point
+	mov x0, #0			// SPSR = EL0t (all bits zero)
+	msr spsr_el1, x0
+
+	eret
 
 .global context_switch
 context_switch:
@@ -43,11 +54,22 @@ context_switch:
 
 	// Save current sp into prev->sp
 	mov x2, sp
-	str x2, [x0, #0]
+	str x2, [x0, #TASK_SP]
 
 	// Load next->sp
-	ldr x2, [x1, #0]
+	ldr x2, [x1, #TASK_SP]
 	mov sp, x2
+
+	// --- Switch TTBR0 if next task has user page tables ---
+	ldr x3, [x1, #TASK_TTBR0]
+	cbz x3, 1f			// skip if ttbr0 == 0 (idle task)
+
+	msr ttbr0_el1, x3
+	isb
+	tlbi vmalle1
+	dsb ish
+	isb
+1:
 
 	// Restore callee-saved registers from next's stack
 	ldp x19, x20, [sp, #0]

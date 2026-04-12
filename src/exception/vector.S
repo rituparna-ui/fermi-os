@@ -4,7 +4,8 @@
 //   [sp + 256] SPSR_EL1
 //   [sp + 264] ESR_EL1
 //   [sp + 272] FAR_EL1
-//   Total: 280 bytes → 288 aligned to 16
+//   [sp + 280] SP_EL0      (user stack pointer, saved on EL0 exceptions)
+//   Total: 288 bytes → 288 aligned to 16
 
 .equ FRAME_SIZE, 288
 
@@ -13,13 +14,23 @@
 .equ EXCEPTION_FIQ,     2
 .equ EXCEPTION_SERROR,  3
 
-// Macro: vector entry stub
-// Each entry allocates a trap frame, saves x0/x1,
-// loads exception type, and branches to common code.
+// Macro: vector entry stub (current EL, SP_ELx)
 .macro VECTOR_ENTRY type
 .balign 128
 	sub sp, sp, #FRAME_SIZE
 	stp x0, x1, [sp, #0]
+	mov x0, #\type
+	b exception_common
+.endm
+
+// Macro: vector entry from lower EL (EL0)
+// Save SP_EL0 since we're now on the kernel stack
+.macro VECTOR_ENTRY_LOWER type
+.balign 128
+	sub sp, sp, #FRAME_SIZE
+	stp x0, x1, [sp, #0]
+	mrs x0, sp_el0
+	str x0, [sp, #280]
 	mov x0, #\type
 	b exception_common
 .endm
@@ -49,11 +60,11 @@ vector_table:
 	VECTOR_ENTRY EXCEPTION_FIQ
 	VECTOR_ENTRY EXCEPTION_SERROR
 
-// Group 2: Lower EL, AArch64 (user → kernel - tdbl)
-	VECTOR_ENTRY EXCEPTION_SYNC
-	VECTOR_ENTRY EXCEPTION_IRQ
-	VECTOR_ENTRY EXCEPTION_FIQ
-	VECTOR_ENTRY EXCEPTION_SERROR
+// Group 2: Lower EL, AArch64 (user EL0 → kernel EL1)
+	VECTOR_ENTRY_LOWER EXCEPTION_SYNC
+	VECTOR_ENTRY_LOWER EXCEPTION_IRQ
+	VECTOR_ENTRY_LOWER EXCEPTION_FIQ
+	VECTOR_ENTRY_LOWER EXCEPTION_SERROR
 
 // Group 3: Lower EL, AArch32 (unused)
 	VECTOR_ENTRY_INVALID EXCEPTION_SYNC
@@ -99,14 +110,21 @@ exception_common:
 	mov x1, sp
 	bl exception_dispatch
 
-	// restore
+	// restore system registers
 	ldr x1, [sp, #248]
 	msr elr_el1, x1
 	ldr x1, [sp, #256]
 	msr spsr_el1, x1
-	// ESR and FAR are read-only, no need to restore
-	// saved not to be restored later, but so the C exception handler can read them
 
+	// Restore SP_EL0 if returning to EL0
+	// Check SPSR_EL1.M[3:0] — if 0, we're returning to EL0
+	and x2, x1, #0xF
+	cbnz x2, 1f
+	ldr x1, [sp, #280]
+	msr sp_el0, x1
+1:
+
+	// restore general-purpose registers
 	ldp x2,  x3,  [sp, #16]
 	ldp x4,  x5,  [sp, #32]
 	ldp x6,  x7,  [sp, #48]

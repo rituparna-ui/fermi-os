@@ -18,16 +18,17 @@
 #define PTE_AF (1ULL << 10)
 // Shareability - how memory is shared between cores
 #define PTE_SH_INNER (3ULL << 8)
-// Access Permissions
-/*
-| AP bits | Meaning |
-| ------- | ------- |
-| 00      | EL1 RW  |
-| 01      | EL1 RO  |
-| 10      | EL0 RW  |
-| 11      | EL0 RO  |
-*/
-#define PTE_AP_RW (0ULL << 6)
+// Access Permissions (AP[7:6] in block/page descriptor)
+// Stage 1 EL1&0 translation regime:
+//   AP[2:1]  EL1    EL0
+//   00       RW     None
+//   01       RW     RW
+//   10       RO     None
+//   11       RO     RO
+#define PTE_AP_RW      (0ULL << 6)  // EL1 RW, EL0 no access
+#define PTE_AP_RW_EL0  (1ULL << 6)  // EL1 RW, EL0 RW
+#define PTE_AP_RO      (2ULL << 6)  // EL1 RO, EL0 no access
+#define PTE_AP_RO_EL0  (3ULL << 6)  // EL1 RO, EL0 RO
 // memory type from MAIR_EL1
 #define PTE_ATTRIDX(idx) ((idx) << 2)
 
@@ -60,8 +61,23 @@ static inline uint64_t *pte_next_table(uint64_t entry) {
 
 static inline int pte_valid(uint64_t entry) { return entry & PTE_VALID; }
 
+// User-space address layout (TTBR0)
+#define USER_TEXT_BASE  0x00400000ULL  // 4 MB — user code
+#define USER_STACK_TOP  0x00800000ULL  // 8 MB — top of user stack
+#define USER_STACK_PAGES 4             // 16 KiB user stack
+
 uint64_t *mmu_init(void);
 uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc);
+
+// empty TTBR0 page table for user task
+uint64_t *mmu_create_user_tables(void);
+
+// Map 2MB-aligned physical region into a user page table at given VA
+void mmu_map_user_page(uint64_t *l0, uint64_t va, uint64_t pa, uint64_t flags);
+
+// Free all page table pages (L0, L1, L2) for a user address space
+void mmu_free_user_tables(uint64_t *l0);
+
 void mmu_run_tests(uint64_t *l1_table);
 
 #endif

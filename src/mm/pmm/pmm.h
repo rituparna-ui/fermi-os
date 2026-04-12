@@ -27,6 +27,7 @@
 #define BITMAP_BIT(pfn) ((pfn) % 64)
 
 void pmm_init(uintptr_t mem_start, uint64_t mem_size);
+void pmm_relocate_upper(void);
 uintptr_t pmm_allocate_page(void);
 uintptr_t pmm_allocate_pages(uint64_t count);
 void pmm_free_page(uintptr_t phys_addr);

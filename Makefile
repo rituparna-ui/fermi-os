@@ -29,7 +29,7 @@ LDFLAGS := -nostdlib -g -T linker.ld
 # QEMU Config
 QEMU_CPU := cortex-a72
 QEMU_MACHINE := virt,gic-version=3 -m 8G
-QEMU_DEVICES := -device virtio-rng-pci,disable-legacy=on
+QEMU_DEVICES := -nic none -device virtio-rng-pci,disable-legacy=on
 # QEMU_MACHINE := virt,gic-version=3,virtualization=on -m 8G
 # QEMU_MACHINE := virt,gic-version=3,virtualization=on,secure=on -m 8G
 QEMU_BASE := qemu-system-aarch64 -machine $(QEMU_MACHINE) -nographic -cpu $(QEMU_CPU) $(QEMU_DEVICES)

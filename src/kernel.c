@@ -5,6 +5,7 @@
 #include "mm/pmm/pmm.h"
 #include "mmio/mmio.h"
 #include "panic/panic.h"
+#include "pci/pci.h"
 #include "sched/sched.h"
 #include "strings/strings.h" // IWYU pragma: keep
 #include "timer/timer.h"
@@ -111,6 +112,8 @@ void kernel_main() {
   heap_init();
 
   gic_init();
+
+  pci_enumerate_bus();
 
   sched_init();
   sched_create_task("task_a", task_a);

@@ -17,7 +17,8 @@ static uint64_t *alloc_table() {
 }
 
 // Build L0 -> L1 -> L2 page table hierarchy
-// maps the first 8GB of physical address space using 2MB blocks
+// maps the first 512GB of physical address space using 2MB blocks
+// covers RAM, device I/O, and PCI ECAM (0x4010000000)
 
 // VA layout:
 // [47:39] → L0 (9 bits)
@@ -39,8 +40,10 @@ static uint64_t *build_identity_tables(uint64_t **out_l1) {
   // L0[0] -> L1 covers first 512GB of the virtual address space
   l0[0] = (uint64_t)l1 | PTE_VALID | PTE_TABLE;
 
-  // 8 L1 entries * 512 L2 entries * 2MB = 8GB
-  for (uint64_t l1i = 0; l1i < 8; l1i++) {
+  // 512 L1 entries * 512 L2 entries * 2MB = 512GB
+  // Covers RAM (0x40000000-0x23FFFFFFF) + device I/O + PCI ECAM (0x4010000000)
+  uint64_t mem_end = MEM_START + MEM_SIZE;
+  for (uint64_t l1i = 0; l1i < 512; l1i++) {
     uint64_t *l2 = alloc_table();
     if (!l2) {
       return 0;
@@ -54,8 +57,9 @@ static uint64_t *build_identity_tables(uint64_t **out_l1) {
         // null ptr deref should fault
         continue;
       }
-      // 0 = device, 1 = normal
-      uint64_t attr = (phys_addr < MEM_START) ? 0 : 1;
+      // AttrIdx 0 = Device memory, 1 = Normal memory
+      // RAM region is normal, everything else (UART, GIC, PCI ECAM) is device
+      uint64_t attr = (phys_addr >= MEM_START && phys_addr < mem_end) ? 1 : 0;
 
       l2[l2i] = phys_addr | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER |
                 PTE_AP_RW | PTE_ATTRIDX(attr);
@@ -79,7 +83,7 @@ uint64_t *mmu_init() {
   __asm__ __volatile__("msr mair_el1, %0" ::"r"(mair));
 
   // TTBR0 (UserSpace)
-  // Identity map first 8GB
+  // Identity map first 512GB (RAM + device I/O + PCI ECAM)
   uint64_t *l1_table = 0;
   l0_table_lo = build_identity_tables(&l1_table);
   if (!l0_table_lo) {

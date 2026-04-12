@@ -17,6 +17,8 @@
 #define PCI_MMIO64_PHYS 0x8000000000UL
 #define PCI_MMIO64_LIMIT 0xFFFFFFFFFFUL
 
+#define MAX_PCI_DEVICES 16
+
 #define MAX_PCI_BUS 256
 #define MAX_PCI_SLOT 32
 #define MAX_PCI_FUNC 8
@@ -24,6 +26,15 @@
 /* PCI Config Space Offsets */
 #define PCI_VENDOR_ID 0x00
 #define PCI_DEVICE_ID 0x02
+
+struct pci_device {
+  uint8_t bus;
+  uint8_t slot;
+  uint8_t func;
+
+  uint16_t vendor_id;
+  uint16_t device_id;
+};
 
 void pci_enumerate_bus(void);
 
@@ -40,5 +51,8 @@ void pci_config_write16(uint16_t bus, uint8_t slot, uint8_t func,
                         uint16_t offset, uint16_t val);
 void pci_config_write8(uint16_t bus, uint8_t slot, uint8_t func,
                        uint16_t offset, uint8_t val);
+
+int pci_find_device(uint16_t vendor_id, uint16_t device_id,
+                    struct pci_device *pci_device);
 
 #endif

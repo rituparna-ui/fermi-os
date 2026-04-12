@@ -1,7 +1,10 @@
 #include "pci.h"
 #include "mmio/mmio.h"
 #include "uart/uart.h"
-#include <stdint.h>
+#include "utils/utils.h"
+
+struct pci_device pci_devices[MAX_PCI_DEVICES];
+uint16_t pci_device_count = 0;
 
 // ECAM addresses passed to mmio_read/write are physical.
 // The MMIO layer adds KERNEL_VA_OFFSET (after mmio_switch_to_upper)
@@ -72,7 +75,35 @@ void pci_enumerate_bus() {
 
         uint16_t device_id = pci_config_read16(bus, slot, func, PCI_DEVICE_ID);
         pci_log_device_found(bus, slot, func, vendor_id, device_id);
+
+        if (pci_device_count >= MAX_PCI_DEVICES) {
+          uart_errorln("[PCI] Max PCI devices limit reached");
+          return;
+        }
+
+        pci_devices[pci_device_count] = (struct pci_device){
+            .bus = bus,
+            .slot = slot,
+            .func = func,
+            .vendor_id = vendor_id,
+            .device_id = device_id,
+        };
+        pci_device_count++;
       }
     }
   }
+}
+
+int pci_find_device(uint16_t vendor_id, uint16_t device_id,
+                    struct pci_device *pci_device) {
+  for (uint64_t i = 0; i < pci_device_count; i++) {
+    struct pci_device current_dev = pci_devices[i];
+
+    if (current_dev.vendor_id == vendor_id &&
+        current_dev.device_id == device_id) {
+      *pci_device = current_dev;
+      return ESUCCESS;
+    }
+  }
+  return EERROR;
 }

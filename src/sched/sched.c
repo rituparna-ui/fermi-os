@@ -39,7 +39,6 @@ void sched_init(void) {
 }
 
 int sched_create_task(const char *name, task_entry_t entry) {
-  // Allocate task struct from heap
   task_t *t = (task_t *)kmalloc(sizeof(task_t));
   if (!t) {
     uart_errorln("[SCHED] Failed to allocate task struct");
@@ -47,36 +46,77 @@ int sched_create_task(const char *name, task_entry_t entry) {
   }
   memset(t, 0, sizeof(task_t));
 
-  // Allocate stack pages
-  uintptr_t stack_phys = pmm_allocate_pages(TASK_STACK_PAGES);
-  if (!stack_phys) {
-    uart_errorln("[SCHED] Failed to allocate task stack");
+  // Kernel stack (used during exceptions and context_switch)
+  uintptr_t kstack_phys = pmm_allocate_pages(TASK_STACK_PAGES);
+  if (!kstack_phys) {
+    uart_errorln("[SCHED] Failed to allocate kernel stack");
+    kfree(t);
+    return -1;
+  }
+  uintptr_t kstack_va = PHYS_TO_VIRT(kstack_phys);
+  uint64_t kstack_size = TASK_STACK_PAGES * PAGE_SIZE;
+  uintptr_t kstack_top = kstack_va + kstack_size;
+  memset((void *)kstack_va, 0, kstack_size);
+
+  // User page tables (TTBR0)
+  uint64_t *user_l0 = mmu_create_user_tables();
+  if (!user_l0) {
+    uart_errorln("[SCHED] Failed to create user page tables");
+    pmm_free_pages(kstack_phys, TASK_STACK_PAGES);
     kfree(t);
     return -1;
   }
 
-  uintptr_t stack_va = PHYS_TO_VIRT(stack_phys);
-  uint64_t stack_size = TASK_STACK_PAGES * PAGE_SIZE;
-  uintptr_t stack_top = stack_va + stack_size;
+  // Map the 2MB block containing the entry function into user space
+  // Entry is a kernel VA — convert to physical, find 2MB-aligned base
+  uint64_t entry_pa = VIRT_TO_PHYS((uint64_t)entry);
+  uint64_t entry_block = entry_pa & ~(_2MB - 1);
+  uint64_t entry_offset = entry_pa - entry_block;
 
-  memset((void *)stack_va, 0, stack_size);
+  // EL0 can read+execute, kernel cannot execute (PXN)
+  // AP[7:6]=01 means EL0 RW, EL1 RW, but we want EL0 RO+exec
+  // AP=11 → EL0 RO, EL1 RO. UXN=0 allows EL0 execute.
+  uint64_t text_flags = PTE_ATTRIDX(1) | PTE_AP_RO_EL0 | PTE_PXN;
+  mmu_map_user_page(user_l0, USER_TEXT_BASE, entry_block, text_flags);
 
-  // Set up initial stack frame for context_switch:
-  //   [sp + 0]  x19  ← real entry point (trampoline reads this)
-  //   [sp + 8]  x20 .. [sp + 72] x28  = 0
-  //   [sp + 80] x29  = 0
-  //   [sp + 88] x30  ← task_trampoline (context_switch ret's here)
-  uint64_t *frame = (uint64_t *)(stack_top - 96);
-  frame[0] = (uint64_t)entry;            // x19
-  frame[11] = (uint64_t)task_trampoline; // x30 (lr)
+  uint64_t user_entry = USER_TEXT_BASE + entry_offset;
+
+  // User stack
+  uintptr_t ustack_phys = pmm_allocate_pages(USER_STACK_PAGES);
+  if (!ustack_phys) {
+    uart_errorln("[SCHED] Failed to allocate user stack");
+    pmm_free_pages(kstack_phys, TASK_STACK_PAGES);
+    kfree(t);
+    return -1;
+  }
+  uintptr_t ustack_va_kern = PHYS_TO_VIRT(ustack_phys);
+  memset((void *)ustack_va_kern, 0, USER_STACK_PAGES * PAGE_SIZE);
+
+  // Map user stack into user address space at USER_STACK_TOP - size
+  uint64_t ustack_user_base = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
+  // Each page is within one 2MB block since stack is small and aligned
+  uint64_t stack_flags = PTE_ATTRIDX(1) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN;
+  mmu_map_user_page(user_l0, ustack_user_base, ustack_phys, stack_flags);
+
+  // Set up initial kernel stack frame for context_switch
+  // task_trampoline will eret to EL0 using x19=user_entry, x20=user_sp
+  uint64_t *frame = (uint64_t *)(kstack_top - 96);
+  frame[0] = user_entry;     // x19 — user entry point
+  frame[1] = USER_STACK_TOP; // x20 — user SP
+  frame[11] =
+      PHYS_TO_VIRT((uint64_t)task_trampoline); // x30 (lr) — must be TTBR1 VA
 
   t->sp = (uint64_t)frame;
   t->pid = next_pid++;
   t->state = TASK_READY;
-  t->stack_phys = stack_phys;
+  t->stack_phys = kstack_phys;
+  t->ttbr0 = (uint64_t)user_l0;
+  t->user_sp = USER_STACK_TOP;
+  t->kstack_top = kstack_top;
+  t->ustack_phys = ustack_phys;
   copy_name(t->name, name);
 
-  // Tail insertion: append at end of circular queue so tasks run in creation order
+  // Insert into circular run queue
   task_t *tail = current;
   while (tail->next != current) {
     tail = tail->next;
@@ -84,8 +124,9 @@ int sched_create_task(const char *name, task_entry_t entry) {
   tail->next = t;
   t->next = current;
 
-  uart_printf("[SCHED] Created task %d '%s' | stack: %x - %x\n", t->pid, name,
-              stack_va, stack_top);
+  uart_printf(
+      "[SCHED] Created EL0 task %d '%s' | kstack: %x | user_entry: %x\n",
+      t->pid, name, kstack_top, user_entry);
 
   return (int)t->pid;
 }
@@ -112,7 +153,8 @@ void schedule(void) {
   }
 
   if (next == prev) {
-    // prev is still runnable — no point switching to idle, let it keep its timeslice
+    // prev is still runnable — no point switching to idle, let it keep its
+    // timeslice
     if (!fallback || prev->state == TASK_RUNNING) {
       return;
     }
@@ -153,8 +195,8 @@ void task_exit(void) {
   // Mark dead — schedule() will unlink and push onto dead_list
   current->state = TASK_DEAD;
 
-  // Switch away permanently, the current task is still on the dying task's stack,
-  // so it cannot freed here. The idle loop calls sched_reap().
+  // Switch away permanently, the current task is still on the dying task's
+  // stack, so it cannot freed here. The idle loop calls sched_reap().
   schedule();
 }
 
@@ -194,9 +236,23 @@ void sched_reap(void) {
 
     uart_printf("[SCHED] Reaping task %d '%s'\n", dead->pid, dead->name);
 
+    // Free kernel stack
     if (dead->stack_phys) {
       pmm_free_pages(dead->stack_phys, TASK_STACK_PAGES);
     }
+
+    // Free user stack
+    if (dead->ustack_phys) {
+      pmm_free_pages(dead->ustack_phys, USER_STACK_PAGES);
+    }
+
+    // Free per-task TTBR0 page table pages (L0, L1, L2)
+    if (dead->ttbr0) {
+      mmu_free_user_tables((uint64_t *)dead->ttbr0);
+    }
+
     kfree(dead);
   }
 }
+
+task_t *sched_current(void) { return current; }

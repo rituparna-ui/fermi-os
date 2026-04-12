@@ -146,6 +146,53 @@ uint64_t *mmu_init() {
   return l1_table;
 }
 
+uint64_t *mmu_create_user_tables(void) {
+  return alloc_table(); // just an empty L0 — walk_page_table will fill on demand
+}
+
+void mmu_map_user_page(uint64_t *l0, uint64_t va, uint64_t pa, uint64_t flags) {
+  uint64_t *pte = walk_page_table(l0, va, 1);
+  if (!pte) {
+    uart_errorln("[MMU] Failed to map user page");
+    return;
+  }
+  *pte = (pa & ~(_2MB - 1)) | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER | flags;
+}
+
+void mmu_free_user_tables(uint64_t *l0_phys) {
+  // Walk L0 → L1 → L2 and free all intermediate table pages.
+  // L2 entries are 2MB block descriptors — the physical blocks they point to
+  // (user text, user stack) are freed separately by the scheduler.
+  //
+  // PTEs store physical addresses. use PHYS_TO_VIRT to dereference
+  // them since TTBR0 may not have an identity map when this runs.
+  uint64_t *l0 = (uint64_t *)PHYS_TO_VIRT((uintptr_t)l0_phys);
+
+  for (int i = 0; i < 512; i++) {
+    if (!pte_valid(l0[i]))
+      continue;
+
+    uintptr_t l1_phys = (uintptr_t)pte_next_table(l0[i]);
+    uint64_t *l1 = (uint64_t *)PHYS_TO_VIRT(l1_phys);
+
+    for (int j = 0; j < 512; j++) {
+      if (!pte_valid(l1[j]))
+        continue;
+
+      // Only free if this is a table entry pointing to an L2 page
+      // (bit[1] = 1 == table; bit[1] = 0 == 1GB block)
+      if (l1[j] & PTE_TABLE) {
+        uintptr_t l2_phys = (uintptr_t)pte_next_table(l1[j]);
+        pmm_free_page(l2_phys);
+      }
+    }
+
+    pmm_free_page(l1_phys);
+  }
+
+  pmm_free_page((uintptr_t)l0_phys);
+}
+
 // Walk L0 → L1 → L2
 // Return a pointer to L2 entry
 uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc) {

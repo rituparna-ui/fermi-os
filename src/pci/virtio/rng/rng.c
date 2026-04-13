@@ -15,5 +15,12 @@ void pci_virtio_rng_init() {
 
   uart_println("[RNG] Device found");
 
+  if (pci_get_header_type(&rng_dev.pci) != PCI_ENDPOINT_DEV_TYPE) {
+    uart_errorln("[RNG]: Unexpected header type");
+    return;
+  }
+
+  pci_assign_bars(&rng_dev.pci);
+
   return;
 }

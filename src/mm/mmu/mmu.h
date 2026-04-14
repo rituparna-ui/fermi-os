@@ -25,13 +25,14 @@
 //   01       RW     RW
 //   10       RO     None
 //   11       RO     RO
-#define PTE_AP_RW      (0ULL << 6)  // EL1 RW, EL0 no access
-#define PTE_AP_RW_EL0  (1ULL << 6)  // EL1 RW, EL0 RW
-#define PTE_AP_RO      (2ULL << 6)  // EL1 RO, EL0 no access
-#define PTE_AP_RO_EL0  (3ULL << 6)  // EL1 RO, EL0 RO
+#define PTE_AP_RW (0ULL << 6)     // EL1 RW, EL0 no access
+#define PTE_AP_RW_EL0 (1ULL << 6) // EL1 RW, EL0 RW
+#define PTE_AP_RO (2ULL << 6)     // EL1 RO, EL0 no access
+#define PTE_AP_RO_EL0 (3ULL << 6) // EL1 RO, EL0 RO
 // memory type from MAIR_EL1
 #define PTE_ATTRIDX(idx) ((idx) << 2)
 
+#define _512GB 0x8000000000ULL
 #define _1GB 0x40000000ULL
 #define _2MB 0x200000ULL
 
@@ -62,9 +63,9 @@ static inline uint64_t *pte_next_table(uint64_t entry) {
 static inline int pte_valid(uint64_t entry) { return entry & PTE_VALID; }
 
 // User-space address layout (TTBR0)
-#define USER_TEXT_BASE  0x00400000ULL  // 4 MB — user code
-#define USER_STACK_TOP  0x00800000ULL  // 8 MB — top of user stack
-#define USER_STACK_PAGES 4             // 16 KiB user stack
+#define USER_TEXT_BASE 0x00400000ULL // 4 MB — user code
+#define USER_STACK_TOP 0x00800000ULL // 8 MB — top of user stack
+#define USER_STACK_PAGES 4           // 16 KiB user stack
 
 uint64_t *mmu_init(void);
 uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc);

@@ -17,8 +17,9 @@ static uint64_t *alloc_table() {
 }
 
 // Build L0 -> L1 -> L2 page table hierarchy
-// maps the first 512GB of physical address space using 2MB blocks
-// covers RAM, device I/O, and PCI ECAM (0x4010000000)
+// maps the first 1TB of physical address space using 2MB blocks
+// L0[0]: 0-512GB — RAM, device I/O, PCI ECAM (0x4010000000)
+// L0[1]: 512GB-1TB — PCI MMIO64 window (0x8000000000+)
 
 // VA layout:
 // [47:39] → L0 (9 bits)
@@ -37,11 +38,10 @@ static uint64_t *build_identity_tables(uint64_t **out_l1) {
   if (!l1) {
     return 0;
   }
-  // L0[0] -> L1 covers first 512GB of the virtual address space
+  // L0[0] -> L1 covers first 512GB (0x0 - 0x7FFFFFFFFF)
+  // Contains RAM, device I/O, PCI ECAM
   l0[0] = (uint64_t)l1 | PTE_VALID | PTE_TABLE;
 
-  // 512 L1 entries * 512 L2 entries * 2MB = 512GB
-  // Covers RAM (0x40000000-0x23FFFFFFF) + device I/O + PCI ECAM (0x4010000000)
   uint64_t mem_end = MEM_START + MEM_SIZE;
   for (uint64_t l1i = 0; l1i < 512; l1i++) {
     uint64_t *l2 = alloc_table();
@@ -66,6 +66,30 @@ static uint64_t *build_identity_tables(uint64_t **out_l1) {
     }
   }
 
+  // L0[1] -> L1 covers 512GB - 1TB (0x8000000000 - 0xFFFFFFFFFF)
+  // Contains PCI MMIO64 window — all device memory
+  uint64_t *l1_hi = alloc_table();
+  if (!l1_hi) {
+    return 0;
+  }
+  l0[1] = (uint64_t)l1_hi | PTE_VALID | PTE_TABLE;
+
+  for (uint64_t l1i = 0; l1i < 512; l1i++) {
+    uint64_t *l2 = alloc_table();
+    if (!l2) {
+      return 0;
+    }
+
+    l1_hi[l1i] = (uint64_t)l2 | PTE_VALID | PTE_TABLE;
+
+    for (uint64_t l2i = 0; l2i < 512; l2i++) {
+      uint64_t phys_addr = _512GB + l1i * _1GB + l2i * _2MB;
+
+      l2[l2i] = phys_addr | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER |
+                PTE_AP_RW | PTE_ATTRIDX(0); // all device memory
+    }
+  }
+
   if (out_l1) {
     *out_l1 = l1;
   }
@@ -83,7 +107,7 @@ uint64_t *mmu_init() {
   __asm__ __volatile__("msr mair_el1, %0" ::"r"(mair));
 
   // TTBR0 (UserSpace)
-  // Identity map first 512GB (RAM + device I/O + PCI ECAM)
+  // Identity map first 1TB (RAM + device I/O + PCI ECAM + PCI MMIO64)
   uint64_t *l1_table = 0;
   l0_table_lo = build_identity_tables(&l1_table);
   if (!l0_table_lo) {
@@ -151,7 +175,8 @@ uint64_t *mmu_init() {
 }
 
 uint64_t *mmu_create_user_tables(void) {
-  return alloc_table(); // just an empty L0 — walk_page_table will fill on demand
+  return alloc_table(); // just an empty L0 — walk_page_table will fill on
+                        // demand
 }
 
 void mmu_map_user_page(uint64_t *l0, uint64_t va, uint64_t pa, uint64_t flags) {
@@ -160,7 +185,8 @@ void mmu_map_user_page(uint64_t *l0, uint64_t va, uint64_t pa, uint64_t flags) {
     uart_errorln("[MMU] Failed to map user page");
     return;
   }
-  *pte = (pa & ~(_2MB - 1)) | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER | flags;
+  *pte = (pa & ~(_2MB - 1)) | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER |
+         flags;
 }
 
 void mmu_free_user_tables(uint64_t *l0_phys) {

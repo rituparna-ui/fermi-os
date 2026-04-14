@@ -151,6 +151,32 @@ uint32_t pci_get_bar_size(uint8_t bus, uint8_t slot, uint8_t func,
   return size;
 }
 
+// For 64-bit BARs, probe both BAR[i] and BAR[i+1] to get the full size
+uint64_t pci_get_bar_size64(uint8_t bus, uint8_t slot, uint8_t func,
+                            uint16_t offset_lo, uint16_t offset_hi) {
+  // Save originals
+  uint32_t orig_lo = pci_config_read32(bus, slot, func, offset_lo);
+  uint32_t orig_hi = pci_config_read32(bus, slot, func, offset_hi);
+
+  // Write all-1s to both halves
+  pci_config_write32(bus, slot, func, offset_lo, 0xFFFFFFFF);
+  pci_config_write32(bus, slot, func, offset_hi, 0xFFFFFFFF);
+
+  // Read back
+  uint32_t mask_lo = pci_config_read32(bus, slot, func, offset_lo);
+  uint32_t mask_hi = pci_config_read32(bus, slot, func, offset_hi);
+
+  // Restore originals
+  pci_config_write32(bus, slot, func, offset_lo, orig_lo);
+  pci_config_write32(bus, slot, func, offset_hi, orig_hi);
+
+  // Mask lower 4 control bits of the low word
+  uint64_t mask = ((uint64_t)mask_hi << 32) | (mask_lo & ~0xFUL);
+  uint64_t size = ~mask + 1;
+
+  return size;
+}
+
 void pci_assign_bars(struct pci_device *dev) {
   uart_println("[PCI] Assigning BARs");
 
@@ -171,17 +197,16 @@ void pci_assign_bars(struct pci_device *dev) {
 
     /* Memory Space BAR Layout */
     uint8_t type = (bar >> 1) & 0x03;
-    /* Amount of memory the device needs for its registers to be memory mapped
-     */
-    uint32_t size = pci_get_bar_size(b, d, f, bar_offset);
-
-    if (size == 0 || size == 0xFFFFFFFF) {
-      // unused bar
-      dev->bar_addr[i] = 0;
-      continue;
-    }
 
     if (type == 0x00) {
+      /* 32-bit BAR */
+      uint32_t size = pci_get_bar_size(b, d, f, bar_offset);
+
+      if (size == 0 || size == 0xFFFFFFFF) {
+        dev->bar_addr[i] = 0;
+        continue;
+      }
+
       uart_println("[PCI][32 Bit Memory Space]");
       uart_puts(" BAR");
       uart_putdec(i);
@@ -193,13 +218,23 @@ void pci_assign_bars(struct pci_device *dev) {
       pci_config_write32(b, d, f, bar_offset, (uint32_t)addr);
       dev->bar_addr[i] = addr;
     } else if (type == 0x02) {
+      /* 64-bit BAR — probe both halves for correct size */
+      uint32_t bar_offset_hi = PCI_BAR0 + (i + 1) * 4;
+      uint64_t size64 = pci_get_bar_size64(b, d, f, bar_offset, bar_offset_hi);
+
+      if (size64 == 0) {
+        dev->bar_addr[i] = 0;
+        i++; // skip upper BAR
+        continue;
+      }
+
       uart_println("[PCI][64 Bit Memory Space]");
       uart_puts(" BAR");
       uart_putdec(i);
       uart_puts(" has size: ");
-      uart_puthex(size);
+      uart_puthex(size64);
       uart_println("");
-      uintptr_t addr = alloc_mmio64(size);
+      uintptr_t addr = alloc_mmio64(size64);
       // lower 32 bit
       pci_config_write32(b, d, f, bar_offset, (uint32_t)(addr & 0xFFFFFFFF));
       // upper 32 bit

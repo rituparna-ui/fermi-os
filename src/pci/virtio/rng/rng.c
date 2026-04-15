@@ -23,5 +23,6 @@ void pci_virtio_rng_init() {
   pci_assign_bars(&rng_dev.pci);
   pci_enable_device(&rng_dev.pci);
 
+  virtio_parse_capabilities(&rng_dev.pci, &rng_dev.pci_caps);
   return;
 }

@@ -35,3 +35,8 @@ void print_current_el() {
   uart_printf("Current Exception Level: %s\n", el_name);
   return;
 }
+
+void dsb_sy() {
+  __asm__ volatile("dsb sy" ::: "memory");
+  return;
+}

@@ -135,7 +135,7 @@ uint8_t pci_get_header_type(struct pci_device *dev) {
 }
 
 static uint32_t pci_get_bar_size(uint8_t bus, uint8_t slot, uint8_t func,
-                          uint16_t offset) {
+                                 uint16_t offset) {
   uint32_t original = pci_config_read32(bus, slot, func, offset);
   pci_config_write32(bus, slot, func, offset, 0xFFFFFFFF);
   uint32_t size_mask = pci_config_read32(bus, slot, func, offset);
@@ -143,6 +143,10 @@ static uint32_t pci_get_bar_size(uint8_t bus, uint8_t slot, uint8_t func,
 
   // mask lower 4 bits (control bits)
   size_mask &= ~0xF;
+  if (size_mask == 0) {
+    // unimplemented BAR
+    return 0;
+  }
   uint32_t size = ~size_mask + 1;
 
   return size;
@@ -150,7 +154,7 @@ static uint32_t pci_get_bar_size(uint8_t bus, uint8_t slot, uint8_t func,
 
 // For 64-bit BARs, probe both BAR[i] and BAR[i+1] to get the full size
 static uint64_t pci_get_bar_size64(uint8_t bus, uint8_t slot, uint8_t func,
-                            uint16_t offset_lo, uint16_t offset_hi) {
+                                   uint16_t offset_lo, uint16_t offset_hi) {
   // Save originals
   uint32_t orig_lo = pci_config_read32(bus, slot, func, offset_lo);
   uint32_t orig_hi = pci_config_read32(bus, slot, func, offset_hi);

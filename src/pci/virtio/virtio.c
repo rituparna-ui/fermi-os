@@ -83,7 +83,7 @@ void virtio_parse_capabilities(struct pci_device *dev,
     return;
   }
 
-  int cap_ptr = pci_config_read8(bus, slot, func, PCI_CAP_PTR);
+  uint8_t cap_ptr = pci_config_read8(bus, slot, func, PCI_CAP_PTR);
 
   while (cap_ptr) {
     uint8_t cap_id = pci_config_read8(bus, slot, func, cap_ptr);

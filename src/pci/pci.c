@@ -3,13 +3,17 @@
 #include "uart/uart.h"
 #include "utils/utils.h"
 
-struct pci_device pci_devices[MAX_PCI_DEVICES];
-uint16_t pci_device_count = 0;
+static struct pci_device pci_devices[MAX_PCI_DEVICES];
+static uint16_t pci_device_count = 0;
 
-uintptr_t mmio32_next = PCI_MMIO32_PHYS;
-uintptr_t mmio64_next = PCI_MMIO64_PHYS;
+static uintptr_t mmio32_next = PCI_MMIO32_PHYS;
+static uintptr_t mmio64_next = PCI_MMIO64_PHYS;
 
-uintptr_t alloc_mmio32(uint32_t size) {
+static uintptr_t alloc_mmio32(uint32_t size) {
+  /* Align up to the BAR's natural alignment */
+  uintptr_t mask = (uintptr_t)size - 1;
+  mmio32_next = (mmio32_next + mask) & ~mask;
+
   if (mmio32_next & (size - 1)) {
     mmio32_next = (mmio32_next + size) & ~(size - 1);
   }
@@ -19,7 +23,11 @@ uintptr_t alloc_mmio32(uint32_t size) {
   return addr;
 }
 
-uintptr_t alloc_mmio64(uint64_t size) {
+static uintptr_t alloc_mmio64(uint64_t size) {
+  /* Align up to the BAR's natural alignment */
+  uintptr_t mask = (uintptr_t)size - 1;
+  mmio64_next = (mmio64_next + mask) & ~mask;
+
   if (mmio64_next & (size - 1)) {
     mmio64_next = (mmio64_next + size) & ~(size - 1);
   }
@@ -71,17 +79,8 @@ void pci_config_write8(uint16_t bus, uint8_t slot, uint8_t func,
 
 static void pci_log_device_found(uint16_t bus, uint8_t slot, uint8_t func,
                                  uint16_t vendor_id, uint16_t device_id) {
-  uart_puts("[PCI] Device found at ");
-  uart_putdec(bus);
-  uart_puts(":");
-  uart_putdec(slot);
-  uart_puts(".");
-  uart_putdec(func);
-  uart_puts(" | VendorID: ");
-  uart_puthex(vendor_id);
-  uart_puts(", DeviceID: ");
-  uart_puthex(device_id);
-  uart_println("");
+  uart_printf("[PCI] Device found at %d:%d.%d | VendorID: %x, DeviceID: %x\n",
+              bus, slot, func, vendor_id, device_id);
 }
 
 void pci_enumerate_bus() {
@@ -119,12 +118,10 @@ void pci_enumerate_bus() {
 
 int pci_find_device(uint16_t vendor_id, uint16_t device_id,
                     struct pci_device *pci_device) {
-  for (uint64_t i = 0; i < pci_device_count; i++) {
-    struct pci_device current_dev = pci_devices[i];
-
-    if (current_dev.vendor_id == vendor_id &&
-        current_dev.device_id == device_id) {
-      *pci_device = current_dev;
+  for (uint16_t i = 0; i < pci_device_count; i++) {
+    if (pci_devices[i].vendor_id == vendor_id &&
+        pci_devices[i].device_id == device_id) {
+      *pci_device = pci_devices[i];
       return ESUCCESS;
     }
   }
@@ -137,7 +134,7 @@ uint8_t pci_get_header_type(struct pci_device *dev) {
   return header_type;
 }
 
-uint32_t pci_get_bar_size(uint8_t bus, uint8_t slot, uint8_t func,
+static uint32_t pci_get_bar_size(uint8_t bus, uint8_t slot, uint8_t func,
                           uint16_t offset) {
   uint32_t original = pci_config_read32(bus, slot, func, offset);
   pci_config_write32(bus, slot, func, offset, 0xFFFFFFFF);
@@ -152,7 +149,7 @@ uint32_t pci_get_bar_size(uint8_t bus, uint8_t slot, uint8_t func,
 }
 
 // For 64-bit BARs, probe both BAR[i] and BAR[i+1] to get the full size
-uint64_t pci_get_bar_size64(uint8_t bus, uint8_t slot, uint8_t func,
+static uint64_t pci_get_bar_size64(uint8_t bus, uint8_t slot, uint8_t func,
                             uint16_t offset_lo, uint16_t offset_hi) {
   // Save originals
   uint32_t orig_lo = pci_config_read32(bus, slot, func, offset_lo);

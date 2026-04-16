@@ -5,6 +5,8 @@
 #include "mm/pmm/pmm.h"
 #include "mmio/mmio.h"
 #include "panic/panic.h"
+#include "pci/pci.h"
+#include "rng/rng.h"
 #include "sched/sched.h"
 #include "strings/strings.h" // IWYU pragma: keep
 #include "timer/timer.h"
@@ -112,12 +114,17 @@ void kernel_main() {
 
   gic_init();
 
+  pci_enumerate_bus();
+  pci_virtio_rng_init();
+
+  /*
   sched_init();
   sched_create_task("task_a", task_a);
   sched_create_task("task_b", task_b);
 
   timer_init();
   timer_start(TIMER_INTERVAL_MS);
+  */
 
   uart_println("[KERNEL] Ready! running idle task...");
 

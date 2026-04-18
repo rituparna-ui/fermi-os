@@ -99,11 +99,11 @@ void pci_virtio_blk_init(void) {
   /* Step 6: Re-read and verify FEATURES_OK stuck */
   status = mmio_read8(base + VIRTIO_COMMON_STATUS);
   if (!(status & VIRTIO_STATUS_FEATURES_OK)) {
-    uart_errorln("[RNG] FEATURES_OK failed");
+    uart_errorln("[BLK] FEATURES_OK failed");
     return;
   }
-  uart_printf("[RNG] Status: %x\n", (uint32_t)status);
-  uart_println("[RNG] FEATURES_OK !");
+  uart_printf("[BLK] Status: %x\n", (uint32_t)status);
+  uart_println("[BLK] FEATURES_OK !");
 
   /* Step 6: Setup virtqueue 0 */
   blk_dev.vq.desc = blk_desc;
@@ -111,7 +111,7 @@ void pci_virtio_blk_init(void) {
   blk_dev.vq.used = &blk_used;
 
   if (virtqueue_setup(base, 0, &blk_dev.vq, &blk_dev.pci_caps) != ESUCCESS) {
-    uart_errorln("[RNG] Virtqueue setup failed");
+    uart_errorln("[BLK] Virtqueue setup failed");
     return;
   }
 

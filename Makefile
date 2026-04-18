@@ -27,9 +27,15 @@ ASFLAGS := -g
 LDFLAGS := -nostdlib -g -T linker.ld
 
 # QEMU Config
+DISK_IMG := $(BUILD_DIR)/disk.img
+DISK_SIZE := 1G
+
 QEMU_CPU := cortex-a72
 QEMU_MACHINE := virt,gic-version=3 -m 8G
-QEMU_DEVICES := -nic none -device virtio-rng-pci,disable-legacy=on
+QEMU_DEVICES := -nic none \
+	-device virtio-rng-pci,disable-legacy=on \
+	-drive file=$(DISK_IMG),if=none,format=raw,id=d0 \
+	-device virtio-blk-pci,drive=d0,disable-legacy=on
 # QEMU_MACHINE := virt,gic-version=3,virtualization=on -m 8G
 # QEMU_MACHINE := virt,gic-version=3,virtualization=on,secure=on -m 8G
 QEMU_BASE := qemu-system-aarch64 -machine $(QEMU_MACHINE) -nographic -cpu $(QEMU_CPU) $(QEMU_DEVICES)
@@ -57,11 +63,18 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.S
 	@$(AS) $(ASFLAGS) $< -o $@
 
 # Run QEMU
-run: all
+run: all disk
 	@$(QEMU_BASE) $(QEMU_FLAGS_RUN)
 
-debug: all
+debug: all disk
 	@$(QEMU_BASE) $(QEMU_FLAGS_DEBUG)
+
+disk: $(DISK_IMG)
+
+$(DISK_IMG):
+	@mkdir -p $(BUILD_DIR)
+	@echo "Creating $(DISK_IMG) ($(DISK_SIZE) sparse)"
+	@truncate -s $(DISK_SIZE) $@
 
 # GDB Config
 GDB := gdb-multiarch

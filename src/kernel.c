@@ -1,3 +1,4 @@
+#include "blk/blk.h"
 #include "exception.h"
 #include "gic/gic.h"
 #include "mm/heap/heap.h"
@@ -116,6 +117,7 @@ void kernel_main() {
 
   pci_enumerate_bus();
   pci_virtio_rng_init();
+  pci_virtio_blk_init();
 
   /*
   sched_init();

@@ -6,6 +6,7 @@
 #include "pci/virtio/virtio.h"
 
 /* Virtqueue descriptor flags */
+#define VIRTQ_DESC_F_NONE 0  /* no flags; device reads this buffer */
 #define VIRTQ_DESC_F_NEXT 1  /* buffer continues via 'next' field */
 #define VIRTQ_DESC_F_WRITE 2 /* device writes (vs reads) */
 
@@ -56,6 +57,13 @@ struct virtqueue {
   struct virtq_used *used;
 };
 
+/* single-segment descriptor for chain submission */
+struct virtq_seg {
+  uint64_t pa;
+  uint32_t len;
+  uint16_t flags; /* VIRTQ_DESC_F_WRITE if device writes into this segment */
+};
+
 /*
  * virtqueue_setup — configure a virtqueue via the common config MMIO registers.
  *   common_cfg_base: PA of VirtIO common config
@@ -80,5 +88,15 @@ void virtqueue_notify(struct virtqueue *vq);
 /* spin until the device produces a used entry.
  * Returns the number of bytes written by the device. */
 uint32_t virtqueue_poll(struct virtqueue *vq);
+/*
+ * virtqueue_submit_chain — add a chain of N linked descriptors.
+ *   segs: array of N segments
+ *   n:    number of segments (must be >= 1 and <= vq->size)
+ * The head is linked via VIRTQ_DESC_F_NEXT through segs[n-1]; only the
+ * head index is published to the available ring.
+ * Returns the head descriptor index.
+ */
+uint16_t virtqueue_submit_chain(struct virtqueue *vq,
+                                const struct virtq_seg *segs, uint16_t n);
 
 #endif

@@ -73,8 +73,13 @@ disk: $(DISK_IMG)
 
 $(DISK_IMG):
 	@mkdir -p $(BUILD_DIR)
-	@echo "Creating $(DISK_IMG) ($(DISK_SIZE) sparse)"
+	@echo "Creating $(DISK_IMG) ($(DISK_SIZE) sparse, FAT32)"
 	@truncate -s $(DISK_SIZE) $@
+	@mkfs.fat -F 32 -n FERMI $@ > /dev/null
+	@printf 'Hello from Fermi OS!\nThis is HELLO.TXT on a FAT32 volume.\n' \
+		| MTOOLS_SKIP_CHECK=1 mcopy -i $@ - ::/HELLO.TXT
+	@printf '\336\255\276\357\312\376\272\276' \
+		| MTOOLS_SKIP_CHECK=1 mcopy -i $@ - ::/DATA.BIN
 
 # GDB Config
 GDB := gdb-multiarch

@@ -6,6 +6,7 @@
 #include "pci/virtio/virtio.h"
 
 /* Virtqueue descriptor flags */
+#define VIRTQ_DESC_F_NONE 0  /* no flags; device reads this buffer */
 #define VIRTQ_DESC_F_NEXT 1  /* buffer continues via 'next' field */
 #define VIRTQ_DESC_F_WRITE 2 /* device writes (vs reads) */
 

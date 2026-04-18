@@ -143,7 +143,8 @@ int blk_read(uint64_t sector, void *buf) {
   status = 0xFF;
 
   struct virtq_seg segs[3] = {
-      {VIRT_TO_PHYS((uint64_t)(uintptr_t)&hdr), sizeof(hdr), 0},
+      {VIRT_TO_PHYS((uint64_t)(uintptr_t)&hdr), sizeof(hdr),
+       VIRTQ_DESC_F_NONE},
       {VIRT_TO_PHYS((uint64_t)(uintptr_t)buf), VIRTIO_BLK_SECTOR_SIZE,
        VIRTQ_DESC_F_WRITE},
       {VIRT_TO_PHYS((uint64_t)(uintptr_t)&status), 1, VIRTQ_DESC_F_WRITE},
@@ -155,6 +156,35 @@ int blk_read(uint64_t sector, void *buf) {
 
   if (status != VIRTIO_BLK_S_OK) {
     uart_printf("[BLK] read sector %d failed: status=%x\n", sector,
+                (uint32_t)status);
+    return EERROR;
+  }
+  return ESUCCESS;
+}
+
+int blk_write(uint64_t sector, const void *buf) {
+  static struct virtio_blk_req hdr __attribute__((aligned(16)));
+  static volatile uint8_t status __attribute__((aligned(16)));
+
+  hdr.type = VIRTIO_BLK_T_OUT;
+  hdr.reserved = 0;
+  hdr.sector = sector;
+  status = 0xFF;
+
+  struct virtq_seg segs[3] = {
+      {VIRT_TO_PHYS((uint64_t)(uintptr_t)&hdr), sizeof(hdr),
+       VIRTQ_DESC_F_NONE},
+      {VIRT_TO_PHYS((uint64_t)(uintptr_t)buf), VIRTIO_BLK_SECTOR_SIZE,
+       VIRTQ_DESC_F_NONE},
+      {VIRT_TO_PHYS((uint64_t)(uintptr_t)&status), 1, VIRTQ_DESC_F_WRITE},
+  };
+
+  virtqueue_submit_chain(&blk_dev.vq, segs, 3);
+  virtqueue_notify(&blk_dev.vq);
+  virtqueue_poll(&blk_dev.vq);
+
+  if (status != VIRTIO_BLK_S_OK) {
+    uart_printf("[BLK] write sector %d failed: status=%x\n", sector,
                 (uint32_t)status);
     return EERROR;
   }

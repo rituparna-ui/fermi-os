@@ -13,8 +13,9 @@
 
 #define VIRTIO_BLK_SECTOR_SIZE 512
 
-/* Header types */
+/* Request Header Types */
 #define VIRTIO_BLK_T_IN 0
+#define VIRTIO_BLK_T_OUT 1
 
 /* status byte values */
 #define VIRTIO_BLK_S_OK 0
@@ -36,5 +37,6 @@ struct virtio_blk_req {
 
 void pci_virtio_blk_init(void);
 int blk_read(uint64_t sector, void *buf);
+int blk_write(uint64_t sector, const void *buf);
 
 #endif

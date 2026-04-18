@@ -111,3 +111,31 @@ uint32_t virtqueue_poll(struct virtqueue *vq) {
 
   return written;
 }
+
+uint16_t virtqueue_submit_chain(struct virtqueue *vq,
+                                const struct virtq_seg *segs, uint16_t n) {
+  uint16_t head = vq->free_head;
+
+  for (uint16_t i = 0; i < n; i++) {
+    uint16_t idx = (head + i) % vq->size;
+    uint16_t flags = segs[i].flags;
+    if (i < n - 1)
+      flags |= VIRTQ_DESC_F_NEXT;
+
+    vq->desc[idx].addr = segs[i].pa;
+    vq->desc[idx].len = segs[i].len;
+    vq->desc[idx].flags = flags;
+    vq->desc[idx].next = (i < n - 1) ? ((head + i + 1) % vq->size) : 0;
+  }
+
+  vq->free_head = (head + n) % vq->size;
+
+  uint16_t avail_idx = vq->avail->idx;
+  vq->avail->ring[avail_idx % vq->size] = head;
+  dsb_sy();
+
+  vq->avail->idx = avail_idx + 1;
+  dsb_sy();
+
+  return head;
+}

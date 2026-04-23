@@ -1,5 +1,6 @@
 #include "blk/blk.h"
 #include "exception.h"
+#include "fat32/fat32.h"
 #include "gic/gic.h"
 #include "mm/heap/heap.h"
 #include "mm/mmu/mmu.h"
@@ -118,6 +119,27 @@ void kernel_main() {
   pci_enumerate_bus();
   pci_virtio_rng_init();
   pci_virtio_blk_init();
+
+  if (fat32_mount() != ESUCCESS) {
+    uart_printf("[FS][FAT32] Unable to mount file system");
+  }
+
+  uint32_t first_cluster, size;
+
+  if (fat32_find("HELLO.TXT", &first_cluster, &size) == ESUCCESS) {
+    uart_printf("[FAT32] HELLO.TXT: cluster=%d size=%d\n",
+                (uint64_t)first_cluster, (uint64_t)size);
+
+    static char filebuf[512];
+    int n = fat32_read(first_cluster, size, filebuf, sizeof(filebuf) - 1);
+
+    if (n > 0) {
+      filebuf[n] = 0;
+      uart_printf("[FAT32] contents:\n%s\n", filebuf);
+    }
+  } else {
+    uart_errorln("[FAT32] HELLO.TXT not found");
+  }
 
   /*
   sched_init();

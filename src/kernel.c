@@ -156,6 +156,25 @@ void kernel_main() {
     uart_errorln("[FAT32] SUBDIR/INFO.TXT not found");
   }
 
+  /* Test FAT32 write: create a file, then read it back */
+  const char *test_data = "Written by Fermi OS kernel!\n";
+  if (fat32_create("CREATED.TXT", test_data, 28) == ESUCCESS) {
+    uart_println("[FAT32] Created CREATED.TXT");
+
+    if (fat32_find("CREATED.TXT", &first_cluster, &size) == ESUCCESS) {
+      static char vbuf[512];
+      int n = fat32_read(first_cluster, size, vbuf, sizeof(vbuf) - 1);
+      if (n > 0) {
+        vbuf[n] = 0;
+        uart_printf("[FAT32] Read back: %s", vbuf);
+      }
+    } else {
+      uart_errorln("[FAT32] CREATED.TXT not found after create");
+    }
+  } else {
+    uart_errorln("[FAT32] Failed to create CREATED.TXT");
+  }
+
   /*
   sched_init();
   sched_create_task("task_a", task_a);

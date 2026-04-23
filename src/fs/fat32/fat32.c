@@ -176,6 +176,211 @@ int fat32_find(const char *path, uint32_t *out_first_cluster,
   return EERROR;
 }
 
+/* Write a 32-bit FAT entry for the given cluster. */
+static int fat_write(uint32_t cluster, uint32_t value) {
+  uint32_t fat_offset = cluster * 4;
+  uint32_t sector = vol.fat_start_sector + fat_offset / SECTOR;
+  uint32_t offset = fat_offset % SECTOR;
+  if (blk_read(sector, sec_buf) != ESUCCESS)
+    return EERROR;
+  /* Preserve upper 4 bits of existing entry */
+  uint32_t existing;
+  memcpy(&existing, sec_buf + offset, 4);
+  value = (existing & 0xF0000000) | (value & 0x0FFFFFFF);
+  memcpy(sec_buf + offset, &value, 4);
+  if (blk_write(sector, sec_buf) != ESUCCESS)
+    return EERROR;
+  return ESUCCESS;
+}
+
+/* Scan FAT for a free cluster (entry == 0). Returns 0 on failure. */
+static uint32_t fat_alloc_cluster(void) {
+  /* Cluster 0 and 1 are reserved, start scanning from 2 */
+  uint32_t total_sectors =
+      vol.data_start_sector; /* rough upper bound for FAT scan */
+  for (uint32_t c = 2;; c++) {
+    uint32_t fat_offset = c * 4;
+    uint32_t sector = vol.fat_start_sector + fat_offset / SECTOR;
+    if (sector >= vol.data_start_sector)
+      break; /* past end of FAT */
+    uint32_t offset = fat_offset % SECTOR;
+    if (blk_read(sector, sec_buf) != ESUCCESS)
+      return 0;
+    uint32_t val;
+    memcpy(&val, sec_buf + offset, 4);
+    if ((val & 0x0FFFFFFF) == 0) {
+      /* Mark as end-of-chain */
+      if (fat_write(c, 0x0FFFFFFF) != ESUCCESS)
+        return 0;
+      return c;
+    }
+  }
+  (void)total_sectors;
+  return 0;
+}
+
+/* Find a free directory entry slot (name[0]==0x00 or 0xE5) in the directory
+ * starting at dir_cluster. Writes the entry and flushes the sector. */
+static int dir_add_entry(uint32_t dir_cluster, const struct dir_entry *entry) {
+  uint32_t cluster = dir_cluster;
+  while (cluster < FAT32_EOC) {
+    uint32_t base = cluster_to_sector(cluster);
+    for (uint32_t s = 0; s < vol.sectors_per_cluster; s++) {
+      if (blk_read(base + s, sec_buf) != ESUCCESS)
+        return EERROR;
+      for (uint32_t off = 0; off < SECTOR; off += DIR_ENTRY_SIZE) {
+        uint8_t first = sec_buf[off];
+        if (first == 0x00 || first == 0xE5) {
+          memcpy(sec_buf + off, entry, DIR_ENTRY_SIZE);
+          if (blk_write(base + s, sec_buf) != ESUCCESS)
+            return EERROR;
+          return ESUCCESS;
+        }
+      }
+    }
+    cluster = fat_next(cluster);
+  }
+  return EERROR;
+}
+
+/* Write data to a cluster chain, one sector at a time. */
+static int cluster_write_data(uint32_t first_cluster, const void *data,
+                              uint32_t len) {
+  const uint8_t *src = (const uint8_t *)data;
+  uint32_t remaining = len;
+  uint32_t cluster = first_cluster;
+
+  while (remaining > 0 && cluster < FAT32_EOC) {
+    uint32_t base = cluster_to_sector(cluster);
+    for (uint32_t s = 0; s < vol.sectors_per_cluster && remaining > 0; s++) {
+      /* If less than a full sector, read-modify-write */
+      if (remaining < SECTOR) {
+        memset(sec_buf, 0, SECTOR);
+        memcpy(sec_buf, src, remaining);
+      } else {
+        memcpy(sec_buf, src, SECTOR);
+      }
+      if (blk_write(base + s, sec_buf) != ESUCCESS)
+        return EERROR;
+      uint32_t chunk = remaining < SECTOR ? remaining : SECTOR;
+      src += chunk;
+      remaining -= chunk;
+    }
+    cluster = fat_next(cluster);
+  }
+  return ESUCCESS;
+}
+
+int fat32_create(const char *path, const void *data, uint32_t len) {
+  /* Split path into parent directory and filename */
+  const char *p = path;
+  while (*p == '/')
+    p++;
+
+  /* Find last '/' to separate dir from filename */
+  const char *last_slash = 0;
+  for (const char *s = p; *s; s++) {
+    if (*s == '/')
+      last_slash = s;
+  }
+
+  uint32_t dir_cluster = vol.root_cluster;
+
+  char filename[13];
+  if (last_slash) {
+    /* Walk to parent directory */
+    const char *walk = p;
+    while (walk < last_slash) {
+      const char *seg = walk;
+      while (walk < last_slash && *walk != '/')
+        walk++;
+
+      int seg_len = (int)(walk - seg);
+      char component[13];
+      if (seg_len > 12)
+        seg_len = 12;
+      for (int i = 0; i < seg_len; i++)
+        component[i] = seg[i];
+      component[seg_len] = '\0';
+
+      uint8_t target[11];
+      to_83(component, target);
+
+      uint32_t cluster, size;
+      uint8_t attr;
+      if (dir_lookup(dir_cluster, target, &cluster, &size, &attr) != ESUCCESS)
+        return EERROR;
+      if (!(attr & ATTR_DIRECTORY))
+        return EERROR;
+      dir_cluster = cluster;
+
+      while (walk <= last_slash && *walk == '/')
+        walk++;
+    }
+    /* Filename is after last slash */
+    const char *fname = last_slash + 1;
+    int i = 0;
+    while (fname[i] && i < 12) {
+      filename[i] = fname[i];
+      i++;
+    }
+    filename[i] = '\0';
+  } else {
+    /* No directory component — file goes in root */
+    int i = 0;
+    while (p[i] && i < 12) {
+      filename[i] = p[i];
+      i++;
+    }
+    filename[i] = '\0';
+  }
+
+  /* Allocate clusters for data */
+  uint32_t clusters_needed =
+      len == 0 ? 0 : (len + vol.bytes_per_cluster - 1) / vol.bytes_per_cluster;
+
+  uint32_t first_cluster = 0;
+  uint32_t prev_cluster = 0;
+
+  for (uint32_t i = 0; i < clusters_needed; i++) {
+    uint32_t c = fat_alloc_cluster();
+    if (c == 0)
+      return EERROR;
+    if (i == 0)
+      first_cluster = c;
+    if (prev_cluster) {
+      /* Chain previous cluster to this one */
+      if (fat_write(prev_cluster, c) != ESUCCESS)
+        return EERROR;
+    }
+    prev_cluster = c;
+  }
+
+  /* Write file data */
+  if (len > 0 && first_cluster) {
+    if (cluster_write_data(first_cluster, data, len) != ESUCCESS)
+      return EERROR;
+  }
+
+  /* Build directory entry */
+  struct dir_entry de;
+  memset(&de, 0, sizeof(de));
+
+  uint8_t name83[11];
+  to_83(filename, name83);
+  memcpy(de.name, name83, 11);
+
+  de.attr = 0x20; /* ATTR_ARCHIVE */
+  de.first_cluster_hi = (uint16_t)(first_cluster >> 16);
+  de.first_cluster_lo = (uint16_t)(first_cluster & 0xFFFF);
+  de.size = len;
+
+  if (dir_add_entry(dir_cluster, &de) != ESUCCESS)
+    return EERROR;
+
+  return ESUCCESS;
+}
+
 int fat32_read(uint32_t first_cluster, uint32_t size, void *buf,
                uint32_t buf_len) {
   if (size > buf_len)

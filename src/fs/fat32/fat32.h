@@ -58,4 +58,7 @@ int fat32_find(const char *path, uint32_t *out_first_cluster,
 int fat32_read(uint32_t first_cluster, uint32_t size, void *buf,
                uint32_t buf_len);
 
+/* Create a new file at path with given data. Supports subdirectories. */
+int fat32_create(const char *path, const void *data, uint32_t len);
+
 #endif

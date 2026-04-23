@@ -86,6 +86,9 @@ $(DISK_IMG):
 		| MTOOLS_SKIP_CHECK=1 mcopy -i $@ - ::/HELLO.TXT
 	@printf '\336\255\276\357\312\376\272\276' \
 		| MTOOLS_SKIP_CHECK=1 mcopy -i $@ - ::/DATA.BIN
+	@MTOOLS_SKIP_CHECK=1 mmd -i $@ ::/SUBDIR
+	@printf 'Hello from a subdirectory!\n' \
+		| MTOOLS_SKIP_CHECK=1 mcopy -i $@ - ::/SUBDIR/INFO.TXT
 
 # GDB Config
 GDB := gdb-multiarch

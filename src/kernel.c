@@ -141,6 +141,21 @@ void kernel_main() {
     uart_errorln("[FAT32] HELLO.TXT not found");
   }
 
+  if (fat32_find("SUBDIR/INFO.TXT", &first_cluster, &size) == ESUCCESS) {
+    uart_printf("[FAT32] SUBDIR/INFO.TXT: cluster=%d size=%d\n",
+                (uint64_t)first_cluster, (uint64_t)size);
+
+    static char filebuf2[512];
+    int n = fat32_read(first_cluster, size, filebuf2, sizeof(filebuf2) - 1);
+
+    if (n > 0) {
+      filebuf2[n] = 0;
+      uart_printf("[FAT32] contents:\n%s\n", filebuf2);
+    }
+  } else {
+    uart_errorln("[FAT32] SUBDIR/INFO.TXT not found");
+  }
+
   /*
   sched_init();
   sched_create_task("task_a", task_a);

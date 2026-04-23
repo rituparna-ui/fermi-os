@@ -84,12 +84,12 @@ int fat32_mount(void) {
   return ESUCCESS;
 }
 
-int fat32_find(const char *name, uint32_t *out_first_cluster,
-               uint32_t *out_size) {
-  uint8_t target[11];
-  to_83(name, target);
-
-  uint32_t cluster = vol.root_cluster;
+/* Search directory starting at dir_cluster for a single 8.3 component.
+ * Returns ESUCCESS and fills out_cluster, out_size, out_attr on match. */
+static int dir_lookup(uint32_t dir_cluster, const uint8_t target[11],
+                      uint32_t *out_cluster, uint32_t *out_size,
+                      uint8_t *out_attr) {
+  uint32_t cluster = dir_cluster;
   while (cluster < FAT32_EOC) {
     uint32_t base = cluster_to_sector(cluster);
     for (uint32_t s = 0; s < vol.sectors_per_cluster; s++) {
@@ -100,10 +100,10 @@ int fat32_find(const char *name, uint32_t *out_first_cluster,
         if (e->name[0] == 0x00)
           return EERROR; /* end of directory */
         if (e->name[0] == 0xE5)
-          continue; /* deleted */
+          continue;
         if (e->attr == ATTR_LFN)
-          continue; /* skip LFN slots */
-        if (e->attr & (ATTR_VOLUME_ID | ATTR_DIRECTORY))
+          continue;
+        if (e->attr & ATTR_VOLUME_ID)
           continue;
 
         int match = 1;
@@ -114,15 +114,65 @@ int fat32_find(const char *name, uint32_t *out_first_cluster,
           }
         }
         if (match) {
-          *out_first_cluster =
+          *out_cluster =
               ((uint32_t)e->first_cluster_hi << 16) | e->first_cluster_lo;
           *out_size = e->size;
+          *out_attr = e->attr;
           return ESUCCESS;
         }
       }
     }
     cluster = fat_next(cluster);
   }
+  return EERROR;
+}
+
+int fat32_find(const char *path, uint32_t *out_first_cluster,
+               uint32_t *out_size) {
+  /* Skip leading slash */
+  while (*path == '/')
+    path++;
+
+  uint32_t cur_cluster = vol.root_cluster;
+
+  while (*path) {
+    /* Extract next component (up to '/' or end) */
+    const char *seg = path;
+    while (*path && *path != '/')
+      path++;
+    int seg_len = (int)(path - seg);
+    while (*path == '/')
+      path++;
+
+    /* Build a null-terminated component for to_83 */
+    char component[13];
+    if (seg_len > 12)
+      seg_len = 12;
+    for (int i = 0; i < seg_len; i++)
+      component[i] = seg[i];
+    component[seg_len] = '\0';
+
+    uint8_t target[11];
+    to_83(component, target);
+
+    uint32_t cluster, size;
+    uint8_t attr;
+    if (dir_lookup(cur_cluster, target, &cluster, &size, &attr) != ESUCCESS)
+      return EERROR;
+
+    if (*path) {
+      /* More components remain — this must be a directory */
+      if (!(attr & ATTR_DIRECTORY))
+        return EERROR;
+      cur_cluster = cluster;
+    } else {
+      /* Final component */
+      *out_first_cluster = cluster;
+      *out_size = size;
+      return ESUCCESS;
+    }
+  }
+
   return EERROR;
 }
 

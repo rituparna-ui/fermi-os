@@ -50,8 +50,8 @@ struct dir_entry {
 
 int fat32_mount(void);
 
-/* Look up in the root directory (no subdirectories) */
-int fat32_find(const char *name, uint32_t *out_first_cluster,
+/* Look up a file by path (supports subdirectories, e.g. "DOCS/README.TXT") */
+int fat32_find(const char *path, uint32_t *out_first_cluster,
                uint32_t *out_size);
 
 /* Returns bytes read, or -1 on error. */

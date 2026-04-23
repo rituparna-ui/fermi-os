@@ -22,8 +22,9 @@ static uint32_t fat_next(uint32_t cluster) {
   uint32_t fat_offset = cluster * 4;
   uint32_t sector = vol.fat_start_sector + fat_offset / SECTOR;
   uint32_t offset = fat_offset % SECTOR;
-  if (blk_read(sector, sec_buf) != ESUCCESS)
+  if (blk_read(sector, sec_buf) != ESUCCESS) {
     return FAT32_EOC;
+  }
   uint32_t val;
   memcpy(&val, sec_buf + offset, 4);
   return val & 0x0FFFFFFF;
@@ -35,19 +36,23 @@ static void to_83(const char *name, uint8_t out[11]) {
   int i = 0;
   while (i < 8 && name[i] && name[i] != '.') {
     char c = name[i];
-    if (c >= 'a' && c <= 'z')
+    if (c >= 'a' && c <= 'z') {
       c -= 32;
+    }
     out[i++] = (uint8_t)c;
   }
-  while (name[i] && name[i] != '.')
+  while (name[i] && name[i] != '.') {
     i++;
-  if (name[i] == '.')
+  }
+  if (name[i] == '.') {
     i++;
+  }
   int j = 0;
   while (j < 3 && name[i]) {
     char c = name[i++];
-    if (c >= 'a' && c <= 'z')
+    if (c >= 'a' && c <= 'z') {
       c -= 32;
+    }
     out[8 + j++] = (uint8_t)c;
   }
 }
@@ -93,18 +98,23 @@ static int dir_lookup(uint32_t dir_cluster, const uint8_t target[11],
   while (cluster < FAT32_EOC) {
     uint32_t base = cluster_to_sector(cluster);
     for (uint32_t s = 0; s < vol.sectors_per_cluster; s++) {
-      if (blk_read(base + s, sec_buf) != ESUCCESS)
+      if (blk_read(base + s, sec_buf) != ESUCCESS) {
         return EERROR;
+      }
       for (uint32_t off = 0; off < SECTOR; off += DIR_ENTRY_SIZE) {
         struct dir_entry *e = (struct dir_entry *)(sec_buf + off);
-        if (e->name[0] == 0x00)
+        if (e->name[0] == 0x00) {
           return EERROR; /* end of directory */
-        if (e->name[0] == 0xE5)
+        }
+        if (e->name[0] == 0xE5) {
           continue;
-        if (e->attr == ATTR_LFN)
+        }
+        if (e->attr == ATTR_LFN) {
           continue;
-        if (e->attr & ATTR_VOLUME_ID)
+        }
+        if (e->attr & ATTR_VOLUME_ID) {
           continue;
+        }
 
         int match = 1;
         for (int i = 0; i < 11; i++) {
@@ -130,26 +140,31 @@ static int dir_lookup(uint32_t dir_cluster, const uint8_t target[11],
 int fat32_find(const char *path, uint32_t *out_first_cluster,
                uint32_t *out_size) {
   /* Skip leading slash */
-  while (*path == '/')
+  while (*path == '/') {
     path++;
+  }
 
   uint32_t cur_cluster = vol.root_cluster;
 
   while (*path) {
     /* Extract next component (up to '/' or end) */
     const char *seg = path;
-    while (*path && *path != '/')
+    while (*path && *path != '/') {
       path++;
+    }
     int seg_len = (int)(path - seg);
-    while (*path == '/')
+    while (*path == '/') {
       path++;
+    }
 
     /* Build a null-terminated component for to_83 */
     char component[13];
-    if (seg_len > 12)
+    if (seg_len > 12) {
       seg_len = 12;
-    for (int i = 0; i < seg_len; i++)
+    }
+    for (int i = 0; i < seg_len; i++) {
       component[i] = seg[i];
+    }
     component[seg_len] = '\0';
 
     uint8_t target[11];
@@ -157,13 +172,15 @@ int fat32_find(const char *path, uint32_t *out_first_cluster,
 
     uint32_t cluster, size;
     uint8_t attr;
-    if (dir_lookup(cur_cluster, target, &cluster, &size, &attr) != ESUCCESS)
+    if (dir_lookup(cur_cluster, target, &cluster, &size, &attr) != ESUCCESS) {
       return EERROR;
+    }
 
     if (*path) {
       /* More components remain — this must be a directory */
-      if (!(attr & ATTR_DIRECTORY))
+      if (!(attr & ATTR_DIRECTORY)) {
         return EERROR;
+      }
       cur_cluster = cluster;
     } else {
       /* Final component */
@@ -181,15 +198,17 @@ static int fat_write(uint32_t cluster, uint32_t value) {
   uint32_t fat_offset = cluster * 4;
   uint32_t sector = vol.fat_start_sector + fat_offset / SECTOR;
   uint32_t offset = fat_offset % SECTOR;
-  if (blk_read(sector, sec_buf) != ESUCCESS)
+  if (blk_read(sector, sec_buf) != ESUCCESS) {
     return EERROR;
+  }
   /* Preserve upper 4 bits of existing entry */
   uint32_t existing;
   memcpy(&existing, sec_buf + offset, 4);
   value = (existing & 0xF0000000) | (value & 0x0FFFFFFF);
   memcpy(sec_buf + offset, &value, 4);
-  if (blk_write(sector, sec_buf) != ESUCCESS)
+  if (blk_write(sector, sec_buf) != ESUCCESS) {
     return EERROR;
+  }
   return ESUCCESS;
 }
 
@@ -201,17 +220,20 @@ static uint32_t fat_alloc_cluster(void) {
   for (uint32_t c = 2;; c++) {
     uint32_t fat_offset = c * 4;
     uint32_t sector = vol.fat_start_sector + fat_offset / SECTOR;
-    if (sector >= vol.data_start_sector)
+    if (sector >= vol.data_start_sector) {
       break; /* past end of FAT */
+    }
     uint32_t offset = fat_offset % SECTOR;
-    if (blk_read(sector, sec_buf) != ESUCCESS)
+    if (blk_read(sector, sec_buf) != ESUCCESS) {
       return 0;
+    }
     uint32_t val;
     memcpy(&val, sec_buf + offset, 4);
     if ((val & 0x0FFFFFFF) == 0) {
       /* Mark as end-of-chain */
-      if (fat_write(c, 0x0FFFFFFF) != ESUCCESS)
+      if (fat_write(c, 0x0FFFFFFF) != ESUCCESS) {
         return 0;
+      }
       return c;
     }
   }
@@ -226,14 +248,16 @@ static int dir_add_entry(uint32_t dir_cluster, const struct dir_entry *entry) {
   while (cluster < FAT32_EOC) {
     uint32_t base = cluster_to_sector(cluster);
     for (uint32_t s = 0; s < vol.sectors_per_cluster; s++) {
-      if (blk_read(base + s, sec_buf) != ESUCCESS)
+      if (blk_read(base + s, sec_buf) != ESUCCESS) {
         return EERROR;
+      }
       for (uint32_t off = 0; off < SECTOR; off += DIR_ENTRY_SIZE) {
         uint8_t first = sec_buf[off];
         if (first == 0x00 || first == 0xE5) {
           memcpy(sec_buf + off, entry, DIR_ENTRY_SIZE);
-          if (blk_write(base + s, sec_buf) != ESUCCESS)
+          if (blk_write(base + s, sec_buf) != ESUCCESS) {
             return EERROR;
+          }
           return ESUCCESS;
         }
       }
@@ -260,8 +284,9 @@ static int cluster_write_data(uint32_t first_cluster, const void *data,
       } else {
         memcpy(sec_buf, src, SECTOR);
       }
-      if (blk_write(base + s, sec_buf) != ESUCCESS)
+      if (blk_write(base + s, sec_buf) != ESUCCESS) {
         return EERROR;
+      }
       uint32_t chunk = remaining < SECTOR ? remaining : SECTOR;
       src += chunk;
       remaining -= chunk;
@@ -274,14 +299,16 @@ static int cluster_write_data(uint32_t first_cluster, const void *data,
 int fat32_create(const char *path, const void *data, uint32_t len) {
   /* Split path into parent directory and filename */
   const char *p = path;
-  while (*p == '/')
+  while (*p == '/') {
     p++;
+  }
 
   /* Find last '/' to separate dir from filename */
   const char *last_slash = 0;
   for (const char *s = p; *s; s++) {
-    if (*s == '/')
+    if (*s == '/') {
       last_slash = s;
+    }
   }
 
   uint32_t dir_cluster = vol.root_cluster;
@@ -292,15 +319,18 @@ int fat32_create(const char *path, const void *data, uint32_t len) {
     const char *walk = p;
     while (walk < last_slash) {
       const char *seg = walk;
-      while (walk < last_slash && *walk != '/')
+      while (walk < last_slash && *walk != '/') {
         walk++;
+      }
 
       int seg_len = (int)(walk - seg);
       char component[13];
-      if (seg_len > 12)
+      if (seg_len > 12) {
         seg_len = 12;
-      for (int i = 0; i < seg_len; i++)
+      }
+      for (int i = 0; i < seg_len; i++) {
         component[i] = seg[i];
+      }
       component[seg_len] = '\0';
 
       uint8_t target[11];
@@ -308,14 +338,17 @@ int fat32_create(const char *path, const void *data, uint32_t len) {
 
       uint32_t cluster, size;
       uint8_t attr;
-      if (dir_lookup(dir_cluster, target, &cluster, &size, &attr) != ESUCCESS)
+      if (dir_lookup(dir_cluster, target, &cluster, &size, &attr) != ESUCCESS) {
         return EERROR;
-      if (!(attr & ATTR_DIRECTORY))
+      }
+      if (!(attr & ATTR_DIRECTORY)) {
         return EERROR;
+      }
       dir_cluster = cluster;
 
-      while (walk <= last_slash && *walk == '/')
+      while (walk <= last_slash && *walk == '/') {
         walk++;
+      }
     }
     /* Filename is after last slash */
     const char *fname = last_slash + 1;
@@ -344,22 +377,26 @@ int fat32_create(const char *path, const void *data, uint32_t len) {
 
   for (uint32_t i = 0; i < clusters_needed; i++) {
     uint32_t c = fat_alloc_cluster();
-    if (c == 0)
+    if (c == 0) {
       return EERROR;
-    if (i == 0)
+    }
+    if (i == 0) {
       first_cluster = c;
+    }
     if (prev_cluster) {
       /* Chain previous cluster to this one */
-      if (fat_write(prev_cluster, c) != ESUCCESS)
+      if (fat_write(prev_cluster, c) != ESUCCESS) {
         return EERROR;
+      }
     }
     prev_cluster = c;
   }
 
   /* Write file data */
   if (len > 0 && first_cluster) {
-    if (cluster_write_data(first_cluster, data, len) != ESUCCESS)
+    if (cluster_write_data(first_cluster, data, len) != ESUCCESS) {
       return EERROR;
+    }
   }
 
   /* Build directory entry */
@@ -375,16 +412,18 @@ int fat32_create(const char *path, const void *data, uint32_t len) {
   de.first_cluster_lo = (uint16_t)(first_cluster & 0xFFFF);
   de.size = len;
 
-  if (dir_add_entry(dir_cluster, &de) != ESUCCESS)
+  if (dir_add_entry(dir_cluster, &de) != ESUCCESS) {
     return EERROR;
+  }
 
   return ESUCCESS;
 }
 
 int fat32_read(uint32_t first_cluster, uint32_t size, void *buf,
                uint32_t buf_len) {
-  if (size > buf_len)
+  if (size > buf_len) {
     size = buf_len;
+  }
 
   uint8_t *out = (uint8_t *)buf;
   uint32_t remaining = size;
@@ -393,8 +432,9 @@ int fat32_read(uint32_t first_cluster, uint32_t size, void *buf,
   while (remaining > 0 && cluster < FAT32_EOC) {
     uint32_t base = cluster_to_sector(cluster);
     for (uint32_t s = 0; s < vol.sectors_per_cluster && remaining > 0; s++) {
-      if (blk_read(base + s, sec_buf) != ESUCCESS)
+      if (blk_read(base + s, sec_buf) != ESUCCESS) {
         return -1;
+      }
       uint32_t chunk = remaining < SECTOR ? remaining : SECTOR;
       memcpy(out, sec_buf, chunk);
       out += chunk;

@@ -1,5 +1,6 @@
 #include "blk/blk.h"
 #include "exception.h"
+#include "fat32/fat32.h"
 #include "gic/gic.h"
 #include "mm/heap/heap.h"
 #include "mm/mmu/mmu.h"
@@ -118,6 +119,61 @@ void kernel_main() {
   pci_enumerate_bus();
   pci_virtio_rng_init();
   pci_virtio_blk_init();
+
+  if (fat32_mount() != ESUCCESS) {
+    uart_printf("[FS][FAT32] Unable to mount file system");
+  }
+
+  uint32_t first_cluster, size;
+
+  if (fat32_find("HELLO.TXT", &first_cluster, &size) == ESUCCESS) {
+    uart_printf("[FAT32] HELLO.TXT: cluster=%d size=%d\n",
+                (uint64_t)first_cluster, (uint64_t)size);
+
+    static char filebuf[512];
+    int n = fat32_read(first_cluster, size, filebuf, sizeof(filebuf) - 1);
+
+    if (n > 0) {
+      filebuf[n] = 0;
+      uart_printf("[FAT32] contents:\n%s\n", filebuf);
+    }
+  } else {
+    uart_errorln("[FAT32] HELLO.TXT not found");
+  }
+
+  if (fat32_find("SUBDIR/INFO.TXT", &first_cluster, &size) == ESUCCESS) {
+    uart_printf("[FAT32] SUBDIR/INFO.TXT: cluster=%d size=%d\n",
+                (uint64_t)first_cluster, (uint64_t)size);
+
+    static char filebuf2[512];
+    int n = fat32_read(first_cluster, size, filebuf2, sizeof(filebuf2) - 1);
+
+    if (n > 0) {
+      filebuf2[n] = 0;
+      uart_printf("[FAT32] contents:\n%s\n", filebuf2);
+    }
+  } else {
+    uart_errorln("[FAT32] SUBDIR/INFO.TXT not found");
+  }
+
+  /* Test FAT32 write: create a file, then read it back */
+  const char *test_data = "Written by Fermi OS kernel!\n";
+  if (fat32_create("CREATED.TXT", test_data, 28) == ESUCCESS) {
+    uart_println("[FAT32] Created CREATED.TXT");
+
+    if (fat32_find("CREATED.TXT", &first_cluster, &size) == ESUCCESS) {
+      static char vbuf[512];
+      int n = fat32_read(first_cluster, size, vbuf, sizeof(vbuf) - 1);
+      if (n > 0) {
+        vbuf[n] = 0;
+        uart_printf("[FAT32] Read back: %s", vbuf);
+      }
+    } else {
+      uart_errorln("[FAT32] CREATED.TXT not found after create");
+    }
+  } else {
+    uart_errorln("[FAT32] Failed to create CREATED.TXT");
+  }
 
   /*
   sched_init();

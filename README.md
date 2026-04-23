@@ -23,7 +23,7 @@ Inside the Docker container, install required dependencies.
 ```bash
 apt update && apt upgrade
 
-apt install make qemu-system gcc-aarch64-linux-gnu gdb-multiarch tmux
+apt install make qemu-system gcc-aarch64-linux-gnu gdb-multiarch tmux mtools dosfstools
 ln -sf aarch64-linux-gnu-as /usr/bin/as
 ```
 

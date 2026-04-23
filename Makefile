@@ -22,7 +22,13 @@ C_OBJECTS := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(C_SOURCES))
 OBJECTS := $(S_OBJECTS) $(C_OBJECTS)
 
 # Flags
-CFLAGS := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 -mstrict-align -I $(SRC_DIR)/lib -I $(SRC_DIR) -I $(SRC_DIR)/exception -I $(SRC_DIR)/pci/virtio -I $(SRC_DIR)/syscall
+CFLAGS := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 -mstrict-align \
+					-I $(SRC_DIR)/lib \
+					-I $(SRC_DIR) \
+					-I $(SRC_DIR)/exception \
+					-I $(SRC_DIR)/pci/virtio \
+					-I $(SRC_DIR)/syscall \
+					-I $(SRC_DIR)/fs
 ASFLAGS := -g
 LDFLAGS := -nostdlib -g -T linker.ld
 
@@ -73,8 +79,16 @@ disk: $(DISK_IMG)
 
 $(DISK_IMG):
 	@mkdir -p $(BUILD_DIR)
-	@echo "Creating $(DISK_IMG) ($(DISK_SIZE) sparse)"
+	@echo "Creating $(DISK_IMG) ($(DISK_SIZE) sparse, FAT32)"
 	@truncate -s $(DISK_SIZE) $@
+	@mkfs.fat -F 32 -n FERMI $@ > /dev/null
+	@printf 'Hello from Fermi OS!\nThis is HELLO.TXT on a FAT32 volume.\n' \
+		| MTOOLS_SKIP_CHECK=1 mcopy -i $@ - ::/HELLO.TXT
+	@printf '\336\255\276\357\312\376\272\276' \
+		| MTOOLS_SKIP_CHECK=1 mcopy -i $@ - ::/DATA.BIN
+	@MTOOLS_SKIP_CHECK=1 mmd -i $@ ::/SUBDIR
+	@printf 'Hello from a subdirectory!\n' \
+		| MTOOLS_SKIP_CHECK=1 mcopy -i $@ - ::/SUBDIR/INFO.TXT
 
 # GDB Config
 GDB := gdb-multiarch

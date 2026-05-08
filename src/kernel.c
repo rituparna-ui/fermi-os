@@ -57,6 +57,18 @@ void early_init() {
   uart_println("[BOOT] MMU Enabled. Jumping to Upper Half");
 }
 
+static inline int64_t sys_read(int fd, void *buf, uint64_t count) {
+  register int x0 __asm__("x0") = fd;
+  register void *x1 __asm__("x1") = buf;
+  register uint64_t x2 __asm__("x2") = count;
+  register uint64_t x8 __asm__("x8") = 0; /* SYS_READ */
+  __asm__ __volatile__("svc #0"
+                       : "+r"(x0)
+                       : "r"(x1), "r"(x2), "r"(x8)
+                       : "memory");
+  return (int64_t)x0;
+}
+
 static inline int64_t sys_write(int fd, const char *buf, uint64_t len) {
   register int x0 __asm__("x0") = fd;
   register const char *x1 __asm__("x1") = buf;
@@ -66,6 +78,20 @@ static inline int64_t sys_write(int fd, const char *buf, uint64_t len) {
                        : "+r"(x0)
                        : "r"(x1), "r"(x2), "r"(x8)
                        : "memory");
+  return (int64_t)x0;
+}
+
+static inline int64_t sys_open(const char *path) {
+  register const char *x0 __asm__("x0") = path;
+  register uint64_t x8 __asm__("x8") = 2; /* SYS_OPEN */
+  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+  return (int64_t)x0;
+}
+
+static inline int64_t sys_close(int fd) {
+  register int x0 __asm__("x0") = fd;
+  register uint64_t x8 __asm__("x8") = 3; /* SYS_CLOSE */
+  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8) : "memory");
   return (int64_t)x0;
 }
 
@@ -80,19 +106,56 @@ static inline void sys_sleep(uint64_t ms) {
   __asm__ __volatile__("svc #0" ::"r"(x0), "r"(x8) : "memory");
 }
 
+/* Task A: open a file from FAT32 and print it through fd=1. */
 static void task_a(void) {
-  const char msg[] = "[Task A] Hello from EL0 via fd=1!\n";
-  sys_write(1, msg, sizeof(msg) - 1);
+  const char banner[] = "[Task A] reading /mnt/fat32/HELLO.TXT\n";
+  sys_write(1, banner, sizeof(banner) - 1);
 
-  const char done[] = "[Task A] exiting\n";
+  int fd = sys_open("/mnt/fat32/HELLO.TXT");
+  if (fd < 0) {
+    const char err[] = "[Task A] open failed\n";
+    sys_write(1, err, sizeof(err) - 1);
+    sys_exit();
+  }
+
+  char buf[128];
+  int64_t n = sys_read(fd, buf, sizeof(buf));
+  if (n > 0) sys_write(1, buf, (uint64_t)n);
+
+  sys_close(fd);
+
+  const char done[] = "[Task A] done\n";
   sys_write(1, done, sizeof(done) - 1);
   sys_exit();
 }
 
+/* Task B: read 4 random bytes from /dev/rng every 500ms and print them. */
 static void task_b(void) {
+  int fd = sys_open("/dev/rng");
+  if (fd < 0) {
+    const char err[] = "[Task B] open /dev/rng failed\n";
+    sys_write(1, err, sizeof(err) - 1);
+    sys_exit();
+  }
+
   while (1) {
-    const char msg[] = "[Task B] running at EL0\n";
-    sys_write(1, msg, sizeof(msg) - 1);
+    unsigned char r[4];
+    int64_t n = sys_read(fd, r, 4);
+    if (n == 4) {
+      /* Render 4 bytes as hex into a fixed buffer and emit */
+      char line[32];
+      const char *hex = "0123456789ABCDEF";
+      int p = 0;
+      const char prefix[] = "[Task B] rng: ";
+      for (size_t i = 0; i < sizeof(prefix) - 1; i++) line[p++] = prefix[i];
+      for (int i = 0; i < 4; i++) {
+        line[p++] = hex[(r[i] >> 4) & 0xF];
+        line[p++] = hex[r[i] & 0xF];
+        line[p++] = ' ';
+      }
+      line[p++] = '\n';
+      sys_write(1, line, (uint64_t)p);
+    }
     sys_sleep(500);
   }
 }

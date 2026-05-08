@@ -13,6 +13,24 @@ typedef enum {
 struct vnode;
 struct file;
 
+/*
+ * file_operations is the VFS's per-vnode "vtable": a set of function
+ * pointers that each filesystem/device fills in with its own read/write
+ * implementation. When the kernel handles read(fd, ...), it looks up the
+ * vnode for that fd and calls vnode->ops->read(...) — the actual function
+ * invoked is decided at runtime based on which vnode it is.
+ *
+ * This is C's way of doing dynamic polymorphism:
+ *   /dev/console → ops = UART read/write
+ *   /dev/rng     → ops = virtio-rng read
+ *   /dev/zero    → ops = fill-with-zeros
+ *   future fat32 regular file → ops = fat32 read/write
+ *
+ * Equivalent C++ would be: an abstract class `Vnode` with virtual read/
+ * write methods, and subclasses for each driver/filesystem. The compiler
+ * would generate a vtable behind the scenes — which is exactly what we
+ * build by hand here.
+ */
 typedef struct file_operations {
   int (*read)(struct vnode *node, struct file *f, void *buf, size_t count);
   int (*write)(struct vnode *node, struct file *f, const void *buf,
@@ -32,6 +50,9 @@ void vfs_init(void);
 vnode_t *vfs_root(void);
 vnode_t *vfs_create_node(vnode_t *parent, const char *name, vnode_type_t type);
 vnode_t *vfs_resolve(const char *path);
+
+/* Register a char device under /dev/<name>. Creates /dev if missing. */
+vnode_t *vfs_register_chardev(const char *name, file_operations_t *ops);
 
 /* Open file */
 typedef struct file {

@@ -48,6 +48,23 @@ vnode_t *vfs_create_node(vnode_t *parent, const char *name, vnode_type_t type) {
   return n;
 }
 
+vnode_t *vfs_register_chardev(const char *name, file_operations_t *ops) {
+  vnode_t *dev = vfs_resolve("/dev");
+
+  if (!dev) {
+    dev = vfs_create_node(vfs_root(), "dev", VNODE_DIR);
+  }
+
+  vnode_t *node = vfs_create_node(dev, name, VNODE_CHR);
+
+  if (node) {
+    node->ops = ops;
+  }
+
+  uart_printf("[VFS] Registered /dev/%s\n", name);
+  return node;
+}
+
 static int name_match(const char *node_name, const char *s, size_t len) {
   int i;
   for (i = 0; i < (int)len; i++) {

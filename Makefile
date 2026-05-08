@@ -28,7 +28,8 @@ CFLAGS := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 -mstrict-a
 					-I $(SRC_DIR)/exception \
 					-I $(SRC_DIR)/pci/virtio \
 					-I $(SRC_DIR)/syscall \
-					-I $(SRC_DIR)/fs
+					-I $(SRC_DIR)/fs \
+					-I $(SRC_DIR)/devices
 ASFLAGS := -g
 LDFLAGS := -nostdlib -g -T linker.ld
 

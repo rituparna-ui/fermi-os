@@ -10,24 +10,33 @@ static struct virtq_desc rng_desc[VIRTQ_MAX_SIZE]
 static struct virtq_avail rng_avail __attribute__((aligned(4096)));
 static struct virtq_used rng_used __attribute__((aligned(4096)));
 
-/* Buffer for the random byte */
-static uint8_t rand_byte;
+/* Bounce buffer for DMA: device writes here, we copy to caller */
+#define RNG_BUF_SIZE 256
+static uint8_t rng_buf[RNG_BUF_SIZE] __attribute__((aligned(64)));
 
 struct virtio_rng rng_dev;
 
-static void request_byte() {
-  /* Submit a request for 1 random byte.
-   * The descriptor addr must be a physical address for DMA. */
-  uart_println("[RNG] Requesting random byte...");
-  uint64_t rand_byte_pa = VIRT_TO_PHYS((uint64_t)(uintptr_t)&rand_byte);
-  virtqueue_submit(&rng_dev.vq, rand_byte_pa, 1, VIRTQ_DESC_F_WRITE);
-  virtqueue_notify(&rng_dev.vq);
+int rng_read(void *dst, uint32_t count) {
+  uint32_t done = 0;
+  uint8_t *out = (uint8_t *)dst;
 
-  uart_println("[RNG] Waiting for device...");
-  virtqueue_poll(&rng_dev.vq);
+  while (done < count) {
+    uint32_t chunk = count - done;
+    if (chunk > RNG_BUF_SIZE) {
+      chunk = RNG_BUF_SIZE;
+    }
 
-  uart_println("[RNG] Got response!");
-  uart_printf("Random byte: %x\n", (uint32_t)rand_byte);
+    uint64_t pa = VIRT_TO_PHYS((uint64_t)(uintptr_t)rng_buf);
+    virtqueue_submit(&rng_dev.vq, pa, chunk, VIRTQ_DESC_F_WRITE);
+    virtqueue_notify(&rng_dev.vq);
+    virtqueue_poll(&rng_dev.vq);
+
+    for (uint32_t i = 0; i < chunk; i++) {
+      out[done + i] = rng_buf[i];
+    }
+    done += chunk;
+  }
+  return (int)done;
 }
 
 void pci_virtio_rng_init() {
@@ -141,8 +150,6 @@ void pci_virtio_rng_init() {
   mmio_write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_DRIVER_OK);
   dsb_sy();
   uart_println("[RNG] DRIVER_OK set");
-
-  request_byte();
 
   return;
 }

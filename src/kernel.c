@@ -1,4 +1,5 @@
 #include "blk/blk.h"
+#include "devices.h"
 #include "exception.h"
 #include "fat32/fat32.h"
 #include "gic/gic.h"
@@ -99,19 +100,6 @@ static void task_b(void) {
 // runs in VAS Upper Half after boot.S relocates program counter and stack
 // pointer
 
-static int console_write(vnode_t *node, file_t *f, const void *buf,
-                         size_t count) {
-  (void)node;
-  (void)f;
-  const char *p = buf;
-
-  for (size_t i = 0; i < count; i++) {
-    uart_putc(p[i]);
-  }
-
-  return (int)count;
-}
-
 void kernel_main() {
   // all device access through TTBR1
   mmio_switch_to_upper();
@@ -145,27 +133,43 @@ void kernel_main() {
 
   vfs_init();
 
-  /* Register /dev/console for UART */
-  vnode_t *dev = vfs_create_node(vfs_root(), "dev", VNODE_DIR);
-  vnode_t *con = vfs_create_node(dev, "console", VNODE_CHR);
+  /* Register /dev/console, /dev/null, /dev/zero, /dev/rng */
+  devices_register();
 
-  static file_operations_t console_ops = {
-      .read = NULL,
-      .write = console_write,
-  };
-  con->ops = &console_ops;
-
-  /* open fd, write */
+  /* read 8 random bytes via /dev/rng, fill 16 zeros via /dev/zero */
   fd_table_t *fdt = fd_table_create();
-  int fd = fd_open(fdt, "/dev/console");
-  const char *hello = "[VFS] fd_write works testing !\n";
-  int n = 0;
-  while (hello[n]) {
-    n++;
+
+  int rfd = fd_open(fdt, "/dev/rng");
+  uint8_t rbuf[8];
+  int rn = fd_read(fdt, rfd, rbuf, sizeof(rbuf));
+  uart_printf("[TEST] /dev/rng read %d bytes: ", rn);
+
+  for (int i = 0; i < rn; i++) {
+    uart_printf("%x ", (uint64_t)rbuf[i]);
   }
-  fd_write(fdt, fd, hello, n);
-  fd_close(fdt, fd);
+
+  uart_putc('\n');
+  fd_close(fdt, rfd);
+
+  int zfd = fd_open(fdt, "/dev/zero");
+  uint8_t zbuf[4];
+  zbuf[0] = 0xAA;
+  zbuf[1] = 0xBB;
+  zbuf[2] = 0xCC;
+  zbuf[3] = 0xDD;
+  int zn = fd_read(fdt, zfd, zbuf, sizeof(zbuf));
+  uart_printf("[TEST] /dev/zero read %d bytes: %x %x %x %x\n", zn,
+              (uint64_t)zbuf[0], (uint64_t)zbuf[1], (uint64_t)zbuf[2],
+              (uint64_t)zbuf[3]);
+  fd_close(fdt, zfd);
+
+  int nfd = fd_open(fdt, "/dev/null");
+  int nn = fd_write(fdt, nfd, "swallowed\n", 10);
+  uart_printf("[TEST] /dev/null write returned %d\n", nn);
+  fd_close(fdt, nfd);
+
   fd_table_destroy(fdt);
+
   uint32_t first_cluster, size;
 
   if (fat32_find("HELLO.TXT", &first_cluster, &size) == ESUCCESS) {

@@ -168,6 +168,14 @@ void kernel_main() {
   uart_printf("[TEST] /dev/null write returned %d\n", nn);
   fd_close(fdt, nfd);
 
+  /* /dev/blk: read sector 0 (FAT32 boot sector, should end 0x55 0xAA) */
+  int vfd = fd_open(fdt, "/dev/blk");
+  static uint8_t sec[512];
+  int vr = fd_read(fdt, vfd, sec, 512);
+  uart_printf("[TEST] /dev/blk read %d bytes, boot sig: %x %x\n", vr,
+              (uint64_t)sec[510], (uint64_t)sec[511]);
+  fd_close(fdt, vfd);
+
   fd_table_destroy(fdt);
 
   uint32_t first_cluster, size;

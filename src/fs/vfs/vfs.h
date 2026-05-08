@@ -8,6 +8,7 @@ typedef enum {
   VNODE_REG, // Regular file
   VNODE_DIR, // Directory
   VNODE_CHR, // Char dev
+  VNODE_BLK, // Block dev
 } vnode_type_t;
 
 struct vnode;
@@ -54,6 +55,14 @@ vnode_t *vfs_resolve(const char *path);
 /* Register a char device under /dev/<name>. Creates /dev if missing. */
 vnode_t *vfs_register_chardev(const char *name, file_operations_t *ops);
 
+/* Register a block device under /dev/<name>. Creates /dev if missing. */
+vnode_t *vfs_register_blockdev(const char *name, file_operations_t *ops);
+
+/* Seek whence values */
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+
 /* Open file */
 typedef struct file {
   vnode_t *vnode;
@@ -73,5 +82,6 @@ int fd_open(fd_table_t *t, const char *path);
 int fd_read(fd_table_t *t, int fd, void *buf, size_t count);
 int fd_write(fd_table_t *t, int fd, const void *buf, size_t count);
 int fd_close(fd_table_t *t, int fd);
+int64_t fd_seek(fd_table_t *t, int fd, int64_t offset, int whence);
 
 #endif

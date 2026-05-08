@@ -1,7 +1,11 @@
 #include "devices.h"
+#include "blk/blk.h"
 #include "rng/rng.h"
 #include "uart/uart.h"
+#include "utils/utils.h"
 #include "vfs/vfs.h"
+
+#define SECTOR 512
 
 /* ---- /dev/uart ---- */
 static int console_read(vnode_t *n, file_t *f, void *buf, size_t count) {
@@ -94,10 +98,64 @@ static file_operations_t rng_ops = {
     .write = NULL,
 };
 
+/* ---- /dev/blk (raw block device) ----
+ * Byte-granular offsets but reads/writes must be sector-aligned:
+ *   - f->offset % 512 == 0
+ *   - count      % 512 == 0
+ * Returns number of bytes transferred, -1 on error.
+ */
+
+static int blk_dev_read(vnode_t *n, file_t *f, void *buf, size_t count) {
+  (void)n;
+
+  if ((f->offset % SECTOR) != 0 || (count % SECTOR) != 0) {
+    return -1;
+  }
+
+  size_t sectors = count / SECTOR;
+  uint64_t sector = (uint64_t)f->offset / SECTOR;
+  uint8_t *p = buf;
+
+  for (size_t i = 0; i < sectors; i++) {
+    if (blk_read(sector + i, p + i * SECTOR) != ESUCCESS) {
+      return -1;
+    }
+  }
+
+  f->offset += (int64_t)count;
+  return (int)count;
+}
+
+static int blk_dev_write(vnode_t *n, file_t *f, const void *buf, size_t count) {
+  (void)n;
+  if ((f->offset % SECTOR) != 0 || (count % SECTOR) != 0) {
+    return -1;
+  }
+
+  size_t sectors = count / SECTOR;
+  uint64_t sector = (uint64_t)f->offset / SECTOR;
+  const uint8_t *p = buf;
+
+  for (size_t i = 0; i < sectors; i++) {
+    if (blk_write(sector + i, p + i * SECTOR) != ESUCCESS) {
+      return -1;
+    }
+  }
+
+  f->offset += (int64_t)count;
+  return (int)count;
+}
+
+static file_operations_t blk_ops = {
+    .read = blk_dev_read,
+    .write = blk_dev_write,
+};
+
 /* ---- Entry point ---- */
 void devices_register(void) {
   vfs_register_chardev("console", &console_ops);
   vfs_register_chardev("null", &null_ops);
   vfs_register_chardev("zero", &zero_ops);
   vfs_register_chardev("rng", &rng_ops);
+  vfs_register_blockdev("blk", &blk_ops);
 }

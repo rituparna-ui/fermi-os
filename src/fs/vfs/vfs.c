@@ -65,6 +65,23 @@ vnode_t *vfs_register_chardev(const char *name, file_operations_t *ops) {
   return node;
 }
 
+vnode_t *vfs_register_blockdev(const char *name, file_operations_t *ops) {
+  vnode_t *dev = vfs_resolve("/dev");
+
+  if (!dev) {
+    dev = vfs_create_node(vfs_root(), "dev", VNODE_DIR);
+  }
+
+  vnode_t *node = vfs_create_node(dev, name, VNODE_BLK);
+
+  if (node) {
+    node->ops = ops;
+  }
+
+  uart_printf("[VFS] Registered /dev/%s (block)\n", name);
+  return node;
+}
+
 static int name_match(const char *node_name, const char *s, size_t len) {
   int i;
   for (i = 0; i < (int)len; i++) {
@@ -226,4 +243,38 @@ int fd_close(fd_table_t *t, int fd) {
   t->fds[fd] = NULL;
 
   return 0;
+}
+
+int64_t fd_seek(fd_table_t *t, int fd, int64_t offset, int whence) {
+  if (fd < 0 || fd >= MAX_FDS || !t->fds[fd]) {
+    return -1;
+  }
+
+  file_t *f = t->fds[fd];
+
+  /* char devices are not seekable */
+  if (f->vnode->type == VNODE_CHR) {
+    return -1;
+  }
+
+  int64_t new_off;
+  switch (whence) {
+  case SEEK_SET:
+    new_off = offset;
+    break;
+  case SEEK_CUR:
+    new_off = f->offset + offset;
+    break;
+  case SEEK_END:
+    return -1; /* no size tracked yet */
+  default:
+    return -1;
+  }
+
+  if (new_off < 0) {
+    return -1;
+  }
+
+  f->offset = new_off;
+  return new_off;
 }

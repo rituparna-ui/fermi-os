@@ -3,6 +3,9 @@
 
 #include <stdint.h>
 
+/* forward decl */
+struct fd_table;
+
 #define TASK_STACK_PAGES 4 // 16 KiB per task (kernel stack)
 #define USER_STACK_PAGES 4 // 16 KiB user stack
 
@@ -27,6 +30,7 @@ typedef struct task {
   uintptr_t kstack_top;  // top of per-task kernel stack (for exception entry)
   uintptr_t ustack_phys; // physical address of user stack (for freeing)
   char name[16];
+  struct fd_table *fds;
   struct task *next;
 } task_t;
 

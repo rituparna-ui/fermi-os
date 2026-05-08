@@ -94,6 +94,20 @@ static void task_b(void) {
 
 // runs in VAS Upper Half after boot.S relocates program counter and stack
 // pointer
+
+static int console_write(vnode_t *node, file_t *f, const void *buf,
+                         size_t count) {
+  (void)node;
+  (void)f;
+  const char *p = buf;
+
+  for (size_t i = 0; i < count; i++) {
+    uart_putc(p[i]);
+  }
+
+  return (int)count;
+}
+
 void kernel_main() {
   // all device access through TTBR1
   mmio_switch_to_upper();
@@ -127,14 +141,22 @@ void kernel_main() {
 
   vfs_init();
 
+  /* Register /dev/console for UART */
   vnode_t *dev = vfs_create_node(vfs_root(), "dev", VNODE_DIR);
-  vfs_create_node(dev, "console", VNODE_CHR);
-  vnode_t *found = vfs_resolve("/dev/uart/console");
-  if (found) {
-    uart_printf("[VFS] Resolved /dev/console -> '%s'\n", found->name);
-  } else {
-    uart_println("[VFS] FAILED to resolve /dev/console");
-  }
+  vnode_t *con = vfs_create_node(dev, "console", VNODE_CHR);
+
+  static file_operations_t console_ops = {
+      .read = NULL,
+      .write = console_write,
+  };
+  con->ops = &console_ops;
+
+  /* open fd, write */
+  fd_table_t *fdt = fd_table_create();
+  int fd = fd_open(fdt, "/dev/console");
+  const char *msg = "[VFS] Hello through fd!\n";
+  fd_write(fdt, fd, msg, 24);
+  fd_close(fdt, fd);
   uint32_t first_cluster, size;
 
   if (fat32_find("HELLO.TXT", &first_cluster, &size) == ESUCCESS) {

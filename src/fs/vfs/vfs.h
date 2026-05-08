@@ -33,4 +33,23 @@ vnode_t *vfs_root(void);
 vnode_t *vfs_create_node(vnode_t *parent, const char *name, vnode_type_t type);
 vnode_t *vfs_resolve(const char *path);
 
+/* Open file */
+typedef struct file {
+  vnode_t *vnode;
+  int64_t offset;
+} file_t;
+
+/* Per-process fd table */
+#define MAX_FDS 64
+
+typedef struct fd_table {
+  file_t *fds[MAX_FDS];
+} fd_table_t;
+
+fd_table_t *fd_table_create(void);
+int fd_open(fd_table_t *t, const char *path);
+int fd_read(fd_table_t *t, int fd, void *buf, size_t count);
+int fd_write(fd_table_t *t, int fd, const void *buf, size_t count);
+int fd_close(fd_table_t *t, int fd);
+
 #endif

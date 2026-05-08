@@ -1,4 +1,5 @@
 #include "vfs.h"
+#include "mm/heap/heap.h"
 #include "strings/strings.h"
 #include "uart/uart.h"
 
@@ -110,4 +111,89 @@ vnode_t *vfs_resolve(const char *path) {
   }
 
   return cur;
+}
+
+fd_table_t *fd_table_create(void) {
+  fd_table_t *t = kmalloc(sizeof(fd_table_t));
+
+  if (t) {
+    memset(t, 0, sizeof(*t));
+  }
+
+  return t;
+}
+
+static int alloc_fd(fd_table_t *t) {
+  for (int i = 0; i < MAX_FDS; i++) {
+    if (!t->fds[i]) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+int fd_open(fd_table_t *t, const char *path) {
+  vnode_t *node = vfs_resolve(path);
+
+  if (!node) {
+    return -1;
+  }
+
+  int fd = alloc_fd(t);
+
+  if (fd < 0) {
+    return -1;
+  }
+
+  file_t *f = kmalloc(sizeof(file_t));
+
+  if (!f) {
+    return -1;
+  }
+
+  f->vnode = node;
+  f->offset = 0;
+  t->fds[fd] = f;
+
+  return fd;
+}
+
+int fd_read(fd_table_t *t, int fd, void *buf, size_t count) {
+  if (fd < 0 || fd >= MAX_FDS || !t->fds[fd]) {
+    return -1;
+  }
+
+  file_t *f = t->fds[fd];
+
+  if (!f->vnode->ops || !f->vnode->ops->read) {
+    return -1;
+  }
+
+  return f->vnode->ops->read(f->vnode, f, buf, count);
+}
+
+int fd_write(fd_table_t *t, int fd, const void *buf, size_t count) {
+  if (fd < 0 || fd >= MAX_FDS || !t->fds[fd]) {
+    return -1;
+  }
+
+  file_t *f = t->fds[fd];
+
+  if (!f->vnode->ops || !f->vnode->ops->write) {
+    return -1;
+  }
+
+  return f->vnode->ops->write(f->vnode, f, buf, count);
+}
+
+int fd_close(fd_table_t *t, int fd) {
+  if (fd < 0 || fd >= MAX_FDS || !t->fds[fd]) {
+    return -1;
+  }
+
+  kfree(t->fds[fd]);
+  t->fds[fd] = NULL;
+
+  return 0;
 }

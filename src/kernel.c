@@ -14,6 +14,7 @@
 #include "timer/timer.h"
 #include "uart/uart.h"
 #include "utils/utils.h"
+#include "vfs/vfs.h"
 #include <stdint.h>
 
 extern uint8_t __bss_start;
@@ -124,6 +125,16 @@ void kernel_main() {
     uart_printf("[FS][FAT32] Unable to mount file system");
   }
 
+  vfs_init();
+
+  vnode_t *dev = vfs_create_node(vfs_root(), "dev", VNODE_DIR);
+  vfs_create_node(dev, "console", VNODE_CHR);
+  vnode_t *found = vfs_resolve("/dev/uart/console");
+  if (found) {
+    uart_printf("[VFS] Resolved /dev/console -> '%s'\n", found->name);
+  } else {
+    uart_println("[VFS] FAILED to resolve /dev/console");
+  }
   uint32_t first_cluster, size;
 
   if (fat32_find("HELLO.TXT", &first_cluster, &size) == ESUCCESS) {

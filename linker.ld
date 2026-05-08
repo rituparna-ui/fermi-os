@@ -1,10 +1,13 @@
 ENTRY(_start)
 
+KERNEL_PA = 0x40000000;
+KERNEL_VA = 0xFFFF000040000000;
+
 SECTIONS
 {
-	. = 0x40000000;
+	. = KERNEL_VA;
 
-	.text ALIGN(4096) : {
+	.text ALIGN(4096) : AT(KERNEL_PA) {
 		*(.text.boot)
 		. = ALIGN(2048);
 		*(.text.vectors)

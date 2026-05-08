@@ -149,9 +149,10 @@ void kernel_main() {
   vnode_t *dev = vfs_create_node(vfs_root(), "dev", VNODE_DIR);
   vnode_t *con = vfs_create_node(dev, "console", VNODE_CHR);
 
-  static file_operations_t console_ops;
-  console_ops.read = NULL;
-  console_ops.write = console_write; /* runtime assign — PC-relative, upper half */
+  static file_operations_t console_ops = {
+      .read = NULL,
+      .write = console_write,
+  };
   con->ops = &console_ops;
 
   /* open fd, write */

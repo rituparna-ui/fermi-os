@@ -105,7 +105,7 @@ int sched_create_task(const char *name, task_entry_t entry) {
   frame[0] = user_entry;     // x19 — user entry point
   frame[1] = USER_STACK_TOP; // x20 — user SP
   frame[11] =
-      PHYS_TO_VIRT((uint64_t)task_trampoline); // x30 (lr) — must be TTBR1 VA
+      (uint64_t)task_trampoline; // x30 (lr) — already TTBR1 VA with -fno-pic
 
   t->sp = (uint64_t)frame;
   t->pid = next_pid++;

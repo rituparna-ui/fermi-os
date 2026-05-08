@@ -157,6 +157,7 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
 void exceptions_init(void) {
   uart_println("[EXCEPTION] Installing vector table (physical)");
 
+  /* Before MMU: (uint64_t)vector_table is PC-relative → physical */
   uint64_t vbar = (uint64_t)vector_table;
   uart_printf("[EXCEPTION] VBAR_EL1 = %x\n", vbar);
 
@@ -169,7 +170,9 @@ void exceptions_init(void) {
 void exceptions_init_upper(void) {
   uart_println("[EXCEPTION] Relocating vector table to upper half");
 
-  uint64_t vbar = PHYS_TO_VIRT((uint64_t)vector_table);
+  /* With -fno-pic, &vector_table via adrp+add is PC-relative: physical
+     before MMU, upper-half after MMU. We're already in upper half here. */
+  uint64_t vbar = (uint64_t)vector_table;
   uart_printf("[EXCEPTION] VBAR_EL1 = %x\n", vbar);
 
   __asm__ __volatile__("msr vbar_el1, %0" ::"r"(vbar));

@@ -56,38 +56,42 @@ void early_init() {
   uart_println("[BOOT] MMU Enabled. Jumping to Upper Half");
 }
 
-static inline uint64_t sys_write(const char *buf, uint64_t len) {
-  register const char *x0 __asm__("x0") = buf;
-  register uint64_t x1 __asm__("x1") = len;
-  register uint64_t x8 __asm__("x8") = 0;
-  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory");
-  return (uint64_t)x0;
+static inline int64_t sys_write(int fd, const char *buf, uint64_t len) {
+  register int x0 __asm__("x0") = fd;
+  register const char *x1 __asm__("x1") = buf;
+  register uint64_t x2 __asm__("x2") = len;
+  register uint64_t x8 __asm__("x8") = 1; /* SYS_WRITE */
+  __asm__ __volatile__("svc #0"
+                       : "+r"(x0)
+                       : "r"(x1), "r"(x2), "r"(x8)
+                       : "memory");
+  return (int64_t)x0;
 }
 
 static inline void sys_exit(void) {
-  register uint64_t x8 __asm__("x8") = 1;
+  register uint64_t x8 __asm__("x8") = 4; /* SYS_EXIT */
   __asm__ __volatile__("svc #0" ::"r"(x8) : "memory");
 }
 
 static inline void sys_sleep(uint64_t ms) {
   register uint64_t x0 __asm__("x0") = ms;
-  register uint64_t x8 __asm__("x8") = 3;
+  register uint64_t x8 __asm__("x8") = 6; /* SYS_SLEEP */
   __asm__ __volatile__("svc #0" ::"r"(x0), "r"(x8) : "memory");
 }
 
 static void task_a(void) {
-  const char msg[] = "[Task A] Hello from EL0 via SVC!\n";
-  sys_write(msg, sizeof(msg) - 1);
+  const char msg[] = "[Task A] Hello from EL0 via fd=1!\n";
+  sys_write(1, msg, sizeof(msg) - 1);
 
   const char done[] = "[Task A] exiting\n";
-  sys_write(done, sizeof(done) - 1);
+  sys_write(1, done, sizeof(done) - 1);
   sys_exit();
 }
 
 static void task_b(void) {
   while (1) {
     const char msg[] = "[Task B] running at EL0\n";
-    sys_write(msg, sizeof(msg) - 1);
+    sys_write(1, msg, sizeof(msg) - 1);
     sys_sleep(500);
   }
 }
@@ -154,9 +158,14 @@ void kernel_main() {
   /* open fd, write */
   fd_table_t *fdt = fd_table_create();
   int fd = fd_open(fdt, "/dev/console");
-  const char *msg = "[VFS] Hello through fd!\n";
-  fd_write(fdt, fd, msg, 24);
+  const char *hello = "[VFS] fd_write works testing !\n";
+  int n = 0;
+  while (hello[n]) {
+    n++;
+  }
+  fd_write(fdt, fd, hello, n);
   fd_close(fdt, fd);
+  fd_table_destroy(fdt);
   uint32_t first_cluster, size;
 
   if (fat32_find("HELLO.TXT", &first_cluster, &size) == ESUCCESS) {

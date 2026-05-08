@@ -123,6 +123,19 @@ fd_table_t *fd_table_create(void) {
   return t;
 }
 
+void fd_table_destroy(fd_table_t *t) {
+  if (!t) {
+    return;
+  }
+
+  for (int i = 0; i < MAX_FDS; i++) {
+    if (t->fds[i]) {
+      kfree(t->fds[i]);
+    }
+  }
+  kfree(t);
+}
+
 static int alloc_fd(fd_table_t *t) {
   for (int i = 0; i < MAX_FDS; i++) {
     if (!t->fds[i]) {

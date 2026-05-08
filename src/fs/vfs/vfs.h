@@ -47,6 +47,7 @@ typedef struct fd_table {
 } fd_table_t;
 
 fd_table_t *fd_table_create(void);
+void fd_table_destroy(fd_table_t *t);
 int fd_open(fd_table_t *t, const char *path);
 int fd_read(fd_table_t *t, int fd, void *buf, size_t count);
 int fd_write(fd_table_t *t, int fd, const void *buf, size_t count);

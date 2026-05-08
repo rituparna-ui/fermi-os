@@ -61,4 +61,16 @@ int fat32_read(uint32_t first_cluster, uint32_t size, void *buf,
 /* Create a new file at path with given data. Supports subdirectories. */
 int fat32_create(const char *path, const void *data, uint32_t len);
 
+/* Look up a single 8.3 name inside a directory starting at dir_cluster.
+ * On success: fills first_cluster, size, and is_dir. */
+int fat32_lookup_in_dir(uint32_t dir_cluster, const char *name,
+                        uint32_t *out_first_cluster, uint32_t *out_size,
+                        int *out_is_dir);
+
+/* Expose the mounted volume's root cluster (for VFS mount) */
+uint32_t fat32_root_cluster(void);
+
+/* Attach FAT32 to the VFS at `path` (path must be an existing empty dir). */
+int fat32_vfs_mount(const char *path);
+
 #endif

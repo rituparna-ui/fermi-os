@@ -98,6 +98,11 @@ static vnode_t *find_child(vnode_t *dir, const char *name, size_t len) {
       return c;
     }
   }
+  /* Not cached — query filesystem */
+  if (dir->v_ops && dir->v_ops->lookup) {
+    return dir->v_ops->lookup(dir, name, len);
+  }
+
   return NULL;
 }
 

@@ -136,6 +136,10 @@ void kernel_main() {
   /* Register /dev/console, /dev/null, /dev/zero, /dev/rng */
   devices_register();
 
+  vnode_t *mnt = vfs_create_node(vfs_root(), "mnt", VNODE_DIR);
+  vfs_create_node(mnt, "fat32", VNODE_DIR);
+  fat32_vfs_mount("/mnt/fat32");
+
   /* read 8 random bytes via /dev/rng, fill 16 zeros via /dev/zero */
   fd_table_t *fdt = fd_table_create();
 
@@ -175,6 +179,33 @@ void kernel_main() {
   uart_printf("[TEST] /dev/blk read %d bytes, boot sig: %x %x\n", vr,
               (uint64_t)sec[510], (uint64_t)sec[511]);
   fd_close(fdt, vfd);
+
+  int hfd = fd_open(fdt, "/mnt/fat32/HELLO.TXT");
+  static char hbuf[128];
+  int hn = fd_read(fdt, hfd, hbuf, sizeof(hbuf) - 1);
+
+  if (hn > 0) {
+    hbuf[hn] = '\0';
+    uart_printf("[TEST] /mnt/fat32/HELLO.TXT (%d bytes):\n%s", hn, hbuf);
+  } else {
+    uart_printf("[TEST] /mnt/fat32/HELLO.TXT read failed (%d)\n", hn);
+  }
+
+  fd_close(fdt, hfd);
+
+  /* Subdir */
+  int sfd = fd_open(fdt, "/mnt/fat32/SUBDIR/INFO.TXT");
+  static char sbuf[128];
+  int sn = fd_read(fdt, sfd, sbuf, sizeof(sbuf) - 1);
+
+  if (sn > 0) {
+    sbuf[sn] = '\0';
+    uart_printf("[TEST] /mnt/fat32/SUBDIR/INFO.TXT (%d bytes): %s", sn, sbuf);
+  } else {
+    uart_printf("[TEST] SUBDIR/INFO.TXT failed (%d)\n", sn);
+  }
+
+  fd_close(fdt, sfd);
 
   fd_table_destroy(fdt);
 

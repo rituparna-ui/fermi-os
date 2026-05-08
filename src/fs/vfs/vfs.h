@@ -38,10 +38,21 @@ typedef struct file_operations {
                size_t count);
 } file_operations_t;
 
+/*
+ * vnode_operations: per-directory vtable for tree traversal.
+ * Filesystems fill in `lookup` to resolve a name inside a directory on demand.
+ */
+typedef struct vnode_operations {
+  struct vnode *(*lookup)(struct vnode *dir, const char *name, size_t namelen);
+} vnode_operations_t;
+
 typedef struct vnode {
   char name[64];
   vnode_type_t type;
-  file_operations_t *ops;
+  file_operations_t *ops;    /* how to read/write this node */
+  vnode_operations_t *v_ops; /* how to traverse (if directory) */
+  void *private_data;        /* fs/driver-specific per-vnode state */
+  uint64_t size;             /* for regular files */
   struct vnode *parent;
   struct vnode *children;
   struct vnode *next;

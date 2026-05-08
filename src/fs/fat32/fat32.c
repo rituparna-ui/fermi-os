@@ -444,3 +444,26 @@ int fat32_read(uint32_t first_cluster, uint32_t size, void *buf,
   }
   return (int)(size - remaining);
 }
+
+/* ---- Public wrappers for VFS integration ---- */
+int fat32_lookup_in_dir(uint32_t dir_cluster, const char *name,
+                        uint32_t *out_first_cluster, uint32_t *out_size,
+                        int *out_is_dir) {
+  uint8_t target[11];
+  to_83(name, target);
+
+  uint32_t cluster, size;
+  uint8_t attr;
+
+  if (dir_lookup(dir_cluster, target, &cluster, &size, &attr) != ESUCCESS) {
+    return EERROR;
+  }
+
+  *out_first_cluster = cluster;
+  *out_size = size;
+  *out_is_dir = (attr & ATTR_DIRECTORY) ? 1 : 0;
+
+  return ESUCCESS;
+}
+
+uint32_t fat32_root_cluster(void) { return vol.root_cluster; }

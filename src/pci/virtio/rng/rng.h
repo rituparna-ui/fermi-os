@@ -15,5 +15,6 @@ struct virtio_rng {
 };
 
 void pci_virtio_rng_init(void);
+int rng_read(void *buf, uint32_t count);
 
 #endif

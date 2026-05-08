@@ -5,6 +5,7 @@
 #include "strings/strings.h" // IWYU pragma: keep
 #include "timer/timer.h"
 #include "uart/uart.h"
+#include "vfs/vfs.h"
 
 // switch.S: unmasks IRQs, calls x19, then calls task_exit
 extern void task_trampoline(void);
@@ -104,7 +105,7 @@ int sched_create_task(const char *name, task_entry_t entry) {
   frame[0] = user_entry;     // x19 — user entry point
   frame[1] = USER_STACK_TOP; // x20 — user SP
   frame[11] =
-      PHYS_TO_VIRT((uint64_t)task_trampoline); // x30 (lr) — must be TTBR1 VA
+      (uint64_t)task_trampoline; // x30 (lr) — already TTBR1 VA with -fno-pic
 
   t->sp = (uint64_t)frame;
   t->pid = next_pid++;
@@ -115,6 +116,14 @@ int sched_create_task(const char *name, task_entry_t entry) {
   t->kstack_top = kstack_top;
   t->ustack_phys = ustack_phys;
   copy_name(t->name, name);
+
+  /* Per-task fd table: open /dev/console for fd 0, 1, 2 */
+  t->fds = fd_table_create();
+  if (t->fds) {
+    fd_open(t->fds, "/dev/console"); /* stdin  = 0 */
+    fd_open(t->fds, "/dev/console"); /* stdout = 1 */
+    fd_open(t->fds, "/dev/console"); /* stderr = 2 */
+  }
 
   // Insert into circular run queue
   task_t *tail = current;
@@ -249,6 +258,11 @@ void sched_reap(void) {
     // Free per-task TTBR0 page table pages (L0, L1, L2)
     if (dead->ttbr0) {
       mmu_free_user_tables((uint64_t *)dead->ttbr0);
+    }
+
+    // Free fd table
+    if (dead->fds) {
+      fd_table_destroy(dead->fds);
     }
 
     kfree(dead);

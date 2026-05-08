@@ -4,29 +4,24 @@
 .equ KERNEL_VA_OFFSET, 0xFFFF000000000000
 
 _start:
+	// Symbols are now linked at upper-half VAs.
+	// Before MMU is on, we need PHYSICAL addresses, so subtract the offset.
+	ldr x0, =__stack_top
+	ldr x1, =KERNEL_VA_OFFSET
+	sub x0, x0, x1			// physical stack top
+	mov sp, x0
+
+	// PC is physical. early_init is linked at upper-half but bl is PC-relative,
+	// so it branches to physical early_init. early_init enables MMU.
+	bl early_init
+
+	// MMU now on, TTBR1 maps upper half. Switch to upper-half VAs directly.
 	ldr x0, =__stack_top
 	mov sp, x0
 
-	// runs at physical addresses
-	// sets up UART, PMM, MMU
-	bl early_init
-
-	// jump to upper half
-	// TTBR1 maps 0xFFFF_0000_0000_0000+ to PA 0x0000+
-	// just add KERNEL_VA_OFFSET to jump address
-	
-	// relocate stack to upper half
-	ldr x0, =KERNEL_VA_OFFSET
-	add sp, sp, x0
-
-	// upper half address of kernel_main
-	// bl is a relative jump
 	ldr x1, =kernel_main
-	add x1, x1, x0
 	br x1
 
 	// panic if kernel_main returns
-	ldr x0, =KERNEL_VA_OFFSET
 	ldr x1, =kernel_panic_return
-	add x1, x1, x0
 	br x1

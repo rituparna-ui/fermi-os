@@ -1,4 +1,5 @@
 #include "blk/blk.h"
+#include "devices.h"
 #include "exception.h"
 #include "fat32/fat32.h"
 #include "gic/gic.h"
@@ -14,6 +15,7 @@
 #include "timer/timer.h"
 #include "uart/uart.h"
 #include "utils/utils.h"
+#include "vfs/vfs.h"
 #include <stdint.h>
 
 extern uint8_t __bss_start;
@@ -55,44 +57,49 @@ void early_init() {
   uart_println("[BOOT] MMU Enabled. Jumping to Upper Half");
 }
 
-static inline uint64_t sys_write(const char *buf, uint64_t len) {
-  register const char *x0 __asm__("x0") = buf;
-  register uint64_t x1 __asm__("x1") = len;
-  register uint64_t x8 __asm__("x8") = 0;
-  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory");
-  return (uint64_t)x0;
+static inline int64_t sys_write(int fd, const char *buf, uint64_t len) {
+  register int x0 __asm__("x0") = fd;
+  register const char *x1 __asm__("x1") = buf;
+  register uint64_t x2 __asm__("x2") = len;
+  register uint64_t x8 __asm__("x8") = 1; /* SYS_WRITE */
+  __asm__ __volatile__("svc #0"
+                       : "+r"(x0)
+                       : "r"(x1), "r"(x2), "r"(x8)
+                       : "memory");
+  return (int64_t)x0;
 }
 
 static inline void sys_exit(void) {
-  register uint64_t x8 __asm__("x8") = 1;
+  register uint64_t x8 __asm__("x8") = 4; /* SYS_EXIT */
   __asm__ __volatile__("svc #0" ::"r"(x8) : "memory");
 }
 
 static inline void sys_sleep(uint64_t ms) {
   register uint64_t x0 __asm__("x0") = ms;
-  register uint64_t x8 __asm__("x8") = 3;
+  register uint64_t x8 __asm__("x8") = 6; /* SYS_SLEEP */
   __asm__ __volatile__("svc #0" ::"r"(x0), "r"(x8) : "memory");
 }
 
 static void task_a(void) {
-  const char msg[] = "[Task A] Hello from EL0 via SVC!\n";
-  sys_write(msg, sizeof(msg) - 1);
+  const char msg[] = "[Task A] Hello from EL0 via fd=1!\n";
+  sys_write(1, msg, sizeof(msg) - 1);
 
   const char done[] = "[Task A] exiting\n";
-  sys_write(done, sizeof(done) - 1);
+  sys_write(1, done, sizeof(done) - 1);
   sys_exit();
 }
 
 static void task_b(void) {
   while (1) {
     const char msg[] = "[Task B] running at EL0\n";
-    sys_write(msg, sizeof(msg) - 1);
+    sys_write(1, msg, sizeof(msg) - 1);
     sys_sleep(500);
   }
 }
 
 // runs in VAS Upper Half after boot.S relocates program counter and stack
 // pointer
+
 void kernel_main() {
   // all device access through TTBR1
   mmio_switch_to_upper();
@@ -124,65 +131,21 @@ void kernel_main() {
     uart_printf("[FS][FAT32] Unable to mount file system");
   }
 
-  uint32_t first_cluster, size;
+  vfs_init();
 
-  if (fat32_find("HELLO.TXT", &first_cluster, &size) == ESUCCESS) {
-    uart_printf("[FAT32] HELLO.TXT: cluster=%d size=%d\n",
-                (uint64_t)first_cluster, (uint64_t)size);
+  /* Register /dev/console, /dev/null, /dev/zero, /dev/rng */
+  devices_register();
 
-    static char filebuf[512];
-    int n = fat32_read(first_cluster, size, filebuf, sizeof(filebuf) - 1);
+  vnode_t *mnt = vfs_create_node(vfs_root(), "mnt", VNODE_DIR);
+  vfs_create_node(mnt, "fat32", VNODE_DIR);
+  fat32_vfs_mount("/mnt/fat32");
 
-    if (n > 0) {
-      filebuf[n] = 0;
-      uart_printf("[FAT32] contents:\n%s\n", filebuf);
-    }
-  } else {
-    uart_errorln("[FAT32] HELLO.TXT not found");
-  }
-
-  if (fat32_find("SUBDIR/INFO.TXT", &first_cluster, &size) == ESUCCESS) {
-    uart_printf("[FAT32] SUBDIR/INFO.TXT: cluster=%d size=%d\n",
-                (uint64_t)first_cluster, (uint64_t)size);
-
-    static char filebuf2[512];
-    int n = fat32_read(first_cluster, size, filebuf2, sizeof(filebuf2) - 1);
-
-    if (n > 0) {
-      filebuf2[n] = 0;
-      uart_printf("[FAT32] contents:\n%s\n", filebuf2);
-    }
-  } else {
-    uart_errorln("[FAT32] SUBDIR/INFO.TXT not found");
-  }
-
-  /* Test FAT32 write: create a file, then read it back */
-  const char *test_data = "Written by Fermi OS kernel!\n";
-  if (fat32_create("CREATED.TXT", test_data, 28) == ESUCCESS) {
-    uart_println("[FAT32] Created CREATED.TXT");
-
-    if (fat32_find("CREATED.TXT", &first_cluster, &size) == ESUCCESS) {
-      static char vbuf[512];
-      int n = fat32_read(first_cluster, size, vbuf, sizeof(vbuf) - 1);
-      if (n > 0) {
-        vbuf[n] = 0;
-        uart_printf("[FAT32] Read back: %s", vbuf);
-      }
-    } else {
-      uart_errorln("[FAT32] CREATED.TXT not found after create");
-    }
-  } else {
-    uart_errorln("[FAT32] Failed to create CREATED.TXT");
-  }
-
-  /*
   sched_init();
   sched_create_task("task_a", task_a);
   sched_create_task("task_b", task_b);
 
   timer_init();
   timer_start(TIMER_INTERVAL_MS);
-  */
 
   uart_println("[KERNEL] Ready! running idle task...");
 

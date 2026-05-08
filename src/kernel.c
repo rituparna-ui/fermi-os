@@ -149,10 +149,9 @@ void kernel_main() {
   vnode_t *dev = vfs_create_node(vfs_root(), "dev", VNODE_DIR);
   vnode_t *con = vfs_create_node(dev, "console", VNODE_CHR);
 
-  static file_operations_t console_ops = {
-      .read = NULL,
-      .write = console_write,
-  };
+  static file_operations_t console_ops;
+  console_ops.read = NULL;
+  console_ops.write = console_write; /* runtime assign — PC-relative, upper half */
   con->ops = &console_ops;
 
   /* open fd, write */
@@ -217,14 +216,12 @@ void kernel_main() {
     uart_errorln("[FAT32] Failed to create CREATED.TXT");
   }
 
-  /*
   sched_init();
   sched_create_task("task_a", task_a);
   sched_create_task("task_b", task_b);
 
   timer_init();
   timer_start(TIMER_INTERVAL_MS);
-  */
 
   uart_println("[KERNEL] Ready! running idle task...");
 

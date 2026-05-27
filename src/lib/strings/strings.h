@@ -16,4 +16,22 @@ int strncmp(const char *a, const char *b, size_t n);
 char *strncpy(char *dest, const char *src, size_t n);
 const char *strchr(const char *s, int c);
 
+#include <stdarg.h>
+
+/* snprintf-like formatter writing to a fixed-size buffer.
+ * Supported specifiers (subset of stdio):
+ *   %s   const char *  (NULL prints "(null)")
+ *   %d   int64_t       (signed decimal)
+ *   %u   uint64_t      (unsigned decimal)
+ *   %x   uint64_t      (lowercase hex, no 0x prefix)
+ *   %c   char (passed as int per default-promotion)
+ *   %%   literal percent
+ *
+ * Returns the number of bytes that would have been written excluding
+ * the NUL terminator (POSIX semantics). The output is always NUL-
+ * terminated when buflen > 0.
+ */
+int ksnprintf(char *buf, size_t buflen, const char *fmt, ...);
+int kvsnprintf(char *buf, size_t buflen, const char *fmt, va_list args);
+
 #endif

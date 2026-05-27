@@ -103,6 +103,109 @@ char *strncpy(char *dest, const char *src, size_t n) {
   return dest;
 }
 
+/* Internal: write one char to buf if there's room (always advances pos). */
+static inline void buf_putc(char *buf, size_t buflen, size_t *pos, char c) {
+  if (*pos + 1 < buflen) {
+    buf[*pos] = c;
+  }
+  (*pos)++;
+}
+
+static void buf_puts(char *buf, size_t buflen, size_t *pos, const char *s) {
+  while (*s) {
+    buf_putc(buf, buflen, pos, *s++);
+  }
+}
+
+static void buf_putu(char *buf, size_t buflen, size_t *pos, uint64_t val,
+                     int base) {
+  static const char digits[] = "0123456789abcdef";
+  char tmp[24];
+  int i = 0;
+  if (val == 0) {
+    buf_putc(buf, buflen, pos, '0');
+    return;
+  }
+  while (val > 0) {
+    tmp[i++] = digits[val % (uint64_t)base];
+    val /= (uint64_t)base;
+  }
+  while (i--) {
+    buf_putc(buf, buflen, pos, tmp[i]);
+  }
+}
+
+int kvsnprintf(char *buf, size_t buflen, const char *fmt, va_list args) {
+  size_t pos = 0;
+
+  while (*fmt) {
+    if (*fmt != '%') {
+      buf_putc(buf, buflen, &pos, *fmt++);
+      continue;
+    }
+    fmt++;
+
+    switch (*fmt) {
+    case '\0':
+      goto done; /* lone trailing % */
+    case 's': {
+      const char *s = va_arg(args, const char *);
+      buf_puts(buf, buflen, &pos, s ? s : "(null)");
+      break;
+    }
+    case 'd': {
+      int val = va_arg(args, int);
+      if (val < 0) {
+        buf_putc(buf, buflen, &pos, '-');
+        /* avoid INT_MIN overflow via unsigned arithmetic */
+        buf_putu(buf, buflen, &pos, (uint64_t)(0 - (uint64_t)val), 10);
+      } else {
+        buf_putu(buf, buflen, &pos, (uint64_t)val, 10);
+      }
+      break;
+    }
+    case 'u': {
+      uint64_t val = va_arg(args, uint64_t);
+      buf_putu(buf, buflen, &pos, val, 10);
+      break;
+    }
+    case 'x': {
+      uint64_t val = va_arg(args, uint64_t);
+      buf_putu(buf, buflen, &pos, val, 16);
+      break;
+    }
+    case 'c': {
+      char c = (char)va_arg(args, int);
+      buf_putc(buf, buflen, &pos, c);
+      break;
+    }
+    case '%':
+      buf_putc(buf, buflen, &pos, '%');
+      break;
+    default:
+      /* Unknown specifier: pass through literally. */
+      buf_putc(buf, buflen, &pos, '%');
+      buf_putc(buf, buflen, &pos, *fmt);
+      break;
+    }
+    fmt++;
+  }
+done:
+  if (buflen > 0) {
+    buf[(pos < buflen) ? pos : buflen - 1] = '\0';
+  }
+  return (int)pos;
+}
+
+int ksnprintf(char *buf, size_t buflen, const char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  int n = kvsnprintf(buf, buflen, fmt, args);
+  va_end(args);
+  return n;
+}
+
+
 const char *strchr(const char *s, int c) {
   unsigned char target = (unsigned char)c;
   for (; *s; s++) {

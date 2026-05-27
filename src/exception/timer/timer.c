@@ -90,3 +90,8 @@ uint64_t timer_get_count() {
 }
 
 uint64_t timer_get_ticks() { return tick_count; }
+
+uint64_t timer_uptime_ms(void) { return tick_count * TIMER_INTERVAL_MS; }
+uint64_t timer_uptime_seconds(void) {
+  return (tick_count * TIMER_INTERVAL_MS) / 1000;
+}

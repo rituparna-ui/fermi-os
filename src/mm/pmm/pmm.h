@@ -34,4 +34,10 @@ void pmm_free_page(uintptr_t phys_addr);
 void pmm_free_pages(uintptr_t phys_addr, uint64_t count);
 void pmm_print_info(void);
 
+/* Read-only stats helpers (used by /proc/meminfo and similar). */
+uint64_t pmm_get_total_pages(void);
+uint64_t pmm_get_used_pages(void);
+uint64_t pmm_get_free_pages(void);
+uint64_t pmm_get_reserved_pages(void);
+
 #endif

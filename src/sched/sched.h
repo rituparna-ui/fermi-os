@@ -47,4 +47,10 @@ void sched_wake_sleepers(void);
 void sched_reap(void);
 task_t *sched_current(void);
 
+/* Iteration support for /proc/tasks. The run queue is circular and
+ * always non-empty (idle is always present); walk t->next until you
+ * loop back to the returned head. */
+task_t *sched_first_task(void);
+const char *task_state_name(task_state_t s);
+
 #endif

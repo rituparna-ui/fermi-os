@@ -17,5 +17,7 @@ void timer_set_callback(timer_callback_t cb);
 uint64_t timer_get_frequency(void);
 uint64_t timer_get_count(void);
 uint64_t timer_get_ticks(void);
+uint64_t timer_uptime_ms(void);
+uint64_t timer_uptime_seconds(void);
 
 #endif

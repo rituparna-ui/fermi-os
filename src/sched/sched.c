@@ -300,3 +300,20 @@ void sched_reap(void) {
 }
 
 task_t *sched_current(void) { return current; }
+
+task_t *sched_first_task(void) { return &idle_task; }
+
+const char *task_state_name(task_state_t s) {
+  switch (s) {
+  case TASK_READY:
+    return "READY";
+  case TASK_RUNNING:
+    return "RUNNING";
+  case TASK_SLEEPING:
+    return "SLEEPING";
+  case TASK_DEAD:
+    return "DEAD";
+  default:
+    return "?";
+  }
+}

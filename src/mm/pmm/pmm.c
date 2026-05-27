@@ -175,8 +175,14 @@ void pmm_free_pages(uintptr_t phys_addr, uint64_t count) {
   }
 }
 
+uint64_t pmm_get_total_pages(void) { return total_pages; }
+uint64_t pmm_get_used_pages(void) { return used_pages; }
+uint64_t pmm_get_free_pages(void) { return total_pages - used_pages; }
+uint64_t pmm_get_reserved_pages(void) { return reserved_pages; }
+
+
 void pmm_free_page(uintptr_t phys_addr) {
-  uart_printf("[PMM] attempting to free address %x\n", phys_addr);
+  // uart_printf("[PMM] attempting to free address %x\n", phys_addr);
 
   if (phys_addr < mem_region_start || phys_addr >= mem_region_end) {
     uart_errorln("[PMM] address outside managed region");

@@ -49,6 +49,16 @@ void *kmalloc(size_t size) {
     return 0;
   }
 
+  // Reject sizes that would overflow the 16-byte alignment rounding.
+  // HEAP_ALIGN_UP(x) computes (x + 15) & ~15; if x > SIZE_MAX - 15 the
+  // addition wraps to a small value, which would let the first-fit search
+  // succeed and return a much-smaller-than-requested block. The caller's
+  // write would then trash adjacent heap metadata.
+  if (size > SIZE_MAX - (HEAP_ALIGN - 1)) {
+    uart_errorln("[HEAP] kmalloc: size overflow");
+    return 0;
+  }
+
   size = HEAP_ALIGN_UP(size);
 
   block_header_t *current = heap_head;

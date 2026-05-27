@@ -55,4 +55,18 @@ struct virtio_net {
 
 void pci_virtio_net_init(void);
 
+/* Send a raw Ethernet frame (Dst MAC + Src MAC + ethertype + payload).
+ * The driver prepends the virtio_net_hdr internally; the caller does not
+ * include it in `frame`. Returns the number of bytes accepted by the
+ * device (== len on success), or a negative value on error.
+ *
+ * Synchronous: blocks (polls) until the device acks the descriptor chain
+ * via the used ring. */
+int net_tx(const void *frame, uint32_t len);
+
+/* Hand-crafted ARP request to QEMU's slirp gateway (10.0.2.2). Used as a
+ * smoke test that the TX path is actually reaching the device. Once V3
+ * lands, the ARP reply will be observable on the RX queue. */
+int net_send_arp_probe(void);
+
 #endif

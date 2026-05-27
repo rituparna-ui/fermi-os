@@ -3,6 +3,7 @@
 #include "mmio/mmio.h"
 #include "uart/uart.h"
 #include "utils/utils.h"
+#include "strings/strings.h"
 
 /* Page-aligned backing memory for both virtqueues. RX is queue 0, TX is
  * queue 1. Each queue gets its own descriptor table, available ring, and
@@ -18,6 +19,76 @@ static struct virtq_avail tx_avail __attribute__((aligned(4096)));
 static struct virtq_used  tx_used  __attribute__((aligned(4096)));
 
 static struct virtio_net net_dev;
+
+/* TX header (modern, 12 bytes). All zero for plain Ethernet — no GSO,
+ * no checksum offload. We keep one global instance because net_tx is
+ * synchronous (poll-completed) so re-use is safe. */
+static struct virtio_net_hdr tx_hdr __attribute__((aligned(16)));
+
+int net_tx(const void *frame, uint32_t len) {
+  if (!frame || len == 0) {
+    return -1;
+  }
+
+  memset(&tx_hdr, 0, sizeof(tx_hdr));
+
+  struct virtq_seg segs[2] = {
+      {VIRT_TO_PHYS((uint64_t)(uintptr_t)&tx_hdr), VIRTIO_NET_HDR_LEN,
+       VIRTQ_DESC_F_NONE},
+      {VIRT_TO_PHYS((uint64_t)(uintptr_t)frame), len, VIRTQ_DESC_F_NONE},
+  };
+
+  virtqueue_submit_chain(&net_dev.tx_vq, segs, 2);
+  virtqueue_notify(&net_dev.tx_vq);
+  virtqueue_poll(&net_dev.tx_vq);
+
+  return (int)len;
+}
+
+/* Build a 60-byte (Ethernet minimum) ARP request asking who has 10.0.2.2
+ * (QEMU's slirp gateway), broadcast over the LAN. We embed our MAC as the
+ * sender hardware address and 10.0.2.15 as the sender protocol address
+ * (the slirp default for the first guest). */
+static uint8_t arp_frame[60] __attribute__((aligned(16)));
+
+int net_send_arp_probe(void) {
+  if (!net_dev.have_mac) {
+    uart_errorln("[NET] arp_probe: no MAC negotiated");
+    return -1;
+  }
+
+  memset(arp_frame, 0, sizeof(arp_frame));
+
+  /* Ethernet header (14 bytes) */
+  for (int i = 0; i < 6; i++) {
+    arp_frame[i] = 0xFF; /* dst = broadcast */
+  }
+  for (int i = 0; i < 6; i++) {
+    arp_frame[6 + i] = net_dev.mac[i]; /* src */
+  }
+  arp_frame[12] = 0x08;
+  arp_frame[13] = 0x06; /* ethertype = ARP */
+
+  /* ARP body (28 bytes) */
+  uint8_t *a = &arp_frame[14];
+  a[0] = 0x00; a[1] = 0x01;       /* HTYPE = Ethernet */
+  a[2] = 0x08; a[3] = 0x00;       /* PTYPE = IPv4 */
+  a[4] = 6;                        /* HLEN */
+  a[5] = 4;                        /* PLEN */
+  a[6] = 0x00; a[7] = 0x01;       /* OPER = request */
+  for (int i = 0; i < 6; i++) {
+    a[8 + i] = net_dev.mac[i];     /* SHA (sender HW) */
+  }
+  /* SPA (sender IP) = 10.0.2.15 */
+  a[14] = 10; a[15] = 0; a[16] = 2; a[17] = 15;
+  /* THA (target HW) = 0; already zeroed */
+  /* TPA (target IP) = 10.0.2.2 (slirp gateway) */
+  a[24] = 10; a[25] = 0; a[26] = 2; a[27] = 2;
+
+  uart_println("[NET] Sending ARP probe for 10.0.2.2 (slirp gateway)");
+  return net_tx(arp_frame, sizeof(arp_frame));
+}
+
 
 void pci_virtio_net_init(void) {
   uart_println("[NET] Initializing Device");
@@ -164,5 +235,12 @@ void pci_virtio_net_init(void) {
     uart_printf("[NET] Link: %s (status=%x)\n",
                 (net_dev.link_status & VIRTIO_NET_S_LINK_UP) ? "UP" : "DOWN",
                 (uint64_t)net_dev.link_status);
+  }
+
+  /* Smoke-test the TX path by sending a broadcast ARP request. We can't
+   * verify the reply yet (RX path lands in V3), but the device acking
+   * the descriptor chain is enough to know the wire side is alive. */
+  if (net_send_arp_probe() > 0) {
+    uart_println("[NET] ARP probe TX accepted by device");
   }
 }

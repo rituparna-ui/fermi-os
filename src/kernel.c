@@ -11,6 +11,7 @@
 #include "panic/panic.h"
 #include "pci/pci.h"
 #include "rng/rng.h"
+#include "net/net.h"
 #include "sched/sched.h"
 #include "strings/strings.h" // IWYU pragma: keep
 #include "timer/timer.h"
@@ -190,6 +191,7 @@ void kernel_main() {
   pci_enumerate_bus();
   pci_virtio_rng_init();
   pci_virtio_blk_init();
+  pci_virtio_net_init();
 
   if (fat32_mount() != ESUCCESS) {
     uart_printf("[FS][FAT32] Unable to mount file system");

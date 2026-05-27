@@ -41,7 +41,8 @@ DISK_SIZE := 1G
 
 QEMU_CPU := cortex-a72
 QEMU_MACHINE := virt,gic-version=3 -m 8G
-QEMU_DEVICES := -nic none \
+QEMU_DEVICES := -netdev user,id=n0 \
+	-device virtio-net-pci,netdev=n0,disable-legacy=on \
 	-device virtio-rng-pci,disable-legacy=on \
 	-drive file=$(DISK_IMG),if=none,format=raw,id=d0 \
 	-device virtio-blk-pci,drive=d0,disable-legacy=on

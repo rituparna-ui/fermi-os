@@ -90,6 +90,82 @@ int net_send_arp_probe(void) {
 }
 
 
+/* RX path. We pre-fill the RX queue with a small bank of fixed-size
+ * buffers; the device fills them as packets arrive. net_rx_poll drains
+ * one used entry, copies the payload to the caller (skipping the
+ * virtio_net_hdr), and re-arms the same buffer.
+ *
+ * Buffer ↔ descriptor mapping: virtqueue_submit allocates from free_head
+ * and doesn't return the index it picked, so we shadow it with our own
+ * counter and update rx_desc_to_buf[] in lockstep with each submit. */
+#define NET_RX_BUF_COUNT 8
+#define NET_RX_BUF_SIZE  1600 /* 12B hdr + 1500 MTU + slack */
+
+static uint8_t rx_bufs[NET_RX_BUF_COUNT][NET_RX_BUF_SIZE]
+    __attribute__((aligned(64)));
+static int     rx_desc_to_buf[VIRTQ_MAX_SIZE];
+static uint8_t rx_initialized;
+
+static void net_rx_submit_buf(int buf_idx) {
+  uint16_t desc_id = net_dev.rx_vq.free_head;
+  uint64_t pa = VIRT_TO_PHYS((uint64_t)(uintptr_t)rx_bufs[buf_idx]);
+  virtqueue_submit(&net_dev.rx_vq, pa, NET_RX_BUF_SIZE, VIRTQ_DESC_F_WRITE);
+  rx_desc_to_buf[desc_id] = buf_idx;
+}
+
+static void net_rx_init(void) {
+  for (int i = 0; i < (int)VIRTQ_MAX_SIZE; i++) {
+    rx_desc_to_buf[i] = -1;
+  }
+  for (int i = 0; i < NET_RX_BUF_COUNT; i++) {
+    net_rx_submit_buf(i);
+  }
+  virtqueue_notify(&net_dev.rx_vq);
+  rx_initialized = 1;
+  uart_printf("[NET] RX queue primed with %d buffers (%d bytes each)\n",
+              (uint64_t)NET_RX_BUF_COUNT, (uint64_t)NET_RX_BUF_SIZE);
+}
+
+int net_rx_poll(void *dst, uint32_t max_len) {
+  if (!rx_initialized) {
+    return -1;
+  }
+
+  uint16_t used_now = *(volatile uint16_t *)&net_dev.rx_vq.used->idx;
+  if (net_dev.rx_vq.last_used == used_now) {
+    return 0; /* nothing pending */
+  }
+  dsb_sy();
+
+  uint16_t slot      = net_dev.rx_vq.last_used % net_dev.rx_vq.size;
+  uint32_t desc_id   = net_dev.rx_vq.used->ring[slot].id;
+  uint32_t total_len = net_dev.rx_vq.used->ring[slot].len;
+  net_dev.rx_vq.last_used++;
+
+  if (desc_id >= VIRTQ_MAX_SIZE || rx_desc_to_buf[desc_id] < 0) {
+    uart_errorln("[NET] rx_poll: bogus / unmapped descriptor");
+    return -1;
+  }
+  int buf_idx = rx_desc_to_buf[desc_id];
+  rx_desc_to_buf[desc_id] = -1;
+
+  uint8_t *buf = rx_bufs[buf_idx];
+  int copied = 0;
+  if (total_len >= VIRTIO_NET_HDR_LEN) {
+    uint32_t frame_len = total_len - VIRTIO_NET_HDR_LEN;
+    uint32_t to_copy   = (frame_len < max_len) ? frame_len : max_len;
+    if (dst && to_copy > 0) {
+      memcpy(dst, buf + VIRTIO_NET_HDR_LEN, to_copy);
+    }
+    copied = (int)to_copy;
+  }
+
+  net_rx_submit_buf(buf_idx);
+  virtqueue_notify(&net_dev.rx_vq);
+  return copied;
+}
+
+
 void pci_virtio_net_init(void) {
   uart_println("[NET] Initializing Device");
 
@@ -211,6 +287,10 @@ void pci_virtio_net_init(void) {
   dsb_sy();
   uart_println("[NET] DRIVER_OK set");
 
+  /* Pre-fill the RX queue immediately after DRIVER_OK so a slirp ARP
+   * reply has buffers waiting for it before we send the request. */
+  net_rx_init();
+
   /* Read MAC and link status from device cfg. With F_MAC negotiated the
    * device has placed a 6-byte MAC at offset 0; without it we'd have to
    * generate one ourselves. */
@@ -237,10 +317,31 @@ void pci_virtio_net_init(void) {
                 (uint64_t)net_dev.link_status);
   }
 
-  /* Smoke-test the TX path by sending a broadcast ARP request. We can't
-   * verify the reply yet (RX path lands in V3), but the device acking
-   * the descriptor chain is enough to know the wire side is alive. */
+
+  /* Smoke-test the wire by sending a broadcast ARP request to the slirp
+   * gateway, then poll the RX queue briefly to catch the reply. The reply
+   * is generated synchronously by QEMU, so it should appear within a few
+   * thousand spins; we cap the wait so a wedged device cannot hang boot. */
   if (net_send_arp_probe() > 0) {
     uart_println("[NET] ARP probe TX accepted by device");
   }
+
+  uint8_t rx_buf[256];
+  for (uint32_t spins = 0; spins < 1000000u; spins++) {
+    int n = net_rx_poll(rx_buf, sizeof(rx_buf));
+    if (n > 0) {
+      uart_printf("[NET] RX: %d bytes", (uint64_t)n);
+      if (n >= 14) {
+        uint64_t ethertype = ((uint64_t)rx_buf[12] << 8) | rx_buf[13];
+        uart_printf(" type=%x src=%x:%x:%x:%x:%x:%x",
+                    ethertype,
+                    (uint64_t)rx_buf[6],  (uint64_t)rx_buf[7],
+                    (uint64_t)rx_buf[8],  (uint64_t)rx_buf[9],
+                    (uint64_t)rx_buf[10], (uint64_t)rx_buf[11]);
+      }
+      uart_println("");
+      break;
+    }
+  }
+
 }

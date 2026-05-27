@@ -69,4 +69,13 @@ int net_tx(const void *frame, uint32_t len);
  * lands, the ARP reply will be observable on the RX queue. */
 int net_send_arp_probe(void);
 
+/* Drain one received Ethernet frame (without the virtio_net_hdr) into
+ * `dst`, copying at most `max_len` bytes. The buffer is automatically
+ * re-armed onto the RX queue afterwards.
+ *
+ *   > 0 : number of payload bytes copied
+ *   = 0 : nothing pending
+ *   < 0 : error (e.g. unmapped descriptor) */
+int net_rx_poll(void *dst, uint32_t max_len);
+
 #endif

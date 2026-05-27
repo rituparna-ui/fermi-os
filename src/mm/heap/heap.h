@@ -28,11 +28,15 @@ typedef struct block_header {
 
 #define BLOCK_HEADER_SIZE HEAP_ALIGN_UP(sizeof(block_header_t))
 
-// TODO: add heap_expand in case current heap gets exhausted
 void heap_init(void);
 void *kmalloc(size_t size);
 void kfree(void *ptr);
 void heap_print_info(void);
 void heap_run_tests(void);
+
+// Stats — used by /proc/meminfo and similar.
+uint64_t heap_used_bytes(void);
+uint64_t heap_free_bytes(void);
+uint64_t heap_total_bytes(void);
 
 #endif

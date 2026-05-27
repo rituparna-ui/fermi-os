@@ -6,8 +6,42 @@
 
 static block_header_t *heap_head = 0;
 
-static uintptr_t heap_phys_base = 0;
-static uint64_t heap_page_count = 0;
+// Track each PMM-backed region so kfree can sanity-check that a freed
+// pointer falls within *some* heap region. Address-adjacent blocks may
+// span allocations that came from non-contiguous PMM frames, so coalescing
+// must verify adjacency rather than blindly merging neighbours.
+#define HEAP_MAX_REGIONS 16
+struct heap_region {
+  uintptr_t va_start;
+  uint64_t size_bytes;
+};
+static struct heap_region regions[HEAP_MAX_REGIONS];
+static uint32_t region_count = 0;
+
+// Grow at least this many pages per heap_expand call to amortize the
+// cost of pmm_allocate_pages and bookkeeping.
+#define HEAP_EXPAND_MIN_PAGES 64
+
+static int register_region(uintptr_t va, uint64_t bytes) {
+  if (region_count >= HEAP_MAX_REGIONS) {
+    uart_errorln("[HEAP] region table full");
+    return -1;
+  }
+  regions[region_count].va_start = va;
+  regions[region_count].size_bytes = bytes;
+  region_count++;
+  return 0;
+}
+
+static int addr_in_any_region(uintptr_t addr) {
+  for (uint32_t i = 0; i < region_count; i++) {
+    if (addr >= regions[i].va_start &&
+        addr < regions[i].va_start + regions[i].size_bytes) {
+      return 1;
+    }
+  }
+  return 0;
+}
 
 void heap_init(void) {
   uart_println("[HEAP] Initializing");
@@ -18,9 +52,6 @@ void heap_init(void) {
     uart_errorln("[HEAP] Failed to allocate pages for heap");
     return;
   }
-
-  heap_phys_base = phys;
-  heap_page_count = pages;
 
   uintptr_t va = PHYS_TO_VIRT(phys);
   uint64_t heap_size = pages * PAGE_SIZE;
@@ -34,11 +65,60 @@ void heap_init(void) {
   heap_head->is_free = 1;
   heap_head->next = 0;
 
+  register_region(va, heap_size);
+
   uart_printf("[HEAP] Heap VA: %x - %x\n", va, va + heap_size);
   uart_printf("[HEAP] Usable: %d KiB (%d bytes) | Header: %d bytes\n",
               heap_head->size / 1024, heap_head->size, BLOCK_HEADER_SIZE);
 
   uart_println("[HEAP] Initialized!");
+}
+
+// Try to grow the heap by allocating more PMM pages. Returns 0 on success,
+// -1 on failure. The new region is appended to the address-ordered free
+// list as a single free block; because PMM may hand back non-adjacent
+// physical frames between calls, the coalescing walk in kfree verifies
+// physical adjacency before merging across blocks.
+static int heap_expand(size_t need_bytes) {
+  uint64_t bytes_required = need_bytes + BLOCK_HEADER_SIZE;
+  uint64_t pages = (bytes_required + PAGE_SIZE - 1) / PAGE_SIZE;
+  if (pages < HEAP_EXPAND_MIN_PAGES) {
+    pages = HEAP_EXPAND_MIN_PAGES;
+  }
+
+  uintptr_t phys = pmm_allocate_pages(pages);
+  if (!phys) {
+    uart_errorln("[HEAP] expand: pmm_allocate_pages failed");
+    return -1;
+  }
+
+  uintptr_t va = PHYS_TO_VIRT(phys);
+  uint64_t bytes = pages * PAGE_SIZE;
+  memset((void *)va, 0, bytes);
+
+  block_header_t *new_block = (block_header_t *)va;
+  new_block->size = bytes - BLOCK_HEADER_SIZE;
+  new_block->is_free = 1;
+  new_block->next = 0;
+
+  // Append at end of list (kept in insertion order; coalescing handles
+  // ordering inconsistencies via the adjacency check.)
+  block_header_t *tail = heap_head;
+  while (tail->next) {
+    tail = tail->next;
+  }
+  tail->next = new_block;
+
+  if (register_region(va, bytes) != 0) {
+    /* Region table overflow — unlink to avoid an unverifiable region. */
+    tail->next = 0;
+    pmm_free_pages(phys, pages);
+    return -1;
+  }
+
+  uart_printf("[HEAP] Expanded by %d KiB (%d pages) at VA %x\n", bytes / 1024,
+              pages, va);
+  return 0;
 }
 
 // first fit algorithm
@@ -61,35 +141,43 @@ void *kmalloc(size_t size) {
 
   size = HEAP_ALIGN_UP(size);
 
-  block_header_t *current = heap_head;
+  // Try once, expand the heap on failure, try once more.
+  for (int attempt = 0; attempt < 2; attempt++) {
+    block_header_t *current = heap_head;
 
-  while (current) {
-    if (current->is_free && current->size >= size) {
-      // found a suitable block
-      // split if enough leftover for a new block
-      size_t remaining = current->size - size;
-      if (remaining > BLOCK_HEADER_SIZE + HEAP_MIN_BLOCK_SIZE) {
-        /*
-          split
-          BEFORE:  [ header | ========== big free block ========== ]
-          AFTER:   [ header | allocated ] [ new_header | remaining free ]
-        */
-        block_header_t *new_block =
-            (block_header_t *)((uint8_t *)current + BLOCK_HEADER_SIZE + size);
-        new_block->size = remaining - BLOCK_HEADER_SIZE;
-        new_block->is_free = 1;
-        new_block->next = current->next;
+    while (current) {
+      if (current->is_free && current->size >= size) {
+        // found a suitable block
+        // split if enough leftover for a new block
+        size_t remaining = current->size - size;
+        if (remaining > BLOCK_HEADER_SIZE + HEAP_MIN_BLOCK_SIZE) {
+          /*
+            split
+            BEFORE:  [ header | ========== big free block ========== ]
+            AFTER:   [ header | allocated ] [ new_header | remaining free ]
+          */
+          block_header_t *new_block =
+              (block_header_t *)((uint8_t *)current + BLOCK_HEADER_SIZE + size);
+          new_block->size = remaining - BLOCK_HEADER_SIZE;
+          new_block->is_free = 1;
+          new_block->next = current->next;
 
-        current->size = size;
-        current->next = new_block;
+          current->size = size;
+          current->next = new_block;
+        }
+
+        current->is_free = 0;
+        // + BLOCK_HEADER_SIZE to reach forward to the payload address
+        return (void *)((uint8_t *)current + BLOCK_HEADER_SIZE);
       }
 
-      current->is_free = 0;
-      // + BLOCK_HEADER_SIZE to reach forward to the payload address
-      return (void *)((uint8_t *)current + BLOCK_HEADER_SIZE);
+      current = current->next;
     }
 
-    current = current->next;
+    // No fit — try to grow the heap once.
+    if (heap_expand(size) != 0) {
+      break;
+    }
   }
 
   uart_errorln("[HEAP] kmalloc: out of memory!");
@@ -106,11 +194,9 @@ void kfree(void *ptr) {
       (block_header_t *)((uint8_t *)ptr - BLOCK_HEADER_SIZE);
 
   uintptr_t block_addr = (uintptr_t)block;
-  uintptr_t heap_va_start = PHYS_TO_VIRT(heap_phys_base);
-  uintptr_t heap_va_end = heap_va_start + (heap_page_count * PAGE_SIZE);
 
-  if (block_addr < heap_va_start || block_addr >= heap_va_end) {
-    uart_errorln("[HEAP] kfree: pointer outside heap region!");
+  if (!addr_in_any_region(block_addr)) {
+    uart_errorln("[HEAP] kfree: pointer outside heap regions!");
     return;
   }
 
@@ -123,13 +209,20 @@ void kfree(void *ptr) {
 
   /*
     coalescing
-    walk the entire list and merge consecutive free blocks
+    walk the entire list and merge consecutive free blocks, but only
+    when they are *physically* adjacent — heap_expand may have appended
+    blocks that are non-contiguous in memory.
     BEFORE:  [ hdr | free 64B ] → [ hdr | free 128B ] → ...
     AFTER:   [ hdr | free 64B + hdr_size + 128B      ] → ...
   */
   block_header_t *current = heap_head;
   while (current) {
     while (current->is_free && current->next && current->next->is_free) {
+      uintptr_t end_of_current =
+          (uintptr_t)current + BLOCK_HEADER_SIZE + current->size;
+      if (end_of_current != (uintptr_t)current->next) {
+        break; // gap between blocks — can't safely merge
+      }
       current->size += BLOCK_HEADER_SIZE + current->next->size;
       current->next = current->next->next;
     }
@@ -160,8 +253,40 @@ void heap_print_info(void) {
     current = current->next;
   }
 
-  uart_printf("[HEAP][INFO] Blocks: %d | Used: %d bytes | Free: %d bytes\n",
-              block_count, total_used, total_free);
+  uart_printf("[HEAP][INFO] Blocks: %d | Used: %d bytes | Free: %d bytes "
+              "| Regions: %d\n",
+              block_count, total_used, total_free, region_count);
+}
+
+// Total bytes currently used (allocated payload only, excludes headers).
+uint64_t heap_used_bytes(void) {
+  uint64_t total = 0;
+  for (block_header_t *c = heap_head; c; c = c->next) {
+    if (!c->is_free) {
+      total += c->size;
+    }
+  }
+  return total;
+}
+
+// Total bytes currently in free blocks (excludes headers).
+uint64_t heap_free_bytes(void) {
+  uint64_t total = 0;
+  for (block_header_t *c = heap_head; c; c = c->next) {
+    if (c->is_free) {
+      total += c->size;
+    }
+  }
+  return total;
+}
+
+// Aggregate size of all PMM-backed heap regions in bytes.
+uint64_t heap_total_bytes(void) {
+  uint64_t total = 0;
+  for (uint32_t i = 0; i < region_count; i++) {
+    total += regions[i].size_bytes;
+  }
+  return total;
 }
 
 static void test_result(const char *name, int pass) {

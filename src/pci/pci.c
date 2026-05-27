@@ -14,8 +14,9 @@ static uintptr_t alloc_mmio32(uint32_t size) {
   uintptr_t mask = (uintptr_t)size - 1;
   mmio32_next = (mmio32_next + mask) & ~mask;
 
-  if (mmio32_next & (size - 1)) {
-    mmio32_next = (mmio32_next + size) & ~(size - 1);
+  if (mmio32_next + size - 1 > PCI_MMIO32_LIMIT) {
+    uart_errorln("[PCI] 32-bit MMIO window exhausted");
+    return 0;
   }
 
   uintptr_t addr = mmio32_next;
@@ -28,8 +29,9 @@ static uintptr_t alloc_mmio64(uint64_t size) {
   uintptr_t mask = (uintptr_t)size - 1;
   mmio64_next = (mmio64_next + mask) & ~mask;
 
-  if (mmio64_next & (size - 1)) {
-    mmio64_next = (mmio64_next + size) & ~(size - 1);
+  if (mmio64_next + size - 1 > PCI_MMIO64_LIMIT) {
+    uart_errorln("[PCI] 64-bit MMIO window exhausted");
+    return 0;
   }
 
   uintptr_t addr = mmio64_next;
@@ -219,6 +221,13 @@ void pci_assign_bars(struct pci_device *dev) {
       pci_config_write32(b, d, f, bar_offset, (uint32_t)addr);
       dev->bar_addr[i] = addr;
     } else if (type == 0x02) {
+      /* 64-bit BAR — occupies BAR[i] AND BAR[i+1]. The high half lives at
+       * the next BAR offset, so this is invalid for BAR5 (no BAR6 exists). */
+      if (i + 1 >= 6) {
+        uart_errorln("[PCI] 64-bit BAR cannot occupy BAR5 (no upper half)");
+        dev->bar_addr[i] = 0;
+        continue;
+      }
       /* 64-bit BAR — probe both halves for correct size */
       uint32_t bar_offset_hi = PCI_BAR0 + (i + 1) * 4;
       uint64_t size64 = pci_get_bar_size64(b, d, f, bar_offset, bar_offset_hi);

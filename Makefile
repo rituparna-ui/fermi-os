@@ -20,9 +20,10 @@ C_SOURCES := $(shell find $(SRC_DIR) -name "*.c")
 S_OBJECTS := $(patsubst $(SRC_DIR)/%.S, $(BUILD_DIR)/%.o, $(S_SOURCES))
 C_OBJECTS := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(C_SOURCES))
 OBJECTS := $(S_OBJECTS) $(C_OBJECTS)
+DEPS    := $(OBJECTS:.o=.d)
 
 # Flags
-CFLAGS := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 -mstrict-align -fno-pic \
+CFLAGS := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 -mstrict-align -fno-pic -MMD -MP \
 					-I $(SRC_DIR)/lib \
 					-I $(SRC_DIR) \
 					-I $(SRC_DIR)/exception \
@@ -30,7 +31,8 @@ CFLAGS := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 -mstrict-a
 					-I $(SRC_DIR)/syscall \
 					-I $(SRC_DIR)/fs \
 					-I $(SRC_DIR)/devices
-ASFLAGS := -g
+# Assemble .S through the C preprocessor so future #include / #define expand correctly
+ASFLAGS := -g -MMD -MP
 LDFLAGS := -nostdlib -g -T linker.ld
 
 # QEMU Config
@@ -50,6 +52,9 @@ QEMU_BASE := qemu-system-aarch64 -machine $(QEMU_MACHINE) -nographic -cpu $(QEMU
 QEMU_FLAGS_RUN   := -kernel $(TARGET)
 QEMU_FLAGS_DEBUG := -kernel $(TARGET) -s -S
 
+.PHONY: all run debug clean gdb tmux disk dump_dts compile_commands.json
+
+
 all: $(TARGET)
 
 # TARGET depends on all .o files
@@ -67,7 +72,7 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.S
 	@echo "AS  $<"
 	@mkdir -p $(dir $@)
-	@$(AS) $(ASFLAGS) $< -o $@
+	@$(CC) $(CFLAGS) -x assembler-with-cpp -c $< -o $@
 
 # Run QEMU
 run: all disk
@@ -123,6 +128,10 @@ dump_dts:
 	$(QEMU_BASE) $(QEMU_FLAGS_RUN) -machine dumpdtb=$(BUILD_DIR)/qemu-virt.dtb
 	@dtc -I dtb -O dts -o $(BUILD_DIR)/qemu-virt.dts $(BUILD_DIR)/qemu-virt.dtb
 	@rm $(BUILD_DIR)/qemu-virt.dtb
+
+# Auto-generated header dependencies (-MMD -MP). Header edits now trigger rebuilds.
+-include $(DEPS)
+
 
 clean:
 	@echo "Cleaning up..."

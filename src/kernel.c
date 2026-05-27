@@ -1,4 +1,5 @@
 #include "blk/blk.h"
+#include "proc/proc.h"
 #include "devices.h"
 #include "exception.h"
 #include "fat32/fat32.h"
@@ -202,6 +203,8 @@ void kernel_main() {
   vnode_t *mnt = vfs_create_node(vfs_root(), "mnt", VNODE_DIR);
   vfs_create_node(mnt, "fat32", VNODE_DIR);
   fat32_vfs_mount("/mnt/fat32");
+
+  proc_init();
 
   sched_init();
   sched_create_task("task_a", task_a);

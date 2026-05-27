@@ -6,19 +6,27 @@
 // Loads next->sp, restores registers, returns into next task.
 // Also swaps TTBR0_EL1 for per-task user page tables.
 //
-// Stack frame layout (12 registers × 8 bytes = 96):
-//   [sp + 0]   x19
-//   [sp + 8]   x20
-//   [sp + 16]  x21
-//   [sp + 24]  x22
-//   [sp + 32]  x23
-//   [sp + 40]  x24
-//   [sp + 48]  x25
-//   [sp + 56]  x26
-//   [sp + 64]  x27
-//   [sp + 72]  x28
-//   [sp + 80]  x29 (frame pointer)
-//   [sp + 88]  x30 (link register / return address)
+// Stack frame layout (12 GPRs + 8 SIMD = 160 bytes):
+//   [sp + 0]    x19
+//   [sp + 8]    x20
+//   [sp + 16]   x21
+//   [sp + 24]   x22
+//   [sp + 32]   x23
+//   [sp + 40]   x24
+//   [sp + 48]   x25
+//   [sp + 56]   x26
+//   [sp + 64]   x27
+//   [sp + 72]   x28
+//   [sp + 80]   x29 (frame pointer)
+//   [sp + 88]   x30 (link register / return address)
+//   [sp + 96]   d8   (callee-saved SIMD/FP, AAPCS64)
+//   [sp + 104]  d9
+//   [sp + 112]  d10
+//   [sp + 120]  d11
+//   [sp + 128]  d12
+//   [sp + 136]  d13
+//   [sp + 144]  d14
+//   [sp + 152]  d15
 
 // task_t field offsets — must match sched.h
 .equ TASK_SP,       0
@@ -44,13 +52,18 @@ task_trampoline:
 .global context_switch
 context_switch:
 	// Save callee-saved registers onto prev's stack
-	sub sp, sp, #96
+	sub sp, sp, #160
 	stp x19, x20, [sp, #0]
 	stp x21, x22, [sp, #16]
 	stp x23, x24, [sp, #32]
 	stp x25, x26, [sp, #48]
 	stp x27, x28, [sp, #64]
 	stp x29, x30, [sp, #80]
+	// Save callee-saved SIMD/FP regs (lower 64 bits of v8–v15)
+	stp d8,  d9,  [sp, #96]
+	stp d10, d11, [sp, #112]
+	stp d12, d13, [sp, #128]
+	stp d14, d15, [sp, #144]
 
 	// Save current sp into prev->sp
 	mov x2, sp
@@ -78,6 +91,11 @@ context_switch:
 	ldp x25, x26, [sp, #48]
 	ldp x27, x28, [sp, #64]
 	ldp x29, x30, [sp, #80]
-	add sp, sp, #96
+	// Restore callee-saved SIMD/FP regs
+	ldp d8,  d9,  [sp, #96]
+	ldp d10, d11, [sp, #112]
+	ldp d12, d13, [sp, #128]
+	ldp d14, d15, [sp, #144]
+	add sp, sp, #160
 
 	ret

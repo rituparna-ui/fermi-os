@@ -117,9 +117,12 @@ int sched_create_task(const char *name, task_entry_t entry) {
   mmu_map_user_range(user_l0, ustack_user_base, ustack_phys,
                      USER_STACK_PAGES, stack_flags);
 
-  // Set up initial kernel stack frame for context_switch
-  // task_trampoline will eret to EL0 using x19=user_entry, x20=user_sp
-  uint64_t *frame = (uint64_t *)(kstack_top - 96);
+  // Set up initial kernel stack frame for context_switch.
+  // Frame size matches the layout in switch.S: 12 GPRs (x19–x30) + 8 SIMD
+  // (d8–d15) = 160 bytes. d8–d15 are left zero (a fresh task has no FP
+  // state to preserve); the surrounding memset already zeroed the kstack.
+  // task_trampoline will eret to EL0 using x19=user_entry, x20=user_sp.
+  uint64_t *frame = (uint64_t *)(kstack_top - 160);
   frame[0] = user_entry;     // x19 — user entry point
   frame[1] = USER_STACK_TOP; // x20 — user SP
   frame[11] =

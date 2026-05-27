@@ -146,7 +146,10 @@ uint64_t *mmu_init() {
       (0b010ULL << 32); // IPS = 40-bit PA (1TB) (needed for >4GB RAM)
 
   __asm__ __volatile__("msr tcr_el1, %0" ::"r"(tcr));
-  __asm__ __volatile__("dsb ishst");
+  // ARM ARM (DDI 0487, §D5.4): writes to translation table base registers
+  // require a full DSB ISH (not the store-only ISHST variant) so prior
+  // table-page stores are observable to the table walker.
+  __asm__ __volatile__("dsb ish");
 
   __asm__ __volatile__("msr ttbr0_el1, %0" ::"r"(l0_table_lo));
   __asm__ __volatile__("msr ttbr1_el1, %0" ::"r"(l0_table_hi));

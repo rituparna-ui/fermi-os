@@ -96,12 +96,27 @@ void virtqueue_submit(struct virtqueue *vq, uint64_t buf_pa, uint32_t len,
 }
 
 void virtqueue_notify(struct virtqueue *vq) {
-  mmio_write32(vq->notify_addr, 0);
+  // VirtIO 1.x §4.1.4.4 mandates a 16-bit write to the notify register
+  // (without VIRTIO_F_NOTIFICATION_DATA). The device looks up the queue
+  // from the notify_addr's offset, so the data value isn't actually used
+  // here — the *width* is what the spec requires.
+  mmio_write16(vq->notify_addr, 0);
 }
 
+// Upper bound on busy-wait iterations before assuming the device is wedged.
+// Virtio operations on QEMU complete within microseconds; 10 M iterations
+// is a multi-millisecond grace period before we give up.
+#define VIRTQUEUE_POLL_MAX_SPINS 10000000u
+
 uint32_t virtqueue_poll(struct virtqueue *vq) {
-  /* Busy wait until device increments used.idx */
+  /* Busy wait until device increments used.idx, with a timeout so a wedged
+   * device cannot hang the kernel forever. */
+  uint32_t spins = 0;
   while (*(volatile uint16_t *)&vq->used->idx == vq->last_used) {
+    if (++spins >= VIRTQUEUE_POLL_MAX_SPINS) {
+      uart_errorln("[VQ] virtqueue_poll: timeout waiting for device");
+      return 0;
+    }
   }
   dsb_sy();
 

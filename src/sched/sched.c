@@ -34,7 +34,13 @@ void sched_init(void) {
 
   memset(&idle_task, 0, sizeof(task_t));
   idle_task.pid = next_pid++;
-  idle_task.state = TASK_RUNNING;
+  // TASK_READY (not TASK_RUNNING): schedule() needs idle to be a READY
+  // candidate so it can be picked as a fallback when no other task is
+  // runnable. The transition to TASK_RUNNING happens lazily inside
+  // schedule() once it's actually selected. Without this, calling
+  // sleep_ms before the first preemption returned immediately because
+  // the scheduler couldn't pick idle as a fallback.
+  idle_task.state = TASK_READY;
   idle_task.stack_phys = 0;    // kernel stack, not PMM-managed
   idle_task.next = &idle_task; // circular: points to itself
   copy_name(idle_task.name, "idle");
@@ -104,6 +110,9 @@ int sched_create_task(const char *name, task_entry_t entry) {
   uintptr_t ustack_phys = pmm_allocate_pages(USER_STACK_PAGES);
   if (!ustack_phys) {
     uart_errorln("[SCHED] Failed to allocate user stack");
+    // user_l0 has the text mapping populated; tear down its L1/L2/L3 tables
+    // along with the L0 itself so we don't leak page-table pages.
+    mmu_free_user_tables(user_l0);
     pmm_free_pages(kstack_phys, TASK_STACK_PAGES);
     kfree(t);
     return -1;

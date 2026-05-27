@@ -1,4 +1,5 @@
 #include "proc.h"
+#include "net/net.h"
 #include "mm/heap/heap.h"
 #include "mm/pmm/pmm.h"
 #include "sched/sched.h"
@@ -111,6 +112,13 @@ static int gen_tasks(char *buf, size_t buflen) {
   return (int)pos;
 }
 
+static int gen_netinfo(char *buf, size_t buflen) {
+  /* net.c builds the snapshot directly into the caller buffer. The
+   * proc_read_via wrapper handles offset / EOF semantics around it. */
+  return net_get_info(buf, (uint32_t)buflen);
+}
+
+
 static int gen_version(char *buf, size_t buflen) {
   return ksnprintf(buf, buflen,
                    "Fermi OS aarch64 (cortex-a72)\n"
@@ -133,6 +141,11 @@ static int read_tasks(struct vnode *n, file_t *f, void *buf, size_t count) {
   (void)n;
   return proc_read_via(gen_tasks, f, buf, count);
 }
+static int read_netinfo(struct vnode *n, file_t *f, void *buf, size_t count) {
+  (void)n;
+  return proc_read_via(gen_netinfo, f, buf, count);
+}
+
 static int read_version(struct vnode *n, file_t *f, void *buf, size_t count) {
   (void)n;
   return proc_read_via(gen_version, f, buf, count);
@@ -141,6 +154,8 @@ static int read_version(struct vnode *n, file_t *f, void *buf, size_t count) {
 static file_operations_t uptime_ops  = {.read = read_uptime,  .write = 0};
 static file_operations_t meminfo_ops = {.read = read_meminfo, .write = 0};
 static file_operations_t tasks_ops   = {.read = read_tasks,   .write = 0};
+static file_operations_t netinfo_ops = {.read = read_netinfo, .write = 0};
+
 static file_operations_t version_ops = {.read = read_version, .write = 0};
 
 /* ------------------------------------------------------------------ */
@@ -169,7 +184,9 @@ void proc_init(void) {
   register_file(proc, "uptime",  &uptime_ops);
   register_file(proc, "meminfo", &meminfo_ops);
   register_file(proc, "tasks",   &tasks_ops);
+  register_file(proc, "netinfo", &netinfo_ops);
+
   register_file(proc, "version", &version_ops);
 
-  uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, version");
+  uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, netinfo, version");
 }

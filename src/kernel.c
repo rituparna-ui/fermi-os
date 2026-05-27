@@ -120,11 +120,23 @@ static void task_a(void) {
     sys_exit();
   }
 
-  char buf[128];
+  char buf[256];
   int64_t n = sys_read(fd, buf, sizeof(buf));
   if (n > 0) sys_write(1, buf, (uint64_t)n);
 
   sys_close(fd);
+
+  /* Also dump /proc/netinfo to demonstrate the new endpoint surfacing
+   * the live virtio-net state through the existing fd / VFS plumbing. */
+  const char ni_banner[] = "[Task A] cat /proc/netinfo\n";
+  sys_write(1, ni_banner, sizeof(ni_banner) - 1);
+  fd = sys_open("/proc/netinfo");
+  if (fd >= 0) {
+    n = sys_read(fd, buf, sizeof(buf));
+    if (n > 0) sys_write(1, buf, (uint64_t)n);
+    sys_close(fd);
+  }
+
 
   const char done[] = "[Task A] done\n";
   sys_write(1, done, sizeof(done) - 1);

@@ -20,6 +20,10 @@ static struct virtq_used  tx_used  __attribute__((aligned(4096)));
 
 static struct virtio_net net_dev;
 
+/* Per-direction packet counters — surfaced via /proc/netinfo. */
+static uint64_t rx_packets;
+static uint64_t tx_packets;
+
 /* TX header (modern, 12 bytes). All zero for plain Ethernet — no GSO,
  * no checksum offload. We keep one global instance because net_tx is
  * synchronous (poll-completed) so re-use is safe. */
@@ -41,6 +45,8 @@ int net_tx(const void *frame, uint32_t len) {
   virtqueue_submit_chain(&net_dev.tx_vq, segs, 2);
   virtqueue_notify(&net_dev.tx_vq);
   virtqueue_poll(&net_dev.tx_vq);
+
+  tx_packets++;
 
   return (int)len;
 }
@@ -162,6 +168,10 @@ int net_rx_poll(void *dst, uint32_t max_len) {
 
   net_rx_submit_buf(buf_idx);
   virtqueue_notify(&net_dev.rx_vq);
+  if (copied > 0) {
+    rx_packets++;
+  }
+
   return copied;
 }
 
@@ -269,6 +279,66 @@ static int net_send_ping(uint16_t seq) {
   uart_printf("[NET] Sending ICMP echo request seq=%d to 10.0.2.2\n",
               (uint64_t)seq);
   return net_tx(ping_frame, sizeof(ping_frame));
+}
+
+
+/* Render a /proc-style snapshot of the device state. Caller-allocated
+ * buffer; safe to truncate. Returns bytes written. */
+int net_get_info(char *buf, uint32_t buflen) {
+  static const char hex[] = "0123456789abcdef";
+  uint32_t pos = 0;
+
+  /* MAC */
+  static const char mac_label[] = "mac:        ";
+  for (uint32_t i = 0; i < sizeof(mac_label) - 1 && pos < buflen; i++) {
+    buf[pos++] = mac_label[i];
+  }
+  for (int i = 0; i < 6 && pos + 3 <= buflen; i++) {
+    if (i > 0) buf[pos++] = ':';
+    buf[pos++] = hex[net_dev.mac[i] >> 4];
+    buf[pos++] = hex[net_dev.mac[i] & 0xF];
+  }
+  if (pos < buflen) buf[pos++] = '\n';
+
+  /* Link */
+  int n = ksnprintf(buf + pos, buflen - pos, "link:       %s\n",
+                    (net_dev.link_status & VIRTIO_NET_S_LINK_UP) ? "UP"
+                                                                 : "DOWN");
+  if (n > 0) pos += (uint32_t)n;
+
+  /* IPv4 stub config (hard-coded slirp defaults for now) */
+  n = ksnprintf(buf + pos, buflen - pos,
+                "ip:         10.0.2.15\n"
+                "gateway:    10.0.2.2\n");
+  if (n > 0) pos += (uint32_t)n;
+
+  /* Gateway MAC (learned via ARP) */
+  static const char gw_label[] = "gw_mac:     ";
+  for (uint32_t i = 0; i < sizeof(gw_label) - 1 && pos < buflen; i++) {
+    buf[pos++] = gw_label[i];
+  }
+  if (have_gateway_mac) {
+    for (int i = 0; i < 6 && pos + 3 <= buflen; i++) {
+      if (i > 0) buf[pos++] = ':';
+      buf[pos++] = hex[gateway_mac[i] >> 4];
+      buf[pos++] = hex[gateway_mac[i] & 0xF];
+    }
+  } else {
+    static const char unknown[] = "(unknown)";
+    for (uint32_t i = 0; i < sizeof(unknown) - 1 && pos < buflen; i++) {
+      buf[pos++] = unknown[i];
+    }
+  }
+  if (pos < buflen) buf[pos++] = '\n';
+
+  /* Counters */
+  n = ksnprintf(buf + pos, buflen - pos,
+                "rx_packets: %u\n"
+                "tx_packets: %u\n",
+                rx_packets, tx_packets);
+  if (n > 0) pos += (uint32_t)n;
+
+  return (int)pos;
 }
 
 

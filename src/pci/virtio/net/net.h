@@ -78,4 +78,9 @@ int net_send_arp_probe(void);
  *   < 0 : error (e.g. unmapped descriptor) */
 int net_rx_poll(void *dst, uint32_t max_len);
 
+/* Render a /proc-style multi-line snapshot of the device state into `buf`.
+ * Returns bytes written. Snapshot includes MAC, link status, IPv4 stub
+ * config, learned gateway MAC, and packet counters. */
+int net_get_info(char *buf, uint32_t buflen);
+
 #endif

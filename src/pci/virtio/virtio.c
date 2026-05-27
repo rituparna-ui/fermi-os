@@ -40,6 +40,14 @@ void virtio_populate_capabilities(struct pci_device *pci_dev,
   uint32_t offset = pci_config_read32(b, d, f, cap_ptr + 8);
   uint32_t length = pci_config_read32(b, d, f, cap_ptr + 0x0C);
 
+  // PCI defines exactly 6 BARs (BAR0–BAR5). A malformed or unusual device
+  // could advertise an out-of-range index here; bounds-check before
+  // dereferencing the fixed-size pci_dev->bar_addr[6] array.
+  if (bar >= 6) {
+    uart_errorln("[VIRTIO] populate_capabilities: invalid BAR index");
+    return;
+  }
+
   uintptr_t cap_addr = (uintptr_t)(pci_dev->bar_addr[bar] + offset);
 
   uart_printf("  type=%d (%s) bar=%d offset=%x length=%x -> addr=%x\n",

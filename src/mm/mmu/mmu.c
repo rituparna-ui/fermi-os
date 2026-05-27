@@ -230,40 +230,49 @@ uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc) {
   uint64_t l1i = L1_INDEX(va);
   uint64_t l2i = L2_INDEX(va);
 
-  // L0 Table
-  uint64_t *l1_table;
+  // PTEs hold physical addresses, and table-pages themselves are referenced
+  // by physical address (alloc_table returns the pmm phys). After MMU enable,
+  // dereferencing a phys pointer through TTBR0 only works when TTBR0 happens
+  // to identity-map RAM. To be safe regardless of which task's TTBR0 is
+  // loaded, route every table read/write through the upper-half kernel
+  // mapping (TTBR1) via PHYS_TO_VIRT.
+  uint64_t *l0 = (uint64_t *)PHYS_TO_VIRT((uintptr_t)l0_table);
 
-  if (!pte_valid(l0_table[l0i])) {
+  // L0 -> L1
+  uint64_t *l1;
+  if (!pte_valid(l0[l0i])) {
     if (!alloc)
       return 0;
 
-    l1_table = alloc_table();
-    if (!l1_table)
+    uint64_t *l1_phys = alloc_table();
+    if (!l1_phys)
       return 0;
 
-    l0_table[l0i] = (uint64_t)l1_table | PTE_VALID | PTE_TABLE;
+    l0[l0i] = (uint64_t)l1_phys | PTE_VALID | PTE_TABLE;
+    l1 = (uint64_t *)PHYS_TO_VIRT((uintptr_t)l1_phys);
   } else {
-    l1_table = pte_next_table(l0_table[l0i]);
+    uintptr_t l1_phys = (uintptr_t)pte_next_table(l0[l0i]);
+    l1 = (uint64_t *)PHYS_TO_VIRT(l1_phys);
   }
 
-  // L1 Table
-  uint64_t *l2_table;
-
-  if (!pte_valid(l1_table[l1i])) {
+  // L1 -> L2
+  uint64_t *l2;
+  if (!pte_valid(l1[l1i])) {
     if (!alloc)
       return 0;
 
-    l2_table = alloc_table();
-    if (!l2_table)
+    uint64_t *l2_phys = alloc_table();
+    if (!l2_phys)
       return 0;
 
-    l1_table[l1i] = (uint64_t)l2_table | PTE_VALID | PTE_TABLE;
+    l1[l1i] = (uint64_t)l2_phys | PTE_VALID | PTE_TABLE;
+    l2 = (uint64_t *)PHYS_TO_VIRT((uintptr_t)l2_phys);
   } else {
-    l2_table = pte_next_table(l1_table[l1i]);
+    uintptr_t l2_phys = (uintptr_t)pte_next_table(l1[l1i]);
+    l2 = (uint64_t *)PHYS_TO_VIRT(l2_phys);
   }
 
-  // L2 Table
-  return &l2_table[l2i];
+  return &l2[l2i];
 }
 
 static void print_result(const char *name, int pass) {

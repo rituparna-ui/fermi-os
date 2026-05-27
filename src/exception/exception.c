@@ -124,7 +124,7 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
       break;
     }
 
-    if (intid == 30) {
+    if (intid == TIMER_PPI_INTID) {
       timer_handle_irq();
     } else {
       uart_printf("[IRQ] INTID %d (not implemented)\n", (uint64_t)intid);

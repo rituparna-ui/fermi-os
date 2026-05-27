@@ -67,6 +67,16 @@ void pmm_init(uintptr_t mem_start, uint64_t mem_size) {
 
   uart_println("[PMM] Zeroing Bitmap");
   memset(bitmap, 0, bitmap_bytes);
+
+  // The bitmap rounds up to whole 64-bit words. If total_pages isn't a
+  // multiple of 64, the high bits of the last word represent pages that
+  // do not exist. Mark them used so the allocator's outer fast-path
+  // (skip when word == ~0ULL) doesn't dive into them, and so the inner
+  // loop never returns a page_frame_number >= total_pages.
+  if (total_pages % 64 != 0) {
+    uint64_t real_bits = total_pages % 64;
+    bitmap[bitmap_size - 1] = ~((1ULL << real_bits) - 1);
+  }
   uart_println("[PMM] Mark kernel and bitmap space reserved");
 
   // kernel image + stack + bitmap

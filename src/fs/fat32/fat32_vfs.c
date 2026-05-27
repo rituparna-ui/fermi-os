@@ -51,19 +51,22 @@ static vnode_t *fat32_lookup(vnode_t *dir, const char *name, size_t namelen) {
     return NULL;
   }
 
-  vnode_t *child = vfs_create_node(dir, tmp, is_dir ? VNODE_DIR : VNODE_REG);
-  if (!child) {
-    return NULL;
-  }
-
+  // Allocate the per-vnode FAT32 state BEFORE creating the vnode.
+  // vfs_create_node prepends the new node onto dir->children immediately,
+  // so a kmalloc failure after that point would leave a dangling vnode
+  // with NULL private_data permanently stuck in the directory cache.
   fat32_priv_t *cpd = kmalloc(sizeof(fat32_priv_t));
-
   if (!cpd) {
     return NULL;
   }
-
   cpd->first_cluster = cluster;
   cpd->size = size;
+
+  vnode_t *child = vfs_create_node(dir, tmp, is_dir ? VNODE_DIR : VNODE_REG);
+  if (!child) {
+    kfree(cpd);
+    return NULL;
+  }
   child->private_data = cpd;
   child->size = size;
 
@@ -83,21 +86,43 @@ static int fat32_file_read(vnode_t *n, file_t *f, void *buf, size_t count) {
     return -1;
   }
 
-  /* read from offset 0 only. Real fat32_read doesn't take
-   * an offset, so for now we require f->offset == 0. */
-  if (f->offset != 0) {
+  if (f->offset >= pd->size) {
+    /* EOF */
+    return 0;
+  }
+
+  uint64_t remaining = pd->size - f->offset;
+  uint32_t to_read = (uint32_t)((remaining < count) ? remaining : count);
+
+  /* fat32_read reads from cluster start, so to support arbitrary offsets
+   * we read the [0, offset+to_read) prefix into a scratch buffer and copy
+   * the requested slice out. O(n) per call rather than O(1), but correct
+   * for chunked / non-zero-offset reads. A future fat32_read_at(cluster,
+   * offset, len, buf) would be O(1). */
+  uint32_t total_needed = (uint32_t)f->offset + to_read;
+  uint8_t *tmp = (uint8_t *)kmalloc(total_needed);
+  if (!tmp) {
     return -1;
   }
 
-  uint32_t to_read = pd->size < count ? pd->size : (uint32_t)count;
-  int n_read = fat32_read(pd->first_cluster, to_read, buf, to_read);
-
-  if (n_read < 0) {
+  int got = fat32_read(pd->first_cluster, total_needed, tmp, total_needed);
+  if (got < 0) {
+    kfree(tmp);
     return -1;
   }
+  if ((uint32_t)got <= (uint32_t)f->offset) {
+    kfree(tmp);
+    return 0; /* short read landed before the requested offset */
+  }
+  if ((uint32_t)got < total_needed) {
+    to_read = (uint32_t)got - (uint32_t)f->offset;
+  }
 
-  f->offset += n_read;
-  return n_read;
+  memcpy(buf, tmp + f->offset, to_read);
+  kfree(tmp);
+
+  f->offset += to_read;
+  return (int)to_read;
 }
 
 /* Mount the FAT32 filesystem root at `path`. `path` must already exist as

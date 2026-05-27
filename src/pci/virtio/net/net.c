@@ -166,6 +166,112 @@ int net_rx_poll(void *dst, uint32_t max_len) {
 }
 
 
+/* ----- L3 helpers: ARP-reply parser, IPv4/ICMP checksum, ICMP echo. ----- */
+
+static uint8_t gateway_mac[6];
+static uint8_t have_gateway_mac;
+
+/* RFC 1071 "internet checksum": 16-bit one's complement sum of all 16-bit
+ * words, then complement. Reads bytes in network order so we don't depend
+ * on host endianness. The returned value is the network-order checksum;
+ * the caller stores it as MSB then LSB. */
+static uint16_t inet_csum(const uint8_t *data, uint32_t len) {
+  uint32_t sum = 0;
+  while (len >= 2) {
+    sum += ((uint32_t)data[0] << 8) | data[1];
+    data += 2;
+    len -= 2;
+  }
+  if (len == 1) {
+    sum += (uint32_t)data[0] << 8;
+  }
+  while (sum >> 16) {
+    sum = (sum & 0xFFFF) + (sum >> 16);
+  }
+  return (uint16_t)~sum;
+}
+
+/* If `frame` is an ARP reply, store the sender hardware address as our
+ * cached gateway MAC. Silently ignored otherwise. */
+static void parse_arp_reply(const uint8_t *frame, uint32_t len) {
+  if (len < 42)                       return; /* eth14 + arp28 */
+  if (frame[12] != 0x08 || frame[13] != 0x06) return; /* ethertype != ARP */
+  const uint8_t *a = &frame[14];
+  if (a[6] != 0x00 || a[7] != 0x02)   return; /* OPER != reply */
+
+  for (int i = 0; i < 6; i++) {
+    gateway_mac[i] = a[8 + i];
+  }
+  have_gateway_mac = 1;
+  uart_printf("[NET] Learned gateway MAC: %x:%x:%x:%x:%x:%x\n",
+              (uint64_t)gateway_mac[0], (uint64_t)gateway_mac[1],
+              (uint64_t)gateway_mac[2], (uint64_t)gateway_mac[3],
+              (uint64_t)gateway_mac[4], (uint64_t)gateway_mac[5]);
+}
+
+#define ICMP_PING_PAYLOAD 56
+static uint8_t ping_frame[14 + 20 + 8 + ICMP_PING_PAYLOAD]
+    __attribute__((aligned(16)));
+
+/* Send an ICMP echo request to 10.0.2.2 (slirp gateway). Requires the
+ * gateway MAC to be learned (via an ARP exchange). Returns bytes sent or
+ * negative on error. */
+static int net_send_ping(uint16_t seq) {
+  if (!have_gateway_mac) {
+    uart_errorln("[NET] ping: no gateway MAC (run ARP first)");
+    return -1;
+  }
+
+  memset(ping_frame, 0, sizeof(ping_frame));
+
+  /* Ethernet header */
+  for (int i = 0; i < 6; i++) ping_frame[i]     = gateway_mac[i];
+  for (int i = 0; i < 6; i++) ping_frame[6 + i] = net_dev.mac[i];
+  ping_frame[12] = 0x08;
+  ping_frame[13] = 0x00; /* ethertype = IPv4 */
+
+  /* IPv4 header (20 bytes) */
+  uint8_t *ip = &ping_frame[14];
+  ip[0] = 0x45;                     /* version=4, IHL=5 */
+  ip[1] = 0;                        /* TOS */
+  uint16_t total = 20 + 8 + ICMP_PING_PAYLOAD;
+  ip[2] = (total >> 8) & 0xFF;
+  ip[3] =  total       & 0xFF;
+  ip[4] = 0; ip[5] = 0;             /* id */
+  ip[6] = 0; ip[7] = 0;             /* flags + frag offset */
+  ip[8] = 64;                       /* TTL */
+  ip[9] = 1;                        /* proto = ICMP */
+  ip[10] = 0; ip[11] = 0;           /* csum (placeholder) */
+  /* src = 10.0.2.15, dst = 10.0.2.2 */
+  ip[12] = 10; ip[13] = 0; ip[14] = 2; ip[15] = 15;
+  ip[16] = 10; ip[17] = 0; ip[18] = 2; ip[19] = 2;
+
+  uint16_t ipcsum = inet_csum(ip, 20);
+  ip[10] = (ipcsum >> 8) & 0xFF;
+  ip[11] =  ipcsum       & 0xFF;
+
+  /* ICMP echo request, 8-byte header + payload */
+  uint8_t *icmp = &ping_frame[14 + 20];
+  icmp[0] = 8;                      /* type = echo request */
+  icmp[1] = 0;                      /* code */
+  icmp[2] = 0; icmp[3] = 0;         /* csum (placeholder) */
+  icmp[4] = 0; icmp[5] = 42;        /* identifier = 42 */
+  icmp[6] = (seq >> 8) & 0xFF;
+  icmp[7] =  seq       & 0xFF;
+  for (int i = 0; i < ICMP_PING_PAYLOAD; i++) {
+    icmp[8 + i] = (uint8_t)('a' + (i % 26));
+  }
+
+  uint16_t iccsum = inet_csum(icmp, 8 + ICMP_PING_PAYLOAD);
+  icmp[2] = (iccsum >> 8) & 0xFF;
+  icmp[3] =  iccsum       & 0xFF;
+
+  uart_printf("[NET] Sending ICMP echo request seq=%d to 10.0.2.2\n",
+              (uint64_t)seq);
+  return net_tx(ping_frame, sizeof(ping_frame));
+}
+
+
 void pci_virtio_net_init(void) {
   uart_println("[NET] Initializing Device");
 
@@ -326,7 +432,9 @@ void pci_virtio_net_init(void) {
     uart_println("[NET] ARP probe TX accepted by device");
   }
 
+  /* RX bookkeeping for both the ARP reply and the ICMP echo reply. */
   uint8_t rx_buf[256];
+
   for (uint32_t spins = 0; spins < 1000000u; spins++) {
     int n = net_rx_poll(rx_buf, sizeof(rx_buf));
     if (n > 0) {
@@ -340,7 +448,30 @@ void pci_virtio_net_init(void) {
                     (uint64_t)rx_buf[10], (uint64_t)rx_buf[11]);
       }
       uart_println("");
+      parse_arp_reply(rx_buf, (uint32_t)n);
       break;
+    }
+  }
+
+  /* Full L3 round-trip: now that we know slirp's MAC, fire an ICMP echo
+   * request and watch for the matching reply. */
+  if (have_gateway_mac && net_send_ping(1) > 0) {
+    for (uint32_t spins = 0; spins < 2000000u; spins++) {
+      int n = net_rx_poll(rx_buf, sizeof(rx_buf));
+      if (n >= 14 + 20 + 8 &&
+          rx_buf[12] == 0x08 && rx_buf[13] == 0x00 /* IPv4 */) {
+        const uint8_t *ip   = &rx_buf[14];
+        const uint8_t *icmp = &rx_buf[14 + 20];
+        if (ip[9] == 1 /* ICMP */ && icmp[0] == 0 /* echo reply */) {
+          uart_printf(
+              "[NET] PING reply from %d.%d.%d.%d ttl=%d seq=%d \\o/\n",
+              (uint64_t)ip[12], (uint64_t)ip[13],
+              (uint64_t)ip[14], (uint64_t)ip[15],
+              (uint64_t)ip[8],
+              (uint64_t)(((uint32_t)icmp[6] << 8) | icmp[7]));
+          break;
+        }
+      }
     }
   }
 

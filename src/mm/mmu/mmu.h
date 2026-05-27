@@ -69,8 +69,6 @@ static inline int pte_valid(uint64_t entry) { return entry & PTE_VALID; }
 #define USER_STACK_PAGES 4           // 16 KiB user stack
 
 uint64_t *mmu_init(void);
-uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc);
-
 // empty TTBR0 page table for user task
 uint64_t *mmu_create_user_tables(void);
 

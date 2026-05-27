@@ -325,7 +325,7 @@ static uint64_t *walk_levels(uint64_t *l0_table, uint64_t va, int target_level,
 }
 
 // Walk to the L2 entry. Used by tests that install 2 MB block descriptors.
-uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc) {
+static uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc) {
   return walk_levels(l0_table, va, 2, alloc);
 }
 
@@ -333,13 +333,13 @@ static void print_result(const char *name, int pass) {
   uart_printf("[MMU TEST] %s: %s\n", name, pass ? "PASS" : "FAIL");
 }
 
-int test_mmu_enabled() {
+static int test_mmu_enabled(void) {
   uint64_t sctlr;
   __asm__ __volatile__("mrs %0, sctlr_el1" : "=r"(sctlr));
   return (sctlr & 1);
 }
 
-int test_identity_mapping() {
+static int test_identity_mapping(void) {
   uintptr_t page = pmm_allocate_page();
   if (!page) {
     uart_errorln(
@@ -356,49 +356,10 @@ int test_identity_mapping() {
   return pass;
 }
 
-int test_remap(uint64_t *l1_table) {
-  uart_println("[MMU TEST] Running SAFE remap test");
+/* test_remap was removed: it was never invoked from mmu_run_tests and
+ * mutated TTBR0 mappings in a way that's no longer safe with per-task L0s. */
 
-  uint64_t idx1 = 6;
-  uint64_t idx2 = 7;
-
-  uint64_t *va1 = (uint64_t *)(idx1 * 0x40000000ULL);
-  uint64_t *va2 = (uint64_t *)(idx2 * 0x40000000ULL);
-
-  // Before swap: va2 → PA 0x1C0000000 (identity mapped)
-  // Write a known value to PA 0x1C0000000 via va2
-  *va2 = 0xABABAABB;
-  __asm__ __volatile__("dsb ish");
-
-  uint64_t old1 = l1_table[idx1];
-  uint64_t old2 = l1_table[idx2];
-
-  // Swap mappings: va1 → PA 0x1C0000000, va2 → PA 0x180000000
-  l1_table[idx1] = old2;
-  l1_table[idx2] = old1;
-
-  __asm__ __volatile__("tlbi vmalle1");
-  __asm__ __volatile__("dsb ish");
-  __asm__ __volatile__("isb");
-
-  // After swap, va1 should now point to PA 0x1C0000000
-  // which contains 0xABABAABB
-  uart_printf("[MMU TEST] va1=%x va2=%x\n", (uint64_t)va1, (uint64_t)va2);
-
-  int pass = (*va1 == 0xABABAABB);
-
-  // Restore original mappings
-  l1_table[idx1] = old1;
-  l1_table[idx2] = old2;
-
-  __asm__ __volatile__("tlbi vmalle1");
-  __asm__ __volatile__("dsb ish");
-  __asm__ __volatile__("isb");
-
-  return pass;
-}
-
-int test_remap_l2(uint64_t *l1_table) {
+static int test_remap_l2(uint64_t *l1_table) {
   uart_println("[MMU TEST] L2 remap test");
 
   uint64_t l1_idx = 1;  // safe RAM region
@@ -436,7 +397,7 @@ int test_remap_l2(uint64_t *l1_table) {
   return pass;
 }
 
-int test_walk(uint64_t *l0) {
+static int test_walk(uint64_t *l0) {
   uart_println("[MMU WALK TEST]");
 
   uint64_t va = 0x50000000;
@@ -462,7 +423,7 @@ int test_walk(uint64_t *l0) {
   return *check == 0x12345678;
 }
 
-int test_ttbr1_upper_half() {
+static int test_ttbr1_upper_half(void) {
   uart_println("[MMU TEST] TTBR1 upper half access test");
 
   uintptr_t pa = pmm_allocate_page();

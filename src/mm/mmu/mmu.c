@@ -174,28 +174,38 @@ uint64_t *mmu_init() {
   return l1_table;
 }
 
+// Forward decl: walk_levels is defined later but used by mmu_map_user_range.
+static uint64_t *walk_levels(uint64_t *l0_table, uint64_t va, int target_level,
+                             int alloc);
+
+
 uint64_t *mmu_create_user_tables(void) {
   return alloc_table(); // just an empty L0 — walk_page_table will fill on
                         // demand
 }
 
-void mmu_map_user_page(uint64_t *l0, uint64_t va, uint64_t pa, uint64_t flags) {
-  uint64_t *pte = walk_page_table(l0, va, 1);
-  if (!pte) {
-    uart_errorln("[MMU] Failed to map user page");
-    return;
+void mmu_map_user_range(uint64_t *l0, uint64_t va, uint64_t pa,
+                        uint64_t pages, uint64_t flags) {
+  for (uint64_t i = 0; i < pages; i++) {
+    uint64_t *pte = walk_levels(l0, va + i * PAGE_SIZE, 3, 1);
+    if (!pte) {
+      uart_errorln("[MMU] mmu_map_user_range: walk failed");
+      return;
+    }
+    // L3 page descriptors share their bit[1]=1 encoding with table
+    // descriptors. Without PTE_TABLE the entry would be invalid.
+    *pte = ((pa + i * PAGE_SIZE) & PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE |
+           PTE_AF | PTE_SH_INNER | flags;
   }
-  *pte = (pa & ~(_2MB - 1)) | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER |
-         flags;
 }
 
 void mmu_free_user_tables(uint64_t *l0_phys) {
-  // Walk L0 → L1 → L2 and free all intermediate table pages.
-  // L2 entries are 2MB block descriptors — the physical blocks they point to
-  // (user text, user stack) are freed separately by the scheduler.
+  // Walk L0 → L1 → L2 → L3 and free every intermediate table page.
+  // L3 page descriptors point to user data pages (text / stack), which are
+  // freed separately by the scheduler.
   //
-  // PTEs store physical addresses. use PHYS_TO_VIRT to dereference
-  // them since TTBR0 may not have an identity map when this runs.
+  // PTEs store physical addresses. Use PHYS_TO_VIRT to dereference them
+  // since TTBR0 may not have an identity map when this runs.
   uint64_t *l0 = (uint64_t *)PHYS_TO_VIRT((uintptr_t)l0_phys);
 
   for (int i = 0; i < 512; i++) {
@@ -208,13 +218,25 @@ void mmu_free_user_tables(uint64_t *l0_phys) {
     for (int j = 0; j < 512; j++) {
       if (!pte_valid(l1[j]))
         continue;
+      // bit[1] = 1 → table descriptor; bit[1] = 0 → 1 GB block (no L2 to free)
+      if (!(l1[j] & PTE_TABLE))
+        continue;
 
-      // Only free if this is a table entry pointing to an L2 page
-      // (bit[1] = 1 == table; bit[1] = 0 == 1GB block)
-      if (l1[j] & PTE_TABLE) {
-        uintptr_t l2_phys = (uintptr_t)pte_next_table(l1[j]);
-        pmm_free_page(l2_phys);
+      uintptr_t l2_phys = (uintptr_t)pte_next_table(l1[j]);
+      uint64_t *l2 = (uint64_t *)PHYS_TO_VIRT(l2_phys);
+
+      for (int k = 0; k < 512; k++) {
+        if (!pte_valid(l2[k]))
+          continue;
+        // bit[1] = 1 → L3 table; bit[1] = 0 → legacy 2 MB block
+        if (!(l2[k] & PTE_TABLE))
+          continue;
+
+        uintptr_t l3_phys = (uintptr_t)pte_next_table(l2[k]);
+        pmm_free_page(l3_phys);
       }
+
+      pmm_free_page(l2_phys);
     }
 
     pmm_free_page(l1_phys);
@@ -222,20 +244,23 @@ void mmu_free_user_tables(uint64_t *l0_phys) {
 
   pmm_free_page((uintptr_t)l0_phys);
 }
-
-// Walk L0 → L1 → L2
-// Return a pointer to L2 entry
-uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc) {
+// Walk the per-task L0 -> L1 -> L2 -> L3 tables, allocating intermediate
+// table pages on demand when alloc=1. Returns a pointer (via TTBR1 high
+// half) to the entry at `target_level` (2 = L2, 3 = L3).
+//
+// PTEs hold physical addresses, and table-pages themselves are referenced
+// by physical address (alloc_table returns the pmm phys). After MMU enable,
+// dereferencing a phys pointer through TTBR0 only works when TTBR0 happens
+// to identity-map RAM. To be safe regardless of which task's TTBR0 is
+// loaded, route every table read/write through the upper-half kernel
+// mapping (TTBR1) via PHYS_TO_VIRT.
+static uint64_t *walk_levels(uint64_t *l0_table, uint64_t va, int target_level,
+                             int alloc) {
   uint64_t l0i = L0_INDEX(va);
   uint64_t l1i = L1_INDEX(va);
   uint64_t l2i = L2_INDEX(va);
+  uint64_t l3i = L3_INDEX(va);
 
-  // PTEs hold physical addresses, and table-pages themselves are referenced
-  // by physical address (alloc_table returns the pmm phys). After MMU enable,
-  // dereferencing a phys pointer through TTBR0 only works when TTBR0 happens
-  // to identity-map RAM. To be safe regardless of which task's TTBR0 is
-  // loaded, route every table read/write through the upper-half kernel
-  // mapping (TTBR1) via PHYS_TO_VIRT.
   uint64_t *l0 = (uint64_t *)PHYS_TO_VIRT((uintptr_t)l0_table);
 
   // L0 -> L1
@@ -272,7 +297,33 @@ uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc) {
     l2 = (uint64_t *)PHYS_TO_VIRT(l2_phys);
   }
 
-  return &l2[l2i];
+  if (target_level == 2) {
+    return &l2[l2i];
+  }
+
+  // L2 -> L3  (target_level == 3)
+  uint64_t *l3;
+  if (!pte_valid(l2[l2i])) {
+    if (!alloc)
+      return 0;
+
+    uint64_t *l3_phys = alloc_table();
+    if (!l3_phys)
+      return 0;
+
+    l2[l2i] = (uint64_t)l3_phys | PTE_VALID | PTE_TABLE;
+    l3 = (uint64_t *)PHYS_TO_VIRT((uintptr_t)l3_phys);
+  } else {
+    uintptr_t l3_phys = (uintptr_t)pte_next_table(l2[l2i]);
+    l3 = (uint64_t *)PHYS_TO_VIRT(l3_phys);
+  }
+
+  return &l3[l3i];
+}
+
+// Walk to the L2 entry. Used by tests that install 2 MB block descriptors.
+uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc) {
+  return walk_levels(l0_table, va, 2, alloc);
 }
 
 static void print_result(const char *name, int pass) {

@@ -7,6 +7,11 @@
 #include "uart/uart.h"
 #include "vfs/vfs.h"
 
+// Marks the page-aligned upper bound of read-only kernel pages that are safe
+// to expose to EL0 (.text + .rodata). Defined by the linker script.
+extern uint8_t __user_text_end[];
+
+
 // switch.S: unmasks IRQs, calls x19, then calls task_exit
 extern void task_trampoline(void);
 
@@ -68,17 +73,30 @@ int sched_create_task(const char *name, task_entry_t entry) {
     return -1;
   }
 
-  // Map the 2MB block containing the entry function into user space
-  // Entry is a kernel VA — convert to physical, find 2MB-aligned base
+  // Map the kernel pages from the entry function up through end-of-.rodata
+  // into user space. The compiler emits PC-relative ADRP+ADD to reach string
+  // literals, so every .rodata page that the task references must lie within
+  // the contiguous window. We stop at __user_text_end so .data / .bss are
+  // never exposed to user mode.
   uint64_t entry_pa = VIRT_TO_PHYS((uint64_t)entry);
-  uint64_t entry_block = entry_pa & ~(_2MB - 1);
-  uint64_t entry_offset = entry_pa - entry_block;
+  uint64_t entry_page_base = PAGE_ALIGN_DOWN(entry_pa);
+  uint64_t entry_offset = entry_pa - entry_page_base;
 
-  // EL0 can read+execute, kernel cannot execute (PXN)
-  // AP[7:6]=01 means EL0 RW, EL1 RW, but we want EL0 RO+exec
-  // AP=11 → EL0 RO, EL1 RO. UXN=0 allows EL0 execute.
+  uint64_t user_text_end_pa = VIRT_TO_PHYS((uint64_t)__user_text_end);
+  if (user_text_end_pa <= entry_page_base) {
+    uart_errorln("[SCHED] entry is past __user_text_end");
+    pmm_free_page((uintptr_t)user_l0);
+    pmm_free_pages(kstack_phys, TASK_STACK_PAGES);
+    kfree(t);
+    return -1;
+  }
+  uint64_t text_pages = (user_text_end_pa - entry_page_base) / PAGE_SIZE;
+
+  // EL0 read+execute, kernel cannot execute (PXN).
+  // AP=11 → EL0 RO, EL1 RO. UXN bit cleared → EL0 may execute.
   uint64_t text_flags = PTE_ATTRIDX(1) | PTE_AP_RO_EL0 | PTE_PXN;
-  mmu_map_user_page(user_l0, USER_TEXT_BASE, entry_block, text_flags);
+  mmu_map_user_range(user_l0, USER_TEXT_BASE, entry_page_base,
+                     text_pages, text_flags);
 
   uint64_t user_entry = USER_TEXT_BASE + entry_offset;
 
@@ -95,9 +113,9 @@ int sched_create_task(const char *name, task_entry_t entry) {
 
   // Map user stack into user address space at USER_STACK_TOP - size
   uint64_t ustack_user_base = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
-  // Each page is within one 2MB block since stack is small and aligned
   uint64_t stack_flags = PTE_ATTRIDX(1) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN;
-  mmu_map_user_page(user_l0, ustack_user_base, ustack_phys, stack_flags);
+  mmu_map_user_range(user_l0, ustack_user_base, ustack_phys,
+                     USER_STACK_PAGES, stack_flags);
 
   // Set up initial kernel stack frame for context_switch
   // task_trampoline will eret to EL0 using x19=user_entry, x20=user_sp
@@ -255,7 +273,7 @@ void sched_reap(void) {
       pmm_free_pages(dead->ustack_phys, USER_STACK_PAGES);
     }
 
-    // Free per-task TTBR0 page table pages (L0, L1, L2)
+    // Free per-task TTBR0 page table pages (L0, L1, L2, L3)
     if (dead->ttbr0) {
       mmu_free_user_tables((uint64_t *)dead->ttbr0);
     }

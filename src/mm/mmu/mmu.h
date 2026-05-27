@@ -43,6 +43,7 @@
 #define L0_INDEX(va) (((va) >> 39) & 0x1FF)
 #define L1_INDEX(va) (((va) >> 30) & 0x1FF)
 #define L2_INDEX(va) (((va) >> 21) & 0x1FF)
+#define L3_INDEX(va) (((va) >> 12) & 0x1FF)
 
 // User cannot execute
 #define PTE_UXN (1ULL << 54)
@@ -73,10 +74,15 @@ uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc);
 // empty TTBR0 page table for user task
 uint64_t *mmu_create_user_tables(void);
 
-// Map 2MB-aligned physical region into a user page table at given VA
-void mmu_map_user_page(uint64_t *l0, uint64_t va, uint64_t pa, uint64_t flags);
+// Map a contiguous run of 4 KiB pages [pa, pa + pages*PAGE_SIZE) into the
+// user page table at virtual address va.
+// Preconditions: va and pa are 4 KiB-aligned. flags carry the AP / UXN /
+// PXN / ATTRIDX bits; PTE_VALID, PTE_AF and PTE_SH_INNER are added
+// internally.
+void mmu_map_user_range(uint64_t *l0, uint64_t va, uint64_t pa,
+                        uint64_t pages, uint64_t flags);
 
-// Free all page table pages (L0, L1, L2) for a user address space
+// Free all page table pages (L0, L1, L2, L3) for a user address space
 void mmu_free_user_tables(uint64_t *l0);
 
 void mmu_run_tests(uint64_t *l1_table);

@@ -18,6 +18,12 @@ SECTIONS
 		*(.rodata*)
 	}
 
+	/* Marks the upper bound of pages that may be exposed to EL0 user tasks
+	 * via mmu_map_user_range. Everything past here (.data, .bss) is
+	 * kernel-private and must NEVER be mapped into a user TTBR0. */
+	. = ALIGN(4096);
+	__user_text_end = .;
+
 	.data ALIGN(4096) : {
 		*(.data*)
 	}

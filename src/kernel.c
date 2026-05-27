@@ -25,7 +25,7 @@ static void zero_bss(void) {
   memset(&__bss_start, 0, (size_t)(&__bss_end - &__bss_start));
 }
 
-void enable_fp_simd() {
+static void enable_fp_simd(void) {
   // CPACR_EL1.FPEN = 0b11
   // GCC uses SIMD registers for varargs
   // got ESR_EL1 : 0x1FE00000 while building uart_printf

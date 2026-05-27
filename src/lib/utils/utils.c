@@ -1,7 +1,7 @@
 #include "utils.h"
 #include "uart/uart.h"
 
-uint8_t get_current_el_number() {
+static uint8_t get_current_el_number(void) {
   // CurrentEL is a 64 bit register
   uint64_t CurrentEL = -1;
 
@@ -13,7 +13,7 @@ uint8_t get_current_el_number() {
   return el;
 }
 
-char *get_el_name(uint8_t el) {
+static const char *get_el_name(uint8_t el) {
   switch (el) {
   case 0:
     return "User Space";
@@ -30,7 +30,7 @@ char *get_el_name(uint8_t el) {
 
 void print_current_el() {
   uint8_t el = get_current_el_number();
-  char *el_name = get_el_name(el);
+  const char *el_name = get_el_name(el);
 
   uart_printf("Current Exception Level: %s\n", el_name);
   return;

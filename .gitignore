@@ -1,3 +1,7 @@
 build/
 compile_commands.json
 .cache/
+.DS_Store
+*.swp
+*.o
+*.d

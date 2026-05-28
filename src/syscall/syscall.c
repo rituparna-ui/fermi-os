@@ -176,6 +176,12 @@ void syscall_dispatch(trap_frame_t *frame) {
   }
 
 
+  case SYS_KILL:
+    /* arg0 = pid. Returns 0 on success or -1. */
+    ret = (int64_t)sched_kill_task(arg0);
+    break;
+
+
   default:
     uart_printf("[SYSCALL] Unknown syscall %u\n", num);
     ret = -1;

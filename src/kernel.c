@@ -221,6 +221,7 @@ static void sh_help(void) {
       "  irqs            - cat /proc/interrupts\n"
       "  version         - cat /proc/version\n"
       "  cat <path>      - print a file\n"
+      "  kill <pid>      - terminate a task by pid\n"
       "  top             - 5x refresh of tasks/mem/net (1 s)\n"
       "  ping            - ICMP echo the slirp gateway (10.0.2.2)\n"
       "  sleep <ms>      - block for <ms> milliseconds\n"
@@ -323,6 +324,17 @@ static void task_shell(void) {
         sys_sleep(1000);
       }
       sh_print("(top finished)\n");
+
+    } else if (u_starts_with(line, "kill ")) {
+      int pid = u_atou(line + 5);
+      register int64_t x0 __asm__("x0") = (int64_t)pid;
+      register uint64_t x8 __asm__("x8") = 11; /* SYS_KILL */
+      __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+      if (x0 == 0) {
+        sh_print("killed.\n");
+      } else {
+        sh_print("kill: no such pid (or pid is idle)\n");
+      }
 
     } else if (u_streq(line, "clear")) {
       sh_print("\x1b[2J\x1b[H");

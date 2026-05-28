@@ -49,6 +49,12 @@ int sched_create_kernel_task(const char *name, task_entry_t entry);
 void schedule(void);
 void yield(void);
 void task_exit(void);
+
+/* Kill the task with the given pid. Marks it DEAD, unlinks it from the
+ * run queue, and pushes it onto the reaper list. If pid refers to the
+ * caller, falls through to task_exit(). Returns 0 on success, -1 if the
+ * pid is not found, already dead, or refers to the idle task (pid 0). */
+int sched_kill_task(uint64_t pid);
 void sleep_ms(uint64_t ms);
 void sched_wake_sleepers(void);
 void sched_reap(void);

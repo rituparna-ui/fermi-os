@@ -300,6 +300,59 @@ void task_exit(void) {
   schedule();
 }
 
+int sched_kill_task(uint64_t pid) {
+  /* Refuse to kill the idle task — the scheduler relies on it as a
+   * fallback when nothing else is runnable. */
+  if (pid == 0) {
+    uart_errorln("[SCHED] kill: refusing to kill idle (pid 0)");
+    return -1;
+  }
+
+  task_t *head = sched_first_task();
+  task_t *t    = head;
+  do {
+    if (t->pid != pid) {
+      t = t->next;
+      continue;
+    }
+    if (t->state == TASK_DEAD) {
+      return -1; /* already gone */
+    }
+    if (t == current) {
+      /* Killing self — use the existing self-exit path so the trap frame
+       * on our own kstack is unwound naturally. */
+      task_exit();
+      return 0;
+    }
+
+    /* Mask IRQs while we mutate the run queue + dead_list to avoid
+     * racing with timer-driven schedule(). */
+    uint64_t daif;
+    __asm__ __volatile__("mrs %0, daif" : "=r"(daif));
+    __asm__ __volatile__("msr daifset, #2");
+
+    uart_printf("[SCHED] Killing task %d '%s'\n", pid, t->name);
+
+    /* Find predecessor in the circular list. caller != t guaranteed. */
+    task_t *p = t;
+    while (p->next != t) {
+      p = p->next;
+    }
+    p->next = t->next;
+
+    /* Push onto dead_list for sched_reap to clean up next idle pass. */
+    t->next   = dead_list;
+    dead_list = t;
+    t->state  = TASK_DEAD;
+
+    __asm__ __volatile__("msr daif, %0" ::"r"(daif));
+    return 0;
+  } while (t != head);
+
+  return -1; /* pid not found */
+}
+
+
 void sleep_ms(uint64_t ms) {
   uint64_t interval_ms = TIMER_INTERVAL_MS;
   uint64_t ticks_needed = ms / interval_ms;

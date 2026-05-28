@@ -126,6 +126,15 @@ static int gen_interrupts(char *buf, size_t buflen) {
 }
 
 
+static int gen_cmdline(char *buf, size_t buflen) {
+  /* Stub kernel command line. Once we add real boot-arg parsing this will
+   * surface what was actually passed; for now report the static defaults
+   * the kernel comes up with. */
+  return ksnprintf(buf, buflen,
+                   "console=ttyAMA0 maxcpus=1 net=virtio-net-pci ip=10.0.2.15\n");
+}
+
+
 static int gen_version(char *buf, size_t buflen) {
   return ksnprintf(buf, buflen,
                    "Fermi OS aarch64 (cortex-a72)\n"
@@ -159,6 +168,11 @@ static int read_interrupts(struct vnode *n, file_t *f, void *buf,
   return proc_read_via(gen_interrupts, f, buf, count);
 }
 
+static int read_cmdline(struct vnode *n, file_t *f, void *buf, size_t count) {
+  (void)n;
+  return proc_read_via(gen_cmdline, f, buf, count);
+}
+
 static int read_version(struct vnode *n, file_t *f, void *buf, size_t count) {
   (void)n;
   return proc_read_via(gen_version, f, buf, count);
@@ -169,6 +183,8 @@ static file_operations_t meminfo_ops = {.read = read_meminfo, .write = 0};
 static file_operations_t tasks_ops   = {.read = read_tasks,   .write = 0};
 static file_operations_t netinfo_ops = {.read = read_netinfo, .write = 0};
 static file_operations_t interrupts_ops = {.read = read_interrupts, .write = 0};
+
+static file_operations_t cmdline_ops = {.read = read_cmdline, .write = 0};
 
 static file_operations_t version_ops = {.read = read_version, .write = 0};
 
@@ -201,7 +217,9 @@ void proc_init(void) {
   register_file(proc, "netinfo", &netinfo_ops);
   register_file(proc, "interrupts", &interrupts_ops);
 
+  register_file(proc, "cmdline", &cmdline_ops);
+
   register_file(proc, "version", &version_ops);
 
-  uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, interrupts, netinfo, version");
+  uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, interrupts, netinfo, cmdline, version");
 }

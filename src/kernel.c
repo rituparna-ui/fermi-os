@@ -221,6 +221,7 @@ static void sh_help(void) {
       "  irqs            - cat /proc/interrupts\n"
       "  version         - cat /proc/version\n"
       "  cat <path>      - print a file\n"
+      "  top             - 5x refresh of tasks/mem/net (1 s)\n"
       "  ping            - ICMP echo the slirp gateway (10.0.2.2)\n"
       "  sleep <ms>      - block for <ms> milliseconds\n"
       "  clear           - clear the terminal (ANSI)\n"
@@ -306,6 +307,22 @@ static void task_shell(void) {
         out[p++] = '\n';
         sys_write(1, out, (uint64_t)p);
       }
+
+    } else if (u_streq(line, "top")) {
+      /* Tiny system monitor: clear + print task / mem / net snapshots
+       * five times, sleeping 1 s between iterations. Pure user-space —
+       * uses only sh_print, sh_cat, sys_sleep. */
+      for (int i = 0; i < 5; i++) {
+        sh_print("\x1b[2J\x1b[H");
+        sh_print("=== Fermi top ===\n\n");
+        sh_cat("/proc/tasks");
+        sh_print("\n");
+        sh_cat("/proc/meminfo");
+        sh_print("\n");
+        sh_cat("/proc/netinfo");
+        sys_sleep(1000);
+      }
+      sh_print("(top finished)\n");
 
     } else if (u_streq(line, "clear")) {
       sh_print("\x1b[2J\x1b[H");

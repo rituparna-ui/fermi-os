@@ -20,9 +20,18 @@
 [block_header_t (metadata) | payload (usable memory)]
 ←── BLOCK_HEADER_SIZE ──→ ←──── block->size ──────→
 */
+/* Sentinel magics in the header to catch double-free, use-after-free, and
+ * wild-pointer frees. Validated on every kfree(); a mismatch logs a
+ * diagnostic and refuses the operation rather than corrupting the free list.
+ * is_free remains for fast scans — magic and is_free agree on every well-
+ * formed block. */
+#define BLOCK_MAGIC_ALLOC 0xA110CEDUL
+#define BLOCK_MAGIC_FREE  0xFEEDF1EEUL
+
 typedef struct block_header {
   size_t size;               // usable payload size (excludes header)
-  int is_free;               // 1 = free, 0 = allocated
+  uint32_t magic;            // BLOCK_MAGIC_ALLOC | BLOCK_MAGIC_FREE
+  uint32_t is_free;          // 1 = free, 0 = allocated (mirror of magic)
   struct block_header *next; // next block in list (address order)
 } block_header_t;
 

@@ -63,6 +63,7 @@ void heap_init(void) {
   heap_head = (block_header_t *)va;
   heap_head->size = heap_size - BLOCK_HEADER_SIZE;
   heap_head->is_free = 1;
+  heap_head->magic = BLOCK_MAGIC_FREE;
   heap_head->next = 0;
 
   register_region(va, heap_size);
@@ -99,6 +100,7 @@ static int heap_expand(size_t need_bytes) {
   block_header_t *new_block = (block_header_t *)va;
   new_block->size = bytes - BLOCK_HEADER_SIZE;
   new_block->is_free = 1;
+  new_block->magic = BLOCK_MAGIC_FREE;
   new_block->next = 0;
 
   // Append at end of list (kept in insertion order; coalescing handles
@@ -160,6 +162,7 @@ void *kmalloc(size_t size) {
               (block_header_t *)((uint8_t *)current + BLOCK_HEADER_SIZE + size);
           new_block->size = remaining - BLOCK_HEADER_SIZE;
           new_block->is_free = 1;
+          new_block->magic = BLOCK_MAGIC_FREE;
           new_block->next = current->next;
 
           current->size = size;
@@ -167,6 +170,7 @@ void *kmalloc(size_t size) {
         }
 
         current->is_free = 0;
+        current->magic = BLOCK_MAGIC_ALLOC;
         // + BLOCK_HEADER_SIZE to reach forward to the payload address
         return (void *)((uint8_t *)current + BLOCK_HEADER_SIZE);
       }
@@ -200,12 +204,23 @@ void kfree(void *ptr) {
     return;
   }
 
+  if (block->magic != BLOCK_MAGIC_ALLOC) {
+    /* Either a wild pointer, or the block has already been freed (its magic
+     * was rewritten to FREE), or memory next to the header was clobbered.
+     * Either way, do not touch the free list. */
+    uart_printf("[HEAP] kfree: bad magic %x at %x — refusing\n",
+                (uint64_t)block->magic, (uint64_t)block_addr);
+    return;
+  }
+
+
   if (block->is_free) {
     uart_errorln("[HEAP] kfree: double free detected!");
     return;
   }
 
   block->is_free = 1;
+  block->magic = BLOCK_MAGIC_FREE;
 
   /*
     coalescing

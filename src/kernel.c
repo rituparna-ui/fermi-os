@@ -110,6 +110,14 @@ static inline int64_t sys_getpid(void) {
 }
 
 
+static inline int64_t sys_uptime(void) {
+  register int64_t x0 __asm__("x0");
+  register uint64_t x8 __asm__("x8") = 9; /* SYS_UPTIME */
+  __asm__ __volatile__("svc #0" : "=r"(x0) : "r"(x8) : "memory");
+  return x0;
+}
+
+
 static inline void sys_sleep(uint64_t ms) {
   register uint64_t x0 __asm__("x0") = ms;
   register uint64_t x8 __asm__("x8") = 6; /* SYS_SLEEP */

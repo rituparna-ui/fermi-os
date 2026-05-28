@@ -14,6 +14,7 @@
 #define SYS_SLEEP 6
 #define SYS_GETPID 7
 #define SYS_LSEEK 8
+#define SYS_UPTIME 9
 
 /* SYS_LSEEK whence — mirrors POSIX so user-space and the kernel agree. */
 #define SEEK_SET 0

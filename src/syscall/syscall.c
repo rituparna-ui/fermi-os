@@ -1,6 +1,7 @@
 #include "syscall.h"
 #include "mm/mmu/mmu.h" // USER_STACK_TOP
 #include "sched/sched.h"
+#include "timer/timer.h"
 #include "uart/uart.h"
 #include "vfs/vfs.h"
 
@@ -125,6 +126,12 @@ void syscall_dispatch(trap_frame_t *frame) {
     if (fds) {
       ret = fd_seek(fds, (int)arg0, (int64_t)arg1, (int)arg2);
     }
+    break;
+
+  case SYS_UPTIME:
+    /* Milliseconds since boot. Uses the kernel's tick counter; resolution
+     * is therefore TIMER_INTERVAL_MS (10 ms by default). */
+    ret = (int64_t)timer_uptime_ms();
     break;
 
 

@@ -15,6 +15,7 @@
 #define SYS_GETPID 7
 #define SYS_LSEEK 8
 #define SYS_UPTIME 9
+#define SYS_NET_PING 10  /* arg0 = seq; returns reply TTL or -1 */
 
 /* SYS_LSEEK whence — mirrors POSIX so user-space and the kernel agree. */
 #define SEEK_SET 0

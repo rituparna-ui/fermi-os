@@ -118,6 +118,14 @@ static inline int64_t sys_uptime(void) {
 }
 
 
+static inline int64_t sys_net_ping(uint16_t seq) {
+  register uint64_t x0 __asm__("x0") = (uint64_t)seq;
+  register uint64_t x8 __asm__("x8") = 10; /* SYS_NET_PING */
+  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+  return (int64_t)x0;
+}
+
+
 static inline void sys_sleep(uint64_t ms) {
   register uint64_t x0 __asm__("x0") = ms;
   register uint64_t x8 __asm__("x8") = 6; /* SYS_SLEEP */
@@ -213,6 +221,7 @@ static void sh_help(void) {
       "  irqs            - cat /proc/interrupts\n"
       "  version         - cat /proc/version\n"
       "  cat <path>      - print a file\n"
+      "  ping            - ICMP echo the slirp gateway (10.0.2.2)\n"
       "  sleep <ms>      - block for <ms> milliseconds\n"
       "  clear           - clear the terminal (ANSI)\n"
       "  exit            - terminate the shell task\n");
@@ -281,6 +290,23 @@ static void task_shell(void) {
       sh_cat("/proc/interrupts");
     } else if (u_streq(line, "version")) {
       sh_cat("/proc/version");
+    } else if (u_streq(line, "ping")) {
+      /* One-shot ICMP echo to slirp gateway via SYS_NET_PING. */
+      static uint16_t shell_ping_seq = 100; /* avoid colliding with netd */
+      shell_ping_seq++;
+      int64_t ttl = sys_net_ping(shell_ping_seq);
+      if (ttl < 0) {
+        sh_print("ping: no reply\n");
+      } else {
+        char out[64];
+        const char prefix[] = "reply from 10.0.2.2 ttl=";
+        int p = 0;
+        for (size_t i = 0; i < sizeof(prefix) - 1; i++) out[p++] = prefix[i];
+        p += u_render_uint(out + p, (int)(sizeof(out) - p), (uint64_t)ttl);
+        out[p++] = '\n';
+        sys_write(1, out, (uint64_t)p);
+      }
+
     } else if (u_streq(line, "clear")) {
       sh_print("\x1b[2J\x1b[H");
     } else if (u_starts_with(line, "sleep ")) {

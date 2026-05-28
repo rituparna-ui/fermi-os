@@ -1,6 +1,7 @@
 #include "syscall.h"
 #include "mm/mmu/mmu.h" // USER_STACK_TOP
 #include "sched/sched.h"
+#include "net/net.h"
 #include "timer/timer.h"
 #include "uart/uart.h"
 #include "vfs/vfs.h"
@@ -141,6 +142,38 @@ void syscall_dispatch(trap_frame_t *frame) {
      * is therefore TIMER_INTERVAL_MS (10 ms by default). */
     ret = (int64_t)timer_uptime_ms();
     break;
+
+
+  case SYS_NET_PING: {
+    /* arg0 = seq number. Sends one ICMP echo request to the slirp gateway
+     * and busy-polls the RX queue for the matching reply. Returns the
+     * reply's IP TTL on success, or -1 if no reply arrived in time.
+     *
+     * Race: shares net_rx_poll with kernel-mode netd. With single-CPU
+     * scheduling and IRQ-driven preemption, both pollers may consume
+     * frames the other expected. Both sides handle 'no reply' gracefully
+     * so the worst outcome is an occasional spurious failure. */
+    uint16_t seq = (uint16_t)arg0;
+    if (net_send_ping(seq) <= 0) {
+      ret = -1;
+      break;
+    }
+    uint8_t buf[256];
+    int got_ttl = -1;
+    for (uint32_t spins = 0; spins < 2000000u && got_ttl < 0; spins++) {
+      int n = net_rx_poll(buf, sizeof(buf));
+      if (n < 14 + 20 + 8)                 continue;
+      if (buf[12] != 0x08 || buf[13] != 0x00) continue; /* not IPv4 */
+      const uint8_t *ip   = &buf[14];
+      const uint8_t *icmp = &buf[14 + 20];
+      if (ip[9] != 1 || icmp[0] != 0)      continue;     /* not ICMP echo reply */
+      uint16_t reply_seq = ((uint16_t)icmp[6] << 8) | icmp[7];
+      if (reply_seq != seq)                 continue;     /* not our reply */
+      got_ttl = ip[8];
+    }
+    ret = (int64_t)got_ttl;
+    break;
+  }
 
 
   default:

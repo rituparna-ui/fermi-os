@@ -27,4 +27,13 @@ void gic_enable_irq(uint32_t intid);
 uint64_t gic_ack_irq(void);
 void gic_end_irq(uint64_t intid);
 
+/* Per-INTID interrupt counters — surfaced by /proc/interrupts.
+ * gic_count_irq() is called from the IRQ dispatch path after the
+ * acknowledgement so spurious 1023 entries do not contribute. */
+void gic_count_irq(uint32_t intid);
+
+/* Render a /proc-style table of INTID -> count -> source string into buf.
+ * Returns bytes written. */
+int gic_render_interrupts(char *buf, uint32_t buflen);
+
 #endif

@@ -124,6 +124,9 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
       break;
     }
 
+    gic_count_irq(intid);
+
+
     if (intid == TIMER_PPI_INTID) {
       timer_handle_irq();
     } else {

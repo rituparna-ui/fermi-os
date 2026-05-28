@@ -1,6 +1,7 @@
 #include "gic.h"
 #include "mmio/mmio.h"
 #include "uart/uart.h"
+#include "strings/strings.h"
 
 static void enable_system_register_interface() {
   uart_println("[GIC] Enabling System Register Interface");
@@ -81,6 +82,48 @@ uint64_t gic_ack_irq() {
   __asm__ __volatile__("mrs %0, icc_iar1_el1" : "=r"(ack));
   return ack;
 }
+
+/* Per-INTID counters. Sized to cover the SGI/PPI/SPI range we actually
+ * use (timer PPI 30, GIC SPIs from 32 onward). 256 = 1 KiB of state and
+ * comfortably covers the QEMU virt machine. INTIDs >= 256 are silently
+ * ignored — no kernel correctness impact, just no /proc visibility. */
+#define GIC_COUNTERS_MAX 256
+static uint64_t irq_counts[GIC_COUNTERS_MAX];
+
+void gic_count_irq(uint32_t intid) {
+  if (intid < GIC_COUNTERS_MAX) {
+    irq_counts[intid]++;
+  }
+}
+
+static const char *gic_intid_source(uint32_t intid) {
+  if (intid == 30)  return "timer (PPI)";
+  if (intid < 16)   return "SGI";
+  if (intid < 32)   return "PPI";
+  return "SPI";
+}
+
+int gic_render_interrupts(char *buf, uint32_t buflen) {
+  uint32_t pos = 0;
+  static const char header[] = "INTID  COUNT     SOURCE\n";
+  for (uint32_t i = 0; i < sizeof(header) - 1 && pos < buflen; i++) {
+    buf[pos++] = header[i];
+  }
+  for (uint32_t i = 0; i < GIC_COUNTERS_MAX; i++) {
+    if (irq_counts[i] == 0)         continue;
+    if (pos >= buflen)              break;
+    char tmp[64];
+    int n = ksnprintf(tmp, sizeof(tmp), "%u    %u  %s\n",
+                      (uint64_t)i, irq_counts[i], gic_intid_source(i));
+    if (n <= 0) continue;
+    uint32_t to_copy = (uint32_t)n;
+    if (to_copy > buflen - pos) to_copy = buflen - pos;
+    memcpy(buf + pos, tmp, to_copy);
+    pos += to_copy;
+  }
+  return (int)pos;
+}
+
 
 void gic_end_irq(uint64_t intid) {
   __asm__ __volatile__("msr icc_eoir1_el1, %0" ::"r"(intid));

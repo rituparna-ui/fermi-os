@@ -160,6 +160,17 @@ static void task_a(void) {
   }
 
 
+  /* Also dump /proc/interrupts so we observe the GIC counters from EL0. */
+  const char ir_banner[] = "[Task A] cat /proc/interrupts\n";
+  sys_write(1, ir_banner, sizeof(ir_banner) - 1);
+  fd = sys_open("/proc/interrupts");
+  if (fd >= 0) {
+    n = sys_read(fd, buf, sizeof(buf));
+    if (n > 0) sys_write(1, buf, (uint64_t)n);
+    sys_close(fd);
+  }
+
+
   const char done[] = "[Task A] done\n";
   sys_write(1, done, sizeof(done) - 1);
   sys_exit();

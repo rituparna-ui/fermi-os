@@ -1,5 +1,6 @@
 #include "proc.h"
 #include "net/net.h"
+#include "gic/gic.h"
 #include "mm/heap/heap.h"
 #include "mm/pmm/pmm.h"
 #include "sched/sched.h"
@@ -118,6 +119,12 @@ static int gen_netinfo(char *buf, size_t buflen) {
   return net_get_info(buf, (uint32_t)buflen);
 }
 
+static int gen_interrupts(char *buf, size_t buflen) {
+  /* gic_render_interrupts writes directly into our buffer; the
+   * proc_read_via wrapper handles offset / EOF semantics around it. */
+  return gic_render_interrupts(buf, (uint32_t)buflen);
+}
+
 
 static int gen_version(char *buf, size_t buflen) {
   return ksnprintf(buf, buflen,
@@ -146,6 +153,12 @@ static int read_netinfo(struct vnode *n, file_t *f, void *buf, size_t count) {
   return proc_read_via(gen_netinfo, f, buf, count);
 }
 
+static int read_interrupts(struct vnode *n, file_t *f, void *buf,
+                           size_t count) {
+  (void)n;
+  return proc_read_via(gen_interrupts, f, buf, count);
+}
+
 static int read_version(struct vnode *n, file_t *f, void *buf, size_t count) {
   (void)n;
   return proc_read_via(gen_version, f, buf, count);
@@ -155,6 +168,7 @@ static file_operations_t uptime_ops  = {.read = read_uptime,  .write = 0};
 static file_operations_t meminfo_ops = {.read = read_meminfo, .write = 0};
 static file_operations_t tasks_ops   = {.read = read_tasks,   .write = 0};
 static file_operations_t netinfo_ops = {.read = read_netinfo, .write = 0};
+static file_operations_t interrupts_ops = {.read = read_interrupts, .write = 0};
 
 static file_operations_t version_ops = {.read = read_version, .write = 0};
 
@@ -185,8 +199,9 @@ void proc_init(void) {
   register_file(proc, "meminfo", &meminfo_ops);
   register_file(proc, "tasks",   &tasks_ops);
   register_file(proc, "netinfo", &netinfo_ops);
+  register_file(proc, "interrupts", &interrupts_ops);
 
   register_file(proc, "version", &version_ops);
 
-  uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, netinfo, version");
+  uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, interrupts, netinfo, version");
 }

@@ -191,14 +191,31 @@ static void sh_print(const char *s) {
   sys_write(1, s, n);
 }
 
+static int u_atou(const char *s) {
+  int v = 0;
+  while (*s >= '0' && *s <= '9') {
+    v = v * 10 + (*s - '0');
+    s++;
+  }
+  return v;
+}
+
+
 static void sh_help(void) {
   sh_print(
       "Fermi shell built-ins:\n"
-      "  help        - show this\n"
-      "  pid         - print my task pid\n"
-      "  uptime      - print ms since boot\n"
-      "  cat <path>  - print a file\n"
-      "  exit        - terminate the shell task\n");
+      "  help            - show this\n"
+      "  pid             - print my task pid\n"
+      "  uptime          - print ms since boot\n"
+      "  ps              - cat /proc/tasks\n"
+      "  free            - cat /proc/meminfo\n"
+      "  ifconfig        - cat /proc/netinfo\n"
+      "  irqs            - cat /proc/interrupts\n"
+      "  version         - cat /proc/version\n"
+      "  cat <path>      - print a file\n"
+      "  sleep <ms>      - block for <ms> milliseconds\n"
+      "  clear           - clear the terminal (ANSI)\n"
+      "  exit            - terminate the shell task\n");
 }
 
 static void sh_pid(void) {
@@ -254,6 +271,22 @@ static void task_shell(void) {
       sh_uptime();
     } else if (u_starts_with(line, "cat ")) {
       sh_cat(line + 4);
+    } else if (u_streq(line, "ps")) {
+      sh_cat("/proc/tasks");
+    } else if (u_streq(line, "free")) {
+      sh_cat("/proc/meminfo");
+    } else if (u_streq(line, "ifconfig")) {
+      sh_cat("/proc/netinfo");
+    } else if (u_streq(line, "irqs")) {
+      sh_cat("/proc/interrupts");
+    } else if (u_streq(line, "version")) {
+      sh_cat("/proc/version");
+    } else if (u_streq(line, "clear")) {
+      sh_print("\x1b[2J\x1b[H");
+    } else if (u_starts_with(line, "sleep ")) {
+      int ms = u_atou(line + 6);
+      sys_sleep((uint64_t)ms);
+
     } else if (u_streq(line, "exit")) {
       sh_print("bye!\n");
       sys_exit();

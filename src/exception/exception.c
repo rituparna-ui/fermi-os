@@ -91,16 +91,32 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
       break;
 
     case EC_DATA_ABORT_CUR:
-    case EC_DATA_ABORT_LO:
       dump_trap_frame(type, frame);
-      kernel_panic("Data abort");
+      kernel_panic("Data abort (kernel)");
       break;
 
-    case EC_INST_ABORT_CUR:
-    case EC_INST_ABORT_LO:
-      dump_trap_frame(type, frame);
-      kernel_panic("Instruction abort");
+    case EC_DATA_ABORT_LO: {
+      task_t *t = sched_current();
+      uart_printf(
+          "[EXCEPTION] Task %u '%s' data abort: ELR=%x FAR=%x ESR=%x — killing task\n",
+          t->pid, t->name, frame->elr, frame->far, frame->esr);
+      task_exit();
       break;
+    }
+
+    case EC_INST_ABORT_CUR:
+      dump_trap_frame(type, frame);
+      kernel_panic("Instruction abort (kernel)");
+      break;
+
+    case EC_INST_ABORT_LO: {
+      task_t *t = sched_current();
+      uart_printf(
+          "[EXCEPTION] Task %u '%s' instruction abort: ELR=%x FAR=%x ESR=%x — killing task\n",
+          t->pid, t->name, frame->elr, frame->far, frame->esr);
+      task_exit();
+      break;
+    }
 
     case EC_BRK:
       uart_println("[EXCEPTION] Breakpoint hit");

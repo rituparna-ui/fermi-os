@@ -116,6 +116,24 @@ static inline void sys_sleep(uint64_t ms) {
   __asm__ __volatile__("svc #0" ::"r"(x0), "r"(x8) : "memory");
 }
 
+/* Task that deliberately faults to exercise the kill-on-fault path: writes
+ * to an unmapped user VA, which should trigger a Data Abort from EL0. The
+ * kernel is expected to log the fault, kill *only* this task, and keep the
+ * other tasks running. */
+static void task_crash(void) {
+  const char banner[] =
+      "[Task C] about to deref a bad pointer at 0x12345678 (expect kill)\n";
+  sys_write(1, banner, sizeof(banner) - 1);
+
+  volatile uint64_t *bad = (volatile uint64_t *)0x12345678ULL;
+  *bad = 0xDEADBEEFCAFEBABEULL;
+
+  const char unreached[] = "[Task C] !!! continued past fault !!!\n";
+  sys_write(1, unreached, sizeof(unreached) - 1);
+  sys_exit();
+}
+
+
 /* Task A: open a file from FAT32 and print it through fd=1. */
 static void task_a(void) {
   const char banner[] = "[Task A] reading /mnt/fat32/HELLO.TXT\n";
@@ -269,6 +287,7 @@ void kernel_main() {
   sched_init();
   sched_create_task("task_a", task_a);
   sched_create_task("task_b", task_b);
+  sched_create_task("task_crash", task_crash);
 
   timer_init();
   timer_start(TIMER_INTERVAL_MS);

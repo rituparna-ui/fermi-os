@@ -124,6 +124,146 @@ static inline void sys_sleep(uint64_t ms) {
   __asm__ __volatile__("svc #0" ::"r"(x0), "r"(x8) : "memory");
 }
 
+/* ----------------------------------------------------------------
+ * Tiny EL0 user-space helpers used by task_shell. Defined inline
+ * because user-space cannot call into the kernel string library.
+ * ---------------------------------------------------------------- */
+
+static int u_render_uint(char *buf, int max, uint64_t v) {
+  if (max < 1) return 0;
+  if (v == 0) { buf[0] = '0'; return 1; }
+  char tmp[24];
+  int n = 0;
+  while (v > 0 && n < (int)sizeof(tmp)) {
+    tmp[n++] = (char)('0' + (v % 10));
+    v /= 10;
+  }
+  int out = 0;
+  while (n > 0 && out < max) {
+    buf[out++] = tmp[--n];
+  }
+  return out;
+}
+
+static int u_streq(const char *a, const char *b) {
+  while (*a && *b && *a == *b) { a++; b++; }
+  return *a == '\0' && *b == '\0';
+}
+
+static int u_starts_with(const char *s, const char *prefix) {
+  while (*prefix) {
+    if (*s != *prefix) return 0;
+    s++; prefix++;
+  }
+  return 1;
+}
+
+/* Read a line from fd 0 (stdin = /dev/console) with simple line-editing.
+ * Echoes typed characters back so the user sees them. Returns line length
+ * (excluding the trailing NUL). */
+static int u_read_line(char *buf, int max) {
+  int n = 0;
+  while (n < max - 1) {
+    char c;
+    int64_t r = sys_read(0, &c, 1);
+    if (r <= 0) continue;
+    if (c == '\r' || c == '\n') {
+      sys_write(1, "\n", 1);
+      break;
+    }
+    if (c == 0x7F || c == 0x08) { /* DEL or BS */
+      if (n > 0) {
+        n--;
+        sys_write(1, "\b \b", 3);
+      }
+      continue;
+    }
+    buf[n++] = c;
+    sys_write(1, &c, 1); /* echo */
+  }
+  buf[n] = '\0';
+  return n;
+}
+
+static void sh_print(const char *s) {
+  uint64_t n = 0;
+  while (s[n]) n++;
+  sys_write(1, s, n);
+}
+
+static void sh_help(void) {
+  sh_print(
+      "Fermi shell built-ins:\n"
+      "  help        - show this\n"
+      "  pid         - print my task pid\n"
+      "  uptime      - print ms since boot\n"
+      "  cat <path>  - print a file\n"
+      "  exit        - terminate the shell task\n");
+}
+
+static void sh_pid(void) {
+  char buf[32];
+  const char prefix[] = "pid = ";
+  uint32_t p = 0;
+  for (size_t i = 0; i < sizeof(prefix) - 1; i++) buf[p++] = prefix[i];
+  p += (uint32_t)u_render_uint(buf + p, (int)(sizeof(buf) - p),
+                               (uint64_t)sys_getpid());
+  buf[p++] = '\n';
+  sys_write(1, buf, p);
+}
+
+static void sh_uptime(void) {
+  char buf[32];
+  const char prefix[] = "uptime = ";
+  uint32_t p = 0;
+  for (size_t i = 0; i < sizeof(prefix) - 1; i++) buf[p++] = prefix[i];
+  p += (uint32_t)u_render_uint(buf + p, (int)(sizeof(buf) - p),
+                               (uint64_t)sys_uptime());
+  const char suffix[] = " ms\n";
+  for (size_t i = 0; i < sizeof(suffix) - 1; i++) buf[p++] = suffix[i];
+  sys_write(1, buf, p);
+}
+
+static void sh_cat(const char *path) {
+  int fd = sys_open(path);
+  if (fd < 0) {
+    sh_print("cat: cannot open\n");
+    return;
+  }
+  char buf[256];
+  int64_t n;
+  while ((n = sys_read(fd, buf, sizeof(buf))) > 0) {
+    sys_write(1, buf, (uint64_t)n);
+  }
+  sys_close(fd);
+}
+
+static void task_shell(void) {
+  sh_print("\nWelcome to the Fermi shell. Type 'help' to start.\n");
+  while (1) {
+    sh_print("$ ");
+    char line[128];
+    int n = u_read_line(line, sizeof(line));
+    if (n == 0) continue;
+
+    if (u_streq(line, "help")) {
+      sh_help();
+    } else if (u_streq(line, "pid")) {
+      sh_pid();
+    } else if (u_streq(line, "uptime")) {
+      sh_uptime();
+    } else if (u_starts_with(line, "cat ")) {
+      sh_cat(line + 4);
+    } else if (u_streq(line, "exit")) {
+      sh_print("bye!\n");
+      sys_exit();
+    } else {
+      sh_print("unknown command — try 'help'\n");
+    }
+  }
+}
+
+
 /* Task that deliberately faults to exercise the kill-on-fault path: writes
  * to an unmapped user VA, which should trigger a Data Abort from EL0. The
  * kernel is expected to log the fault, kill *only* this task, and keep the
@@ -295,6 +435,7 @@ void kernel_main() {
   sched_init();
   sched_create_task("task_a", task_a);
   sched_create_task("task_b", task_b);
+  sched_create_task("task_shell", task_shell);
   sched_create_task("task_crash", task_crash);
 
   timer_init();

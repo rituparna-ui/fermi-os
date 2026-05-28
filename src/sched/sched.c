@@ -15,6 +15,7 @@ extern uint8_t __user_text_end[];
 
 // switch.S: unmasks IRQs, calls x19, then calls task_exit
 extern void task_trampoline(void);
+extern void kernel_task_trampoline(void);
 
 // Idle task is statically allocated, always exists
 static task_t idle_task;
@@ -50,6 +51,62 @@ void sched_init(void) {
 
   uart_println("[SCHED] Initialized! Idle task registered");
 }
+
+/* Create an EL1 kernel-mode task. Mirrors sched_create_task minus the
+ * user_l0 / user-stack / fd-table setup; trampoline is
+ * kernel_task_trampoline (no eret to EL0). */
+int sched_create_kernel_task(const char *name, task_entry_t entry) {
+  task_t *t = (task_t *)kmalloc(sizeof(task_t));
+  if (!t) {
+    uart_errorln("[SCHED] Failed to allocate kernel task struct");
+    return -1;
+  }
+  memset(t, 0, sizeof(task_t));
+
+  uintptr_t kstack_phys = pmm_allocate_pages(TASK_STACK_PAGES);
+  if (!kstack_phys) {
+    uart_errorln("[SCHED] Failed to allocate kernel-task stack");
+    kfree(t);
+    return -1;
+  }
+  uintptr_t kstack_va = PHYS_TO_VIRT(kstack_phys);
+  uint64_t kstack_size = TASK_STACK_PAGES * PAGE_SIZE;
+  uintptr_t kstack_top = kstack_va + kstack_size;
+  memset((void *)kstack_va, 0, kstack_size);
+
+  /* Same 160-byte frame layout as user tasks. d8–d15 stay zero. */
+  uint64_t *frame = (uint64_t *)(kstack_top - 160);
+  frame[0]  = (uint64_t)entry;                  /* x19 — entry function    */
+  frame[1]  = 0;                                /* x20 — unused for kernel */
+  frame[11] = (uint64_t)kernel_task_trampoline; /* x30 — trampoline        */
+
+  t->sp = (uint64_t)frame;
+  t->pid = next_pid++;
+  t->state = TASK_READY;
+  t->stack_phys = kstack_phys;
+  /* No user mappings — context_switch skips TTBR0 swap when ttbr0 == 0. */
+  t->ttbr0 = 0;
+  t->user_sp = 0;
+  t->kstack_top = kstack_top;
+  t->ustack_phys = 0;
+  copy_name(t->name, name);
+  /* Kernel tasks talk to the VFS / drivers directly; no fd table. */
+  t->fds = (struct fd_table *)0;
+
+  /* Insert into the circular run queue */
+  task_t *tail = current;
+  while (tail->next != current) {
+    tail = tail->next;
+  }
+  tail->next = t;
+  t->next = current;
+
+  uart_printf(
+      "[SCHED] Created EL1 kernel task %d '%s' | kstack: %x | entry: %x\n",
+      t->pid, name, kstack_top, (uint64_t)entry);
+  return (int)t->pid;
+}
+
 
 int sched_create_task(const char *name, task_entry_t entry) {
   task_t *t = (task_t *)kmalloc(sizeof(task_t));

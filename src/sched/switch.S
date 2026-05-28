@@ -49,6 +49,18 @@ task_trampoline:
 
 	eret
 
+// Kernel-task trampoline: first code a kernel-mode (EL1) task runs.
+// x19 = entry function pointer. We just call it directly — no eret, no
+// privilege change. If the entry returns, fall through to task_exit so
+// the task is cleanly torn down by the scheduler.
+.global kernel_task_trampoline
+kernel_task_trampoline:
+	msr daifclr, #2		// unmask IRQs
+	blr x19
+	bl  task_exit
+1:	b 1b			// unreachable
+
+
 .global context_switch
 context_switch:
 	// Save callee-saved registers onto prev's stack

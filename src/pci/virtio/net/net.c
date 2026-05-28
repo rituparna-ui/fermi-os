@@ -226,7 +226,7 @@ static uint8_t ping_frame[14 + 20 + 8 + ICMP_PING_PAYLOAD]
 /* Send an ICMP echo request to 10.0.2.2 (slirp gateway). Requires the
  * gateway MAC to be learned (via an ARP exchange). Returns bytes sent or
  * negative on error. */
-static int net_send_ping(uint16_t seq) {
+int net_send_ping(uint16_t seq) {
   if (!have_gateway_mac) {
     uart_errorln("[NET] ping: no gateway MAC (run ARP first)");
     return -1;

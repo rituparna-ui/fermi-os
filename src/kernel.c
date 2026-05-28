@@ -389,6 +389,57 @@ static void task_b(void) {
 // runs in VAS Upper Half after boot.S relocates program counter and stack
 // pointer
 
+/* netd: kernel-mode (EL1) daemon. Periodically pings the slirp gateway,
+ * drains incoming RX, and prints the ICMP echo reply latency in ticks.
+ * Lives at EL1 so it can call net_send_ping / net_rx_poll directly
+ * without the syscall round-trip a user task would need. */
+static void netd(void) {
+  uart_println("[netd] starting (kernel-mode background pinger)");
+  uint16_t seq = 2; /* seq 1 was sent during pci_virtio_net_init */
+  while (1) {
+    sleep_ms(5000);
+
+    /* Drain anything that came in while we slept (slirp DHCP retries etc.) */
+    uint8_t buf[256];
+    int drained = 0;
+    while (net_rx_poll(buf, sizeof(buf)) > 0) drained++;
+    if (drained > 0) {
+      uart_printf("[netd] drained %d async frames before ping\n",
+                  (uint64_t)drained);
+    }
+
+    uint64_t t0 = timer_get_ticks();
+    if (net_send_ping(seq) <= 0) {
+      continue;
+    }
+
+    /* Wait for matching ICMP echo reply. */
+    int got = 0;
+    for (uint32_t spins = 0; spins < 2000000u && !got; spins++) {
+      int n = net_rx_poll(buf, sizeof(buf));
+      if (n < 14 + 20 + 8)                 continue;
+      if (buf[12] != 0x08 || buf[13] != 0x00) continue;       /* not IPv4 */
+      const uint8_t *ip   = &buf[14];
+      const uint8_t *icmp = &buf[14 + 20];
+      if (ip[9] != 1)    continue;                            /* not ICMP */
+      if (icmp[0] != 0)  continue;                            /* not echo reply */
+      uint16_t reply_seq = ((uint16_t)icmp[6] << 8) | icmp[7];
+      if (reply_seq != seq) continue;
+
+      uint64_t t1 = timer_get_ticks();
+      uart_printf("[netd] ping seq=%d reply ttl=%d in %d ticks\n",
+                  (uint64_t)seq, (uint64_t)ip[8],
+                  (uint64_t)(t1 - t0));
+      got = 1;
+    }
+    if (!got) {
+      uart_printf("[netd] ping seq=%d — no reply\n", (uint64_t)seq);
+    }
+    seq++;
+  }
+}
+
+
 void kernel_main() {
   // all device access through TTBR1
   mmio_switch_to_upper();
@@ -437,6 +488,7 @@ void kernel_main() {
   sched_create_task("task_b", task_b);
   sched_create_task("task_shell", task_shell);
   sched_create_task("task_crash", task_crash);
+  sched_create_kernel_task("netd", netd);
 
   timer_init();
   timer_start(TIMER_INTERVAL_MS);

@@ -39,6 +39,13 @@ extern void context_switch(task_t *prev, task_t *next);
 
 void sched_init(void);
 int sched_create_task(const char *name, task_entry_t entry);
+
+/* Create an EL1 kernel-mode task. Unlike sched_create_task, no user_l0
+ * is allocated and TTBR0 is left at 0 (so context_switch skips the
+ * per-task user mapping swap). The entry function runs at EL1 with the
+ * kernel's full privileges and is expected to call task_exit() or fall
+ * off the end (kernel_task_trampoline calls task_exit if it returns). */
+int sched_create_kernel_task(const char *name, task_entry_t entry);
 void schedule(void);
 void yield(void);
 void task_exit(void);

@@ -83,4 +83,10 @@ int net_rx_poll(void *dst, uint32_t max_len);
  * config, learned gateway MAC, and packet counters. */
 int net_get_info(char *buf, uint32_t buflen);
 
+/* Send an ICMP echo request to the slirp gateway (10.0.2.2). Requires the
+ * gateway MAC to be learned (via an earlier ARP exchange). Caller picks
+ * the seq number; identifier is fixed at 42. Returns bytes sent or a
+ * negative value on error. */
+int net_send_ping(uint16_t seq);
+
 #endif

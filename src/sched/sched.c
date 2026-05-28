@@ -9,6 +9,7 @@
 
 // Marks the page-aligned upper bound of read-only kernel pages that are safe
 // to expose to EL0 (.text + .rodata). Defined by the linker script.
+extern uint8_t __text_start[];
 extern uint8_t __user_text_end[];
 
 
@@ -79,32 +80,35 @@ int sched_create_task(const char *name, task_entry_t entry) {
     return -1;
   }
 
-  // Map the kernel pages from the entry function up through end-of-.rodata
-  // into user space. The compiler emits PC-relative ADRP+ADD to reach string
-  // literals, so every .rodata page that the task references must lie within
-  // the contiguous window. We stop at __user_text_end so .data / .bss are
-  // never exposed to user mode.
-  uint64_t entry_pa = VIRT_TO_PHYS((uint64_t)entry);
-  uint64_t entry_page_base = PAGE_ALIGN_DOWN(entry_pa);
-  uint64_t entry_offset = entry_pa - entry_page_base;
-
+  // Map the entire .text + .rodata range [__text_start, __user_text_end)
+  // as a single contiguous window starting at USER_TEXT_BASE. Every EL0
+  // task gets the same mapping shape, regardless of where in .text its
+  // entry function happens to land. This is required because GCC's
+  // PC-relative ADRP+ADD can reach pages BEFORE the entry function (e.g.
+  // helpers like memset that the linker placed earlier in .text); a
+  // narrower window starting at the entry's page would fault on those.
+  // .data and .bss remain kernel-private (linker-enforced).
+  uint64_t entry_pa         = VIRT_TO_PHYS((uint64_t)entry);
+  uint64_t text_start_pa    = VIRT_TO_PHYS((uint64_t)__text_start);
   uint64_t user_text_end_pa = VIRT_TO_PHYS((uint64_t)__user_text_end);
-  if (user_text_end_pa <= entry_page_base) {
-    uart_errorln("[SCHED] entry is past __user_text_end");
+
+  if (entry_pa < text_start_pa || entry_pa >= user_text_end_pa) {
+    uart_errorln("[SCHED] entry outside [__text_start, __user_text_end)");
     pmm_free_page((uintptr_t)user_l0);
     pmm_free_pages(kstack_phys, TASK_STACK_PAGES);
     kfree(t);
     return -1;
   }
-  uint64_t text_pages = (user_text_end_pa - entry_page_base) / PAGE_SIZE;
+  uint64_t text_pages = (user_text_end_pa - text_start_pa) / PAGE_SIZE;
+  uint64_t entry_offset_in_text = entry_pa - text_start_pa;
 
   // EL0 read+execute, kernel cannot execute (PXN).
   // AP=11 → EL0 RO, EL1 RO. UXN bit cleared → EL0 may execute.
   uint64_t text_flags = PTE_ATTRIDX(1) | PTE_AP_RO_EL0 | PTE_PXN;
-  mmu_map_user_range(user_l0, USER_TEXT_BASE, entry_page_base,
+  mmu_map_user_range(user_l0, USER_TEXT_BASE, text_start_pa,
                      text_pages, text_flags);
 
-  uint64_t user_entry = USER_TEXT_BASE + entry_offset;
+  uint64_t user_entry = USER_TEXT_BASE + entry_offset_in_text;
 
   // User stack
   uintptr_t ustack_phys = pmm_allocate_pages(USER_STACK_PAGES);

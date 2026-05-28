@@ -23,6 +23,7 @@ SECTIONS
 	. = KERNEL_VA;
 
 	.text ALIGN(4096) : AT(KERNEL_PA) {
+		__text_start = .;
 		*(.text.boot)
 		. = ALIGN(2048);
 		*(.text.vectors)

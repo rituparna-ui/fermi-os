@@ -115,6 +115,19 @@ void syscall_dispatch(trap_frame_t *frame) {
     ret = 0;
     break;
 
+  case SYS_GETPID:
+    /* Returns the calling task's pid. No arguments, no failure mode. */
+    ret = (int64_t)sched_current()->pid;
+    break;
+
+  case SYS_LSEEK:
+    /* arg0 = fd, arg1 = signed offset, arg2 = whence (SEEK_SET/CUR/END) */
+    if (fds) {
+      ret = fd_seek(fds, (int)arg0, (int64_t)arg1, (int)arg2);
+    }
+    break;
+
+
   default:
     uart_printf("[SYSCALL] Unknown syscall %u\n", num);
     ret = -1;

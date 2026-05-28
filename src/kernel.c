@@ -102,6 +102,14 @@ static inline void sys_exit(void) {
   __asm__ __volatile__("svc #0" ::"r"(x8) : "memory");
 }
 
+static inline int64_t sys_getpid(void) {
+  register int64_t x0 __asm__("x0");
+  register uint64_t x8 __asm__("x8") = 7; /* SYS_GETPID */
+  __asm__ __volatile__("svc #0" : "=r"(x0) : "r"(x8) : "memory");
+  return x0;
+}
+
+
 static inline void sys_sleep(uint64_t ms) {
   register uint64_t x0 __asm__("x0") = ms;
   register uint64_t x8 __asm__("x8") = 6; /* SYS_SLEEP */
@@ -112,6 +120,20 @@ static inline void sys_sleep(uint64_t ms) {
 static void task_a(void) {
   const char banner[] = "[Task A] reading /mnt/fat32/HELLO.TXT\n";
   sys_write(1, banner, sizeof(banner) - 1);
+
+  /* Quick demo of SYS_GETPID. We render "[Task A] pid=N\n" by hand and
+   * push it through fd 1 (stdout = /dev/console). */
+  {
+    int64_t pid = sys_getpid();
+    char pidline[32];
+    const char prefix[] = "[Task A] pid=";
+    int p = 0;
+    for (size_t i = 0; i < sizeof(prefix) - 1; i++) pidline[p++] = prefix[i];
+    pidline[p++] = (char)('0' + (pid % 10));
+    pidline[p++] = '\n';
+    sys_write(1, pidline, (uint64_t)p);
+  }
+
 
   int fd = sys_open("/mnt/fat32/HELLO.TXT");
   if (fd < 0) {
@@ -145,6 +167,19 @@ static void task_a(void) {
 
 /* Task B: read 4 random bytes from /dev/rng every 500ms and print them. */
 static void task_b(void) {
+  /* SYS_GETPID demo from task_b too — we should see two distinct pids. */
+  {
+    int64_t pid = sys_getpid();
+    char pidline[32];
+    const char prefix[] = "[Task B] pid=";
+    int p = 0;
+    for (size_t i = 0; i < sizeof(prefix) - 1; i++) pidline[p++] = prefix[i];
+    pidline[p++] = (char)('0' + (pid % 10));
+    pidline[p++] = '\n';
+    sys_write(1, pidline, (uint64_t)p);
+  }
+
+
   int fd = sys_open("/dev/rng");
   if (fd < 0) {
     const char err[] = "[Task B] open /dev/rng failed\n";

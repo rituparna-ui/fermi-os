@@ -89,4 +89,19 @@ int net_get_info(char *buf, uint32_t buflen);
  * negative value on error. */
 int net_send_ping(uint16_t seq);
 
+/* IPv4 + DHCP state. Defined in net.c; populated by dhcp_acquire() at
+ * boot. Initialised to slirp defaults so callers (ARP/ICMP/get_info)
+ * always see something sane. */
+extern uint8_t  g_my_ip[4];
+extern uint8_t  g_subnet_mask[4];
+extern uint8_t  g_gateway_ip[4];
+extern uint8_t  g_dhcp_server[4];
+extern uint32_t g_lease_secs;
+extern uint8_t  g_dhcp_acquired;
+
+/* Run a synchronous DHCP DISCOVER → OFFER → REQUEST → ACK exchange against
+ * the slirp DHCP server. On success commits the lease into the globals
+ * above and returns 0; otherwise leaves them untouched and returns -1. */
+int dhcp_acquire(void);
+
 #endif

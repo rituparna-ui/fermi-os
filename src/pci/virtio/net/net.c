@@ -24,6 +24,16 @@ static struct virtio_net net_dev;
 static uint64_t rx_packets;
 static uint64_t tx_packets;
 
+/* IPv4 + DHCP state. Initialised to slirp defaults so the early ARP/ICMP
+ * smoke tests work even before DHCP runs; dhcp_acquire() then overwrites
+ * them with the real lease. */
+uint8_t  g_my_ip[4]       = {10, 0, 2, 15};
+uint8_t  g_subnet_mask[4] = {255, 255, 255, 0};
+uint8_t  g_gateway_ip[4]  = {10, 0, 2, 2};
+uint8_t  g_dhcp_server[4] = {0, 0, 0, 0};
+uint32_t g_lease_secs     = 0;
+uint8_t  g_dhcp_acquired  = 0;
+
 /* TX header (modern, 12 bytes). All zero for plain Ethernet — no GSO,
  * no checksum offload. We keep one global instance because net_tx is
  * synchronous (poll-completed) so re-use is safe. */
@@ -85,11 +95,11 @@ int net_send_arp_probe(void) {
   for (int i = 0; i < 6; i++) {
     a[8 + i] = net_dev.mac[i];     /* SHA (sender HW) */
   }
-  /* SPA (sender IP) = 10.0.2.15 */
-  a[14] = 10; a[15] = 0; a[16] = 2; a[17] = 15;
+  /* SPA (sender IP) — current lease (slirp default until DHCP runs) */
+  for (int i = 0; i < 4; i++) a[14 + i] = g_my_ip[i];
   /* THA (target HW) = 0; already zeroed */
-  /* TPA (target IP) = 10.0.2.2 (slirp gateway) */
-  a[24] = 10; a[25] = 0; a[26] = 2; a[27] = 2;
+  /* TPA (target IP) — gateway */
+  for (int i = 0; i < 4; i++) a[24 + i] = g_gateway_ip[i];
 
   uart_println("[NET] Sending ARP probe for 10.0.2.2 (slirp gateway)");
   return net_tx(arp_frame, sizeof(arp_frame));
@@ -252,9 +262,9 @@ int net_send_ping(uint16_t seq) {
   ip[8] = 64;                       /* TTL */
   ip[9] = 1;                        /* proto = ICMP */
   ip[10] = 0; ip[11] = 0;           /* csum (placeholder) */
-  /* src = 10.0.2.15, dst = 10.0.2.2 */
-  ip[12] = 10; ip[13] = 0; ip[14] = 2; ip[15] = 15;
-  ip[16] = 10; ip[17] = 0; ip[18] = 2; ip[19] = 2;
+  /* src = our leased IP, dst = gateway */
+  for (int i = 0; i < 4; i++) ip[12 + i] = g_my_ip[i];
+  for (int i = 0; i < 4; i++) ip[16 + i] = g_gateway_ip[i];
 
   uint16_t ipcsum = inet_csum(ip, 20);
   ip[10] = (ipcsum >> 8) & 0xFF;
@@ -306,10 +316,23 @@ int net_get_info(char *buf, uint32_t buflen) {
                                                                  : "DOWN");
   if (n > 0) pos += (uint32_t)n;
 
-  /* IPv4 stub config (hard-coded slirp defaults for now) */
+  /* IPv4 config (DHCP-acquired or default slirp values) */
   n = ksnprintf(buf + pos, buflen - pos,
-                "ip:         10.0.2.15\n"
-                "gateway:    10.0.2.2\n");
+                "ip:         %d.%d.%d.%d\n"
+                "netmask:    %d.%d.%d.%d\n"
+                "gateway:    %d.%d.%d.%d\n"
+                "dhcp:       %s\n"
+                "dhcp_srv:   %d.%d.%d.%d\n"
+                "lease:      %u s\n",
+                g_my_ip[0], g_my_ip[1], g_my_ip[2], g_my_ip[3],
+                g_subnet_mask[0], g_subnet_mask[1],
+                g_subnet_mask[2], g_subnet_mask[3],
+                g_gateway_ip[0], g_gateway_ip[1],
+                g_gateway_ip[2], g_gateway_ip[3],
+                g_dhcp_acquired ? "yes" : "no",
+                g_dhcp_server[0], g_dhcp_server[1],
+                g_dhcp_server[2], g_dhcp_server[3],
+                g_lease_secs);
   if (n > 0) pos += (uint32_t)n;
 
   /* Gateway MAC (learned via ARP) */
@@ -339,6 +362,343 @@ int net_get_info(char *buf, uint32_t buflen) {
   if (n > 0) pos += (uint32_t)n;
 
   return (int)pos;
+}
+
+
+/* ============================ DHCP CLIENT (RFC 2131) ===========================
+ *
+ * Minimal four-step exchange against slirp's built-in DHCP server:
+ *
+ *   guest -> 255.255.255.255:67  DHCPDISCOVER (option 53 = 1)
+ *   guest <- 10.0.2.2:68         DHCPOFFER    (yiaddr filled in)
+ *   guest -> 255.255.255.255:67  DHCPREQUEST  (option 50 = offered IP,
+ *                                              option 54 = server id)
+ *   guest <- 10.0.2.2:68         DHCPACK      (commits the lease)
+ *
+ * UDP checksum is left at 0 (legal for IPv4). All buffers live in BSS.
+ * Synchronous: each TX polls until acked, then we busy-poll RX for the
+ * matching reply, capped so a wedged server can't hang boot.
+ */
+
+#define DHCP_DISCOVER 1
+#define DHCP_OFFER    2
+#define DHCP_REQUEST  3
+#define DHCP_ACK      5
+#define DHCP_NAK      6
+
+#define DHCP_MAGIC_0 0x63
+#define DHCP_MAGIC_1 0x82
+#define DHCP_MAGIC_2 0x53
+#define DHCP_MAGIC_3 0x63
+
+#define DHCP_OPT_SUBNET    1
+#define DHCP_OPT_ROUTER    3
+#define DHCP_OPT_REQ_IP    50
+#define DHCP_OPT_LEASE     51
+#define DHCP_OPT_MSGTYPE   53
+#define DHCP_OPT_SERVER_ID 54
+#define DHCP_OPT_PARAM_REQ 55
+#define DHCP_OPT_END       255
+
+/* DHCP frame buffer: Eth(14) + IP(20) + UDP(8) + BOOTP(236) + magic(4) +
+ * options(<=64). Aligned for the virtqueue. */
+static uint8_t dhcp_frame[14 + 20 + 8 + 240 + 64] __attribute__((aligned(16)));
+static uint8_t bootp_buf[240 + 64]                __attribute__((aligned(16)));
+
+/* Build an Ethernet/IPv4/UDP frame around `payload`. Writes into `frame`,
+ * returns the total frame length on the wire. */
+static uint32_t udp_build(uint8_t *frame,
+                          const uint8_t dst_mac[6],
+                          const uint8_t src_ip[4],
+                          const uint8_t dst_ip[4],
+                          uint16_t src_port, uint16_t dst_port,
+                          const uint8_t *payload, uint32_t payload_len) {
+  uint32_t udp_len = 8 + payload_len;
+  uint32_t ip_len  = 20 + udp_len;
+  uint32_t total   = 14 + ip_len;
+
+  /* Ethernet */
+  for (int i = 0; i < 6; i++) frame[i]     = dst_mac[i];
+  for (int i = 0; i < 6; i++) frame[6 + i] = net_dev.mac[i];
+  frame[12] = 0x08; frame[13] = 0x00;
+
+  /* IPv4 */
+  uint8_t *ip = &frame[14];
+  ip[0] = 0x45;
+  ip[1] = 0;
+  ip[2] = (ip_len >> 8) & 0xFF;
+  ip[3] =  ip_len       & 0xFF;
+  ip[4] = 0; ip[5] = 0;
+  ip[6] = 0; ip[7] = 0;
+  ip[8] = 64;
+  ip[9] = 17; /* UDP */
+  ip[10] = 0; ip[11] = 0;
+  for (int i = 0; i < 4; i++) ip[12 + i] = src_ip[i];
+  for (int i = 0; i < 4; i++) ip[16 + i] = dst_ip[i];
+  uint16_t ipcsum = inet_csum(ip, 20);
+  ip[10] = (ipcsum >> 8) & 0xFF;
+  ip[11] =  ipcsum       & 0xFF;
+
+  /* UDP — checksum 0 (legal for IPv4). */
+  uint8_t *udp = &frame[14 + 20];
+  udp[0] = (src_port >> 8) & 0xFF;
+  udp[1] =  src_port       & 0xFF;
+  udp[2] = (dst_port >> 8) & 0xFF;
+  udp[3] =  dst_port       & 0xFF;
+  udp[4] = (udp_len >> 8) & 0xFF;
+  udp[5] =  udp_len       & 0xFF;
+  udp[6] = 0; udp[7] = 0;
+
+  /* Payload */
+  for (uint32_t i = 0; i < payload_len; i++) udp[8 + i] = payload[i];
+
+  return total;
+}
+
+/* Build a DHCP DISCOVER or REQUEST in `bootp`. Returns total bytes written
+ * (240 fixed header + magic + variable options). */
+static uint32_t dhcp_build(uint8_t *bootp, uint8_t msg_type,
+                           const uint8_t client_mac[6], uint32_t xid,
+                           const uint8_t *requested_ip,
+                           const uint8_t *server_id) {
+  memset(bootp, 0, 240);
+  bootp[0] = 1;  /* BOOTREQUEST */
+  bootp[1] = 1;  /* htype = Ethernet */
+  bootp[2] = 6;  /* hlen */
+  bootp[3] = 0;  /* hops */
+  bootp[4] = (xid >> 24) & 0xFF;
+  bootp[5] = (xid >> 16) & 0xFF;
+  bootp[6] = (xid >>  8) & 0xFF;
+  bootp[7] =  xid        & 0xFF;
+  /* secs, flags, ciaddr, yiaddr, siaddr, giaddr all zero */
+  for (int i = 0; i < 6; i++) bootp[28 + i] = client_mac[i];
+  /* magic cookie */
+  bootp[236] = DHCP_MAGIC_0;
+  bootp[237] = DHCP_MAGIC_1;
+  bootp[238] = DHCP_MAGIC_2;
+  bootp[239] = DHCP_MAGIC_3;
+
+  uint8_t *opt = bootp + 240;
+  uint32_t p = 0;
+
+  /* Option 53: message type */
+  opt[p++] = DHCP_OPT_MSGTYPE;
+  opt[p++] = 1;
+  opt[p++] = msg_type;
+
+  /* Option 55: parameter request list — what we want from the server */
+  opt[p++] = DHCP_OPT_PARAM_REQ;
+  opt[p++] = 4;
+  opt[p++] = DHCP_OPT_SUBNET;
+  opt[p++] = DHCP_OPT_ROUTER;
+  opt[p++] = DHCP_OPT_LEASE;
+  opt[p++] = DHCP_OPT_SERVER_ID;
+
+  /* For REQUEST: include 50 (requested IP) and 54 (server identifier). */
+  if (requested_ip) {
+    opt[p++] = DHCP_OPT_REQ_IP;
+    opt[p++] = 4;
+    for (int i = 0; i < 4; i++) opt[p++] = requested_ip[i];
+  }
+  if (server_id) {
+    opt[p++] = DHCP_OPT_SERVER_ID;
+    opt[p++] = 4;
+    for (int i = 0; i < 4; i++) opt[p++] = server_id[i];
+  }
+
+  opt[p++] = DHCP_OPT_END;
+  return 240 + p;
+}
+
+/* Find option `want` in an options blob. Stores its length in *found_len.
+ * Returns pointer to value bytes, or NULL if missing. */
+static const uint8_t *dhcp_find_option(const uint8_t *opts, uint32_t max_len,
+                                       uint8_t want, uint8_t *found_len) {
+  uint32_t p = 0;
+  while (p < max_len) {
+    uint8_t code = opts[p];
+    if (code == DHCP_OPT_END) return 0;
+    if (code == 0) { p++; continue; }              /* PAD */
+    if (p + 1 >= max_len) return 0;
+    uint8_t len = opts[p + 1];
+    if (p + 2 + len > max_len) return 0;
+    if (code == want) {
+      *found_len = len;
+      return &opts[p + 2];
+    }
+    p += 2 + len;
+  }
+  return 0;
+}
+
+/* Validate that `frame` is a DHCP reply matching `expect_xid` and
+ * `expect_msg`, then extract yiaddr and known options.
+ * Returns 1 on match (out_* filled), 0 otherwise. */
+static int dhcp_parse(const uint8_t *frame, uint32_t flen,
+                      uint32_t expect_xid, uint8_t expect_msg,
+                      uint8_t out_yiaddr[4], uint8_t out_server[4],
+                      uint8_t out_mask[4],   uint8_t out_router[4],
+                      uint32_t *out_lease) {
+  if (flen < 14 + 20 + 8 + 240) return 0;
+  if (frame[12] != 0x08 || frame[13] != 0x00) return 0;
+
+  const uint8_t *ip = &frame[14];
+  if ((ip[0] & 0xF0) != 0x40) return 0;
+  if (ip[9] != 17) return 0; /* UDP */
+  uint32_t ihl = (ip[0] & 0x0F) * 4;
+  if (ihl != 20) return 0;
+
+  const uint8_t *udp = ip + ihl;
+  uint16_t src_port = ((uint16_t)udp[0] << 8) | udp[1];
+  uint16_t dst_port = ((uint16_t)udp[2] << 8) | udp[3];
+  uint16_t udp_len  = ((uint16_t)udp[4] << 8) | udp[5];
+  if (src_port != 67 || dst_port != 68) return 0;
+  if (udp_len < 8 + 240) return 0;
+
+  const uint8_t *bootp = udp + 8;
+  if (bootp[0] != 2) return 0; /* BOOTREPLY */
+  uint32_t xid = ((uint32_t)bootp[4] << 24) | ((uint32_t)bootp[5] << 16) |
+                 ((uint32_t)bootp[6] <<  8) |  bootp[7];
+  if (xid != expect_xid) return 0;
+
+  const uint8_t *magic = bootp + 236;
+  if (magic[0] != DHCP_MAGIC_0 || magic[1] != DHCP_MAGIC_1 ||
+      magic[2] != DHCP_MAGIC_2 || magic[3] != DHCP_MAGIC_3) return 0;
+
+  uint32_t opts_len = (uint32_t)udp_len - 8 - 240;
+  const uint8_t *opts = bootp + 240;
+
+  uint8_t l;
+  const uint8_t *mt = dhcp_find_option(opts, opts_len, DHCP_OPT_MSGTYPE, &l);
+  if (!mt || l != 1 || mt[0] != expect_msg) return 0;
+
+  for (int i = 0; i < 4; i++) out_yiaddr[i] = bootp[16 + i];
+
+  const uint8_t *sid = dhcp_find_option(opts, opts_len, DHCP_OPT_SERVER_ID, &l);
+  if (sid && l == 4) for (int i = 0; i < 4; i++) out_server[i] = sid[i];
+
+  const uint8_t *sm = dhcp_find_option(opts, opts_len, DHCP_OPT_SUBNET, &l);
+  if (sm && l == 4) for (int i = 0; i < 4; i++) out_mask[i] = sm[i];
+
+  const uint8_t *rt = dhcp_find_option(opts, opts_len, DHCP_OPT_ROUTER, &l);
+  if (rt && l >= 4) for (int i = 0; i < 4; i++) out_router[i] = rt[i];
+
+  const uint8_t *ls = dhcp_find_option(opts, opts_len, DHCP_OPT_LEASE, &l);
+  if (ls && l == 4) {
+    *out_lease = ((uint32_t)ls[0] << 24) | ((uint32_t)ls[1] << 16) |
+                 ((uint32_t)ls[2] <<  8) |  ls[3];
+  } else {
+    *out_lease = 0;
+  }
+
+  return 1;
+}
+
+int dhcp_acquire(void) {
+  if (!net_dev.have_mac) {
+    uart_errorln("[DHCP] no MAC; can't run");
+    return -1;
+  }
+
+  uart_println("[DHCP] Starting acquire...");
+
+  static const uint8_t bcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+  static const uint8_t any_ip[4]    = {0, 0, 0, 0};
+  static const uint8_t bcast_ip[4]  = {255, 255, 255, 255};
+
+  /* Transaction id — fixed per acquire. Slirp doesn't enforce uniqueness,
+   * so any non-zero value works for our purposes. */
+  uint32_t xid = 0xFE221001u;
+
+  uint8_t rx[600];
+  uint8_t yiaddr[4]    = {0, 0, 0, 0};
+  uint8_t server_id[4] = {0, 0, 0, 0};
+  uint8_t mask[4]      = {255, 255, 255, 0};
+  uint8_t router[4]    = {0, 0, 0, 0};
+  uint32_t lease       = 0;
+
+  /* ---- DISCOVER ---- */
+  uint32_t blen = dhcp_build(bootp_buf, DHCP_DISCOVER, net_dev.mac, xid,
+                             0, 0);
+  uint32_t flen = udp_build(dhcp_frame, bcast_mac, any_ip, bcast_ip,
+                            68, 67, bootp_buf, blen);
+  if (net_tx(dhcp_frame, flen) <= 0) {
+    uart_errorln("[DHCP] DISCOVER TX failed");
+    return -1;
+  }
+  uart_println("[DHCP] DISCOVER sent");
+
+  /* ---- Wait for OFFER ---- */
+  int got = 0;
+  for (uint32_t s = 0; s < 5000000u && !got; s++) {
+    int n = net_rx_poll(rx, sizeof(rx));
+    if (n > 0 && dhcp_parse(rx, (uint32_t)n, xid, DHCP_OFFER,
+                            yiaddr, server_id, mask, router, &lease)) {
+      got = 1;
+    }
+  }
+  if (!got) {
+    uart_errorln("[DHCP] no OFFER received");
+    return -1;
+  }
+  uart_printf("[DHCP] OFFER: %d.%d.%d.%d (server=%d.%d.%d.%d, lease=%us)\n",
+              (uint64_t)yiaddr[0], (uint64_t)yiaddr[1],
+              (uint64_t)yiaddr[2], (uint64_t)yiaddr[3],
+              (uint64_t)server_id[0], (uint64_t)server_id[1],
+              (uint64_t)server_id[2], (uint64_t)server_id[3],
+              lease);
+
+  /* ---- REQUEST ---- */
+  blen = dhcp_build(bootp_buf, DHCP_REQUEST, net_dev.mac, xid,
+                    yiaddr, server_id);
+  flen = udp_build(dhcp_frame, bcast_mac, any_ip, bcast_ip,
+                   68, 67, bootp_buf, blen);
+  if (net_tx(dhcp_frame, flen) <= 0) {
+    uart_errorln("[DHCP] REQUEST TX failed");
+    return -1;
+  }
+  uart_println("[DHCP] REQUEST sent");
+
+  /* ---- Wait for ACK ---- */
+  uint8_t y2[4]  = {0, 0, 0, 0};
+  uint8_t s2[4]  = {0, 0, 0, 0};
+  uint8_t m2[4]  = {255, 255, 255, 0};
+  uint8_t r2[4]  = {0, 0, 0, 0};
+  uint32_t l2    = 0;
+  got = 0;
+  for (uint32_t s = 0; s < 5000000u && !got; s++) {
+    int n = net_rx_poll(rx, sizeof(rx));
+    if (n > 0 && dhcp_parse(rx, (uint32_t)n, xid, DHCP_ACK,
+                            y2, s2, m2, r2, &l2)) {
+      got = 1;
+    }
+  }
+  if (!got) {
+    uart_errorln("[DHCP] no ACK received");
+    return -1;
+  }
+
+  /* Commit lease to globals so net_send_arp_probe / net_send_ping /
+   * net_get_info pick up the new values immediately. */
+  for (int i = 0; i < 4; i++) g_my_ip[i]       = y2[i];
+  for (int i = 0; i < 4; i++) g_subnet_mask[i] = m2[i];
+  for (int i = 0; i < 4; i++) g_gateway_ip[i]  = r2[i];
+  for (int i = 0; i < 4; i++) g_dhcp_server[i] = s2[i];
+  g_lease_secs    = l2;
+  g_dhcp_acquired = 1;
+
+  uart_printf("[DHCP] Lease ACK \\o/  ip=%d.%d.%d.%d mask=%d.%d.%d.%d "
+              "gw=%d.%d.%d.%d srv=%d.%d.%d.%d lease=%us\n",
+              (uint64_t)g_my_ip[0], (uint64_t)g_my_ip[1],
+              (uint64_t)g_my_ip[2], (uint64_t)g_my_ip[3],
+              (uint64_t)g_subnet_mask[0], (uint64_t)g_subnet_mask[1],
+              (uint64_t)g_subnet_mask[2], (uint64_t)g_subnet_mask[3],
+              (uint64_t)g_gateway_ip[0], (uint64_t)g_gateway_ip[1],
+              (uint64_t)g_gateway_ip[2], (uint64_t)g_gateway_ip[3],
+              (uint64_t)g_dhcp_server[0], (uint64_t)g_dhcp_server[1],
+              (uint64_t)g_dhcp_server[2], (uint64_t)g_dhcp_server[3],
+              g_lease_secs);
+  return 0;
 }
 
 
@@ -492,6 +852,12 @@ void pci_virtio_net_init(void) {
                 (net_dev.link_status & VIRTIO_NET_S_LINK_UP) ? "UP" : "DOWN",
                 (uint64_t)net_dev.link_status);
   }
+
+
+  /* Acquire an IPv4 lease via DHCP before doing any IP-level work, so
+   * subsequent ARP / ICMP frames carry the leased IP rather than the
+   * hard-coded slirp default. */
+  dhcp_acquire();
 
 
   /* Smoke-test the wire by sending a broadcast ARP request to the slirp

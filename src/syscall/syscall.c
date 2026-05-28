@@ -63,6 +63,14 @@ static inline int64_t user_str_ok(uint64_t ptr) {
 }
 
 void syscall_dispatch(trap_frame_t *frame) {
+  /* Allow preemption during the syscall. EL0 had IRQs unmasked, but the
+   * synchronous-from-lower-EL vector entry implicitly masks them. Without
+   * this, a long-blocking syscall (e.g. sys_read polling the UART RX
+   * register inside the shell) would prevent the timer IRQ from firing
+   * and starve every other task. */
+  __asm__ __volatile__("msr daifclr, #2" ::: "memory");
+
+
   uint64_t num = frame->regs[8];
   uint64_t arg0 = frame->regs[0];
   uint64_t arg1 = frame->regs[1];

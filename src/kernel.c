@@ -221,11 +221,14 @@ static void sh_help(void) {
       "  irqs            - cat /proc/interrupts\n"
       "  version         - cat /proc/version\n"
       "  cat <path>      - print a file\n"
+      "  hexdump <path>  - hex+ascii dump of a file\n"
+      "  echo <text>     - print text\n"
       "  kill <pid>      - terminate a task by pid\n"
       "  top             - 5x refresh of tasks/mem/net (1 s)\n"
       "  ping            - ICMP echo the slirp gateway (10.0.2.2)\n"
       "  sleep <ms>      - block for <ms> milliseconds\n"
       "  clear           - clear the terminal (ANSI)\n"
+      "  reboot          - PSCI SYSTEM_RESET (warm restart)\n"
       "  exit            - terminate the shell task\n");
 }
 
@@ -335,6 +338,54 @@ static void task_shell(void) {
       } else {
         sh_print("kill: no such pid (or pid is idle)\n");
       }
+
+    } else if (u_starts_with(line, "echo ")) {
+      sh_print(line + 5);
+      sh_print("\n");
+    } else if (u_starts_with(line, "hexdump ")) {
+      const char *path = line + 8;
+      int fd = sys_open(path);
+      if (fd < 0) {
+        sh_print("hexdump: cannot open\n");
+      } else {
+        static const char hex[] = "0123456789abcdef";
+        uint8_t hbuf[16];
+        uint64_t offset = 0;
+        int64_t got;
+        while ((got = sys_read(fd, hbuf, sizeof(hbuf))) > 0) {
+          char ln[96];
+          int p = 0;
+          for (int i = 7; i >= 0; i--) {
+            ln[p++] = hex[(offset >> (i * 4)) & 0xF];
+          }
+          ln[p++] = ' '; ln[p++] = ' ';
+          for (int i = 0; i < 16; i++) {
+            if (i < got) {
+              ln[p++] = hex[(hbuf[i] >> 4) & 0xF];
+              ln[p++] = hex[hbuf[i] & 0xF];
+            } else {
+              ln[p++] = ' '; ln[p++] = ' ';
+            }
+            ln[p++] = ' ';
+            if (i == 7) ln[p++] = ' ';
+          }
+          ln[p++] = '|';
+          for (int i = 0; i < got; i++) {
+            char c = (char)hbuf[i];
+            ln[p++] = (c >= 32 && c < 127) ? c : '.';
+          }
+          ln[p++] = '|'; ln[p++] = '\n';
+          sys_write(1, ln, (uint64_t)p);
+          offset += (uint64_t)got;
+        }
+        sys_close(fd);
+      }
+    } else if (u_streq(line, "reboot")) {
+      sh_print("rebooting via PSCI SYSTEM_RESET...\n");
+      register uint64_t x0 __asm__("x0") = 0x84000009ULL;
+      __asm__ __volatile__("hvc #0" : "+r"(x0) :: "memory");
+      sh_print("reboot: PSCI returned (unexpected); halting\n");
+      sys_exit();
 
     } else if (u_streq(line, "clear")) {
       sh_print("\x1b[2J\x1b[H");

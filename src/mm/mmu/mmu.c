@@ -7,13 +7,24 @@ static uint64_t *l0_table_lo;
 static uint64_t *l0_table_hi;
 
 static uint64_t *alloc_table() {
-  uint64_t *table = (uint64_t *)pmm_allocate_page();
-  if (!table) {
+  uint64_t *table_phys = (uint64_t *)pmm_allocate_page();
+  if (!table_phys) {
     uart_errorln("[MMU] Failed to allocate table");
     return 0;
   }
-  memset(table, 0, PAGE_SIZE);
-  return table;
+  /* Two phases:
+   *   - Pre-MMU (early_init / build_identity_tables): MMU is off, so every
+   *     pointer is treated as a physical address. Just memset directly.
+   *   - Post-MMU: TTBR0 is per-task and may not identity-map RAM, so
+   *     dereferencing the physical pointer can fault. Route the zero
+   *     through TTBR1 (PHYS_TO_VIRT), which always maps RAM. */
+  uint64_t sctlr;
+  __asm__ __volatile__("mrs %0, sctlr_el1" : "=r"(sctlr));
+  uint64_t *table_va = (sctlr & 1)
+                           ? (uint64_t *)PHYS_TO_VIRT((uintptr_t)table_phys)
+                           : table_phys;
+  memset(table_va, 0, PAGE_SIZE);
+  return table_phys;
 }
 
 // Build L0 -> L1 -> L2 page table hierarchy

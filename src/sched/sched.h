@@ -40,6 +40,16 @@ extern void context_switch(task_t *prev, task_t *next);
 void sched_init(void);
 int sched_create_task(const char *name, task_entry_t entry);
 
+/* fork() implementation — deep-copies the calling task into a new task and
+ * returns the child pid (called from SYS_FORK; the trap_frame_t pointer is
+ * the parent's frame on its kstack). The child's frame is prepared so that
+ * on its first schedule, fork_return ereturns to the same instruction the
+ * parent will return to, with x0 = 0. */
+struct trap_frame;
+int sched_fork(task_t *parent, struct trap_frame *frame);
+extern void fork_return(void);
+
+
 /* Create an EL1 kernel-mode task. Unlike sched_create_task, no user_l0
  * is allocated and TTBR0 is left at 0 (so context_switch skips the
  * per-task user mapping swap). The entry function runs at EL1 with the

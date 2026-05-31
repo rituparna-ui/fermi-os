@@ -181,6 +181,13 @@ void syscall_dispatch(trap_frame_t *frame) {
     ret = (int64_t)sched_kill_task(arg0);
     break;
 
+  case SYS_FORK:
+    /* No arguments. Returns child pid to the caller; the child task,
+     * when first scheduled, returns 0 from this same SVC via fork_return. */
+    ret = (int64_t)sched_fork(sched_current(), frame);
+    break;
+
+
 
   default:
     uart_printf("[SYSCALL] Unknown syscall %u\n", num);

@@ -231,6 +231,149 @@ int sched_create_task(const char *name, task_entry_t entry) {
   return (int)t->pid;
 }
 
+/* Deep-copy the calling task into a new child task. Mirrors the layout
+ * sched_create_task uses, but populates the kstack with a snapshot of the
+ * parent's trap frame so the child resumes from inside the same SVC.
+ *
+ * Returns the child's pid to the parent. The child sees x0 = 0 because
+ * we explicitly clobber the saved x0 in its frame copy.
+ *
+ * Memory model:
+ *   - .text / .rodata window is shared (read-only, EL0 RO + PXN). Same
+ *     physical pages get re-mapped at the same VA in the child's L0.
+ *   - User stack pages are *copied* — fresh PMM allocation, byte-for-byte
+ *     memcpy from parent's stack region.
+ *   - fd table is fresh (stdin/stdout/stderr to /dev/console). POSIX-true
+ *     fd duplication is left as a TODO; current shell-fork-then-exit
+ *     scenarios don't depend on inherited fds.
+ */
+int sched_fork(task_t *parent, struct trap_frame *frame) {
+  if (!parent || !frame) {
+    return -1;
+  }
+
+  task_t *t = (task_t *)kmalloc(sizeof(task_t));
+  if (!t) {
+    uart_errorln("[FORK] Failed to allocate child task struct");
+    return -1;
+  }
+  memset(t, 0, sizeof(task_t));
+
+  /* Child kernel stack. */
+  uintptr_t kstack_phys = pmm_allocate_pages(TASK_STACK_PAGES);
+  if (!kstack_phys) {
+    uart_errorln("[FORK] Failed to allocate child kernel stack");
+    kfree(t);
+    return -1;
+  }
+  uintptr_t kstack_va  = PHYS_TO_VIRT(kstack_phys);
+  uint64_t  kstack_size = TASK_STACK_PAGES * PAGE_SIZE;
+  uintptr_t kstack_top = kstack_va + kstack_size;
+  memset((void *)kstack_va, 0, kstack_size);
+
+  /* Child user-space page table. */
+  uint64_t *user_l0 = mmu_create_user_tables();
+  if (!user_l0) {
+    uart_errorln("[FORK] Failed to allocate child user_l0");
+    pmm_free_pages(kstack_phys, TASK_STACK_PAGES);
+    kfree(t);
+    return -1;
+  }
+
+  /* Re-map the shared .text + .rodata window with the same physical pages.
+   * Same flags / shape as sched_create_task; safe because the pages are
+   * read-only at EL0 (PTE_AP_RO_EL0 + PTE_PXN). */
+  uint64_t text_start_pa    = VIRT_TO_PHYS((uint64_t)__text_start);
+  uint64_t user_text_end_pa = VIRT_TO_PHYS((uint64_t)__user_text_end);
+  uint64_t text_pages       = (user_text_end_pa - text_start_pa) / PAGE_SIZE;
+  uint64_t text_flags       = PTE_ATTRIDX(1) | PTE_AP_RO_EL0 | PTE_PXN;
+  mmu_map_user_range(user_l0, USER_TEXT_BASE, text_start_pa, text_pages,
+                     text_flags);
+
+  /* Fresh user stack — allocate physical pages and copy parent's contents. */
+  uintptr_t ustack_phys = pmm_allocate_pages(USER_STACK_PAGES);
+  if (!ustack_phys) {
+    uart_errorln("[FORK] Failed to allocate child user stack");
+    mmu_free_user_tables(user_l0);
+    pmm_free_pages(kstack_phys, TASK_STACK_PAGES);
+    kfree(t);
+    return -1;
+  }
+  memcpy((void *)PHYS_TO_VIRT(ustack_phys),
+         (const void *)PHYS_TO_VIRT(parent->ustack_phys),
+         USER_STACK_PAGES * PAGE_SIZE);
+
+  uint64_t ustack_user_base = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
+  uint64_t stack_flags = PTE_ATTRIDX(1) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN;
+  mmu_map_user_range(user_l0, ustack_user_base, ustack_phys, USER_STACK_PAGES,
+                     stack_flags);
+
+  /* ---- Lay out child's kstack ---------------------------------------- */
+  /* Trap frame: 288 bytes (matches FRAME_SIZE in vector.S). */
+  uint8_t  *child_frame_bytes = (uint8_t *)(kstack_top - 288);
+  memcpy(child_frame_bytes, (const uint8_t *)frame, 288);
+  /* Child's saved x0 = 0  → distinguishes from parent (which sees pid). */
+  ((uint64_t *)child_frame_bytes)[0] = 0;
+
+  /* context_switch frame: 12 GPRs + 8 SIMD = 160 bytes, just below the
+   * trap frame. x30 = fork_return so the first ret out of context_switch
+   * lands there; x19/x20 unused (fork_return doesn't touch them). */
+  uint64_t *switch_frame = (uint64_t *)((uintptr_t)child_frame_bytes - 160);
+  switch_frame[0]  = 0;                       /* x19 */
+  switch_frame[1]  = 0;                       /* x20 */
+  switch_frame[11] = (uint64_t)fork_return;   /* x30 */
+  /* d8–d15 (offsets 96–152) are already zero from the kstack memset. */
+
+  /* ---- task_t fields -------------------------------------------------- */
+  copy_name(t->name, parent->name);
+  /* Append "+f" if there's room — cosmetic, helps `ps` distinguish them. */
+  int nlen = 0;
+  while (nlen < 16 && t->name[nlen] != '\0') nlen++;
+  if (nlen + 2 < 16) {
+    t->name[nlen]     = '+';
+    t->name[nlen + 1] = 'f';
+    t->name[nlen + 2] = '\0';
+  }
+
+  t->sp          = (uint64_t)switch_frame;
+  t->pid         = next_pid++;
+  t->state       = TASK_READY;
+  t->stack_phys  = kstack_phys;
+  t->ttbr0       = (uint64_t)user_l0;
+  t->user_sp     = parent->user_sp;
+  t->kstack_top  = kstack_top;
+  t->ustack_phys = ustack_phys;
+
+  /* Fresh fd table for the child. POSIX-correct fork would dup all fds;
+   * for the MVP we give the child a clean stdin/stdout/stderr backed by
+   * /dev/console (same as a brand-new task). */
+  t->fds = fd_table_create();
+  if (t->fds) {
+    fd_open(t->fds, "/dev/console");
+    fd_open(t->fds, "/dev/console");
+    fd_open(t->fds, "/dev/console");
+  }
+
+  /* Insert into circular run queue (mask IRQs while we mutate it). */
+  uint64_t daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(daif));
+  __asm__ __volatile__("msr daifset, #2");
+
+  task_t *tail = current;
+  while (tail->next != current) {
+    tail = tail->next;
+  }
+  tail->next = t;
+  t->next    = current;
+
+  __asm__ __volatile__("msr daif, %0" ::"r"(daif));
+
+  uart_printf("[FORK] %d '%s' -> child %d '%s'\n",
+              parent->pid, parent->name, t->pid, t->name);
+  return (int)t->pid;
+}
+
+
 void schedule(void) {
   sched_reap();
 

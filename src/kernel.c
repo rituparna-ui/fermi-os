@@ -132,6 +132,13 @@ static inline void sys_sleep(uint64_t ms) {
   __asm__ __volatile__("svc #0" ::"r"(x0), "r"(x8) : "memory");
 }
 
+static inline int64_t sys_fork(void) {
+  register int64_t x0 __asm__("x0");
+  register uint64_t x8 __asm__("x8") = 12; /* SYS_FORK */
+  __asm__ __volatile__("svc #0" : "=r"(x0) : "r"(x8) : "memory");
+  return x0;
+}
+
 /* ----------------------------------------------------------------
  * Tiny EL0 user-space helpers used by task_shell. Defined inline
  * because user-space cannot call into the kernel string library.
@@ -224,6 +231,7 @@ static void sh_help(void) {
       "  hexdump <path>  - hex+ascii dump of a file\n"
       "  echo <text>     - print text\n"
       "  kill <pid>      - terminate a task by pid\n"
+      "  fork            - spawn a child task; both parent and child print\n"
       "  top             - 5x refresh of tasks/mem/net (1 s)\n"
       "  ping            - ICMP echo the slirp gateway (10.0.2.2)\n"
       "  sleep <ms>      - block for <ms> milliseconds\n"
@@ -327,6 +335,39 @@ static void task_shell(void) {
         sys_sleep(1000);
       }
       sh_print("(top finished)\n");
+
+    } else if (u_streq(line, "fork")) {
+      /* SYS_FORK — child sees 0, parent sees the new pid (or <0 on error). */
+      int64_t r = sys_fork();
+      if (r == 0) {
+        /* CHILD path. Greet via /dev/console then exit. The child has its
+         * own copy of the user stack, so writing locals here doesn't
+         * disturb the parent. */
+        sh_print("[fork-child] hello from the child!\n");
+        {
+          char out[40];
+          const char prefix[] = "[fork-child] my pid=";
+          int p = 0;
+          for (size_t i = 0; i < sizeof(prefix) - 1; i++) out[p++] = prefix[i];
+          p += u_render_uint(out + p, (int)(sizeof(out) - p),
+                             (uint64_t)sys_getpid());
+          out[p++] = '\n';
+          sys_write(1, out, (uint64_t)p);
+        }
+        sys_exit();
+      } else if (r < 0) {
+        sh_print("fork: failed\n");
+      } else {
+        /* PARENT path. */
+        char out[40];
+        const char prefix[] = "fork: child pid=";
+        int p = 0;
+        for (size_t i = 0; i < sizeof(prefix) - 1; i++) out[p++] = prefix[i];
+        p += u_render_uint(out + p, (int)(sizeof(out) - p), (uint64_t)r);
+        out[p++] = '\n';
+        sys_write(1, out, (uint64_t)p);
+      }
+
 
     } else if (u_starts_with(line, "kill ")) {
       int pid = u_atou(line + 5);

@@ -8,6 +8,7 @@ LD := $(CROSS_COMPILE)ld
 # Directories
 SRC_DIR := src
 BUILD_DIR := build
+USER_DIR  := user
 TARGET := $(BUILD_DIR)/kernel.elf
 
 # File discovery - find all .c and .S files in src
@@ -21,6 +22,12 @@ S_OBJECTS := $(patsubst $(SRC_DIR)/%.S, $(BUILD_DIR)/%.o, $(S_SOURCES))
 C_OBJECTS := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(C_SOURCES))
 OBJECTS := $(S_OBJECTS) $(C_OBJECTS)
 DEPS    := $(OBJECTS:.o=.d)
+
+# User-space binaries packaged onto the FAT32 disk and exec()'d at runtime.
+# Each user/<name>.S compiles into user/<name>.elf (linked at USER_TEXT_BASE
+# = 0x400000, _start as entry) and is then objcopy'd into a flat user/<name>.bin.
+USER_SOURCES := $(wildcard $(USER_DIR)/*.S)
+USER_BINS    := $(USER_SOURCES:.S=.bin)
 
 # Flags
 CFLAGS := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 -mstrict-align -fno-pic -MMD -MP \
@@ -75,6 +82,22 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.S
 	@mkdir -p $(dir $@)
 	@$(CC) $(CFLAGS) -x assembler-with-cpp -c $< -o $@
 
+# User-mode program build rules. Linked at USER_TEXT_BASE = 0x400000 to match
+# what the kernel maps in every EL0 task, then objcopy'd to a flat binary so
+# the kernel just memcpy's the bytes into freshly-allocated user pages.
+$(USER_DIR)/%.elf: $(USER_DIR)/%.S
+	@echo "USER GCC $<"
+	@$(CC) -ffreestanding -nostartfiles -nostdlib -fno-pic -static \
+		-Wl,-Ttext=0x400000 -Wl,-e,_start \
+		-o $@ $<
+
+$(USER_DIR)/%.bin: $(USER_DIR)/%.elf
+	@echo "USER OBJCOPY $<"
+	@$(CROSS_COMPILE)objcopy -O binary $< $@
+
+user_bins: $(USER_BINS)
+
+
 # Run QEMU
 run: all disk
 	@$(QEMU_BASE) $(QEMU_FLAGS_RUN)
@@ -84,7 +107,7 @@ debug: all disk
 
 disk: $(DISK_IMG)
 
-$(DISK_IMG):
+$(DISK_IMG): $(USER_BINS)
 	@mkdir -p $(BUILD_DIR)
 	@echo "Creating $(DISK_IMG) ($(DISK_SIZE) sparse, FAT32)"
 	@truncate -s $(DISK_SIZE) $@
@@ -96,6 +119,11 @@ $(DISK_IMG):
 	@MTOOLS_SKIP_CHECK=1 mmd -i $@ ::/SUBDIR
 	@printf 'Hello from a subdirectory!\n' \
 		| MTOOLS_SKIP_CHECK=1 mcopy -i $@ - ::/SUBDIR/INFO.TXT
+	@for bin in $(USER_BINS); do \
+		name=$$(basename $$bin .bin | tr '[:lower:]' '[:upper:]').BIN; \
+		echo "  + $$name <- $$bin"; \
+		MTOOLS_SKIP_CHECK=1 mcopy -i $@ $$bin ::/$$name; \
+	done
 
 # GDB Config
 GDB := gdb-multiarch
@@ -137,3 +165,4 @@ dump_dts:
 clean:
 	@echo "Cleaning up..."
 	@rm -rf $(BUILD_DIR)
+	@rm -f $(USER_DIR)/*.elf $(USER_DIR)/*.bin

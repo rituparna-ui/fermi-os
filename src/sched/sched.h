@@ -29,6 +29,12 @@ typedef struct task {
   uint64_t user_sp;      // SP_EL0 — user stack pointer
   uintptr_t kstack_top;  // top of per-task kernel stack (for exception entry)
   uintptr_t ustack_phys; // physical address of user stack (for freeing)
+  /* If the task was loaded by exec(), exec_text_phys points at the
+   * per-task PMM allocation that holds the binary's bytes; sched_reap
+   * frees it. For tasks running the kernel-shared text image (every
+   * task created via sched_create_task), both fields are 0. */
+  uintptr_t exec_text_phys;
+  uint64_t  exec_text_pages;
   char name[16];
   struct fd_table *fds;
   struct task *next;

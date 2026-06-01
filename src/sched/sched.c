@@ -542,6 +542,13 @@ void sched_reap(void) {
       pmm_free_pages(dead->ustack_phys, USER_STACK_PAGES);
     }
 
+    /* Free per-exec text pages if this task was loaded by exec().
+     * Tasks running the kernel-shared image have exec_text_phys == 0. */
+    if (dead->exec_text_phys) {
+      pmm_free_pages(dead->exec_text_phys, dead->exec_text_pages);
+    }
+
+
     // Free per-task TTBR0 page table pages (L0, L1, L2, L3)
     if (dead->ttbr0) {
       mmu_free_user_tables((uint64_t *)dead->ttbr0);

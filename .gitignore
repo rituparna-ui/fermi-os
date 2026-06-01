@@ -5,3 +5,7 @@ compile_commands.json
 *.swp
 *.o
 *.d
+user/*.elf
+user/*.bin
+wasabi-toolbag/
+

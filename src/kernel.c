@@ -139,6 +139,13 @@ static inline int64_t sys_fork(void) {
   return x0;
 }
 
+static inline int64_t sys_exec(const char *path) {
+  register const char *x0 __asm__("x0") = path;
+  register uint64_t x8 __asm__("x8") = 13; /* SYS_EXEC */
+  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+  return (int64_t)x0;
+}
+
 /* ----------------------------------------------------------------
  * Tiny EL0 user-space helpers used by task_shell. Defined inline
  * because user-space cannot call into the kernel string library.
@@ -232,6 +239,7 @@ static void sh_help(void) {
       "  echo <text>     - print text\n"
       "  kill <pid>      - terminate a task by pid\n"
       "  fork            - spawn a child task; both parent and child print\n"
+      "  exec <path>     - replace this task with a flat binary from disk\n"
       "  top             - 5x refresh of tasks/mem/net (1 s)\n"
       "  ping            - ICMP echo the slirp gateway (10.0.2.2)\n"
       "  sleep <ms>      - block for <ms> milliseconds\n"
@@ -368,6 +376,16 @@ static void task_shell(void) {
         sys_write(1, out, (uint64_t)p);
       }
 
+
+    } else if (u_starts_with(line, "exec ")) {
+      /* SYS_EXEC — if it succeeds, control jumps to the new program's _start
+       * and never returns here. The shell as we know it is gone (replaced).
+       * If it returns, the call failed; report and continue. */
+      const char *path = line + 5;
+      int64_t r = sys_exec(path);
+      if (r < 0) {
+        sh_print("exec: failed (open / read / alloc)\n");
+      }
 
     } else if (u_starts_with(line, "kill ")) {
       int pid = u_atou(line + 5);

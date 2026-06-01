@@ -271,7 +271,14 @@ int64_t fd_seek(fd_table_t *t, int fd, int64_t offset, int whence) {
     new_off = f->offset + offset;
     break;
   case SEEK_END:
-    return -1; /* no size tracked yet */
+    /* For regular files vnode->size is populated at lookup time (FAT32
+     * stores it in the directory entry). Char/block devices fall through
+     * to the failure path below. */
+    if (f->vnode->type != VNODE_REG) {
+      return -1;
+    }
+    new_off = (int64_t)f->vnode->size + offset;
+    break;
   default:
     return -1;
   }

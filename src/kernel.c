@@ -12,6 +12,7 @@
 #include "pci/pci.h"
 #include "rng/rng.h"
 #include "balloon/balloon.h"
+#include "console/console.h"
 #include "net/net.h"
 #include "sched/sched.h"
 #include "strings/strings.h" // IWYU pragma: keep
@@ -251,6 +252,7 @@ static void sh_help(void) {
       "  fork            - spawn a child task; both parent and child print\n"
       "  exec <path>     - replace this task with a flat binary from disk\n"
       "  balloon         - virtio-balloon: status / inflate N / deflate N\n"
+      "  vlog <text>     - send <text> to /dev/vcons (virtio-console host log)\n"
       "  top             - 5x refresh of tasks/mem/net (1 s)\n"
       "  ping            - ICMP echo the slirp gateway (10.0.2.2)\n"
       "  sleep <ms>      - block for <ms> milliseconds\n"
@@ -468,6 +470,24 @@ static void task_shell(void) {
         sys_write(1, out, (uint64_t)p);
       } else {
         sh_print("balloon: usage: balloon [status|inflate N|deflate N]\n");
+      }
+
+
+    } else if (u_starts_with(line, "vlog ")) {
+      /* Send the rest of the line down /dev/vcons — anything written
+       * appears in build/virtio-console.txt on the host. Adds a trailing
+       * newline so each invocation is its own line in the host file. */
+      const char *msg = line + 5;
+      int fd = sys_open("/dev/vcons");
+      if (fd < 0) {
+        sh_print("vlog: cannot open /dev/vcons\n");
+      } else {
+        uint64_t mlen = 0;
+        while (msg[mlen]) mlen++;
+        sys_write(fd, msg, mlen);
+        sys_write(fd, "\n", 1);
+        sys_close(fd);
+        sh_print("vlog: sent (check build/virtio-console.txt on host)\n");
       }
 
 
@@ -750,6 +770,7 @@ void kernel_main() {
   pci_virtio_blk_init();
   pci_virtio_net_init();
   pci_virtio_balloon_init();
+  pci_virtio_console_init();
 
   if (fat32_mount() != ESUCCESS) {
     uart_printf("[FS][FAT32] Unable to mount file system");

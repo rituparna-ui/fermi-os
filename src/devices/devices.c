@@ -1,6 +1,7 @@
 #include "devices.h"
 #include "blk/blk.h"
 #include "rng/rng.h"
+#include "console/console.h"
 #include "uart/uart.h"
 #include "utils/utils.h"
 #include "vfs/vfs.h"
@@ -151,11 +152,37 @@ static file_operations_t blk_ops = {
     .write = blk_dev_write,
 };
 
+/* ---- /dev/vcons ---- virtio-console TX side-channel.
+ * Anything written here lands on the host file wired up by
+ * `-chardev file,id=vc,path=$(BUILD_DIR)/virtio-console.txt` in QEMU.
+ * Reads always return 0 (EOF) — we don't post RX buffers yet. */
+static int vcons_read(vnode_t *n, file_t *f, void *buf, size_t count) {
+  (void)n;
+  (void)f;
+  (void)buf;
+  (void)count;
+  return 0;
+}
+
+static int vcons_write(vnode_t *n, file_t *f, const void *buf, size_t count) {
+  (void)n;
+  (void)f;
+  int n2 = vcons_send(buf, (uint32_t)count);
+  return (n2 < 0) ? -1 : n2;
+}
+
+static file_operations_t vcons_ops = {
+    .read = vcons_read,
+    .write = vcons_write,
+};
+
+
 /* ---- Entry point ---- */
 void devices_register(void) {
   vfs_register_chardev("console", &console_ops);
   vfs_register_chardev("null", &null_ops);
   vfs_register_chardev("zero", &zero_ops);
   vfs_register_chardev("rng", &rng_ops);
+  vfs_register_chardev("vcons", &vcons_ops);
   vfs_register_blockdev("blk", &blk_ops);
 }

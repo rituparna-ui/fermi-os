@@ -56,6 +56,9 @@ QEMU_DEVICES := -netdev user,id=n0 \
 	-device virtio-rng-pci,disable-legacy=on \
 	-drive file=$(DISK_IMG),if=none,format=raw,id=d0 \
 	-device virtio-blk-pci,drive=d0,disable-legacy=on \
+	-chardev file,id=vc,path=$(BUILD_DIR)/virtio-console.txt,mux=off \
+	-device virtio-serial-pci,disable-legacy=on \
+	-device virtconsole,chardev=vc \
 	-device virtio-balloon-pci,disable-legacy=on
 # QEMU_MACHINE := virt,gic-version=3,virtualization=on -m 8G
 # QEMU_MACHINE := virt,gic-version=3,virtualization=on,secure=on -m 8G

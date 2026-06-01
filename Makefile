@@ -26,8 +26,11 @@ DEPS    := $(OBJECTS:.o=.d)
 # User-space binaries packaged onto the FAT32 disk and exec()'d at runtime.
 # Each user/<name>.S compiles into user/<name>.elf (linked at USER_TEXT_BASE
 # = 0x400000, _start as entry) and is then objcopy'd into a flat user/<name>.bin.
-USER_SOURCES := $(wildcard $(USER_DIR)/*.S)
-USER_BINS    := $(USER_SOURCES:.S=.bin)
+USER_S_SOURCES := $(wildcard $(USER_DIR)/*.S)
+USER_C_SOURCES := $(wildcard $(USER_DIR)/*.c)
+USER_BINS      := $(USER_S_SOURCES:.S=.bin) $(USER_C_SOURCES:.c=.bin)
+USER_CRT0      := $(USER_DIR)/lib/crt0.o
+USER_INCLUDE   := -I $(USER_DIR)/include
 
 # Flags
 CFLAGS := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 -mstrict-align -fno-pic -MMD -MP \
@@ -86,11 +89,29 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.S
 # User-mode program build rules. Linked at USER_TEXT_BASE = 0x400000 to match
 # what the kernel maps in every EL0 task, then objcopy'd to a flat binary so
 # the kernel just memcpy's the bytes into freshly-allocated user pages.
+# Assembly user programs are self-contained (their own _start, no crt0).
 $(USER_DIR)/%.elf: $(USER_DIR)/%.S
 	@echo "USER GCC $<"
 	@$(CC) -ffreestanding -nostartfiles -nostdlib -fno-pic -static \
-		-Wl,-Ttext=0x400000 -Wl,-e,_start \
+		-Wl,-Ttext=0x400000 -Wl,-e,_start -Wl,--build-id=none \
 		-o $@ $<
+
+# C user programs link with crt0.o which provides _start and the
+# main->SYS_EXIT trampoline. crt0 is the FIRST input so the linker
+# places .text._start at the start of the output — flat binaries are
+# loaded at USER_TEXT_BASE = 0x400000 and the kernel jumps straight to
+# that address on exec.
+$(USER_CRT0): $(USER_DIR)/lib/crt0.S
+	@echo "USER AS $<"
+	@mkdir -p $(dir $@)
+	@$(CC) -ffreestanding -nostartfiles -nostdlib -fno-pic -c -o $@ $<
+
+$(USER_DIR)/%.elf: $(USER_DIR)/%.c $(USER_CRT0)
+	@echo "USER GCC $<"
+	@$(CC) -ffreestanding -nostartfiles -nostdlib -fno-pic -static \
+		-Wall -Wextra -O0 -g $(USER_INCLUDE) \
+		-Wl,-Ttext=0x400000 -Wl,-e,_start -Wl,--build-id=none \
+		-o $@ $(USER_CRT0) $<
 
 $(USER_DIR)/%.bin: $(USER_DIR)/%.elf
 	@echo "USER OBJCOPY $<"
@@ -166,4 +187,4 @@ dump_dts:
 clean:
 	@echo "Cleaning up..."
 	@rm -rf $(BUILD_DIR)
-	@rm -f $(USER_DIR)/*.elf $(USER_DIR)/*.bin
+	@rm -f $(USER_DIR)/*.elf $(USER_DIR)/*.bin $(USER_DIR)/lib/*.o

@@ -87,8 +87,11 @@ static inline int64_t user_str_ok(uint64_t ptr) {
  * meaningful return because the new image starts running.
  */
 #define EXEC_MAX_BYTES (1U << 20) /* 1 MiB cap */
+#define EXEC_MAX_ARGC 32          /* hard limit on argv count */
+#define EXEC_ARG_BYTES_MAX 1024   /* total string-byte budget for argv */
 
-static int64_t sys_exec(uint64_t arg_path, trap_frame_t *frame) {
+static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
+                        trap_frame_t *frame) {
   if (user_str_ok(arg_path) < 0) {
     return -1;
   }
@@ -99,6 +102,50 @@ static int64_t sys_exec(uint64_t arg_path, trap_frame_t *frame) {
   if (!fds) {
     return -1;
   }
+
+  /* Validate + capture argv while OLD TTBR0 is still active. argv may be
+   * NULL (no-args exec), or a NULL-terminated array of NUL-terminated
+   * strings. Snapshot to kernel scratch buffers so the post-swap stack
+   * can be populated without re-reading user memory.
+   *
+   * Stack layout we'll build (high → low):
+   *   [argv string blob]                 (top)
+   *   [16-byte alignment pad]
+   *   argv[argc] = NULL
+   *   argv[argc-1] = (user VA of str)
+   *   ...
+   *   argv[0] = (user VA of str)         ← argv pointer (passed in x1)
+   *   <SP_EL0 sits 16-byte-aligned below>
+   * The program receives argc in x0, argv in x1, envp (NULL) in x2. */
+  char    arg_kbuf[EXEC_ARG_BYTES_MAX];
+  size_t  arg_offsets[EXEC_MAX_ARGC];
+  int     argc      = 0;
+  size_t  arg_bytes = 0;
+
+  if (arg_argv != 0) {
+    while (argc < EXEC_MAX_ARGC) {
+      uint64_t slot_va = arg_argv + (uint64_t)argc * sizeof(uint64_t);
+      if (!user_buf_ok(slot_va, sizeof(uint64_t))) {
+        return -1;
+      }
+      const char *p = ((const char **)arg_argv)[argc];
+      if (p == NULL) {
+        break; /* NULL-terminator slot */
+      }
+      int64_t len = user_str_ok((uint64_t)p);
+      if (len < 0) {
+        return -1;
+      }
+      if (arg_bytes + (size_t)len + 1 > EXEC_ARG_BYTES_MAX) {
+        return -1;
+      }
+      arg_offsets[argc] = arg_bytes;
+      memcpy(arg_kbuf + arg_bytes, p, (size_t)len + 1);
+      arg_bytes += (size_t)len + 1;
+      argc++;
+    }
+  }
+
 
   /* 1. Open and size the binary. */
   int fd = fd_open(fds, path);
@@ -202,7 +249,42 @@ static int64_t sys_exec(uint64_t arg_path, trap_frame_t *frame) {
   /* sp_el0 lives at offset 280 in the 288-byte on-stack trap frame; the
    * C trap_frame_t (sizeof = 280) doesn't expose it. Poke directly. */
   uint64_t *frame_raw = (uint64_t *)frame;
-  frame_raw[35] = USER_STACK_TOP;
+  uint64_t  new_sp    = USER_STACK_TOP;
+
+  if (argc > 0) {
+    /* Build argv on the new user stack. Write through the kernel's TTBR1
+     * mapping of the freshly-allocated stack pages — PHYS_TO_VIRT(stack_phys)
+     * — so we don't depend on TTBR0 already pointing at new_l0. */
+    uintptr_t stack_kbase   = PHYS_TO_VIRT(stack_phys);
+    uint64_t  stack_user_lo = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
+
+    /* Strings at the very top, growing downward. */
+    uint64_t strings_user_base = USER_STACK_TOP - arg_bytes;
+    memcpy((void *)(stack_kbase + (strings_user_base - stack_user_lo)),
+           arg_kbuf, arg_bytes);
+
+    /* argv array of (argc + 1) pointers, 16-byte aligned, just below the
+     * strings. argv[i] is the *user VA* of the i-th string. */
+    uint64_t  argv_user_top  = strings_user_base & ~(uint64_t)15;
+    uint64_t  argv_user_base = argv_user_top - (uint64_t)(argc + 1) * 8;
+    uint64_t *argv_kernel    = (uint64_t *)(stack_kbase +
+                                            (argv_user_base - stack_user_lo));
+    for (int i = 0; i < argc; i++) {
+      argv_kernel[i] = strings_user_base + arg_offsets[i];
+    }
+    argv_kernel[argc] = 0;
+
+    /* SP_EL0 sits 16-byte aligned below the argv array. */
+    new_sp = argv_user_base & ~(uint64_t)15;
+
+    /* AAPCS64 entry: x0 = argc, x1 = argv, x2 = envp (NULL for now). */
+    frame->regs[0] = (uint64_t)argc;
+    frame->regs[1] = argv_user_base;
+    frame->regs[2] = 0;
+  }
+  frame_raw[35] = new_sp;
+
+
 
   /* 8. Free old image now that we're no longer using it. mmu_free_user_tables
    * walks intermediate tables only — leaf data pages (text, stack) are
@@ -375,11 +457,20 @@ void syscall_dispatch(trap_frame_t *frame) {
   }
 
 
-  case SYS_EXEC:
-    /* arg0 = path. On success the eret will land in the new program;
-     * the return value written below is moot but kept consistent. */
-    ret = sys_exec(arg0, frame);
+  case SYS_EXEC: {
+    /* arg0 = path, arg1 = argv. On success the trap frame has been fully
+     * rewritten so the eret lands in the new program with x0=argc, x1=argv.
+     * We MUST NOT fall through to the dispatcher's frame->regs[0] writeback
+     * — that would clobber argc. Return early so the eret epilogue uses
+     * the frame as-is. On failure (-1), surface that to the caller via the
+     * normal x0 return path. */
+    int64_t r = sys_exec(arg0, arg1, frame);
+    if (r >= 0) {
+      return;
+    }
+    ret = -1;
     break;
+  }
 
 
 

@@ -140,10 +140,11 @@ static inline int64_t sys_fork(void) {
   return x0;
 }
 
-static inline int64_t sys_exec(const char *path) {
+static inline int64_t sys_exec(const char *path, const char *const *argv) {
   register const char *x0 __asm__("x0") = path;
+  register const char *const *x1 __asm__("x1") = argv;
   register uint64_t x8 __asm__("x8") = 13; /* SYS_EXEC */
-  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory");
   return (int64_t)x0;
 }
 
@@ -391,10 +392,32 @@ static void task_shell(void) {
       /* SYS_EXEC — if it succeeds, control jumps to the new program's _start
        * and never returns here. The shell as we know it is gone (replaced).
        * If it returns, the call failed; report and continue. */
-      const char *path = line + 5;
-      int64_t r = sys_exec(path);
-      if (r < 0) {
-        sh_print("exec: failed (open / read / alloc)\n");
+      /* Tokenize the command tail in-place. Replace each space with NUL
+       * and record argv pointers. argv[0] is the command word (the user
+       * conventionally passes the program name there); subsequent slots
+       * are positional args. argv array is NULL-terminated for the kernel. */
+      char *cmd = line + 5;
+      const char *argv[16];
+      int argc = 0;
+      char *p2 = cmd;
+      while (*p2 && argc < 15) {
+        while (*p2 == ' ') p2++;
+        if (!*p2) break;
+        argv[argc++] = p2;
+        while (*p2 && *p2 != ' ') p2++;
+        if (*p2) {
+          *p2 = '\0';
+          p2++;
+        }
+      }
+      argv[argc] = 0;
+      if (argc == 0) {
+        sh_print("exec: usage: exec <path> [args...]\n");
+      } else {
+        int64_t r = sys_exec(argv[0], argv);
+        if (r < 0) {
+          sh_print("exec: failed (open / read / alloc)\n");
+        }
       }
 
     } else if (u_streq(line, "balloon") ||

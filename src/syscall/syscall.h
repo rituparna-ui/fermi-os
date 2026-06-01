@@ -19,6 +19,15 @@
 #define SYS_KILL 11      /* arg0 = pid; returns 0 or -1 */
 #define SYS_FORK 12      /* duplicates the calling task; child sees 0, parent sees child pid */
 #define SYS_EXEC 13      /* arg0 = path to flat user binary; replaces caller image */
+#define SYS_BALLOON 14   /* arg0 = op (0=inflate,1=deflate,2=actual,3=target), arg1 = n */
+
+/* SYS_BALLOON sub-operations. Inflate/deflate hand pages to/from the host
+ * via virtio-balloon; status returns the current size (op=2) or the host's
+ * requested target (op=3). */
+#define BALLOON_OP_INFLATE 0
+#define BALLOON_OP_DEFLATE 1
+#define BALLOON_OP_ACTUAL  2
+#define BALLOON_OP_TARGET  3
 
 /* SYS_LSEEK whence — mirrors POSIX so user-space and the kernel agree. */
 #define SEEK_SET 0

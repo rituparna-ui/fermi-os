@@ -9,6 +9,7 @@
  *   /proc/meminfo   PMM + heap stats (one key per line)
  *   /proc/tasks     PID / state / name table
  *   /proc/version   kernel banner / build info
+ *   /proc/balloon   virtio-balloon actual / host-target page counts
  */
 void proc_init(void);
 

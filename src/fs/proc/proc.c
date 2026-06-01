@@ -9,6 +9,7 @@
 #include "uart/uart.h"
 #include "utils/utils.h"
 #include "vfs/vfs.h"
+#include "balloon/balloon.h"
 
 /* Each /proc file regenerates its content on every read out of live
  * kernel state. The caller-provided buf is filled with bytes
@@ -141,6 +142,18 @@ static int gen_version(char *buf, size_t buflen) {
                    "Built: " __DATE__ " " __TIME__ "\n");
 }
 
+static int gen_balloon(char *buf, size_t buflen) {
+  /* Both counters are in 4 KiB balloon pages. KB == pages * 4. */
+  uint32_t actual = 0, target = 0;
+  balloon_get_status(&actual, &target);
+  return ksnprintf(buf, buflen,
+                   "actual:      %u pages (%u KB)\n"
+                   "host_target: %u pages (%u KB)\n",
+                   (uint64_t)actual, (uint64_t)actual * 4,
+                   (uint64_t)target, (uint64_t)target * 4);
+}
+
+
 /* ------------------------------------------------------------------ */
 /* file_operations wrappers                                            */
 /* ------------------------------------------------------------------ */
@@ -173,6 +186,12 @@ static int read_cmdline(struct vnode *n, file_t *f, void *buf, size_t count) {
   return proc_read_via(gen_cmdline, f, buf, count);
 }
 
+static int read_balloon(struct vnode *n, file_t *f, void *buf, size_t count) {
+  (void)n;
+  return proc_read_via(gen_balloon, f, buf, count);
+}
+
+
 static int read_version(struct vnode *n, file_t *f, void *buf, size_t count) {
   (void)n;
   return proc_read_via(gen_version, f, buf, count);
@@ -185,6 +204,9 @@ static file_operations_t netinfo_ops = {.read = read_netinfo, .write = 0};
 static file_operations_t interrupts_ops = {.read = read_interrupts, .write = 0};
 
 static file_operations_t cmdline_ops = {.read = read_cmdline, .write = 0};
+
+static file_operations_t balloon_ops = {.read = read_balloon, .write = 0};
+
 
 static file_operations_t version_ops = {.read = read_version, .write = 0};
 
@@ -219,7 +241,9 @@ void proc_init(void) {
 
   register_file(proc, "cmdline", &cmdline_ops);
 
+  register_file(proc, "balloon", &balloon_ops);
+  
   register_file(proc, "version", &version_ops);
 
-  uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, interrupts, netinfo, cmdline, version");
+  uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, interrupts, netinfo, cmdline, version, balloon");
 }

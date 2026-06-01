@@ -11,6 +11,7 @@
 #include "panic/panic.h"
 #include "pci/pci.h"
 #include "rng/rng.h"
+#include "balloon/balloon.h"
 #include "net/net.h"
 #include "sched/sched.h"
 #include "strings/strings.h" // IWYU pragma: keep
@@ -146,6 +147,14 @@ static inline int64_t sys_exec(const char *path) {
   return (int64_t)x0;
 }
 
+static inline int64_t sys_balloon(uint64_t op, uint64_t n) {
+  register uint64_t x0 __asm__("x0") = op;
+  register uint64_t x1 __asm__("x1") = n;
+  register uint64_t x8 __asm__("x8") = 14; /* SYS_BALLOON */
+  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory");
+  return (int64_t)x0;
+}
+
 /* ----------------------------------------------------------------
  * Tiny EL0 user-space helpers used by task_shell. Defined inline
  * because user-space cannot call into the kernel string library.
@@ -240,6 +249,7 @@ static void sh_help(void) {
       "  kill <pid>      - terminate a task by pid\n"
       "  fork            - spawn a child task; both parent and child print\n"
       "  exec <path>     - replace this task with a flat binary from disk\n"
+      "  balloon         - virtio-balloon: status / inflate N / deflate N\n"
       "  top             - 5x refresh of tasks/mem/net (1 s)\n"
       "  ping            - ICMP echo the slirp gateway (10.0.2.2)\n"
       "  sleep <ms>      - block for <ms> milliseconds\n"
@@ -386,6 +396,57 @@ static void task_shell(void) {
       if (r < 0) {
         sh_print("exec: failed (open / read / alloc)\n");
       }
+
+    } else if (u_streq(line, "balloon") ||
+               u_starts_with(line, "balloon ")) {
+      /* `balloon`              -> show actual + host target
+       * `balloon inflate N`    -> hand N pages to host
+       * `balloon deflate N`    -> reclaim N pages from host
+       * Numbers are in 4 KiB balloon pages. The driver enforces a hard
+       * cap (VIRTIO_BALLOON_MAX_PAGES) and clamps if PMM is exhausted. */
+      const char *arg = (line[7] == ' ') ? line + 8 : 0;
+      if (!arg || u_streq(arg, "status")) {
+        int64_t a = sys_balloon(2 /*BALLOON_OP_ACTUAL*/, 0);
+        int64_t t = sys_balloon(3 /*BALLOON_OP_TARGET*/, 0);
+        char out[80];
+        const char p1[] = "balloon: actual=";
+        const char p2[] = " pages target=";
+        const char p3[] = " pages\n";
+        int p = 0;
+        for (size_t i = 0; i < sizeof(p1) - 1; i++) out[p++] = p1[i];
+        p += u_render_uint(out + p, (int)(sizeof(out) - p), (uint64_t)a);
+        for (size_t i = 0; i < sizeof(p2) - 1; i++) out[p++] = p2[i];
+        p += u_render_uint(out + p, (int)(sizeof(out) - p), (uint64_t)t);
+        for (size_t i = 0; i < sizeof(p3) - 1; i++) out[p++] = p3[i];
+        sys_write(1, out, (uint64_t)p);
+      } else if (u_starts_with(arg, "inflate ")) {
+        int n = u_atou(arg + 8);
+        int64_t got = sys_balloon(0 /*INFLATE*/, (uint64_t)n);
+        char out[64];
+        const char pfx[] = "balloon: inflated ";
+        const char sfx[] = " pages\n";
+        int p = 0;
+        for (size_t i = 0; i < sizeof(pfx) - 1; i++) out[p++] = pfx[i];
+        p += u_render_uint(out + p, (int)(sizeof(out) - p),
+                           (uint64_t)(got < 0 ? 0 : got));
+        for (size_t i = 0; i < sizeof(sfx) - 1; i++) out[p++] = sfx[i];
+        sys_write(1, out, (uint64_t)p);
+      } else if (u_starts_with(arg, "deflate ")) {
+        int n = u_atou(arg + 8);
+        int64_t got = sys_balloon(1 /*DEFLATE*/, (uint64_t)n);
+        char out[64];
+        const char pfx[] = "balloon: deflated ";
+        const char sfx[] = " pages\n";
+        int p = 0;
+        for (size_t i = 0; i < sizeof(pfx) - 1; i++) out[p++] = pfx[i];
+        p += u_render_uint(out + p, (int)(sizeof(out) - p),
+                           (uint64_t)(got < 0 ? 0 : got));
+        for (size_t i = 0; i < sizeof(sfx) - 1; i++) out[p++] = sfx[i];
+        sys_write(1, out, (uint64_t)p);
+      } else {
+        sh_print("balloon: usage: balloon [status|inflate N|deflate N]\n");
+      }
+
 
     } else if (u_starts_with(line, "kill ")) {
       int pid = u_atou(line + 5);
@@ -665,6 +726,7 @@ void kernel_main() {
   pci_virtio_rng_init();
   pci_virtio_blk_init();
   pci_virtio_net_init();
+  pci_virtio_balloon_init();
 
   if (fat32_mount() != ESUCCESS) {
     uart_printf("[FS][FAT32] Unable to mount file system");

@@ -5,6 +5,7 @@
 #include "timer/timer.h"
 #include "uart/uart.h"
 #include "vfs/vfs.h"
+#include "pci/virtio/balloon/balloon.h"
 
 #include "mm/heap/heap.h"
 #include "mm/pmm/pmm.h"
@@ -345,6 +346,34 @@ void syscall_dispatch(trap_frame_t *frame) {
      * when first scheduled, returns 0 from this same SVC via fork_return. */
     ret = (int64_t)sched_fork(sched_current(), frame);
     break;
+
+  case SYS_BALLOON: {
+    /* arg0 = op (BALLOON_OP_*), arg1 = page count. Status ops ignore arg1
+     * and return the relevant counter. Inflate/deflate return how many
+     * pages actually moved. */
+    uint32_t actual = 0, target = 0;
+    switch (arg0) {
+    case BALLOON_OP_INFLATE:
+      ret = (int64_t)balloon_inflate((uint32_t)arg1);
+      break;
+    case BALLOON_OP_DEFLATE:
+      ret = (int64_t)balloon_deflate((uint32_t)arg1);
+      break;
+    case BALLOON_OP_ACTUAL:
+      balloon_get_status(&actual, NULL);
+      ret = (int64_t)actual;
+      break;
+    case BALLOON_OP_TARGET:
+      balloon_get_status(NULL, &target);
+      ret = (int64_t)target;
+      break;
+    default:
+      ret = -1;
+      break;
+    }
+    break;
+  }
+
 
   case SYS_EXEC:
     /* arg0 = path. On success the eret will land in the new program;

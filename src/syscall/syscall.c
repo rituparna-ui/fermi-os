@@ -10,6 +10,7 @@
 #include "mm/heap/heap.h"
 #include "mm/pmm/pmm.h"
 #include "strings/strings.h"
+#include "elf.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -172,48 +173,50 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
     return -1;
   }
 
-  /* 3. Fresh user-text PMM region; copy code, zero-pad the tail. */
-  size_t code_pages = ((size_t)size + PAGE_SIZE - 1) / PAGE_SIZE;
-  uintptr_t text_phys = pmm_allocate_pages(code_pages);
-  if (!text_phys) {
-    kfree(kbuf);
-    return -1;
-  }
-  uintptr_t text_va = PHYS_TO_VIRT(text_phys);
-  memcpy((void *)text_va, kbuf, (size_t)size);
-  memset((void *)(text_va + (size_t)size), 0,
-         code_pages * PAGE_SIZE - (size_t)size);
-  kfree(kbuf);
-
-  /* 4. Fresh user stack pages. */
+  /* 3. Fresh user stack pages — always 16 KiB, RW + UXN, mapped at the
+   * top of the user range. The stack is independent of the binary; the
+   * ELF loader handles only PT_LOAD segments. */
   uintptr_t stack_phys = pmm_allocate_pages(USER_STACK_PAGES);
   if (!stack_phys) {
-    pmm_free_pages(text_phys, code_pages);
+    kfree(kbuf);
     return -1;
   }
   memset((void *)PHYS_TO_VIRT(stack_phys), 0, USER_STACK_PAGES * PAGE_SIZE);
 
-  /* 5. Build a fresh user_l0 that maps only the new text + stack. */
+  /* 4. Build a fresh user_l0 and load each PT_LOAD into it. elf_load
+   * allocates per-segment PMM pages, copies file bytes, zeros .bss, and
+   * maps with permissions derived from each segment's p_flags (RO+X for
+   * .text, RW+UXN for .data + .bss, RO+UXN for .rodata). On failure it
+   * frees any partial allocations before returning. */
   uint64_t *new_l0 = mmu_create_user_tables();
   if (!new_l0) {
     pmm_free_pages(stack_phys, USER_STACK_PAGES);
-    pmm_free_pages(text_phys, code_pages);
+    kfree(kbuf);
     return -1;
   }
-  uint64_t text_flags  = PTE_ATTRIDX(1) | PTE_AP_RO_EL0 | PTE_PXN;
+
+  elf_image_t img;
+  if (elf_load(kbuf, (size_t)size, new_l0, &img) < 0) {
+    /* elf_load already freed any per-segment pages it allocated; we still
+     * need to tear down the user_l0 page tables and the stack. */
+    mmu_free_user_tables(new_l0);
+    pmm_free_pages(stack_phys, USER_STACK_PAGES);
+    kfree(kbuf);
+    return -1;
+  }
+  kfree(kbuf);
+
+  /* 5. Map the user stack into the new user_l0. */
   uint64_t stack_flags = PTE_ATTRIDX(1) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN;
-  mmu_map_user_range(new_l0, USER_TEXT_BASE, text_phys, code_pages,
-                     text_flags);
-  uint64_t stack_user_base =
-      USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
+  uint64_t stack_user_base = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
   mmu_map_user_range(new_l0, stack_user_base, stack_phys, USER_STACK_PAGES,
                      stack_flags);
 
   /* Print diagnostic *before* the TTBR0 swap. `path` is a user pointer
    * into the OLD address space, which gets unmapped + freed below. */
-  uart_printf("[EXEC] Task %d '%s' loading %s (%d bytes, %d pages)\n",
+  uart_printf("[EXEC] Task %d '%s' loading %s (%d bytes, %d region(s), entry %x)\n",
               cur->pid, cur->name, path, (uint64_t)size,
-              (uint64_t)code_pages);
+              (uint64_t)img.region_count, img.entry);
 
 
   /* 6. Swap in the new image. Save old refs first — we'll free them after
@@ -221,14 +224,12 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
    * still using them. */
   uint64_t  old_ttbr0       = cur->ttbr0;
   uintptr_t old_ustack_phys = cur->ustack_phys;
-  uintptr_t old_exec_phys   = cur->exec_text_phys;
-  uint64_t  old_exec_pages  = cur->exec_text_pages;
+  elf_image_t old_image    = cur->exec_image;
 
   cur->ttbr0          = (uint64_t)new_l0;
   cur->ustack_phys    = stack_phys;
   cur->user_sp        = USER_STACK_TOP;
-  cur->exec_text_phys = text_phys;
-  cur->exec_text_pages = code_pages;
+  cur->exec_image     = img;
 
   __asm__ __volatile__("msr ttbr0_el1, %0\n"
                        "isb\n"
@@ -243,7 +244,7 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
   for (int i = 0; i < 31; i++) {
     frame->regs[i] = 0;
   }
-  frame->elr  = USER_TEXT_BASE;
+  frame->elr  = img.entry;
   frame->spsr = 0; /* EL0t, IRQs unmasked */
 
   /* sp_el0 lives at offset 280 in the 288-byte on-stack trap frame; the
@@ -292,8 +293,11 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
   if (old_ustack_phys) {
     pmm_free_pages(old_ustack_phys, USER_STACK_PAGES);
   }
-  if (old_exec_phys) {
-    pmm_free_pages(old_exec_phys, old_exec_pages);
+  /* Free per-segment regions from the previous exec image (if any). */
+  for (int i = 0; i < old_image.region_count; i++) {
+    if (old_image.regions[i].phys && old_image.regions[i].pages) {
+      pmm_free_pages(old_image.regions[i].phys, old_image.regions[i].pages);
+    }
   }
   if (old_ttbr0) {
     mmu_free_user_tables((uint64_t *)old_ttbr0);

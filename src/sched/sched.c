@@ -542,10 +542,15 @@ void sched_reap(void) {
       pmm_free_pages(dead->ustack_phys, USER_STACK_PAGES);
     }
 
-    /* Free per-exec text pages if this task was loaded by exec().
-     * Tasks running the kernel-shared image have exec_text_phys == 0. */
-    if (dead->exec_text_phys) {
-      pmm_free_pages(dead->exec_text_phys, dead->exec_text_pages);
+    /* Free per-exec PMM regions if this task was loaded by exec(). Tasks
+     * running the kernel-shared image have region_count == 0. Each region
+     * was a separate pmm_allocate_pages() call in elf_load(). */
+    for (int i = 0; i < dead->exec_image.region_count; i++) {
+      uintptr_t p  = dead->exec_image.regions[i].phys;
+      uint64_t  pp = dead->exec_image.regions[i].pages;
+      if (p && pp) {
+        pmm_free_pages(p, pp);
+      }
     }
 
 

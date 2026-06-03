@@ -28,7 +28,8 @@ DEPS    := $(OBJECTS:.o=.d)
 # = 0x400000, _start as entry) and is then objcopy'd into a flat user/<name>.bin.
 USER_S_SOURCES := $(wildcard $(USER_DIR)/*.S)
 USER_C_SOURCES := $(wildcard $(USER_DIR)/*.c)
-USER_BINS      := $(USER_S_SOURCES:.S=.bin) $(USER_C_SOURCES:.c=.bin)
+# Disk now ships ELF directly — the kernel parses ET_EXEC + walks PT_LOADs.
+USER_BINS      := $(USER_S_SOURCES:.S=.elf) $(USER_C_SOURCES:.c=.elf)
 USER_CRT0      := $(USER_DIR)/lib/crt0.o
 USER_INCLUDE   := -I $(USER_DIR)/include
 
@@ -116,9 +117,9 @@ $(USER_DIR)/%.elf: $(USER_DIR)/%.c $(USER_CRT0)
 		-Wl,-Ttext=0x400000 -Wl,-e,_start -Wl,--build-id=none \
 		-o $@ $(USER_CRT0) $<
 
-$(USER_DIR)/%.bin: $(USER_DIR)/%.elf
-	@echo "USER OBJCOPY $<"
-	@$(CROSS_COMPILE)objcopy -O binary $< $@
+# objcopy step removed — the kernel now loads real ELF files. Keeping the
+# rule scaffolding here would reintroduce confusion about which artifact
+# ships on disk.
 
 user_bins: $(USER_BINS)
 
@@ -145,7 +146,7 @@ $(DISK_IMG): $(USER_BINS)
 	@printf 'Hello from a subdirectory!\n' \
 		| MTOOLS_SKIP_CHECK=1 mcopy -i $@ - ::/SUBDIR/INFO.TXT
 	@for bin in $(USER_BINS); do \
-		name=$$(basename $$bin .bin | tr '[:lower:]' '[:upper:]').BIN; \
+		name=$$(basename $$bin .elf | tr '[:lower:]' '[:upper:]').ELF; \
 		echo "  + $$name <- $$bin"; \
 		MTOOLS_SKIP_CHECK=1 mcopy -i $@ $$bin ::/$$name; \
 	done

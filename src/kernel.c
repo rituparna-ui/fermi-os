@@ -251,6 +251,7 @@ static void sh_help(void) {
       "  irqs            - cat /proc/interrupts\n"
       "  version         - cat /proc/version\n"
       "  cpuinfo         - cat /proc/cpuinfo (MIDR / cache / features / cycles)\n"
+      "  stack           - stress test demand-paged user stack growth\n"
       "  cat <path>      - print a file\n"
       "  hexdump <path>  - hex+ascii dump of a file\n"
       "  echo <text>     - print text\n"
@@ -564,6 +565,22 @@ static void task_shell(void) {
       int ms = u_atou(line + 6);
       sys_sleep((uint64_t)ms);
 
+    } else if (u_streq(line, "stack")) {
+      /* Stress demand-paged stack growth. The initial user stack is
+       * 16 KiB; allocating a 64 KiB local buffer forces 16 page faults,
+       * each handled by sched_try_grow_stack. We touch every page to
+       * ensure each fault actually fires (compiler can't elide the
+       * writes thanks to volatile). */
+      volatile char buf[64 * 1024];
+      for (uint64_t i = 0; i < sizeof(buf); i += 4096) {
+        buf[i] = (char)(i & 0xFF);
+      }
+      int ok = 1;
+      for (uint64_t i = 0; i < sizeof(buf); i += 4096) {
+        if (buf[i] != (char)(i & 0xFF)) ok = 0;
+      }
+      sh_print(ok ? "stack: 64 KiB stack probe OK (16 page-grows)\n"
+                  : "stack: 64 KiB stack probe FAILED\n");
     } else if (u_streq(line, "exit")) {
       sh_print("bye!\n");
       sys_exit();

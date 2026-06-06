@@ -9,6 +9,14 @@ struct fd_table;
 
 #define TASK_STACK_PAGES 4 // 16 KiB per task (kernel stack)
 #define USER_STACK_PAGES 4 // 16 KiB user stack
+/* Hard cap for demand-paged user stack growth. The initial USER_STACK_PAGES
+ * are eagerly mapped at task creation; faults in [USER_STACK_TOP - MAX*PAGE,
+ * USER_STACK_TOP - INITIAL*PAGE) trigger sched_try_grow_stack() which maps
+ * a fresh page on demand up to this cap. 64 pages = 256 KiB total stack,
+ * matching a typical Linux RLIMIT_STACK of ~8 MiB scaled to a hobby-kernel
+ * memory budget. */
+#define USER_STACK_PAGES_MAX 64
+#define USER_STACK_GROWN_MAX (USER_STACK_PAGES_MAX - USER_STACK_PAGES)
 
 typedef enum {
   TASK_READY,
@@ -38,6 +46,13 @@ typedef struct task {
   char name[16];
   struct fd_table *fds;
   struct task *next;
+  /* Demand-paged stack growth tracking. Each entry is the physical base
+   * of a 4 KiB page that was lazily mapped into the user stack region by
+   * sched_try_grow_stack(); sched_reap() walks the array to pmm_free them.
+   * Placed at the end of task_t so the existing TASK_TTBR0=40 offset used
+   * by switch.S stays put. */
+  uintptr_t stack_grown_phys[USER_STACK_GROWN_MAX];
+  uint16_t  stack_grown_count;
 } task_t;
 
 // switch.S
@@ -92,6 +107,16 @@ const char *task_state_name(task_state_t s);
  * stale TLB entries. With the current hobby-kernel workloads we never
  * observe a wrap. */
 uint16_t sched_asid_alloc(void);
+
+
+/* Demand-page handler for the user stack. Called from the EL0 data-abort
+ * path BEFORE the fatal kill. If `far` lies in the growth zone
+ * [USER_STACK_TOP - USER_STACK_PAGES_MAX * PAGE, USER_STACK_TOP -
+ * USER_STACK_PAGES * PAGE) and the task hasn't exhausted USER_STACK_GROWN_MAX,
+ * allocates a fresh PMM page, zeros it, and maps it into t->ttbr0 at the
+ * page containing far. Returns 1 on success (caller should resume the user
+ * task), 0 on failure (caller should fall through to the fault dump). */
+int sched_try_grow_stack(task_t *t, uint64_t far);
 
 
 #endif

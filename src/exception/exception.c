@@ -198,6 +198,16 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
 
     case EC_DATA_ABORT_LO: {
       task_t *t = sched_current();
+      uint8_t dfsc = (uint8_t)ESR_ISS_DFSC(frame->esr);
+      /* Translation fault L1/L2/L3 in the user-stack growth zone =>
+       * demand-paged stack growth. Map a page and resume; if anything
+       * about the request is suspicious (out of zone, cap exhausted,
+       * PMM empty) sched_try_grow_stack returns 0 and we fall through
+       * to the fatal kill below. */
+      if ((dfsc == 0x05 || dfsc == 0x06 || dfsc == 0x07) &&
+          sched_try_grow_stack(t, frame->far)) {
+        break;  /* eret resumes the faulting instruction */
+      }
       dump_user_abort("data abort", t, frame);
       task_exit();
       break;

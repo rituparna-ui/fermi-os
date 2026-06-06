@@ -34,6 +34,72 @@ static task_t *dead_list = (void *)0;
  * practice — fermi-os runs a handful of tasks for the whole boot session. */
 static uint16_t next_asid = 1;
 
+/* Demand-paged stack growth. Called from the EL0 data-abort handler when a
+ * user task faults on an address below its currently-mapped stack but inside
+ * the maximum stack range. We allocate one fresh page, zero it, and map it
+ * with EL0 RW + UXN | PXN. The faulting instruction will re-execute and
+ * succeed because the new translation is now installed.
+ *
+ * TLB invalidation: ARMv8 architecturally permits caching of failed
+ * translations, so even though the prior fault implies "no entry", we
+ * issue tlbi vae1 for safety on the affected (VA, ASID) pair before the
+ * user re-tries the access. The dsb ish sequences the page-table store
+ * before the invalidate; isb sequences the invalidate before eret.
+ *
+ * Returns 1 on success, 0 if `far` is outside the growth zone, the cap
+ * is exhausted, or the PMM is empty. */
+int sched_try_grow_stack(task_t *t, uint64_t far) {
+  if (!t || !t->ttbr0) {
+    return 0;
+  }
+
+  /* Bounds: far must be in [stack_max_lo, stack_initial_lo). Below
+   * stack_max_lo is a wild pointer; at-or-above stack_initial_lo means
+   * the page is already (or should already be) mapped — a fault there
+   * is a permission/alignment issue, not a growth case. */
+  uint64_t stack_max_lo     = USER_STACK_TOP - USER_STACK_PAGES_MAX * PAGE_SIZE;
+  uint64_t stack_initial_lo = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
+  if (far < stack_max_lo || far >= stack_initial_lo) {
+    return 0;
+  }
+
+  if (t->stack_grown_count >= USER_STACK_GROWN_MAX) {
+    uart_errorln("[STACK] grow refused: USER_STACK_GROWN_MAX hit");
+    return 0;
+  }
+
+  /* Allocate + zero. memset goes through TTBR1 (PHYS_TO_VIRT) so we don't
+   * depend on TTBR0 happening to identity-map RAM. */
+  uintptr_t pa = pmm_allocate_page();
+  if (!pa) {
+    uart_errorln("[STACK] grow refused: PMM exhausted");
+    return 0;
+  }
+  memset((void *)PHYS_TO_VIRT(pa), 0, PAGE_SIZE);
+
+  uint64_t va = far & ~(uint64_t)(PAGE_SIZE - 1);
+  uint64_t flags = PTE_ATTRIDX(1) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN;
+  uint64_t *l0 = (uint64_t *)ttbr_baddr(t->ttbr0);
+  mmu_map_user_range(l0, va, pa, 1, flags);
+
+  /* tlbi vae1, Xt: Xt[63:48] = ASID, Xt[43:0] = VA[55:12] (page-frame
+   * number). Only the (VA, ASID) pair we just mapped — cheap. */
+  uint16_t asid = ttbr_asid(t->ttbr0);
+  uint64_t arg  = ((uint64_t)asid << TTBR_ASID_SHIFT) | (va >> 12);
+  __asm__ __volatile__("dsb ish\n\t"
+                       "tlbi vae1, %0\n\t"
+                       "dsb ish\n\t"
+                       "isb"
+                       :: "r"(arg));
+
+  t->stack_grown_phys[t->stack_grown_count++] = pa;
+
+  uart_printf("[STACK] grew task %u '%s' by 1 page at %x (now %u dyn pages)\n",
+              t->pid, t->name, va, (uint64_t)t->stack_grown_count);
+  return 1;
+}
+
+
 uint16_t sched_asid_alloc(void) {
   uint16_t a = next_asid++;
   if (next_asid == 0) {
@@ -582,6 +648,17 @@ void sched_reap(void) {
       uint64_t  pp = dead->exec_image.regions[i].pages;
       if (p && pp) {
         pmm_free_pages(p, pp);
+      }
+    }
+
+
+    /* Free pages acquired through demand-paged stack growth.
+     * mmu_free_user_tables walks intermediate L1/L2/L3 tables but not
+     * leaf data pages — those are tracked separately so we can pmm_free
+     * exactly what was pmm_allocate'd in sched_try_grow_stack. */
+    for (int i = 0; i < dead->stack_grown_count; i++) {
+      if (dead->stack_grown_phys[i]) {
+        pmm_free_page(dead->stack_grown_phys[i]);
       }
     }
 

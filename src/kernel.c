@@ -56,8 +56,12 @@ void early_init() {
   pmm_init(MEM_START, MEM_SIZE);
   pmm_print_info();
 
-  mmu_init();
-  // mmu_run_tests(l1);
+  uint64_t *l1_phys = mmu_init();
+  /* Run MMU self-tests right after enable, while TTBR0 still points at the
+   * boot-time identity table (l0_table_lo). The L2 remap test installs a
+   * fresh PTE in this table and verifies VA-→-new-PA propagation; safe to
+   * call only before any per-task user_l0 has taken over TTBR0. */
+  mmu_run_tests(l1_phys);
 
   uart_println("[BOOT] MMU Enabled. Jumping to Upper Half");
 }

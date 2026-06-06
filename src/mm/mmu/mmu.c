@@ -196,8 +196,9 @@ static uint64_t *walk_levels(uint64_t *l0_table, uint64_t va, int target_level,
 
 
 uint64_t *mmu_create_user_tables(void) {
-  return alloc_table(); // just an empty L0 — walk_page_table will fill on
-                        // demand
+  // Just an empty L0 (physical address) — walk_levels() will populate
+  // L1/L2/L3 tables on demand when mmu_map_user_range() is called.
+  return alloc_table();
 }
 
 void mmu_map_user_range(uint64_t *l0, uint64_t va, uint64_t pa,
@@ -341,10 +342,12 @@ static uint64_t *walk_levels(uint64_t *l0_table, uint64_t va, int target_level,
   return &l3[l3i];
 }
 
-// Walk to the L2 entry. Used by tests that install 2 MB block descriptors.
-static uint64_t *walk_page_table(uint64_t *l0_table, uint64_t va, int alloc) {
-  return walk_levels(l0_table, va, 2, alloc);
-}
+/* walk_page_table() removed: it was a thin wrapper around walk_levels()
+ * with target_level=2, used only by a 2 MiB-block test that wrote into
+ * a phys address treated as a VA and could clobber kernel code at PA
+ * 0x40000000 if the PMM happened to hand back an early page. With user
+ * mappings now living at L3 (4 KiB pages), there are no remaining
+ * callers — walk_levels() is the canonical entry point. */
 
 static void print_result(const char *name, int pass) {
   uart_printf("[MMU TEST] %s: %s\n", name, pass ? "PASS" : "FAIL");
@@ -376,69 +379,78 @@ static int test_identity_mapping(void) {
 /* test_remap was removed: it was never invoked from mmu_run_tests and
  * mutated TTBR0 mappings in a way that's no longer safe with per-task L0s. */
 
-static int test_remap_l2(uint64_t *l1_table) {
+/* L2 remap test: rewrite an L2 PTE in the kernel's TTBR0 identity-map
+ * to point at a freshly-allocated 2 MiB region, write through the VA,
+ * and verify the data lands at the new phys via the TTBR1 high-half.
+ *
+ * Prerequisite: TTBR0_EL1 must point at l0_table_lo (the boot-time
+ * identity-mapping table) when this runs. mmu_run_tests() is invoked
+ * from kernel_main right after mmu_init(), before any user task is
+ * created, so this is naturally satisfied.
+ *
+ * pmm_allocate_pages returns 4 KiB-aligned RAM. To install a 2 MiB
+ * block descriptor we need 2 MiB alignment, so we ask for 1024 pages
+ * (4 MiB) and pick the 2 MiB-aligned half. The other half is freed. */
+static int test_remap_l2(uint64_t *l1_table_phys) {
   uart_println("[MMU TEST] L2 remap test");
 
-  uint64_t l1_idx = 1;  // safe RAM region
-  uint64_t l2_idx = 10; // arbitrary 2MB chunk
+  /* l1_table is a *physical* pointer (returned by build_identity_tables
+   * via alloc_table). Route every dereference through PHYS_TO_VIRT so the
+   * test does not depend on TTBR0 happening to identity-map RAM. */
+  uint64_t *l1 = (uint64_t *)PHYS_TO_VIRT((uintptr_t)l1_table_phys);
 
-  uint64_t *l2_table = (uint64_t *)(l1_table[l1_idx] & ~0xFFFULL);
+  uint64_t l1_idx = 1;  // safe RAM region (1 GiB — well past kernel)
+  uint64_t l2_idx = 10; // arbitrary 2 MiB chunk
 
-  uint64_t old = l2_table[l2_idx];
+  /* The L1 entry is a TABLE descriptor; pte_next_table extracts the L2
+   * physical pointer. Access via PHYS_TO_VIRT — same reason as above. */
+  uintptr_t l2_phys = (uintptr_t)pte_next_table(l1[l1_idx]);
+  uint64_t *l2      = (uint64_t *)PHYS_TO_VIRT(l2_phys);
 
-  uint64_t new_phys = ((l1_idx * 0x40000000ULL) + ((l2_idx + 1) * 0x200000ULL));
+  uint64_t old = l2[l2_idx];
 
-  l2_table[l2_idx] = new_phys | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER |
-                     PTE_AP_RW | PTE_ATTRIDX(1);
+  /* Get a 2 MiB-aligned chunk of RAM for the remap target. */
+  uintptr_t alloc_phys = pmm_allocate_pages(1024);  // 4 MiB
+  if (!alloc_phys) {
+    uart_errorln("[MMU TEST] L2 remap: pmm_allocate_pages failed");
+    return 0;
+  }
+  uintptr_t new_phys      = (alloc_phys + (_2MB - 1)) & ~(_2MB - 1);
+  uint64_t  pre_pad_pages = (new_phys - alloc_phys) / PAGE_SIZE;
+  uint64_t  post_pad_pages = 1024 - pre_pad_pages - 512;
 
-  __asm__ __volatile__("tlbi vmalle1");
-  __asm__ __volatile__("dsb ish");
-  __asm__ __volatile__("isb");
+  l2[l2_idx] = new_phys | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER |
+               PTE_AP_RW | PTE_ATTRIDX(1);
 
-  uint64_t va = (l1_idx * 0x40000000ULL) + (l2_idx * 0x200000ULL);
+  __asm__ __volatile__("tlbi vmalle1\n\tdsb ish\n\tisb");
 
-  uint64_t *ptr = (uint64_t *)va;
-  uint64_t *phys_ptr = (uint64_t *)new_phys;
+  /* Intentional VA write: l1_idx*1 GiB + l2_idx*2 MiB lives in the TTBR0
+   * lower half. With TTBR0=l0_table_lo (identity-mapped) at boot, the
+   * write resolves through the freshly-installed PTE to new_phys. */
+  uint64_t va = (l1_idx * _1GB) + (l2_idx * _2MB);
+  *(volatile uint64_t *)va = 0xCAFEBABE;
 
-  *ptr = 0xCAFEBABE;
+  /* Verify via TTBR1 high-half mapping of new_phys — always reachable. */
+  int pass = (*(volatile uint64_t *)PHYS_TO_VIRT(new_phys) == 0xCAFEBABE);
 
-  int pass = (*phys_ptr == 0xCAFEBABE);
+  /* Restore original mapping, flush, and return all pages. */
+  l2[l2_idx] = old;
+  __asm__ __volatile__("tlbi vmalle1\n\tdsb ish\n\tisb");
 
-  // restore
-  l2_table[l2_idx] = old;
-
-  __asm__ __volatile__("tlbi vmalle1");
-  __asm__ __volatile__("dsb ish");
-  __asm__ __volatile__("isb");
+  if (pre_pad_pages)  pmm_free_pages(alloc_phys, pre_pad_pages);
+  pmm_free_pages(new_phys, 512);
+  if (post_pad_pages) pmm_free_pages(new_phys + (512 * PAGE_SIZE), post_pad_pages);
 
   return pass;
 }
 
-static int test_walk(uint64_t *l0) {
-  uart_println("[MMU WALK TEST]");
-
-  uint64_t va = 0x50000000;
-
-  uint64_t pa = pmm_allocate_page();
-  uint64_t aligned_pa = pa & 0xFFFFFFE00000ULL;
-
-  uint64_t *pte = walk_page_table(l0, va, 1);
-
-  *pte = aligned_pa | PTE_VALID | PTE_BLOCK | PTE_AF | PTE_SH_INNER |
-         PTE_AP_RW | PTE_ATTRIDX(1);
-
-  __asm__ __volatile__("tlbi vmalle1");
-  __asm__ __volatile__("dsb ish");
-  __asm__ __volatile__("isb");
-
-  uint64_t *ptr = (uint64_t *)va;
-
-  *ptr = 0x12345678;
-
-  uint64_t *check = (uint64_t *)(aligned_pa + (va & 0x1FFFFF));
-
-  return *check == 0x12345678;
-}
+/* test_walk() removed alongside walk_page_table(): it install a 2 MiB
+ * block at VA 0x50000000 pointing at a 2 MiB-aligned-DOWN phys range,
+ * which could land at PA 0x40000000 (kernel .text) and silently clobber
+ * code. Its essential coverage — that walk_levels() correctly populates
+ * intermediate L1/L2/L3 tables — is now exercised on every boot by
+ * sched_create_task() mapping per-task .text + user-stack via
+ * mmu_map_user_range(). */
 
 static int test_ttbr1_upper_half(void) {
   uart_println("[MMU TEST] TTBR1 upper half access test");
@@ -471,10 +483,9 @@ static int test_ttbr1_upper_half(void) {
   return pass;
 }
 
-void mmu_run_tests(uint64_t *l1_table) {
-  print_result("MMU Enabled", test_mmu_enabled());
+void mmu_run_tests(uint64_t *l1_table_phys) {
+  print_result("MMU Enabled",      test_mmu_enabled());
   print_result("Identity Mapping", test_identity_mapping());
-  print_result("Remap Test L2", test_remap_l2(l1_table));
-  print_result("MMU Table Walk", test_walk(l0_table_lo));
+  print_result("L2 Remap",         test_remap_l2(l1_table_phys));
   print_result("TTBR1 Upper Half", test_ttbr1_upper_half());
 }

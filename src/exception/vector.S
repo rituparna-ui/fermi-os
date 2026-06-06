@@ -1,13 +1,29 @@
 // Trap frame layout:
-//   [sp + 0]   x0 - x30    (31 × 8 = 248 bytes)
+//   [sp + 0]   x0 - x30      (31 × 8 = 248 bytes)
 //   [sp + 248] ELR_EL1
 //   [sp + 256] SPSR_EL1
 //   [sp + 264] ESR_EL1
 //   [sp + 272] FAR_EL1
-//   [sp + 280] SP_EL0      (user stack pointer, saved on EL0 exceptions)
-//   Total: 288 bytes → 288 aligned to 16
+//   [sp + 280] SP_EL0        (user stack pointer, saved on EL0 exceptions)
+//   [sp + 288] q0
+//   [sp + 304] q1
+//   ...
+//   [sp + 400] q7            (q0-q7: caller-clobbered FP/SIMD)
+//   [sp + 416] q16           (q8-q15 are callee-saved — context_switch handles those)
+//   ...
+//   [sp + 656] q31           (q16-q31: caller-clobbered FP/SIMD)
+//   [sp + 672] FPSR
+//   [sp + 680] FPCR
+//   Total: 688 bytes — 16-byte aligned.
+//
+// Why save FP regs in the trap frame? On preemption (timer IRQ at EL0)
+// the C handler chain may use SIMD freely — e.g., uart_printf passes
+// varargs in d0-d7 per AAPCS64 — and clobber the user task's caller-
+// clobbered FP state (q0-q7, q16-q31). Without saving them here, the
+// preempted task resumes with garbage in those registers. q8-q15 are
+// callee-saved per the ABI and already preserved by context_switch.
 
-.equ FRAME_SIZE, 288
+.equ FRAME_SIZE, 688
 
 .equ EXCEPTION_SYNC,    0
 .equ EXCEPTION_IRQ,     1
@@ -105,6 +121,26 @@ exception_common:
 	mrs x1, far_el1
 	str x1, [sp, #272]
 
+	// save FP/SIMD caller-clobbered state (q0-q7, q16-q31, FPSR, FPCR).
+	// Each stp q,q,[sp,#imm] uses scaled 16-byte offsets; all values below
+	// fit the 7-bit signed immediate range (±1008).
+	stp q0,  q1,  [sp, #288]
+	stp q2,  q3,  [sp, #320]
+	stp q4,  q5,  [sp, #352]
+	stp q6,  q7,  [sp, #384]
+	stp q16, q17, [sp, #416]
+	stp q18, q19, [sp, #448]
+	stp q20, q21, [sp, #480]
+	stp q22, q23, [sp, #512]
+	stp q24, q25, [sp, #544]
+	stp q26, q27, [sp, #576]
+	stp q28, q29, [sp, #608]
+	stp q30, q31, [sp, #640]
+	mrs x1, fpsr
+	str x1, [sp, #672]
+	mrs x1, fpcr
+	str x1, [sp, #680]
+
 	// call C handler: exception_dispatch(type, frame)
 	// x0 = exception type (already set)
 	mov x1, sp
@@ -123,6 +159,24 @@ exception_common:
 	ldr x1, [sp, #280]
 	msr sp_el0, x1
 1:
+
+	// restore FP/SIMD caller-clobbered state in reverse order.
+	ldr x1, [sp, #680]
+	msr fpcr, x1
+	ldr x1, [sp, #672]
+	msr fpsr, x1
+	ldp q30, q31, [sp, #640]
+	ldp q28, q29, [sp, #608]
+	ldp q26, q27, [sp, #576]
+	ldp q24, q25, [sp, #544]
+	ldp q22, q23, [sp, #512]
+	ldp q20, q21, [sp, #480]
+	ldp q18, q19, [sp, #448]
+	ldp q16, q17, [sp, #416]
+	ldp q6,  q7,  [sp, #384]
+	ldp q4,  q5,  [sp, #352]
+	ldp q2,  q3,  [sp, #320]
+	ldp q0,  q1,  [sp, #288]
 
 	// restore general-purpose registers
 	ldp x2,  x3,  [sp, #16]

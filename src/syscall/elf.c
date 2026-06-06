@@ -22,6 +22,46 @@
  * correct intra-page offset.
  * --------------------------------------------------------------------------- */
 
+/* Synchronize the icache with the dcache for a freshly-written executable
+ * range. ARMv8 does NOT guarantee I-D coherence at PoU; spec requires:
+ *   1. DC CVAU per D-line  — clean dcache to PoU
+ *   2. DSB ISH               — wait for clean to complete
+ *   3. IC IVAU per I-line   — invalidate icache lines to PoU
+ *   4. DSB ISH + ISB         — wait for invalidate, flush prefetch
+ *
+ * Without this, after we memcpy ELF code bytes via the kernel TTBR1 alias
+ * the CPU may still hold stale (zero / prior allocation) icache lines
+ * for the same physical address when EL0 fetches via the TTBR0 mapping.
+ * Works on QEMU because its icache is self-coherent; would silently fail
+ * on a real Cortex-A72.
+ *
+ * Cache line sizes are read from CTR_EL0 — the architectural way to
+ * discover them rather than hard-coding 64. */
+static void cpu_sync_icache(uintptr_t va, size_t size) {
+  if (size == 0) return;
+
+  uint64_t ctr;
+  __asm__ __volatile__("mrs %0, ctr_el0" : "=r"(ctr));
+  /* CTR_EL0.IminLine[3:0]   = log2(words/I-line); word = 4 bytes */
+  /* CTR_EL0.DminLine[19:16] = log2(words/D-line) */
+  size_t i_line = (size_t)4 << ((ctr >>  0) & 0xF);
+  size_t d_line = (size_t)4 << ((ctr >> 16) & 0xF);
+
+  uintptr_t end = va + size;
+
+  for (uintptr_t p = va & ~((uintptr_t)d_line - 1); p < end; p += d_line) {
+    __asm__ __volatile__("dc cvau, %0" :: "r"(p) : "memory");
+  }
+  __asm__ __volatile__("dsb ish" ::: "memory");
+
+  for (uintptr_t p = va & ~((uintptr_t)i_line - 1); p < end; p += i_line) {
+    __asm__ __volatile__("ic ivau, %0" :: "r"(p) : "memory");
+  }
+  __asm__ __volatile__("dsb ish" ::: "memory");
+  __asm__ __volatile__("isb" ::: "memory");
+}
+
+
 #define MAX_PHNUM 32
 
 static int parse_flags(uint32_t pf, uint64_t *out) {
@@ -183,6 +223,15 @@ int elf_load(const uint8_t *kbuf, size_t size, uint64_t *user_l0,
       memcpy((void *)(kva + intra), kbuf + ph->p_offset,
              (size_t)ph->p_filesz);
     }
+
+    /* Sync icache for executable segments. We just wrote new instructions
+     * via the TTBR1 kernel alias — EL0 will fetch them via TTBR0 next, so
+     * dirty dcache lines must reach PoU and stale icache lines must be
+     * flushed. Non-executable segments don't need this. */
+    if (ph->p_flags & PF_X) {
+      cpu_sync_icache(kva, pages * PAGE_SIZE);
+    }
+
 
     /* Map into the user_l0 at the page-aligned va_lo. */
     mmu_map_user_range(user_l0, va_lo, phys, pages, pte_flags);

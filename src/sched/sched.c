@@ -309,9 +309,13 @@ int sched_fork(task_t *parent, struct trap_frame *frame) {
                      stack_flags);
 
   /* ---- Lay out child's kstack ---------------------------------------- */
-  /* Trap frame: 288 bytes (matches FRAME_SIZE in vector.S). */
-  uint8_t  *child_frame_bytes = (uint8_t *)(kstack_top - 288);
-  memcpy(child_frame_bytes, (const uint8_t *)frame, 288);
+  /* Trap frame: 688 bytes (matches FRAME_SIZE in vector.S — GPRs + sysregs
+   * + SP_EL0 + q0-q7 + q16-q31 + FPSR + FPCR). The whole frame is memcpy\x27d
+   * verbatim so the child resumes inside the same SVC with parent\x27s full
+   * register + FP state; we then clobber x0 = 0 to distinguish it from
+   * the parent\x27s view of the syscall return. */
+  uint8_t  *child_frame_bytes = (uint8_t *)(kstack_top - 688);
+  memcpy(child_frame_bytes, (const uint8_t *)frame, 688);
   /* Child's saved x0 = 0  → distinguishes from parent (which sees pid). */
   ((uint64_t *)child_frame_bytes)[0] = 0;
 

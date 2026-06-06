@@ -247,7 +247,7 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
   frame->elr  = img.entry;
   frame->spsr = 0; /* EL0t, IRQs unmasked */
 
-  /* sp_el0 lives at offset 280 in the 288-byte on-stack trap frame; the
+  /* sp_el0 lives at offset 280 in the 688-byte on-stack trap frame; the
    * C trap_frame_t (sizeof = 280) doesn't expose it. Poke directly. */
   uint64_t *frame_raw = (uint64_t *)frame;
   uint64_t  new_sp    = USER_STACK_TOP;

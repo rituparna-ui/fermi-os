@@ -49,6 +49,31 @@
 #define PTE_UXN (1ULL << 54)
 // kernel cannot execute
 #define PTE_PXN (1ULL << 53)
+// non-Global: TLB entries from this PTE are tagged with the current ASID
+// (TTBR0_EL1[63:48]). Kernel mappings leave nG=0 so they are global and
+// shared across every ASID; user mappings set nG=1 so an ASID change in
+// TTBR0_EL1 makes the previous task's user TLB entries inaccessible without
+// a flush.
+#define PTE_NG (1ULL << 11)
+
+// TTBR_EL1 layout when TCR_EL1.AS=1 (16-bit ASIDs) and TCR_EL1.A1=0:
+//   bits[63:48] = ASID
+//   bits[47:1]  = page-table base address (page-aligned, so [11:0] = 0)
+//   bit [0]     = CnP (we leave 0)
+#define TTBR_ASID_SHIFT 48
+#define TTBR_BADDR_MASK 0x0000FFFFFFFFFFFFULL
+
+static inline uint64_t ttbr_pack(uint64_t baddr, uint16_t asid) {
+  return (baddr & TTBR_BADDR_MASK) | ((uint64_t)asid << TTBR_ASID_SHIFT);
+}
+static inline uint64_t ttbr_baddr(uint64_t ttbr) {
+  return ttbr & TTBR_BADDR_MASK;
+}
+static inline uint16_t ttbr_asid(uint64_t ttbr) {
+  return (uint16_t)(ttbr >> TTBR_ASID_SHIFT);
+}
+
+
 
 // 4KB granule 48-bit OA
 #define PTE_ADDR_MASK 0x0000FFFFFFFFF000ULL

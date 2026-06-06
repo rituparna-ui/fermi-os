@@ -154,8 +154,10 @@ uint64_t *mmu_init() {
                         // TG1 and TG0 have different encodings
                         // TG1[31:30] - bit[31]=RES1, bit[30]=0
       // Common
-      (0b010ULL << 32); // IPS = 40-bit PA (1TB) (needed for >4GB RAM)
-
+      (0b010ULL << 32) | // IPS = 40-bit PA (1TB) (needed for >4GB RAM)
+      // ASID configuration
+      (1ULL << 36);      // AS = 1 → 16-bit ASIDs (65536 contexts)
+                         // A1 = 0 → ASID source is TTBR0_EL1[63:48]
   __asm__ __volatile__("msr tcr_el1, %0" ::"r"(tcr));
   // ARM ARM (DDI 0487, §D5.4): writes to translation table base registers
   // require a full DSB ISH (not the store-only ISHST variant) so prior
@@ -208,8 +210,12 @@ void mmu_map_user_range(uint64_t *l0, uint64_t va, uint64_t pa,
     }
     // L3 page descriptors share their bit[1]=1 encoding with table
     // descriptors. Without PTE_TABLE the entry would be invalid.
+    /* nG = 1: tag this entry with the current ASID so per-task contexts
+     * are isolated by TTBR0_EL1[63:48] without needing a TLB flush on
+     * context switch. Kernel mappings (TTBR1) deliberately leave nG=0 so
+     * they remain global and visible to every ASID. */
     *pte = ((pa + i * PAGE_SIZE) & PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE |
-           PTE_AF | PTE_SH_INNER | flags;
+           PTE_AF | PTE_SH_INNER | PTE_NG | flags;
   }
 }
 

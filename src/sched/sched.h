@@ -82,4 +82,16 @@ task_t *sched_current(void);
 task_t *sched_first_task(void);
 const char *task_state_name(task_state_t s);
 
+/* Allocate a fresh ASID for a new user address space.
+ *
+ * Returns a 16-bit value in [1, 65535]. ASID 0 is reserved for the kernel
+ * (idle / sched_create_kernel_task whose ttbr0 stays 0).
+ *
+ * On wraparound (every 65535 task creations) does a global TLB flush and
+ * resets the counter so the recycled ASIDs are guaranteed not to alias
+ * stale TLB entries. With the current hobby-kernel workloads we never
+ * observe a wrap. */
+uint16_t sched_asid_alloc(void);
+
+
 #endif

@@ -86,13 +86,18 @@ context_switch:
 	mov sp, x2
 
 	// --- Switch TTBR0 if next task has user page tables ---
+	// Each task's ttbr0 already encodes its ASID in [63:48], so the MSR
+	// also switches the TLB context. With user mappings tagged nG=1 in
+	// mmu_map_user_range and ASIDs assigned uniquely per task, no TLBI
+	// is required: stale entries from the previous user task remain in
+	// the TLB harmlessly under their own ASID and the new task starts
+	// with zero entries cached for its ASID. (sched_reap issues a
+	// `tlbi aside1` when a task dies so its ASID's entries are dropped
+	// before the page tables are pmm_free'd.)
 	ldr x3, [x1, #TASK_TTBR0]
-	cbz x3, 1f			// skip if ttbr0 == 0 (idle task)
+	cbz x3, 1f			// skip if ttbr0 == 0 (idle / EL1 task)
 
 	msr ttbr0_el1, x3
-	isb
-	tlbi vmalle1
-	dsb ish
 	isb
 1:
 

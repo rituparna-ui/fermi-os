@@ -25,6 +25,29 @@ static uint64_t next_pid = 0;
 // Dead tasks scheduled for cleanup (singly-linked list)
 static task_t *dead_list = (void *)0;
 
+/* ASID allocator. ASID 0 is reserved (used by tasks with ttbr0 == 0, like
+ * idle and EL1 kernel tasks). User tasks consume ASIDs 1..65535.
+ *
+ * On wraparound from 65535 to 0 we flush the entire TLB and restart at 1.
+ * Reused ASIDs after the flush cannot alias stale TLB entries because the
+ * flush evicted everything. The 65535-task budget is never exhausted in
+ * practice — fermi-os runs a handful of tasks for the whole boot session. */
+static uint16_t next_asid = 1;
+
+uint16_t sched_asid_alloc(void) {
+  uint16_t a = next_asid++;
+  if (next_asid == 0) {
+    /* Counter wrapped past 65535. Flush every TLB entry (global and
+     * non-global) so the next batch of recycled ASIDs starts cold. */
+    __asm__ __volatile__("tlbi vmalle1\n\t"
+                         "dsb ish\n\t"
+                         "isb");
+    next_asid = 1;
+    uart_println("[SCHED] ASID space wrapped \u2014 flushed all TLBs");
+  }
+  return a;
+}
+
 static void copy_name(char *dst, const char *src) {
   for (int i = 0; src[i] && i < 15; i++) {
     dst[i] = src[i];
@@ -202,7 +225,9 @@ int sched_create_task(const char *name, task_entry_t entry) {
   t->pid = next_pid++;
   t->state = TASK_READY;
   t->stack_phys = kstack_phys;
-  t->ttbr0 = (uint64_t)user_l0;
+  /* Pack ASID into TTBR0[63:48] so per-task TLB entries (mapped with
+   * nG=1 by mmu_map_user_range) are isolated from every other task's. */
+  t->ttbr0 = ttbr_pack((uint64_t)user_l0, sched_asid_alloc());
   t->user_sp = USER_STACK_TOP;
   t->kstack_top = kstack_top;
   t->ustack_phys = ustack_phys;
@@ -343,7 +368,10 @@ int sched_fork(task_t *parent, struct trap_frame *frame) {
   t->pid         = next_pid++;
   t->state       = TASK_READY;
   t->stack_phys  = kstack_phys;
-  t->ttbr0       = (uint64_t)user_l0;
+  /* Fresh ASID for the child — separate from parent's so each task has
+   * its own TLB context. The parent's TLB entries stay valid under its
+   * own ASID until it gets context-switched back in. */
+  t->ttbr0       = ttbr_pack((uint64_t)user_l0, sched_asid_alloc());
   t->user_sp     = parent->user_sp;
   t->kstack_top  = kstack_top;
   t->ustack_phys = ustack_phys;
@@ -558,9 +586,21 @@ void sched_reap(void) {
     }
 
 
-    // Free per-task TTBR0 page table pages (L0, L1, L2, L3)
+    /* Invalidate any TLB entries left behind by this task's ASID before we
+     * free its page tables. Without this, a future ASID rollover that
+     * recycles the same value could see lingering entries pointing at
+     * physical pages that have been pmm_free'd and reallocated. */
     if (dead->ttbr0) {
-      mmu_free_user_tables((uint64_t *)dead->ttbr0);
+      uint16_t dead_asid = ttbr_asid(dead->ttbr0);
+      if (dead_asid) {
+        /* tlbi aside1, Xt: ASID lives in Xt[63:48], same layout as TTBR0. */
+        uint64_t arg = (uint64_t)dead_asid << TTBR_ASID_SHIFT;
+        __asm__ __volatile__("tlbi aside1, %0\n\t"
+                             "dsb ish\n\t"
+                             "isb"
+                             :: "r"(arg));
+      }
+      mmu_free_user_tables((uint64_t *)ttbr_baddr(dead->ttbr0));
     }
 
     // Free fd table

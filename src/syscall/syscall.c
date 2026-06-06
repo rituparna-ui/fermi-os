@@ -222,21 +222,26 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
   /* 6. Swap in the new image. Save old refs first — we'll free them after
    * TTBR0 has been switched over so we don't yank our own mappings while
    * still using them. */
-  uint64_t  old_ttbr0       = cur->ttbr0;
-  uintptr_t old_ustack_phys = cur->ustack_phys;
-  elf_image_t old_image    = cur->exec_image;
+  uint64_t    old_ttbr0       = cur->ttbr0;
+  uintptr_t   old_ustack_phys = cur->ustack_phys;
+  elf_image_t old_image       = cur->exec_image;
 
-  cur->ttbr0          = (uint64_t)new_l0;
-  cur->ustack_phys    = stack_phys;
-  cur->user_sp        = USER_STACK_TOP;
-  cur->exec_image     = img;
+  /* Allocate a fresh ASID for the new VA layout. With ASIDs every TLB
+   * entry is tagged: the new ASID has zero entries cached, so we can
+   * safely skip the global tlbi vmalle1 — there's nothing to flush.
+   * Stale entries from the old ASID remain in the TLB and will be
+   * invalidated explicitly below before the old page tables are freed. */
+  uint16_t new_asid  = sched_asid_alloc();
+  uint64_t new_ttbr0 = ttbr_pack((uint64_t)new_l0, new_asid);
 
-  __asm__ __volatile__("msr ttbr0_el1, %0\n"
-                       "isb\n"
-                       "tlbi vmalle1\n"
-                       "dsb ish\n"
-                       "isb\n"
-                       ::"r"(new_l0)
+  cur->ttbr0       = new_ttbr0;
+  cur->ustack_phys = stack_phys;
+  cur->user_sp     = USER_STACK_TOP;
+  cur->exec_image  = img;
+
+  __asm__ __volatile__("msr ttbr0_el1, %0\n\t"
+                       "isb"
+                       ::"r"(new_ttbr0)
                        : "memory");
 
   /* 7. Rewrite the trap frame so the syscall epilogue ererts into the new
@@ -300,7 +305,19 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
     }
   }
   if (old_ttbr0) {
-    mmu_free_user_tables((uint64_t *)old_ttbr0);
+    /* Old user mappings were tagged with the old ASID. Invalidate them
+     * before freeing the L1/L2/L3 pages so a future ASID rollover that
+     * recycles the old value cannot resurrect entries pointing at pages
+     * already returned to the PMM. */
+    uint16_t old_asid = ttbr_asid(old_ttbr0);
+    if (old_asid) {
+      uint64_t arg = (uint64_t)old_asid << TTBR_ASID_SHIFT;
+      __asm__ __volatile__("tlbi aside1, %0\n\t"
+                           "dsb ish\n\t"
+                           "isb"
+                           :: "r"(arg));
+    }
+    mmu_free_user_tables((uint64_t *)ttbr_baddr(old_ttbr0));
   }
 
 /* (diagnostic moved above the swap — `path` and old user state are gone

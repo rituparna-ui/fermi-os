@@ -34,6 +34,13 @@ typedef struct trap_frame {
 #define EC_SERROR 0x2F
 #define EC_BRK 0x3C
 
+// ESR_EL1 ISS layout for Data/Instruction Abort (when EC = 0x20/0x21/0x24/0x25)
+#define ESR_ISS_DFSC(esr) ((esr) & 0x3F)        // [5:0]   Data Fault Status Code
+#define ESR_ISS_WNR(esr)  (((esr) >> 6) & 0x1)  // [6]     Write not Read (data abort only)
+#define ESR_ISS_CM(esr)   (((esr) >> 8) & 0x1)  // [8]     Cache maintenance
+#define ESR_ISS_S1PTW(esr) (((esr) >> 7) & 0x1) // [7]     Stage-1 fault on stage-2 walk
+#define ESR_ISS_EA(esr)   (((esr) >> 9) & 0x1)  // [9]     External Abort
+
 // Exception types
 #define EXCEPTION_SYNC 0
 #define EXCEPTION_IRQ 1

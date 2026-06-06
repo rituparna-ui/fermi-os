@@ -13,6 +13,7 @@
 #include "rng/rng.h"
 #include "balloon/balloon.h"
 #include "console/console.h"
+#include "cpu/cpu.h"
 #include "net/net.h"
 #include "sched/sched.h"
 #include "strings/strings.h" // IWYU pragma: keep
@@ -245,6 +246,7 @@ static void sh_help(void) {
       "  ifconfig        - cat /proc/netinfo\n"
       "  irqs            - cat /proc/interrupts\n"
       "  version         - cat /proc/version\n"
+      "  cpuinfo         - cat /proc/cpuinfo (MIDR / cache / features / cycles)\n"
       "  cat <path>      - print a file\n"
       "  hexdump <path>  - hex+ascii dump of a file\n"
       "  echo <text>     - print text\n"
@@ -322,6 +324,8 @@ static void task_shell(void) {
       sh_cat("/proc/netinfo");
     } else if (u_streq(line, "irqs")) {
       sh_cat("/proc/interrupts");
+    } else if (u_streq(line, "cpuinfo")) {
+      sh_cat("/proc/cpuinfo");
     } else if (u_streq(line, "version")) {
       sh_cat("/proc/version");
     } else if (u_streq(line, "ping")) {
@@ -761,6 +765,7 @@ void kernel_main() {
   __asm__ __volatile__("mov %0, sp" : "=r"(sp));
   uart_printf("[KERNEL] Stack Pointer: %x\n", sp);
 
+  cpu_init();
   heap_init();
 
   gic_init();

@@ -10,6 +10,7 @@
 #include "utils/utils.h"
 #include "vfs/vfs.h"
 #include "balloon/balloon.h"
+#include "cpu/cpu.h"
 
 /* Each /proc file regenerates its content on every read out of live
  * kernel state. The caller-provided buf is filled with bytes
@@ -153,6 +154,11 @@ static int gen_balloon(char *buf, size_t buflen) {
                    (uint64_t)target, (uint64_t)target * 4);
 }
 
+static int gen_cpuinfo(char *buf, size_t buflen) {
+  return cpu_render_info(buf, buflen);
+}
+
+
 
 /* ------------------------------------------------------------------ */
 /* file_operations wrappers                                            */
@@ -192,6 +198,12 @@ static int read_balloon(struct vnode *n, file_t *f, void *buf, size_t count) {
 }
 
 
+static int read_cpuinfo(struct vnode *n, file_t *f, void *buf, size_t count) {
+  (void)n;
+  return proc_read_via(gen_cpuinfo, f, buf, count);
+}
+
+
 static int read_version(struct vnode *n, file_t *f, void *buf, size_t count) {
   (void)n;
   return proc_read_via(gen_version, f, buf, count);
@@ -206,6 +218,9 @@ static file_operations_t interrupts_ops = {.read = read_interrupts, .write = 0};
 static file_operations_t cmdline_ops = {.read = read_cmdline, .write = 0};
 
 static file_operations_t balloon_ops = {.read = read_balloon, .write = 0};
+
+
+static file_operations_t cpuinfo_ops = {.read = read_cpuinfo, .write = 0};
 
 
 static file_operations_t version_ops = {.read = read_version, .write = 0};
@@ -243,7 +258,9 @@ void proc_init(void) {
 
   register_file(proc, "balloon", &balloon_ops);
   
+  register_file(proc, "cpuinfo", &cpuinfo_ops);
+  
   register_file(proc, "version", &version_ops);
 
-  uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, interrupts, netinfo, cmdline, version, balloon");
+  uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, interrupts, netinfo, cmdline, version, balloon, cpuinfo");
 }

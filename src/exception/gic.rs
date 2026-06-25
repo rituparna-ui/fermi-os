@@ -31,6 +31,44 @@ const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
 
 pub const GIC_INTID_NO_PENDING: u64 = 1023;
 
+// Core 1's redistributor frame (GICv3 stride 0x20000 per PE on qemu virt).
+const GICR1_BASE: usize = GICR_BASE + 0x20000;
+const GICR1_WAKER: usize = GICR1_BASE + 0x0014;
+const GICR1_SGI_BASE: usize = GICR1_BASE + 0x10000;
+const GICR1_IGROUPR0: usize = GICR1_SGI_BASE + 0x0080;
+const GICR1_IGRPMODR0: usize = GICR1_SGI_BASE + 0x0D00;
+const GICR1_ISENABLER0: usize = GICR1_SGI_BASE + 0x0100;
+
+/// Bring up the GIC CPU interface + redistributor on the secondary core.
+/// Touches only per-core state (CPU-interface sysregs + core 1's own
+/// redistributor frame); the shared distributor is already configured by the
+/// primary, so this does not race with core 0.
+pub fn secondary_init() {
+    // CPU interface (banked system registers).
+    let mut sre: u64 = crate::mrs!(icc_sre_el1);
+    sre |= 1;
+    crate::msr!(icc_sre_el1, sre);
+    unsafe { core::arch::asm!("isb") };
+    // Wake core 1's redistributor.
+    let mut waker = mmio::read32(GICR1_WAKER);
+    waker &= !GICR_WAKER_PROCESSOR_SLEEP;
+    mmio::write32(GICR1_WAKER, waker);
+    while mmio::read32(GICR1_WAKER) & GICR_WAKER_CHILDREN_ASLEEP != 0 {}
+    // SGIs/PPIs (0-31) as Group 1 Non-secure on core 1's redistributor.
+    mmio::write32(GICR1_IGROUPR0, 0xFFFF_FFFF);
+    mmio::write32(GICR1_IGRPMODR0, 0x0000_0000);
+    crate::msr!(icc_pmr_el1, 0xFF);
+    crate::msr!(icc_igrpen1_el1, 0x01);
+    unsafe { core::arch::asm!("isb") };
+}
+
+/// Enable a PPI/SGI (intid < 32) on core 1's redistributor.
+pub fn secondary_enable_ppi(intid: u32) {
+    let mut v = mmio::read32(GICR1_ISENABLER0);
+    v |= 1 << intid;
+    mmio::write32(GICR1_ISENABLER0, v);
+}
+
 const GIC_COUNTERS_MAX: usize = 256;
 static IRQ_COUNTS: Racy<[u64; GIC_COUNTERS_MAX]> = Racy::new([0; GIC_COUNTERS_MAX]);
 

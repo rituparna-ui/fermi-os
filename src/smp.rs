@@ -5,7 +5,7 @@
 use crate::kprintln;
 use crate::mm::mmu::KERNEL_VA_OFFSET;
 use crate::sched::{self, Task, TASK_READY, TASK_RUNNING};
-use crate::mrs;
+use crate::{mrs, msr};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,6 +28,7 @@ static SECONDARY_MPIDR: AtomicU64 = AtomicU64::new(0);
 static SECONDARY_BEATS: AtomicU64 = AtomicU64::new(0);
 static C1_A_BEATS: AtomicU64 = AtomicU64::new(0);
 static C1_B_BEATS: AtomicU64 = AtomicU64::new(0);
+static C1_TICKS: AtomicU64 = AtomicU64::new(0);
 // Core-1's "current task" pointer (only core 1 touches this).
 static mut C1_CUR: u64 = 0;
 
@@ -56,24 +57,46 @@ fn c1_schedule() {
     }
 }
 
-/// Yield from a core-1 task back to the core-1 scheduler.
-fn c1_yield() {
-    c1_schedule();
-}
-
+// Core-1 tasks are pure CPU loops with NO cooperative yield: only the
+// per-core timer interrupt rotates them. If both counters advance, the
+// secondary core is genuinely preempting.
 extern "C" fn c1_task_a() {
     loop {
         C1_A_BEATS.fetch_add(1, Ordering::Relaxed);
-        for _ in 0..2_000_000u64 { core::hint::spin_loop(); }
-        c1_yield();
+        for _ in 0..400_000u64 { core::hint::spin_loop(); }
     }
 }
 extern "C" fn c1_task_b() {
     loop {
         C1_B_BEATS.fetch_add(1, Ordering::Relaxed);
-        for _ in 0..2_000_000u64 { core::hint::spin_loop(); }
-        c1_yield();
+        for _ in 0..400_000u64 { core::hint::spin_loop(); }
     }
+}
+
+/// Called from the IRQ handler on core 1 when the timer PPI fires: re-arm the
+/// (banked) physical timer and account a core-1 tick.
+pub fn c1_timer_tick() {
+    let freq: u64 = mrs!(cntfrq_el0);
+    let interval = freq / 100; // 10 ms
+    let mut cval: u64 = mrs!(cntp_cval_el0);
+    cval += interval;
+    msr!(cntp_cval_el0, cval);
+    C1_TICKS.fetch_add(1, Ordering::Relaxed);
+    SECONDARY_BEATS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Called from the IRQ handler on core 1 after EOI: preempt to the next task.
+pub fn c1_preempt() {
+    if unsafe { C1_CUR } != 0 {
+        c1_schedule();
+    }
+}
+
+/// True if executing on a secondary core (affinity0 != 0).
+#[inline]
+pub fn is_secondary() -> bool {
+    let mpidr: u64 = mrs!(mpidr_el1);
+    (mpidr & 0xFF) != 0
 }
 
 #[no_mangle]
@@ -95,19 +118,29 @@ pub extern "C" fn rust_secondary_high() -> ! {
         (*idle).state = TASK_RUNNING;
         C1_CUR = idle as u64;
     }
-    SECONDARY_UP.store(1, Ordering::SeqCst);
-    kprintln!("[SMP] core1 scheduling 2 tasks (MPIDR={:#x})", mpidr);
+    // Bring up the GIC CPU interface + redistributor and the per-core timer
+    // on core 1, then unmask IRQs so the timer preempts the tasks.
+    crate::exception::gic::secondary_init();
+    crate::exception::gic::secondary_enable_ppi(crate::exception::timer::TIMER_PPI_INTID);
+    let freq: u64 = mrs!(cntfrq_el0);
+    let now: u64 = mrs!(cntpct_el0);
+    msr!(cntp_cval_el0, now + freq / 100); // 10 ms deadline
+    msr!(cntp_ctl_el0, 1); // enable timer (IRQ still masked)
 
-    // Idle loop: cycle the scheduler so the two tasks make progress.
+    SECONDARY_UP.store(1, Ordering::SeqCst);
+    kprintln!("[SMP] core1 preemptive scheduling, 2 tasks (MPIDR={:#x})", mpidr);
+    unsafe { core::arch::asm!("msr daifclr, #2") }; // unmask IRQs on core 1
+
+    // Idle: wait for the timer; the IRQ handler drives c1 preemption.
     loop {
-        SECONDARY_BEATS.fetch_add(1, Ordering::Relaxed);
-        c1_schedule();
+        unsafe { core::arch::asm!("wfi") };
     }
 }
 
 pub fn heartbeat() -> u64 {
     SECONDARY_BEATS.load(Ordering::Relaxed)
 }
+pub fn core1_ticks() -> u64 { C1_TICKS.load(Ordering::Relaxed) }
 pub fn task_beats() -> (u64, u64) {
     (C1_A_BEATS.load(Ordering::Relaxed), C1_B_BEATS.load(Ordering::Relaxed))
 }

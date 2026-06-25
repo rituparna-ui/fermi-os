@@ -219,17 +219,28 @@ pub extern "C" fn exception_dispatch(type_: u64, frame: *mut TrapFrame) {
             if intid == gic::GIC_INTID_NO_PENDING {
                 return;
             }
-            gic::count_irq(intid as u32);
+            let core1 = crate::smp::is_secondary();
+            if !core1 {
+                gic::count_irq(intid as u32);
+            }
             if intid as u32 == timer::TIMER_PPI_INTID {
-                timer::handle_irq();
+                if core1 {
+                    crate::smp::c1_timer_tick();
+                } else {
+                    timer::handle_irq();
+                }
             } else if intid as u32 == crate::virtio::net::irq_intid() {
                 crate::virtio::net::handle_irq();
             } else {
                 kprintln!("[IRQ] INTID {} (not implemented)", intid);
             }
             gic::end_irq(intid);
-            // schedule() after EOI is wired at the scheduler milestone.
-            crate::schedule_hook();
+            // Per-core preemption after EOI.
+            if core1 {
+                crate::smp::c1_preempt();
+            } else {
+                crate::schedule_hook();
+            }
         }
         EXCEPTION_FIQ => {
             dump_trap_frame(type_, frame);

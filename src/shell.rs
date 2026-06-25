@@ -135,7 +135,7 @@ fn dispatch(line: &str) {
                 let h1 = crate::smp::heartbeat();
                 sched::sleep_ms(300);
                 let h2 = crate::smp::heartbeat();
-                kprintln!("core1 MPIDR={:#x} idle-beats {} -> {}", crate::smp::secondary_mpidr(), h1, h2);
+                kprintln!("core1 MPIDR={:#x} timer-ticks {} -> {} (preemptive)", crate::smp::secondary_mpidr(), h1, h2);
                 let (a1, b1) = crate::smp::task_beats();
                 sched::sleep_ms(300);
                 let (a2, b2) = crate::smp::task_beats();

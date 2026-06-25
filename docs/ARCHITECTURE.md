@@ -190,10 +190,14 @@ kernel PTEs leave it clear (global).
 
 ## Concurrency model
 
-Single core. Shared mutable state is guarded one of three ways:
+Single core. Shared mutable state is guarded one of four ways:
 
-- **`SpinLock<T>`** — structured state mutated post-boot (PMM, heap, PCI, each
-  VirtIO device, FAT32 volume).
+- **`SpinLock<T>`** — structured state mutated post-boot but NOT touched by an
+  IRQ handler (PMM, heap, PCI, each VirtIO device, FAT32 volume).
+- **`SpinLockIrqSafe<T>`** — state locked from BOTH task context and an IRQ
+  handler (the timer). `lock()` masks IRQs before acquiring and the guard
+  restores them on drop, so a tick can't deadlock by spinning on a lock the
+  preempted task holds.
 - **`SyncUnsafeCell<T>`** — scheduler run queue + counters and the VFS vnode
   pool: mutated only with IRQs masked (`irq_save`/`irq_restore`) or during
   single-threaded boot. Every access is `unsafe` with a `// SAFETY (single-core)`
@@ -209,8 +213,8 @@ the timer-IRQ `schedule()` path can't deadlock on a lock.
 ## Test matrix
 
 `ci/smoke-test.sh` (run on every push by `.github/workflows/ci.yml`, after
-`clippy -D warnings` + debug/release builds) boots the kernel headless under
-QEMU and asserts:
+`cargo fmt --check` + `clippy -D warnings` + debug/release builds) boots the
+kernel headless under QEMU and asserts:
 
 | Area | Assertion |
 |------|-----------|
@@ -222,9 +226,16 @@ QEMU and asserts:
 | Networking | `DHCP Lease ACK` + `PING reply from 10.0.2.2` |
 | FAT32 read | `/mnt/fat32/HELLO.TXT` contents |
 | FAT32 write | `create+read RUSTW.TXT round-trip: PASS` |
-| Scheduler | `CHURN TEST PASS` (48 task create/exit/reap, zero page leak) |
+| FAT32 subdir | `mkdir RDIR + create RDIR/INNER.TXT + read: PASS` |
+| FAT32 rm | `create+exists+remove+gone+recreate: PASS` |
+| FAT32 cycle | 5× create/verify/rm, FAT free-space stable (cluster reuse) |
+| Sched churn | `CHURN TEST PASS` (48 task create/exit/reap, zero page leak) |
+| Heap stress | `HEAP STRESS PASS` (>1 MiB expand + coalesce, zero byte leak) |
+| FD stress | `FD STRESS PASS` (64-fd exhaustion, reuse, bad-fd) |
+| Fork stress | `FORK STRESS` (16 forks, frame copy + reap) |
+| ASID wrap | `ASID WRAP PASS` (65535→1 boundary, global TLB flush, risk R3) |
 | Liveness | `KERNEL Ready!`, and no `KERNEL PANIC` / `RUST PANIC` / `FAIL` |
-| EL0 shell | drives `pid` / `fork` / `balloon inflate` / `hexdump` / `exec HELLO.ELF` over stdin |
+| EL0 shell | drives `pid` / `mkdir` / `rm` / `ls` / `fork` / `balloon inflate` / `hexdump` / `exec HELLO.ELF` over stdin |
 
 Built-in self-tests (`mmu::run_tests`, `heap::run_tests`, the BRK probe, and the
 per-driver smoke reads) run on every boot regardless of CI.

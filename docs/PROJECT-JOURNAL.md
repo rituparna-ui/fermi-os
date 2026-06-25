@@ -142,6 +142,24 @@ maintainable:
     naturally.
 - **Docs.** `ARCHITECTURE.md` (subsystem map, boot flow, memory layout, frozen
   ABIs, concurrency model, test matrix) + this journal.
+- **Adversarial bug-hunt + fixes.** A multi-agent audit (per-dimension finders →
+  per-candidate verification against the C original + frozen ABI → ranked
+  synthesis) found **9 confirmed correctness bugs** that single-threaded,
+  QEMU-only testing fundamentally couldn't catch (they need a precise
+  interrupt-timing window or weakly-ordered hardware). All fixed:
+  - *Timer SpinLock deadlock* (port regression): `TIMER` is locked from both a
+    syscall and the timer IRQ; a plain `SpinLock` deadlocks single-core. Added
+    `SpinLockIrqSafe<T>` (masks IRQs while held).
+  - *Run-queue data race*: `schedule()` ran with IRQs unmasked from syscalls;
+    now masks IRQs around the critical section (and `reap()`'s dead-list pop).
+  - *Missing virtqueue DMA barriers* in `submit`/`submit_chain` (the C had this
+    latent too) + non-volatile used-ring reads → `dsb_sy()` + `read_volatile`.
+  - *`fork_return` skipped FP/SIMD restore* and popped only 288 of the copied
+    688-byte frame → full restore, pop 688.
+  - *`sys_exec` leaked/double-freed demand-grown stack pages* → free + reset.
+  - *`mkdir` cluster leak* on write-failure paths → `free_chain` on error.
+  - *`cargo fmt`* applied tree-wide + a fmt CI gate added.
+- **Format gate.** `cargo fmt --check` in CI keeps formatting consistent.
 
 ---
 

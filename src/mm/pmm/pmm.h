@@ -4,7 +4,13 @@
 #include <stdint.h>
 
 #define MEM_START 0x40000000ULL
+/* MEM_SIZE is overridable at build time (-DMEM_SIZE=...). The hypervisor build
+ * uses the full 8 GiB; a reduced-RAM guest build (FermiOS-as-EL1-guest) passes
+ * a smaller value so its PMM only claims the RAM the hypervisor actually backs
+ * with stage-2. */
+#ifndef MEM_SIZE
 #define MEM_SIZE (8ULL * 1024 * 1024 * 1024)
+#endif
 #define PAGE_SIZE 4096
 // Page size = 2^PAGE_SHIFT
 #define PAGE_SHIFT 12

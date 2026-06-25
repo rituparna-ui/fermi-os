@@ -21,6 +21,27 @@ C_SOURCES := $(shell find $(SRC_DIR) -name "*.c")
 S_OBJECTS := $(patsubst $(SRC_DIR)/%.S, $(BUILD_DIR)/%.o, $(S_SOURCES))
 C_OBJECTS := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(C_SOURCES))
 OBJECTS := $(S_OBJECTS) $(C_OBJECTS)
+
+# --- Guest image (FermiOS-as-EL1-guest) ----------------------------------
+# A second build of the SAME sources, with reduced RAM (the hypervisor only
+# backs a small slice of the guest's IPA window with stage-2) and EXCLUDING
+# guest_blob.S (which would embed the guest into itself). Objects go in a
+# separate tree so the two builds never clash. The flat blob is incbin'd into
+# the hypervisor image by src/hyp/guest_blob.S.
+GUEST_OBJ_DIR := $(BUILD_DIR)/guest-obj
+GUEST_MEM_SIZE := (128ULL * 1024 * 1024)
+# The guest is plain FermiOS — exclude ALL hypervisor sources (src/hyp). It runs
+# at EL1; the hyp code is dead there and guest_blob.S would recurse.
+GUEST_S_SOURCES := $(filter-out $(SRC_DIR)/hyp/%, $(S_SOURCES))
+GUEST_C_SOURCES := $(filter-out $(SRC_DIR)/hyp/%, $(C_SOURCES))
+GUEST_S_OBJECTS := $(patsubst $(SRC_DIR)/%.S, $(GUEST_OBJ_DIR)/%.o, $(GUEST_S_SOURCES))
+GUEST_C_OBJECTS := $(patsubst $(SRC_DIR)/%.c, $(GUEST_OBJ_DIR)/%.o, $(GUEST_C_SOURCES))
+GUEST_OBJECTS := $(GUEST_S_OBJECTS) $(GUEST_C_OBJECTS)
+GUEST_ELF := $(BUILD_DIR)/guest.elf
+GUEST_BIN := $(BUILD_DIR)/guest.bin
+# GUEST_BUILD compiles out the hypervisor hooks in kernel_main (the guest is
+# plain FermiOS at EL1 and links none of src/hyp).
+GUEST_CFLAGS := -DMEM_SIZE='$(GUEST_MEM_SIZE)' -DGUEST_BUILD
 DEPS    := $(OBJECTS:.o=.d)
 
 # User-space binaries packaged onto the FAT32 disk and exec()'d at runtime.
@@ -79,11 +100,35 @@ QEMU_FLAGS_DEBUG := -kernel $(TARGET) -s -S
 
 all: $(TARGET)
 
+# The hypervisor image embeds the guest blob (via src/hyp/guest_blob.S), so the
+# blob must exist before guest_blob.o is assembled and before the final link.
+$(BUILD_DIR)/hyp/guest_blob.o: $(GUEST_BIN)
+
 # TARGET depends on all .o files
 $(TARGET): $(OBJECTS)
 	@echo "LD  $@"
 	@mkdir -p $(dir $@)
 	@$(LD) $(LDFLAGS) -o $@ $^
+
+# --- Guest image build rules ---------------------------------------------
+$(GUEST_OBJ_DIR)/%.o: $(SRC_DIR)/%.c
+	@echo "GUEST CC $<"
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) $(GUEST_CFLAGS) -c $< -o $@
+
+$(GUEST_OBJ_DIR)/%.o: $(SRC_DIR)/%.S
+	@echo "GUEST AS  $<"
+	@mkdir -p $(dir $@)
+	@$(CC) $(CFLAGS) $(GUEST_CFLAGS) -x assembler-with-cpp -c $< -o $@
+
+$(GUEST_ELF): $(GUEST_OBJECTS)
+	@echo "LD  $@ (guest)"
+	@mkdir -p $(dir $@)
+	@$(LD) $(LDFLAGS) -o $@ $^
+
+$(GUEST_BIN): $(GUEST_ELF)
+	@echo "OBJCOPY $@ (flat guest image)"
+	@$(CROSS_COMPILE)objcopy -O binary $< $@
 
 # Compile all .c files
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c

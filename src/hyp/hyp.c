@@ -304,3 +304,101 @@ void hyp_run_timeslice_demo(void) {
 
   pmm_free_pages(ram_phys, GUEST_RAM_SIZE / 0x1000);
 }
+
+/* ---- Milestone 7/8: boot the real (reduced-RAM) FermiOS as an EL1 guest ---- */
+
+extern char __guest_blob_start[];
+extern char __guest_blob_end[];
+
+#define FERMI_GUEST_RAM (128ULL * 1024 * 1024) /* must match GUEST_MEM_SIZE */
+/* UART_BASE comes from uart.h (0x09000000). */
+#define ESR_EC_OF(esr)  ESR_EC(esr)
+
+static const char *hyp_ec_name(uint64_t ec) {
+  switch (ec) {
+  case 0x01: return "WFx";
+  case 0x16: return "HVC";
+  case 0x17: return "SMC";
+  case 0x18: return "trapped sysreg";
+  case 0x20: return "instruction abort (lower EL / stage-2)";
+  case 0x24: return "data abort (lower EL / stage-2)";
+  default:   return "other";
+  }
+}
+
+void hyp_boot_fermios_guest(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uint64_t blob_len = (uint64_t)(__guest_blob_end - __guest_blob_start);
+  uart_printf("[HYP] M8: booting FermiOS-as-guest (blob %u bytes, %u MiB RAM)\n",
+              blob_len, FERMI_GUEST_RAM / (1024 * 1024));
+
+  /* Back the guest's RAM window with contiguous host RAM. */
+  uintptr_t ram_phys = pmm_allocate_pages(FERMI_GUEST_RAM / 0x1000);
+  if (!ram_phys) {
+    uart_errorln("[HYP] M8: failed to allocate guest RAM");
+    return;
+  }
+
+  static stage2_t s2;
+  if (!stage2_create(&s2, /*vmid=*/1)) {
+    return;
+  }
+  /* Guest RAM IPA 0x40000000 -> our PMM chunk (Normal-WB, executable). */
+  stage2_map(&s2, GUEST_ENTRY_IPA, (uint64_t)ram_phys, FERMI_GUEST_RAM, /*device=*/0);
+  /* PL011 UART straight-through so the guest's prints appear directly. */
+  stage2_map(&s2, UART_BASE, UART_BASE, 0x1000, /*device=*/1);
+
+  /* Copy the flat guest image into the base of guest RAM. */
+  uint64_t ram_kva = PHYS_TO_VIRT((uint64_t)ram_phys);
+  for (uint64_t i = 0; i < blob_len; i++) {
+    ((volatile uint8_t *)ram_kva)[i] = ((volatile uint8_t *)__guest_blob_start)[i];
+  }
+  guest_sync_icache(ram_kva, (blob_len + 0xFFF) & ~0xFFFULL);
+
+  static vcpu_t v;
+  for (int i = 0; i < 31; i++) {
+    v.x[i] = 0;
+  }
+  v.pc = GUEST_ENTRY_IPA; /* flat image: entry == RAM base (boot.S _start) */
+  v.pstate = 0x3C5;       /* EL1h, DAIF masked (guest's boot.S runs MMU-off) */
+  v.sp_el1 = 0;           /* guest boot.S sets its own SP */
+  v.vttbr = stage2_vttbr(&s2);
+  v.hcr_extra = 0;        /* no IRQ routing yet — observe to first trap */
+  v.vmid = 1;
+  v.id = 0;
+  v.name = "fermios";
+
+  uart_printf("[HYP] entering FermiOS guest: entry=%x VTTBR_EL2=%x\n",
+              v.pc, v.vttbr);
+  uart_println("[HYP] ---- guest output follows ----");
+
+  /* Run the guest, handling only the traps needed to OBSERVE how far it boots.
+   * Bounded so a guest fault loop can't hang the host. */
+  int max_exits = 64;
+  while (max_exits-- > 0) {
+    vcpu_enter(&v);
+    uint64_t ec = ESR_EC_OF(v.esr);
+
+    if (v.exit_reason == HYP_EXC_SYNC && ec == 0x16) {
+      /* Guest HVC (e.g. PSCI reboot). Stop and report. */
+      uart_printf("\n[HYP] guest HVC at pc=%x x0=%x — stopping observation\n",
+                  v.pc, v.x[0]);
+      break;
+    }
+
+    /* Any abort / trap: report the first one richly — this defines what the
+     * next milestone (vGIC etc.) must emulate — and stop. */
+    uint64_t ipa = ((v.hpfar >> 4) << 12) | (v.far & 0xFFF);
+    uart_printf("\n[HYP] guest TRAP: reason=%u EC=%x (%s)\n",
+                v.exit_reason, ec, hyp_ec_name(ec));
+    uart_printf("       guest_pc=%x ESR_EL2=%x FAR_EL2=%x HPFAR_EL2=%x faultIPA=%x\n",
+                v.pc, v.esr, v.far, v.hpfar, ipa);
+    break;
+  }
+
+  uart_println("[HYP] ---- end FermiOS guest observation ----");
+  pmm_free_pages(ram_phys, FERMI_GUEST_RAM / 0x1000);
+}

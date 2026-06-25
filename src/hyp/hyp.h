@@ -63,4 +63,10 @@ void hyp_run_smoke_guest(void);
  * exit + guest resume. No-op at EL1. Runs before the host timer starts. */
 void hyp_run_timeslice_demo(void);
 
+/* Milestone 7/8: load the embedded (reduced-RAM) FermiOS guest image into a
+ * PMM-backed IPA window, build its stage-2 (RAM + straight-through UART), and
+ * run it as an EL1 guest, reporting how far it boots and the first trap it
+ * takes. No-op at EL1. Runs before the host timer starts. */
+void hyp_boot_fermios_guest(void);
+
 #endif /* HYP_HYP_H */

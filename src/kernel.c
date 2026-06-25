@@ -795,9 +795,12 @@ void kernel_main() {
 
   gic_init();
 
+#ifndef GUEST_BUILD
   /* Bring up the EL2 hypervisor trap layer (no-op on legacy EL1 boot).
-   * Milestone 2: self-tests the dedicated EL2 vector table via a host HVC. */
+   * Milestone 2: self-tests the dedicated EL2 vector table via a host HVC.
+   * Compiled out of the guest build (plain FermiOS at EL1, no src/hyp). */
   hyp_init();
+#endif
 
   pci_enumerate_bus();
   pci_virtio_rng_init();
@@ -828,6 +831,7 @@ void kernel_main() {
   sched_create_task("task_crash", task_crash);
   sched_create_kernel_task("netd", netd);
 
+#ifndef GUEST_BUILD
   /* Milestone 3: run the trivial EL1 guest smoke test BEFORE the timer starts,
    * so no preemption/IRQ-routing is involved (the guest exits via HVC). */
   hyp_run_smoke_guest();
@@ -835,6 +839,11 @@ void kernel_main() {
   /* Milestone 4: time-slice a spinning EL1 guest off the EL2 physical timer.
    * Also runs before the host timer so the two timers don't interleave yet. */
   hyp_run_timeslice_demo();
+
+  /* Milestone 8: boot the real (reduced-RAM) FermiOS as an EL1 guest and
+   * observe how far it gets / its first trap. */
+  hyp_boot_fermios_guest();
+#endif
 
   timer_init();
   timer_start(TIMER_INTERVAL_MS);

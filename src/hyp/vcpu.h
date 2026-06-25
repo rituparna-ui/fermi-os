@@ -96,7 +96,7 @@ typedef struct vcpu {
   uint32_t vmid;
   uint32_t id;        /* 0, 1, ... */
   const char *name;
-  int runnable;
+  int runnable;       /* 0 = blocked on WFI awaiting its next interrupt */
 } vcpu_t;
 
 /* The currently-running vCPU (set by the scheduler before each guest entry).
@@ -123,6 +123,19 @@ __attribute__((noreturn)) void vcpu_run_first(void);
 /* Round-robin world switch, called from the EL2 IRQ handler on a scheduler
  * tick. Saves the running guest's full context, restores the next guest's. */
 void vcpu_sched_tick(hyp_trap_frame_t *f);
+
+/* The current guest executed WFI/WFE and is idle. Mark it blocked (so the
+ * scheduler skips it) and world-switch to another runnable guest. The blocked
+ * guest is woken by vcpu_wake_expired() when its vtimer deadline fires. If no
+ * other guest is runnable, this returns and the caller idles via the trap
+ * return (the guest re-checks WFI). */
+void vcpu_block_current(hyp_trap_frame_t *f);
+
+/* Called on each CNTHP fire: inject the timer IRQ into (and mark runnable) any
+ * vCPU whose vtimer deadline has elapsed — including non-current, blocked ones.
+ * Returns 1 if the current vCPU should switch (it blocked and another is now
+ * runnable), else 0. */
+int vcpu_wake_expired(void);
 
 /* CNTHP is shared between the scheduler slice and the running guest's vtimer.
  * hyp_cnthp_arm() programs CNTHP to the sooner of the two deadlines; the

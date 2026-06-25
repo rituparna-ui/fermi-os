@@ -147,12 +147,13 @@ static void handle_sync(uint64_t type, hyp_trap_frame_t *f) {
 
   case EC_WF_TRAPPED:
     /* Guest WFI/WFE — the guest is idle. Skip the instruction so it re-checks
-     * for a pending vIRQ rather than re-trapping the same WFI. The preemptive
-     * CNTHP scheduler tick (and the guest's own folded vtimer deadline) shares
-     * the CPU; we do not world-switch on every WFI (that starves a guest like
-     * FermiOS that idles between ticks). Fairness vs. a pure-spin guest is a
-     * known limitation — see src/hyp/README.md. */
+     * for a pending vIRQ on resume. The guest is idle, so BLOCK it and switch
+     * to another runnable VM; it is woken precisely on its own vtimer deadline
+     * by vcpu_wake_expired (its deadline is folded into CNTHP for all vCPUs).
+     * This gives fair time-sharing: an idle guest yields the CPU to a busy one
+     * instead of busy-trapping WFI for its whole slice. */
     advance_elr(f);
+    vcpu_block_current(f);
     break;
 
   case EC_DATA_ABORT_LO:
@@ -174,24 +175,22 @@ static void handle_irq(hyp_trap_frame_t *f) {
     return; /* spurious */
   }
   if (intid == HYP_CNTHP_PPI) {
-    /* CNTHP is shared between the running guest's vtimer and the scheduler
-     * slice (we arm it to the sooner of the two). Service whichever
-     * deadline(s) have elapsed. */
+    /* CNTHP is the soonest of: the scheduler slice and EVERY vCPU's vtimer
+     * deadline. First inject timer IRQs into (and wake) any vCPU whose deadline
+     * elapsed — including blocked, non-current ones. */
+    int must_switch = vcpu_wake_expired();
+
     uint64_t now;
     __asm__ __volatile__("mrs %0, cntpct_el0" : "=r"(now));
 
-    /* Guest vtimer deadline reached -> inject vINTID 30. Only when ENABLE=1,
-     * IMASK=0, not already pending, and the comparator has actually fired. */
-    if ((cur_vcpu->vtimer.ctl & 1ULL) /*ENABLE*/ &&
-        !(cur_vcpu->vtimer.ctl & 2ULL) /*IMASK*/ &&
-        !cur_vcpu->vtimer.pending && now >= cur_vcpu->vtimer.cval) {
-      vtimer_handle_host_irq();
-    }
-    /* Scheduler slice elapsed -> round-robin (this also re-arms CNTHP). */
     if (now >= hyp_sched_deadline()) {
+      /* Slice elapsed -> round-robin (also re-arms CNTHP). */
+      vcpu_sched_tick(f);
+    } else if (must_switch) {
+      /* Current guest is blocked and another woke up -> switch to it. */
       vcpu_sched_tick(f);
     } else {
-      /* Only the vtimer fired; re-arm CNTHP to the next (folded) deadline. */
+      /* Only a vtimer fired for the current guest; re-arm CNTHP. */
       hyp_cnthp_arm();
     }
   } else {

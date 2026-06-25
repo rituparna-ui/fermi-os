@@ -222,14 +222,18 @@ void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
   *val = r & size_mask;
 }
 
+/* Compose a pending Group1 List Register value for `intid`. */
+static uint64_t lr_pending(uint32_t intid) {
+  return ICH_LR_STATE_PENDING | ICH_LR_GROUP1 |
+         (0xA0ULL << ICH_LR_PRIO_SHIFT) | (uint64_t)intid;
+}
+
 void vgic_inject_ppi(uint32_t intid) {
-  /* Find a free LR (State == Invalid) that does not already hold this INTID. */
+  /* Inject into a free LIVE List Register (current guest). */
   for (uint32_t i = 0; i < vgic_nr_lr; i++) {
     uint64_t lr = lr_read(i);
     if ((lr & ICH_LR_STATE_MASK) == 0) {
-      uint64_t v = ICH_LR_STATE_PENDING | ICH_LR_GROUP1 |
-                   (0xA0ULL << ICH_LR_PRIO_SHIFT) | (uint64_t)intid;
-      lr_write(i, v);
+      lr_write(i, lr_pending(intid));
       return;
     }
     /* Already pending/active for this INTID — guest hasn't consumed it yet. */
@@ -238,4 +242,17 @@ void vgic_inject_ppi(uint32_t intid) {
     }
   }
   /* No free LR: guest is behind on this periodic IRQ; drop silently. */
+}
+
+void vgic_inject_to(struct vcpu_vgic *g, uint32_t intid) {
+  /* Inject into a non-current vCPU's SAVED LR array; presented when restored. */
+  for (uint32_t i = 0; i < vgic_nr_lr; i++) {
+    if ((g->lr[i] & ICH_LR_STATE_MASK) == 0) {
+      g->lr[i] = lr_pending(intid);
+      return;
+    }
+    if ((uint32_t)(g->lr[i] & 0xFFFFFFFFULL) == intid) {
+      return; /* already pending for this INTID */
+    }
+  }
 }

@@ -121,11 +121,22 @@ assume), and injects interrupts by writing a free `ICH_LR<n>_EL2`. GICD/GICR
 
 Each guest has a `struct vcpu` with the full context (GPRs, EL1 sysregs, FP,
 per-VM vGIC, per-VM vtimer, per-VM stage-2 `VTTBR`). The EL2 scheduler preempts
-on the **CNTHP** timer (~50 ms slice), multiplexed with the running guest's
-vtimer via `min(deadline)`. On a tick it saves the outgoing guest's context and
-restores the incoming guest's. A guest can also yield cooperatively via
-`HVC x0=0xFE110000`. The two guests use **separate stage-2 roots**, so both run
-at IPA `0x40000000` but map to different host PA — true memory isolation.
+on the **CNTHP** timer (~10 ms slice). CNTHP is armed to the soonest of {the
+scheduler slice, **every** vCPU's vtimer deadline} — so a blocked guest is woken
+precisely on its own timer even while another VM runs. On a tick it saves the
+outgoing guest's context and restores the incoming guest's. The two guests use
+**separate stage-2 roots**, so both run at IPA `0x40000000` but map to different
+host PA — true memory isolation.
+
+**Fair scheduling (block-on-WFI).** When a guest executes `WFI` (idle, awaiting
+its next interrupt) the hypervisor marks its vCPU *blocked* and world-switches
+to another runnable VM, instead of letting it busy-trap `WFI` for the rest of
+its slice. On each `CNTHP` fire, `vcpu_wake_expired` injects the timer IRQ into —
+and marks runnable — any vCPU whose vtimer deadline elapsed, including blocked,
+non-current ones (injecting into their *saved* List Registers). The result is
+genuine fair time-sharing: an idle, timer-driven guest (FermiOS) and a
+compute-bound guest both make steady concurrent progress. A guest may also yield
+cooperatively via `HVC x0=0xFE110000`.
 
 > Note: the EL2 *virtual* timer (`CNTHV`/PPI 28) does not deliver IRQs reliably
 > on the tested QEMU, so the **physical** EL2 timer (`CNTHP`/PPI 26) drives both
@@ -154,9 +165,8 @@ clobber the guest's caller-saved q-registers.
 
 ## Known limitations / future work
 
-- **Scheduler fairness** is coarse: a spin-heavy guest under-serves a
-  timer-driven one. Needs slice tuning and per-VM timer accounting across
-  switches.
 - **PSCI SYSTEM_RESET** halts rather than warm-resetting.
 - **PCI ECAM** is mapped straight-through; no vPCI model.
 - Single physical CPU only; no SMP guests.
+- The scheduler is round-robin with block-on-WFI; there is no priority or
+  weighting between VMs.

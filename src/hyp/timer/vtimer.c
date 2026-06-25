@@ -105,12 +105,5 @@ int vtimer_emulate_sysreg(hyp_trap_frame_t *f) {
   return 0;
 }
 
-void vtimer_handle_host_irq(void) {
-  /* The current guest's vtimer deadline elapsed. LATCH the condition (pending)
-   * rather than clearing ENABLE — the guest's IRQ handler reads CNTP_CTL_EL0
-   * and must see ISTATUS=1 (clearing ENABLE would make it see a disabled
-   * timer). The guest clears the condition by re-arming CNTP_CVAL/CNTP_TVAL.
-   * CNTHP is re-armed by the caller via hyp_cnthp_arm(). */
-  cur_vcpu->vtimer.pending = 1;
-  vgic_inject_ppi(VTIMER_GUEST_PPI);
-}
+/* Timer-deadline handling (latch pending + inject vINTID 30) now lives in
+ * vcpu_wake_expired() in vcpu.c, which handles non-current vCPUs too. */

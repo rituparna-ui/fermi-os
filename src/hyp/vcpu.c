@@ -94,16 +94,21 @@ __attribute__((noreturn)) void vcpu_run_first(void) {
 
 static uint64_t sched_deadline; /* absolute CNTPCT of the next scheduler slice */
 
-/* Arm CNTHP to min(scheduler deadline, current guest's vtimer deadline). */
+/* True if vCPU v has a live (armed, unmasked, not-yet-fired) vtimer deadline. */
+static int vtimer_armed(const vcpu_t *v) {
+  return (v->vtimer.ctl & 1ULL) /*ENABLE*/ &&
+         !(v->vtimer.ctl & 2ULL) /*IMASK*/ && !v->vtimer.pending;
+}
+
+/* Arm CNTHP to the soonest of: the scheduler slice deadline, and EVERY vCPU's
+ * armed vtimer deadline. Folding in non-current vCPUs is what lets a blocked,
+ * idle guest be woken precisely on its own timer while another VM runs. */
 void hyp_cnthp_arm(void) {
   uint64_t deadline = sched_deadline;
-  /* Fold in the running guest's vtimer deadline only if it is armed, NOT
-   * masked, and NOT already pending (a latched-but-unacked condition must not
-   * re-arm CNTHP or it would storm until the guest re-arms). */
-  if (cur_vcpu && (cur_vcpu->vtimer.ctl & 1ULL) /*ENABLE*/ &&
-      !(cur_vcpu->vtimer.ctl & 2ULL) /*IMASK*/ && !cur_vcpu->vtimer.pending) {
-    uint64_t vt = cur_vcpu->vtimer.cval;
-    if (vt < deadline) deadline = vt;
+  for (int i = 0; i < nr_vcpus; i++) {
+    if (vtimer_armed(&vcpus[i]) && vcpus[i].vtimer.cval < deadline) {
+      deadline = vcpus[i].vtimer.cval;
+    }
   }
   __asm__ __volatile__("msr cnthp_cval_el2, %0" ::"r"(deadline));
   __asm__ __volatile__("msr cnthp_ctl_el2, %0\n\tisb" ::"r"(1ULL));
@@ -132,20 +137,16 @@ static vcpu_t *pick_next(vcpu_t *cur) {
   return cur;
 }
 
-/* Scheduler tick: called from the EL2 IRQ handler when CNTHV (PPI 28) fires.
- * Saves the running guest's context out of the trap frame, restores the next
- * guest's into the frame, so the vector exit path erets into the new guest. */
-void vcpu_sched_tick(hyp_trap_frame_t *f) {
-  sched_arm_slice(); /* schedule the next slice (also re-arms CNTHP) */
-
+/* Switch the running guest to `next`: save prev's context out of the trap
+ * frame + hardware, restore next's into hardware + the frame (so the vector
+ * exit erets into next). No-op if next == prev. */
+static void switch_to(vcpu_t *next, hyp_trap_frame_t *f) {
   vcpu_t *prev = cur_vcpu;
-  vcpu_t *next = pick_next(prev);
   if (next == prev) {
-    return; /* only one runnable guest — keep running it */
+    return;
   }
-  /* Log every 100th switch so the round-robin is visible without flooding. */
   static uint64_t nswitch;
-  if ((nswitch++ % 100) == 0) {
+  if ((nswitch++ % 200) == 0) {
     hyp_puts("[SCHED] world switches: ");
     hyp_puthex(nswitch - 1);
     hyp_putc('\n');
@@ -159,11 +160,63 @@ void vcpu_sched_tick(hyp_trap_frame_t *f) {
   vcpu_save_fp(&prev->fp);
   vgic_save(&prev->vgic);
 
-  /* Restore next into hardware. */
   vcpu_load(next);
 
-  /* Load next's GP into the frame so the vector exit erets into it. */
   for (int i = 0; i < 31; i++) f->regs[i] = next->gp.x[i];
   f->elr = next->gp.elr_el2;
   f->spsr = next->gp.spsr_el2;
+}
+
+/* Inject the timer IRQ into any vCPU whose vtimer deadline has elapsed and mark
+ * it runnable — including non-current, blocked ones (so a blocked idle guest
+ * wakes on its own timer while another VM runs). Returns 1 if the CURRENT vCPU
+ * is blocked and a different vCPU is now runnable (caller should switch). */
+int vcpu_wake_expired(void) {
+  uint64_t now;
+  __asm__ __volatile__("mrs %0, cntpct_el0" : "=r"(now));
+
+  for (int i = 0; i < nr_vcpus; i++) {
+    vcpu_t *v = &vcpus[i];
+    if (vtimer_armed(v) && now >= v->vtimer.cval) {
+      v->vtimer.pending = 1; /* latch ISTATUS; cleared on guest re-arm */
+      if (v == cur_vcpu) {
+        vgic_inject_ppi(VTIMER_GUEST_PPI);     /* live LR */
+      } else {
+        vgic_inject_to(&v->vgic, VTIMER_GUEST_PPI); /* saved LR */
+      }
+      v->runnable = 1; /* a pending IRQ makes a blocked guest runnable again */
+    }
+  }
+
+  if (!cur_vcpu->runnable) {
+    for (int i = 0; i < nr_vcpus; i++) {
+      if (vcpus[i].runnable) return 1; /* someone else can run */
+    }
+  }
+  return 0;
+}
+
+/* Periodic scheduler tick (CNTHP slice elapsed): round-robin to the next
+ * runnable guest. */
+void vcpu_sched_tick(hyp_trap_frame_t *f) {
+  sched_arm_slice(); /* schedule the next slice (also re-arms CNTHP) */
+  switch_to(pick_next(cur_vcpu), f);
+}
+
+/* Current guest did WFI/WFE — block it and switch to another runnable guest.
+ * If none is runnable, leave it running (it re-checks WFI); its own timer will
+ * fire and wake it. The blocked guest is re-armed via hyp_cnthp_arm folding in
+ * all vCPUs' deadlines, and woken by vcpu_wake_expired on the CNTHP fire. */
+void vcpu_block_current(hyp_trap_frame_t *f) {
+  cur_vcpu->runnable = 0;
+  vcpu_t *next = pick_next(cur_vcpu);
+  if (next == cur_vcpu) {
+    /* Nobody else runnable. Keep this vCPU live (un-block) so it can take its
+     * own timer IRQ on the next CNTHP fire. */
+    cur_vcpu->runnable = 1;
+    return;
+  }
+  /* Make sure CNTHP is armed to wake the blocking guest on its own deadline. */
+  hyp_cnthp_arm();
+  switch_to(next, f);
 }

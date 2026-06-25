@@ -41,11 +41,14 @@ void vgic_vcpu_reset(struct vcpu_vgic *g);
 void vgic_save(struct vcpu_vgic *g);      /* live HW interface -> g  (exit)  */
 void vgic_restore(const struct vcpu_vgic *g); /* g -> live HW interface (entry) */
 
-/* Inject a virtual PPI/SPI (e.g. timer INTID 30) into the guest as a pending
- * Group1 interrupt. Picks a free List Register; if none is free (a previous
- * injection of the same INTID is still pending/active), it is a no-op (the
- * guest is simply behind and will catch up). */
+/* Inject a virtual PPI/SPI (e.g. timer INTID 30) into the CURRENT guest as a
+ * pending Group1 interrupt, written directly to a free live List Register. */
 void vgic_inject_ppi(uint32_t intid);
+
+/* Inject into a NON-current vCPU's SAVED vGIC state (its lr[] array), so the
+ * interrupt is present when that vCPU is next restored. Used to wake a blocked
+ * vCPU on its timer deadline while another VM is running. */
+void vgic_inject_to(struct vcpu_vgic *g, uint32_t intid);
 
 /* --- M5: GICD/GICR MMIO emulation --------------------------------------- */
 

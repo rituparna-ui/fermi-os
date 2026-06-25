@@ -20,6 +20,8 @@ QEMU_CPU=cortex-a72
 QEMU_MACHINE="virt,gic-version=3"
 QEMU_MEM=8G
 
+VCONS="${BUILD_DIR}/virtio-console.txt"
+
 exec qemu-system-aarch64 \
 	-machine "${QEMU_MACHINE}" \
 	-cpu "${QEMU_CPU}" \
@@ -30,4 +32,8 @@ exec qemu-system-aarch64 \
 	-device virtio-rng-pci,disable-legacy=on \
 	-drive file="${DISK_IMG}",if=none,format=raw,id=d0 \
 	-device virtio-blk-pci,drive=d0,disable-legacy=on \
+	-chardev file,id=vc,path="${VCONS}",mux=off \
+	-device virtio-serial-pci,disable-legacy=on \
+	-device virtconsole,chardev=vc \
+	-device virtio-balloon-pci,disable-legacy=on \
 	-kernel "${KERNEL}"

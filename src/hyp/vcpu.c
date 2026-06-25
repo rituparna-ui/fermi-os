@@ -2,6 +2,7 @@
 #include "hyp.h"
 #include "hyp_sysregs.h"
 #include "stage2.h"
+#include "snapshot.h"
 #include "vgic/vgic.h"
 #include "timer/vtimer.h"
 #include <stdint.h>
@@ -156,6 +157,10 @@ int64_t vcpu_vmctl(uint64_t op, uint64_t target, uint64_t arg,
     return VMCTL_OK;
   case VMCTL_CPUTIME:
     return (int64_t)t->cpu_ticks;
+  case VMCTL_SNAPSHOT:
+    return snapshot_save((int)target);
+  case VMCTL_RESTORE:
+    return snapshot_restore((int)target);
   case VMCTL_RESET:
     if (t->dead) return VMCTL_EINVAL;
     /* Reset is in-place if it targets the caller; here the control VM never

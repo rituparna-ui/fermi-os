@@ -94,6 +94,8 @@ typedef struct hyp_trap_frame {
 #define VMCTL_STAT    6  /* x2=id, x3=stat index; -> x0 = that exit counter    */
 #define VMCTL_WEIGHT  7  /* x2=id, x3=weight; set proportional CPU share        */
 #define VMCTL_CPUTIME 8  /* x2=id; -> x0 = CPU ticks consumed (CNTPCT)          */
+#define VMCTL_SNAPSHOT 9 /* x2=id; checkpoint that VM's full state to a slot    */
+#define VMCTL_RESTORE 10 /* x2=id; roll that VM back to its snapshot            */
 
 /* VMCTL_STAT indices (x3). */
 #define VMSTAT_HVC        0

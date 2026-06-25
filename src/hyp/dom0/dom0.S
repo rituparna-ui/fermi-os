@@ -29,6 +29,8 @@
 .equ VMCTL_STAT,  6
 .equ VMCTL_WEIGHT, 7
 .equ VMCTL_CPUTIME, 8
+.equ VMCTL_SNAPSHOT, 9
+.equ VMCTL_RESTORE, 10
 
 .section .text.boot.dom0
 .global _dom0_start
@@ -183,10 +185,44 @@ _dom0_start:
 	add	x21, x21, #1
 	b	21b
 22:
+	// --- 9. snapshot / restore demo on vm 1 (the heartbeat guest, 64 MiB) ---
+	// Let it run a bit, SNAPSHOT it (capturing its current beat counter), let it
+	// climb higher, then RESTORE — its beat number visibly jumps back.
+	mov	x20, #30
+23:	bl	d_yield
+	subs	x20, x20, #1
+	b.ne	23b
+
+	adr	x19, m_snap
+	bl	d_puts
+	mov	x1, #VMCTL_SNAPSHOT
+	mov	x2, #1                    // vm 1 = guest2 heartbeat
+	bl	vmctl
+	mov	w23, w0
+	bl	d_puthex2                 // 00 = VMCTL_OK
+	adr	x19, m_nl
+	bl	d_puts
+
+	// let vm 1 climb for a while
+	mov	x20, #60
+24:	bl	d_yield
+	subs	x20, x20, #1
+	b.ne	24b
+
+	adr	x19, m_rest
+	bl	d_puts
+	mov	x1, #VMCTL_RESTORE
+	mov	x2, #1
+	bl	vmctl
+	mov	w23, w0
+	bl	d_puthex2
+	adr	x19, m_nl
+	bl	d_puts
+
 	adr	x19, m_done
 	bl	d_puts
 
-	// --- 9. idle forever ---
+	// --- 10. idle forever ---
 9:	bl	d_yield
 	b	9b
 
@@ -270,6 +306,8 @@ m_done:  .asciz "[dom0] management script complete; idling\r\n"
 m_stats: .asciz "[dom0] exit stats per vm (hvc dabt sysreg wfx irq):\r\n"
 m_wset:  .asciz "[dom0] VMCTL_WEIGHT: vm 2 = 8, vm 3 = 1 (proportional share)\r\n"
 m_cpu:   .asciz "[dom0] cpu time per vm (cntpct bits[31:24]):\r\n"
+m_snap:  .asciz "[dom0] VMCTL_SNAPSHOT vm 1 -> rc=0x"
+m_rest:  .asciz "[dom0] VMCTL_RESTORE vm 1 (rollback) -> rc=0x"
 m_svm:   .asciz "[dom0]  vm 0x"
 m_colon: .asciz ": "
 m_nl:    .asciz "\r\n"

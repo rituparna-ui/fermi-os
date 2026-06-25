@@ -27,32 +27,22 @@ _g2_start:
 	ldr	x21, =0x40210000
 	str	xzr, [x21]
 
-1:	// Heartbeat loop — emit via the PV console (HVC_FERMI_LOG) so the
-	// hypervisor prints it tagged "[guest2]". x1 = buffer IPA, x2 = length.
-	adr	x1, g2_beat
-	mov	x2, #(g2_beat_end - g2_beat)
-	mov	x0, #0
-	movk	x0, #0xFE11, lsl #16	// x0 = 0xFE110003 = HVC_FERMI_LOG
-	movk	x0, #0x0003
-	hvc	#0
-
-	// After 5 heartbeats, request a PSCI SYSTEM_RESET. The hypervisor warm-
-	// resets THIS VM only: it reloads our image and restarts us from _g2_start,
-	// so the banner prints again and the counter restarts. (VM1 is unaffected.)
+1:	// Heartbeat loop — increment the counter in RAM and print "beat NN" via the
+	// PV console. The counter lives in plain guest RAM, so it is part of the VM
+	// snapshot: dom0 can snapshot us at beat N, let us climb, then RESTORE — and
+	// the count visibly jumps back to N, proving the rollback.
 	ldr	x21, =0x40210000
 	ldr	x22, [x21]
 	add	x22, x22, #1
 	str	x22, [x21]
-	cmp	x22, #5
-	b.lt	3f
-	adr	x19, g2_reset_msg
+
+	adr	x19, g2_beat
+	bl	g2_puts                 // "[guest2] beat " (raw UART so dom0 logs interleave)
+	and	w23, w22, #0xFF
+	bl	g2_puthex2              // the beat number
+	adr	x19, g2_nl
 	bl	g2_puts
-	mov	x0, #0
-	movk	x0, #0x8400, lsl #16	// x0 = 0x84000009 = PSCI SYSTEM_RESET
-	movk	x0, #0x0009
-	hvc	#0
-	// not reached — the hyp re-enters us at _g2_start
-3:
+
 	// crude delay
 	mov	x20, #0x4000000
 2:	subs	x20, x20, #1
@@ -76,13 +66,35 @@ g2_puts:
 	b	3b
 4:	ret
 
+// print byte in w23 as two hex digits. Clobbers x9,x10,x12,x15.
+g2_puthex2:
+	ldr	x9, =0x09000000
+	ldr	x10, =0x09000018
+	lsr	w15, w23, #4
+	and	w15, w15, #0xF
+	cmp	w15, #10
+	b.lt	6f
+	add	w15, w15, #('A' - 10)
+	b	7f
+6:	add	w15, w15, #'0'
+7:	ldr	w12, [x10]
+	tbnz	w12, #5, 7b
+	str	w15, [x9]
+	and	w15, w23, #0xF
+	cmp	w15, #10
+	b.lt	8f
+	add	w15, w15, #('A' - 10)
+	b	9f
+8:	add	w15, w15, #'0'
+9:	ldr	w12, [x10]
+	tbnz	w12, #5, 9b
+	str	w15, [x9]
+	ret
+
 .section .rodata.g2
 g2_banner:
 	.asciz "\r\n[VM2] hello from guest 2 (EL1, isolated stage-2)\r\n"
-	// PV-console heartbeat: the hyp prepends "[guest2] ", so the body is just
-	// the text. g2_beat_end marks the length for HVC_FERMI_LOG.
 g2_beat:
-	.ascii "heartbeat (via PV console)\r\n"
-g2_beat_end:
-g2_reset_msg:
-	.asciz "[VM2] 5 beats -> PSCI SYSTEM_RESET (warm restart)\r\n"
+	.asciz "[guest2] beat "
+g2_nl:
+	.asciz "\r\n"

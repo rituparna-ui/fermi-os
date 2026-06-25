@@ -234,6 +234,31 @@ the bytes tagged with the VM name (`[guest2] ...`), and returns the count. This
 is the virtio-console / Xen-console paravirtualised-device pattern: the host
 multiplexes and attributes guest output. VM2's heartbeats use it.
 
+### VM snapshot / restore (checkpoint + rollback)
+
+dom0 can checkpoint a guest's *complete* state and roll it back later
+(`VMCTL_SNAPSHOT` / `VMCTL_RESTORE`) — the foundation of live migration and
+fault recovery. The snapshot captures the target's full execution state (GP +
+EL1 sysregs + FP + vGIC LRs/MMIO model + vtimer) and its private RAM into one
+boot-reserved slot, then restore rolls it all back. Verified live: VM2's beat
+counter climbs to 0x10, dom0 snapshots at 0x0B, and after `VMCTL_RESTORE` the
+guest jumps back to 0x0C and resumes — a precise rollback.
+
+The design was adversarially reviewed; the load-bearing correctness points:
+- **vtimer.cval is an absolute CNTPCT deadline** — stored *relative* and rebased
+  to `now + delta` on restore, else a stale deadline storms the timer IRQ.
+- **Restore flushes the TARGET VMID's** stage-2 TLB (temporarily swapping
+  `VTTBR_EL2`), not the caller's — and makes the rewritten RAM I-cache coherent.
+- Capture reads from the target's `vcpu_t` (it is never the current vCPU), never
+  from hardware; RAM is sized by `ram_size` (not the smaller boot blob).
+- Identity + accounting fields (vmid, vttbr, img_*, run_count, cpu_ticks, stats,
+  weight) are **never** rolled back; a dead VM is never resurrected and an
+  admin-paused VM is never silently un-paused.
+- One **boot-reserved fixed slot** (the bump allocator has no free()), capped at
+  64 MiB — so the 8 GiB FermiOS is deliberately not snapshottable (rejected with
+  `VMCTL_EINVAL`). A `valid` + id/vmid/ram_size stamp guards against restoring a
+  stale or mismatched snapshot over a live guest. (`src/hyp/snapshot.c`.)
+
 ### VM lifecycle (PSCI)
 
 The hypervisor emulates a per-VM PSCI interface (the guest's `hvc`/`smc`):

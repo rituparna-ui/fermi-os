@@ -2,6 +2,7 @@
 #include "hyp_alloc.h"
 #include "hyp_gic.h"
 #include "hyp_sysregs.h"
+#include "snapshot.h"
 #include "stage2.h"
 #include "timer/vtimer.h"
 #include "vcpu.h"
@@ -228,6 +229,7 @@ void hyp_main(void) {
   hyp_puts("[HYP] 5 vCPUs created (incl. privileged dom0). Starting scheduler.\n");
   hyp_puts("--------------------------------------------------\n\n");
 
+  snapshot_init();    /* reserve the VM snapshot slot */
   vcpu_sched_init();  /* arm CNTHV scheduler tick */
   vcpu_run_first();   /* enter VM1 — does not return */
 }

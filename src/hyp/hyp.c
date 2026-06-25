@@ -1,4 +1,5 @@
 #include "hyp.h"
+#include "hyp/hypercall.h" /* HVC_* ABI */
 #include "mm/mmu/mmu.h" /* _1GB, _512GB */
 #include "mm/pmm/pmm.h" /* MEM_START, MEM_SIZE */
 #include "uart/uart.h"  /* UART_BASE / UART_DR / UART_FR */
@@ -48,6 +49,11 @@ __attribute__((aligned(16), section(".hyp_tables"))) uint8_t el2_stack[8192];
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t s2_l0[512];
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t s2_l1_low[512];  /* 0..512 GiB  */
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t s2_l1_high[512]; /* 512G..1 TiB */
+
+/* The single guest's vCPU control block. In .hyp_tables (NOLOAD), so it is
+ * neither zeroed by the guest's zero_bss nor reused by the guest PMM; we
+ * initialise its fields explicitly in hyp_init(). */
+__attribute__((section(".hyp_tables"))) static vcpu_t g_vcpu;
 
 /* --- self-contained PL011 output (no driver state, safe pre-uart_init) --- */
 static void hyp_putc(char c) {
@@ -110,6 +116,12 @@ static void hyp_build_stage2(void) {
 void hyp_init(void) {
   hyp_puts("\n[HYP] Fermi hypervisor online at EL2\n");
 
+  /* Initialise the guest vCPU control block (NOLOAD memory => not zeroed). */
+  g_vcpu.id = 0;
+  g_vcpu.hvc_count = 0;
+  g_vcpu.sysreg_traps = 0;
+  g_vcpu.abort_count = 0;
+
   /* Sanity: confirm we really are at EL2. */
   uint64_t el = (MRS(CurrentEL) >> 2) & 0x3;
   hyp_puts("[HYP] CurrentEL = ");
@@ -149,9 +161,9 @@ void hyp_init(void) {
 
   __asm__ __volatile__("isb");
 
-  /* Enable stage-2 and pin EL1 to AArch64. From this point the EL1 guest's
-   * physical accesses are IPA->PA translated by the tables above. */
-  MSR(hcr_el2, HCR_RW | HCR_VM);
+  /* Enable stage-2, pin EL1 to AArch64, and trap guest ID-register reads
+   * (HCR_EL2.TID3) so we can emulate the CPU feature view. */
+  MSR(hcr_el2, HCR_RW | HCR_VM | HCR_TID3);
   __asm__ __volatile__("isb");
 
   hyp_puts("[HYP] stage-2 enabled (HCR_EL2.VM=1), dropping to EL1 guest...\n");
@@ -163,6 +175,8 @@ static const char *ec_name(uint64_t ec) {
   switch (ec) {
   case EC_HVC64:
     return "HVC (hypercall)";
+  case EC_SYSREG:
+    return "trapped MSR/MRS";
   case EC_DABT_LOWER:
     return "data abort (stage-2)";
   case EC_IABT_LOWER:
@@ -172,67 +186,139 @@ static const char *ec_name(uint64_t ec) {
   }
 }
 
-void el2_dispatch(uint64_t index, el2_frame_t *frame) {
-  uint64_t esr = MRS(esr_el2);
-  uint64_t elr = MRS(elr_el2);
-  uint64_t ec = (esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
+/* HVC hypercall: function ID in x0, args in x1..x3, result back in x0.
+ * ELR_EL2 already points past the HVC, so no PC adjustment is needed. */
+static void hyp_handle_hvc(el2_frame_t *f) {
+  uint64_t fn = f->x[0];
+  uint64_t a1 = f->x[1];
+  uint64_t ret;
 
-  hyp_puts("\n[HYP] *** EL2 trap *** vector=");
+  g_vcpu.hvc_count++;
+
+  switch (fn) {
+  case HVC_VERSION:
+    ret = HYP_ABI_VERSION;
+    break;
+  case HVC_PUTC:
+    hyp_putc((char)a1);
+    ret = 0;
+    break;
+  case HVC_PING:
+    ret = a1 + 1;
+    break;
+  case HVC_VM_INFO:
+    ret = g_vcpu.hvc_count;
+    break;
+  case HVC_YIELD:
+    /* Cooperative yield is a no-op until the M5 world-switch scheduler. */
+    ret = 0;
+    break;
+  default:
+    hyp_puts("[HYP] unknown hypercall fn=");
+    hyp_puthex(fn);
+    hyp_puts("\n");
+    ret = HVC_ERR_BADCALL;
+    break;
+  }
+
+  f->x[0] = ret;
+}
+
+/* Trapped system-register access (EC=0x18), produced here by HCR_EL2.TID3 for
+ * guest reads of the ID_AA64* feature registers. We emulate by returning the
+ * real (optionally massaged) value, then step ELR past the trapped
+ * instruction (unlike HVC, ELR points *at* it).
+ *
+ * ISS layout for MSR/MRS: Op0[21:20] Op2[19:17] Op1[16:14] CRn[13:10]
+ *                         Rt[9:5] CRm[4:1] Direction[0] (1 = read/MRS). */
+static void hyp_handle_sysreg(el2_frame_t *f) {
+  uint64_t esr = MRS(esr_el2);
+  uint64_t iss = esr & 0x1FFFFFFULL;
+  uint64_t op0 = (iss >> 20) & 0x3;
+  uint64_t op2 = (iss >> 17) & 0x7;
+  uint64_t op1 = (iss >> 14) & 0x7;
+  uint64_t crn = (iss >> 10) & 0xF;
+  uint64_t rt = (iss >> 5) & 0x1F;
+  uint64_t crm = (iss >> 1) & 0xF;
+  uint64_t is_read = iss & 0x1;
+  uint64_t val = 0;
+
+  g_vcpu.sysreg_traps++;
+
+  /* Decode by (op0,op1,crn,crm,op2). Pass real values through for the ID
+   * registers Fermi actually consumes; any other ID register under TID3 is
+   * architecturally RES0, so returning 0 is safe. */
+  if (op0 == 3 && op1 == 0 && crn == 0 && crm == 4 && op2 == 0) {
+    val = MRS(id_aa64pfr0_el1); /* ID_AA64PFR0_EL1 */
+    hyp_puts("[HYP] emulated guest MRS ID_AA64PFR0_EL1 -> ");
+    hyp_puthex(val);
+    hyp_puts("\n");
+  } else if (op0 == 3 && op1 == 0 && crn == 0 && crm == 6 && op2 == 0) {
+    val = MRS(id_aa64isar0_el1); /* ID_AA64ISAR0_EL1 */
+  } else if (op0 == 3 && op1 == 0 && crn == 0 && crm == 7 && op2 == 0) {
+    val = MRS(id_aa64mmfr0_el1); /* ID_AA64MMFR0_EL1 */
+  } else {
+    val = 0; /* unhandled ID register: RES0 */
+  }
+
+  if (is_read && rt != 31)
+    f->x[rt] = val;
+
+  /* Skip the trapped instruction. */
+  MSR(elr_el2, MRS(elr_el2) + 4);
+}
+
+/* Lower-EL abort. Real per-guest stage-2 management and isolation arrive in
+ * M3; for now dump the fault context once and park, so we never spin in a
+ * silent re-fault loop. */
+static void hyp_handle_abort(uint64_t index) {
+  g_vcpu.abort_count++;
+
+  uint64_t esr = MRS(esr_el2);
+  uint64_t hpfar = MRS(hpfar_el2);
+  uint64_t ipa = (hpfar >> 4) << 12; /* HPFAR[43:4] = IPA[51:12] */
+
+  hyp_puts("\n[HYP] *** unexpected lower-EL abort *** vector=");
   hyp_puthex(index);
   hyp_puts(" EC=");
-  hyp_puthex(ec);
-  hyp_puts(" (");
-  hyp_puts(ec_name(ec));
-  hyp_puts(")\n      ESR_EL2=");
+  hyp_puthex((esr >> ESR_EC_SHIFT) & ESR_EC_MASK);
+  hyp_puts("\n      ESR_EL2=");
   hyp_puthex(esr);
   hyp_puts(" ELR_EL2=");
-  hyp_puthex(elr);
-  hyp_puts("\n");
+  hyp_puthex(MRS(elr_el2));
+  hyp_puts("\n      FAR_EL2=");
+  hyp_puthex(MRS(far_el2));
+  hyp_puts(" faulting IPA=");
+  hyp_puthex(ipa);
+  hyp_puts("\n[HYP] parking CPU for inspection.\n");
+  for (;;)
+    __asm__ __volatile__("wfi");
+}
 
-  if (ec == EC_HVC64) {
-    /* HVC #imm: the 16-bit immediate is in ESR_EL2[15:0]. ELR_EL2 already
-     * points to the instruction *after* the HVC, so a plain eret resumes
-     * the guest correctly. This is our Milestone-1 proof that guest->EL2
-     * world transitions work. */
-    hyp_puts("      hypercall imm=");
-    hyp_puthex(esr & 0xFFFF);
-    hyp_puts(", returning to guest\n\n");
-    (void)frame;
+void el2_dispatch(uint64_t index, el2_frame_t *frame) {
+  uint64_t ec = (MRS(esr_el2) >> ESR_EC_SHIFT) & ESR_EC_MASK;
+
+  switch (ec) {
+  case EC_HVC64:
+    hyp_handle_hvc(frame);
+    return;
+  case EC_SYSREG:
+    hyp_handle_sysreg(frame);
+    return;
+  case EC_DABT_LOWER:
+  case EC_IABT_LOWER:
+    hyp_handle_abort(index);
+    return;
+  default:
+    hyp_puts("\n[HYP] unhandled EL2 exception: vector=");
+    hyp_puthex(index);
+    hyp_puts(" EC=");
+    hyp_puthex(ec);
+    hyp_puts(" (");
+    hyp_puts(ec_name(ec));
+    hyp_puts(") ELR_EL2=");
+    hyp_puthex(MRS(elr_el2));
+    hyp_puts("\n");
     return;
   }
-
-  /* Any other trap at this milestone is unexpected. For a lower-EL abort,
-   * dump the full stage-2 context ONCE then park the CPU, so the log is
-   * readable instead of an endless re-fault spam loop. */
-  static int dumped = 0;
-  if (!dumped) {
-    dumped = 1;
-    uint64_t far = MRS(far_el2);
-    uint64_t hpfar = MRS(hpfar_el2);
-    uint64_t ipa = (hpfar >> 4) << 12; /* HPFAR[43:4] = IPA[51:12] */
-    hyp_puts("      FAR_EL2=");
-    hyp_puthex(far);
-    hyp_puts(" HPFAR_EL2=");
-    hyp_puthex(hpfar);
-    hyp_puts("\n      faulting IPA=");
-    hyp_puthex(ipa);
-    hyp_puts("\n      VTTBR_EL2=");
-    hyp_puthex(MRS(vttbr_el2));
-    hyp_puts(" VTCR_EL2=");
-    hyp_puthex(MRS(vtcr_el2));
-    hyp_puts("\n      HCR_EL2=");
-    hyp_puthex(MRS(hcr_el2));
-    hyp_puts("\n      &s2_l0=");
-    hyp_puthex((uint64_t)s2_l0);
-    hyp_puts(" s2_l0[0]=");
-    hyp_puthex(s2_l0[0]);
-    hyp_puts("\n      &s2_l1_low=");
-    hyp_puthex((uint64_t)s2_l1_low);
-    hyp_puts(" s2_l1_low[1]=");
-    hyp_puthex(s2_l1_low[1]);
-    hyp_puts("\n[HYP] parking CPU for inspection.\n");
-    for (;;)
-      __asm__ __volatile__("wfi");
-  }
-  hyp_puts("[HYP] unhandled EL2 exception (continuing)\n\n");
 }

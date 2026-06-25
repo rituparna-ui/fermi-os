@@ -4,6 +4,7 @@
 #include "exception.h"
 #include "fat32/fat32.h"
 #include "gic/gic.h"
+#include "hyp/hypercall.h"
 #include "mm/heap/heap.h"
 #include "mm/mmu/mmu.h"
 #include "mm/pmm/pmm.h"
@@ -51,12 +52,19 @@ void early_init() {
   uart_println("Fermi OS - Booting Up...");
   print_current_el();
 
-  /* Milestone-1 hypervisor check: fire a hypercall from the EL1 guest. If a
-   * hypervisor is present beneath us it traps to EL2, logs the HVC, and erets
-   * back here. If we booted bare (no EL2 layer) this is harmless on QEMU. */
-  uart_println("[BOOT] issuing test HVC #0xABCD from EL1 guest...");
-  __asm__ __volatile__("hvc #0xABCD");
-  uart_println("[BOOT] returned from HVC (guest resumed)");
+  /* Hypervisor probe: exercise the hypercall ABI from the EL1 guest. If a
+   * hypervisor is present beneath us these trap to EL2 and return real
+   * values; on a bare boot the HVCs are harmless on QEMU. */
+  uart_println("[BOOT] testing hypervisor calls...");
+  uart_printf("[BOOT]   HVC_VERSION  -> %x\n", hvc_call(HVC_VERSION, 0, 0, 0));
+  uart_printf("[BOOT]   HVC_PING(41) -> %u\n", hvc_call(HVC_PING, 41, 0, 0));
+  uart_puts("[BOOT]   HVC_PUTC ->");
+  hvc_call(HVC_PUTC, ' ', 0, 0);
+  hvc_call(HVC_PUTC, 'h', 0, 0);
+  hvc_call(HVC_PUTC, 'i', 0, 0);
+  hvc_call(HVC_PUTC, '\n', 0, 0);
+  uart_printf("[BOOT]   HVC_VM_INFO  -> %u hypercalls served\n",
+              hvc_call(HVC_VM_INFO, 0, 0, 0));
 
   exceptions_init();
 

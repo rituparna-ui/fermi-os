@@ -32,6 +32,7 @@
 
 /* HCR_EL2 bits */
 #define HCR_VM (1ULL << 0)   /* Enable stage-2 translation for EL1&0          */
+#define HCR_TID3 (1ULL << 18) /* Trap ID group 3 (ID_AA64*) reads to EL2      */
 #define HCR_RW (1ULL << 31)  /* EL1 execution state is AArch64                */
 
 /* CNTHCTL_EL2 bits (non-VHE): let EL1/EL0 reach the physical counter/timer */
@@ -41,9 +42,24 @@
 /* Exception-class values we care about in ESR_EL2[31:26]. */
 #define ESR_EC_SHIFT 26
 #define ESR_EC_MASK 0x3FULL
+#define EC_SYSREG 0x18    /* Trapped MSR/MRS/system instruction (AArch64)     */
 #define EC_HVC64 0x16     /* HVC instruction execution in AArch64 state       */
 #define EC_DABT_LOWER 0x24 /* Data abort from a lower EL (stage-2 fault, etc.) */
 #define EC_IABT_LOWER 0x20 /* Instruction abort from a lower EL               */
+
+/* Per-vCPU control block. For Milestone 2 the single guest is co-resident at
+ * EL1, so this mostly tracks statistics and holds the slots that a real
+ * world-switch (M5) will save/restore. Lives in hypervisor-private memory
+ * (.hyp_tables) so the guest cannot see or zero it. */
+typedef struct {
+  uint64_t id;           /* vCPU identifier                                  */
+  uint64_t hvc_count;    /* hypercalls serviced                              */
+  uint64_t sysreg_traps; /* emulated MSR/MRS accesses                        */
+  uint64_t abort_count;  /* stage-2 / lower-EL aborts seen                   */
+  /* Reserved for M5 world-switch context (guest EL1 sysregs). */
+  uint64_t sp_el1, elr_el1, spsr_el1;
+  uint64_t sctlr_el1, ttbr0_el1, ttbr1_el1, tcr_el1, mair_el1, vbar_el1;
+} vcpu_t;
 
 /* Configure EL2 and stage-2, install the EL2 vector table. Called once from
  * boot.S while still at EL2, MMU off. boot.S performs the eret to EL1. */

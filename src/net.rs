@@ -614,6 +614,140 @@ pub fn resolve(host: &str) -> Option<[u8; 4]> {
     None
 }
 
+fn tcp_checksum(src: &[u8; 4], dst: &[u8; 4], seg: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    sum += ((src[0] as u32) << 8) | src[1] as u32;
+    sum += ((src[2] as u32) << 8) | src[3] as u32;
+    sum += ((dst[0] as u32) << 8) | dst[1] as u32;
+    sum += ((dst[2] as u32) << 8) | dst[3] as u32;
+    sum += 6;
+    sum += seg.len() as u32;
+    let mut i = 0;
+    while i + 1 < seg.len() { sum += ((seg[i] as u32) << 8) | seg[i + 1] as u32; i += 2; }
+    if i < seg.len() { sum += (seg[i] as u32) << 8; }
+    while sum >> 16 != 0 { sum = (sum & 0xFFFF) + (sum >> 16); }
+    !(sum as u16)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_tcp(frame: &mut [u8], dst_mac: &[u8; 6], src_ip: &[u8; 4], dst_ip: &[u8; 4],
+             sport: u16, dport: u16, seq: u32, ack: u32, flags: u8, payload: &[u8]) -> usize {
+    let mac = my_mac();
+    for i in 0..6 { frame[i] = dst_mac[i]; frame[6 + i] = mac[i]; }
+    frame[12] = 0x08; frame[13] = 0x00;
+    let tcp_len = 20 + payload.len();
+    let ip_len = 20 + tcp_len;
+    {
+        let ip = &mut frame[14..34];
+        ip[0] = 0x45;
+        ip[2] = (ip_len >> 8) as u8; ip[3] = ip_len as u8;
+        ip[6] = 0x40;
+        ip[8] = 64; ip[9] = 6;
+        for i in 0..4 { ip[12 + i] = src_ip[i]; ip[16 + i] = dst_ip[i]; }
+        let c = inet_csum(&ip[..20]);
+        ip[10] = (c >> 8) as u8; ip[11] = c as u8;
+    }
+    {
+        let tcp = &mut frame[34..34 + tcp_len];
+        tcp[0] = (sport >> 8) as u8; tcp[1] = sport as u8;
+        tcp[2] = (dport >> 8) as u8; tcp[3] = dport as u8;
+        tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+        tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+        tcp[12] = 5 << 4;
+        tcp[13] = flags;
+        tcp[14] = 0xFF; tcp[15] = 0xFF;
+        tcp[16] = 0; tcp[17] = 0; // checksum field (zero before compute)
+        tcp[18] = 0; tcp[19] = 0; // urgent pointer
+        tcp[20..].copy_from_slice(payload);
+        let c = tcp_checksum(src_ip, dst_ip, tcp);
+        tcp[16] = (c >> 8) as u8; tcp[17] = c as u8;
+    }
+    34 + tcp_len
+}
+
+fn parse_tcp(rx: &[u8], lport: u16) -> Option<(u32, u32, u8, usize, usize)> {
+    if rx.len() < 54 || rx[12] != 0x08 || rx[13] != 0x00 { return None; }
+    let ip = &rx[14..];
+    if ip[9] != 6 { return None; }
+    let ihl = (ip[0] & 0xF) as usize * 4;
+    let iptot = ((ip[2] as usize) << 8) | ip[3] as usize;
+    let tcp = &ip[ihl..];
+    let dport = ((tcp[2] as u16) << 8) | tcp[3] as u16;
+    if dport != lport { return None; }
+    let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+    let ackn = u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]);
+    let flags = tcp[13];
+    let doff = (tcp[12] >> 4) as usize * 4;
+    Some((seq, ackn, flags, 14 + ihl + doff, iptot.saturating_sub(ihl + doff)))
+}
+
+/// Minimal HTTP/1.0 GET over a one-shot TCP connection; prints the response.
+pub fn http_get(host: &str) -> bool {
+    let ip = match resolve(host) { Some(a) => a, None => { uart::println("[TCP] DNS failed"); return false; } };
+    let gw = state().gateway_mac;
+    let src_ip = state().my_ip;
+    let lport: u16 = 0x5566;
+    let isn: u32 = 0x0001_0000;
+    let mut frame = [0u8; 700];
+    let mut rx = [0u8; 1600];
+
+    let flen = build_tcp(&mut frame, &gw, &src_ip, &ip, lport, 80, isn, 0, 0x02, &[]);
+    net::tx(&frame[..flen]);
+
+    let mut server_seq = 0u32;
+    let mut got = false;
+    let dl = timer::get_ticks() + 300;
+    while timer::get_ticks() < dl {
+        let n = net::rx_poll(&mut rx) as usize;
+        if n > 0 {
+            if let Some((seq, _a, flags, _po, _pl)) = parse_tcp(&rx[..n], lport) {
+                if flags & 0x12 == 0x12 { server_seq = seq; got = true; break; }
+            }
+        }
+        idle_wait();
+    }
+    if !got { uart::println("[TCP] no SYN-ACK"); return false; }
+    crate::kprintln!("[TCP] connected to {}.{}.{}.{}:80", ip[0], ip[1], ip[2], ip[3]);
+
+    let my_seq = isn.wrapping_add(1);
+    let their_next = server_seq.wrapping_add(1);
+    // Finalize the handshake with a pure ACK, then send the request.
+    let f = build_tcp(&mut frame, &gw, &src_ip, &ip, lport, 80, my_seq, their_next, 0x10, &[]);
+    net::tx(&frame[..f]);
+
+    let mut req = alloc::vec::Vec::new();
+    req.extend_from_slice(b"GET / HTTP/1.0\r\nHost: ");
+    req.extend_from_slice(host.as_bytes());
+    req.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+    let flen = build_tcp(&mut frame, &gw, &src_ip, &ip, lport, 80, my_seq, their_next, 0x18, &req);
+    net::tx(&frame[..flen]);
+
+    let mut printed = 0usize;
+    let mut next_ack = their_next;
+    let dl = timer::get_ticks() + 500;
+    while timer::get_ticks() < dl && printed < 400 {
+        let n = net::rx_poll(&mut rx) as usize;
+        if n > 0 {
+            if let Some((seq, _a, flags, po, pl)) = parse_tcp(&rx[..n], lport) {
+                if pl > 0 && po + pl <= n {
+                    let end = core::cmp::min(po + pl, po + (400 - printed));
+                    for &c in &rx[po..end] { uart::putc(c); }
+                    printed += end - po;
+                    next_ack = seq.wrapping_add(pl as u32);
+                    let f2 = build_tcp(&mut frame, &gw, &src_ip, &ip, lport, 80, my_seq, next_ack, 0x10, &[]);
+                    net::tx(&frame[..f2]);
+                }
+                if flags & 0x01 != 0 { break; }
+            }
+        }
+        idle_wait();
+    }
+    let flen = build_tcp(&mut frame, &gw, &src_ip, &ip, lport, 80, my_seq, next_ack, 0x11, &[]);
+    net::tx(&frame[..flen]);
+    uart::println("");
+    printed > 0
+}
+
 /// SYS_NET_PING backend: ensure gateway MAC (ARP), send one ping, wait for the
 /// echo reply, and return its TTL (or -1).
 pub fn ping(seq: u16) -> i64 {

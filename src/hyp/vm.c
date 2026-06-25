@@ -82,9 +82,22 @@ static void handle_psci(hyp_trap_frame_t *f) {
      * reset. */
     vcpu_reset(cur_vcpu, f);
     break;
-  case PSCI_FEATURES_FN:
   case PSCI_CPU_ON_FN64:
+    /* x1=target MPIDR, x2=entry IPA, x3=context_id. Powers on an in-group
+     * sibling vCPU (SMP). Result in x0; context_id is delivered to the woken
+     * vCPU's x0, not the caller's. */
+    f->regs[0] = (uint64_t)vcpu_psci_cpu_on(f->regs[1], f->regs[2], f->regs[3]);
+    break;
   case PSCI_AFFINITY_INFO_FN64:
+    f->regs[0] = (uint64_t)vcpu_psci_affinity_info(f->regs[1]);
+    break;
+  case PSCI_FEATURES_FN:
+    /* Advertise CPU_ON / AFFINITY_INFO as implemented (0), else not supported. */
+    if (f->regs[1] == PSCI_CPU_ON_FN64 || f->regs[1] == PSCI_AFFINITY_INFO_FN64)
+      f->regs[0] = 0;
+    else
+      f->regs[0] = (uint64_t)PSCI_NOT_SUPPORTED;
+    break;
   default:
     f->regs[0] = (uint64_t)PSCI_NOT_SUPPORTED;
     break;
@@ -192,7 +205,29 @@ static void handle_sync(uint64_t type, hyp_trap_frame_t *f) {
     break;
 
   case EC_TRAPPED_SYSREG:
-    if (vtimer_emulate_sysreg(f)) {
+    /* ICC_SGI1R_EL1 (op0=3,op1=0,CRn=12,CRm=11,op2=5) — a guest inter-processor
+     * SGI. Trapped via ICH_HCR_EL2.TC; route it in software to the target
+     * sibling vCPU(s). It is write-only (Dir=0 = MSR). */
+    if (ISS_SYS_OP0(f->esr) == 3 && ISS_SYS_OP1(f->esr) == 0 &&
+        ISS_SYS_CRN(f->esr) == 12 && ISS_SYS_CRM(f->esr) == 11 &&
+        ISS_SYS_OP2(f->esr) == 5 && ISS_SYS_DIR(f->esr) == 0) {
+      uint32_t rt = ISS_SYS_RT(f->esr);
+      uint64_t sgi1r = (rt == 31) ? 0 : f->regs[rt];
+      vcpu_sgi_route(sgi1r);
+      advance_elr(f);
+    } else if (ISS_SYS_OP0(f->esr) == 3 && ISS_SYS_OP1(f->esr) == 0 &&
+               ISS_SYS_CRN(f->esr) == 4 && ISS_SYS_CRM(f->esr) == 6 &&
+               ISS_SYS_OP2(f->esr) == 0) {
+      /* ICC_PMR_EL1: also caught by TC (it traps the whole common ICC group),
+       * not just ICC_SGI1R. Forward to the virtual interface's VPMR so the
+       * SMP guest's priority-mask programming takes effect. */
+      uint32_t rt = ISS_SYS_RT(f->esr);
+      int is_write = (ISS_SYS_DIR(f->esr) == 0);
+      uint64_t v = (is_write && rt != 31) ? f->regs[rt] : 0;
+      vgic_emulate_pmr(&cur_vcpu->vgic, is_write, &v);
+      if (!is_write && rt != 31) f->regs[rt] = v;
+      advance_elr(f);
+    } else if (vtimer_emulate_sysreg(f)) {
       advance_elr(f);
     } else {
       hyp_fatal_trap(type, f);

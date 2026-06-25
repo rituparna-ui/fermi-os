@@ -50,6 +50,15 @@ void vgic_inject_ppi(uint32_t intid);
  * vCPU on its timer deadline while another VM is running. */
 void vgic_inject_to(struct vcpu_vgic *g, uint32_t intid);
 
+/* SMP only: enable ICH_HCR_EL2.TC for this vCPU so guest writes to the common
+ * ICC group (notably ICC_SGI1R_EL1) trap to EL2 for software SGI routing.
+ * Single-vCPU VMs must NOT call this (TC also traps ICC_PMR_EL1 et al.). */
+void vgic_enable_sgi_trap(struct vcpu_vgic *g);
+
+/* Emulate a trapped ICC_PMR_EL1 (a side effect of TC trapping the common group)
+ * by forwarding to ICH_VMCR_EL2.VPMR. `val` is the source (write) / dest (read).*/
+void vgic_emulate_pmr(struct vcpu_vgic *g, int is_write, uint64_t *val);
+
 /* --- M5: GICD/GICR MMIO emulation --------------------------------------- */
 
 /* True if `ipa` falls in the emulated GICD or GICR window. */

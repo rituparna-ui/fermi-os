@@ -111,6 +111,8 @@ extern const uint8_t __net_blob_start[];
 extern const uint8_t __net_blob_end[];
 extern const uint8_t __pci_blob_start[];
 extern const uint8_t __pci_blob_end[];
+extern const uint8_t __smp_blob_start[];
+extern const uint8_t __smp_blob_end[];
 
 /* Guest RAM regions in the top reserved GiB (hyp is at 0x250000000, its pool
  * grows up from ~0x250100000). Each region is 2 MiB-aligned and well clear of
@@ -137,6 +139,8 @@ extern const uint8_t __pci_blob_end[];
 #define NET_RAM_SIZE        0x01000000ULL
 #define PCI_HOST_RAM_BASE   0x275000000ULL /* vPCI pciclient        16 MiB */
 #define PCI_RAM_SIZE        0x01000000ULL
+#define SMP_HOST_RAM_BASE   0x276000000ULL /* SMP guest (2 vCPUs)   16 MiB */
+#define SMP_RAM_SIZE        0x01000000ULL
 
 /* Copy a flat blob to a host physical destination (EL2 MMU off) and make it
  * coherent for guest instruction fetch. Used at boot and on warm reset. */
@@ -193,6 +197,8 @@ void hyp_main(void) {
   hyp_copy_image(NET_HOST_RAM_BASE, __net_blob_start, net_size);
   uint64_t pci_size = (uint64_t)(__pci_blob_end - __pci_blob_start);
   hyp_copy_image(PCI_HOST_RAM_BASE, __pci_blob_start, pci_size);
+  uint64_t smp_size = (uint64_t)(__smp_blob_end - __smp_blob_start);
+  hyp_copy_image(SMP_HOST_RAM_BASE, __smp_blob_start, smp_size);
   /* Zero the shared IPC page (its seqno starts at 0). */
   for (volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)IPC_SHARED_PA;
        p < (volatile uint64_t *)(uintptr_t)(IPC_SHARED_PA + 0x1000); p++) {
@@ -218,6 +224,7 @@ void hyp_main(void) {
   uint64_t blk_l1 = s2_build_vm2(BLK_HOST_RAM_BASE, BLK_RAM_SIZE);
   uint64_t net_l1 = s2_build_vm2(NET_HOST_RAM_BASE, NET_RAM_SIZE);
   uint64_t pci_l1 = s2_build_vm2(PCI_HOST_RAM_BASE, PCI_RAM_SIZE);
+  uint64_t smp_l1 = s2_build_vm2(SMP_HOST_RAM_BASE, SMP_RAM_SIZE);
 
   /* GIC + timer virtualization. */
   hyp_gic_init();
@@ -315,7 +322,20 @@ void hyp_main(void) {
                             __pci_blob_start, PCI_HOST_RAM_BASE, pci_size);
   pcic->ram_size = PCI_RAM_SIZE;
 
-  hyp_puts("[HYP] 12 vCPUs created (incl. dom0, vmtgt, crasher, hangguest, rng/blk/net/pci clients). Starting scheduler.\n");
+  /* smpguest: a 2-vCPU SMP VM. Its TWO vCPUs share ONE stage-2 (the same VTTBR
+   * / VMID), so the same IPA maps to the same host PA for both — a real SMP
+   * memory model. The primary (id 12, VMID 13) is a normal vcpu_alloc; the
+   * secondary (id 13) is created OFF via vcpu_alloc_secondary, inheriting the
+   * primary's stage-2/group/image but with a distinct MPIDR affinity (Aff0=1).
+   * The primary brings the secondary up with PSCI CPU_ON, then they ping-pong
+   * an SGI the hyp software-routes between the siblings. */
+  vcpu_t *smp0 = vcpu_alloc("smp-cpu0", GUEST_ENTRY_IPA, s2_make_vttbr(smp_l1, 13), 0,
+                            __smp_blob_start, SMP_HOST_RAM_BASE, smp_size);
+  smp0->ram_size = SMP_RAM_SIZE;
+  vcpu_t *smp1 = vcpu_alloc_secondary(smp0, "smp-cpu1", 0x80000001ULL);
+  (void)smp1; /* brought online by the primary's PSCI CPU_ON, not run yet */
+
+  hyp_puts("[HYP] 14 vCPUs created (incl. dom0, vmtgt, crasher, hangguest, rng/blk/net/pci clients, 2-vCPU SMP). Starting scheduler.\n");
   hyp_puts("--------------------------------------------------\n\n");
 
   snapshot_init();    /* reserve the VM snapshot slot */

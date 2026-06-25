@@ -108,6 +108,17 @@ typedef struct vcpu {
   uint32_t vmid;
   uint32_t id;        /* 0, 1, ... */
   const char *name;
+
+  /* SMP: sibling vCPUs of one VM share group_id + vttbr_el2 + vmid but each has
+   * a distinct mpidr (affinity). A secondary starts powered OFF (online=0) and
+   * is brought up by PSCI CPU_ON. Single-vCPU VMs have a unique group_id, mpidr
+   * 0x80000000, and online=1. */
+  uint32_t group_id;  /* links sibling vCPUs of one SMP VM */
+  uint64_t mpidr;     /* per-vCPU VMPIDR_EL2 (affinity; bit31 RES1, U=0) */
+  int      is_smp;    /* 1 = part of a multi-vCPU VM: enable ICH_HCR_EL2.TC so
+                       * ICC_SGI1R_EL1 traps for software inter-CPU SGI routing.
+                       * Single-vCPU VMs leave this 0 (TC would also trap PMR). */
+  int      online;    /* 0 = powered off (pre-CPU_ON / CPU_OFF), never scheduled */
   int runnable;       /* 0 = blocked on WFI awaiting its next interrupt */
   int dead;           /* 1 = powered off (PSCI SYSTEM_OFF), never runs again */
 
@@ -207,6 +218,25 @@ int vcpu_ring_doorbell(vcpu_t *from);
 
 /* Look up a vCPU by id (for wiring peers). */
 vcpu_t *vcpu_by_id(int id);
+
+/* Allocate a SECONDARY (AP) vCPU for an SMP VM: inherits the primary's stage-2
+ * (vttbr_el2/vmid), group_id, and image fields; gets the given distinct mpidr
+ * affinity; starts powered OFF (online=0) until PSCI CPU_ON. Returns it. */
+vcpu_t *vcpu_alloc_secondary(vcpu_t *primary, const char *name, uint64_t mpidr);
+
+/* PSCI CPU_ON: power on the in-group sibling whose affinity matches
+ * target_mpidr, entering it at entry_ipa with x0 = context_id. Returns a PSCI
+ * status (SUCCESS / ALREADY_ON / INVALID_PARAMETERS). */
+int64_t vcpu_psci_cpu_on(uint64_t target_mpidr, uint64_t entry_ipa,
+                         uint64_t context_id);
+
+/* PSCI AFFINITY_INFO: 0 = ON, 1 = OFF for the in-group sibling matching
+ * target_mpidr; INVALID_PARAMETERS if none. */
+int64_t vcpu_psci_affinity_info(uint64_t target_mpidr);
+
+/* Route a guest SGI (decoded from ICC_SGI1R_EL1) to its in-group target
+ * sibling(s): inject `intid` (an SGI 0..15) into each, waking blocked ones. */
+void vcpu_sgi_route(uint64_t sgi1r);
 
 /* Management hypercall (HVC_FERMI_VMCTL) from a privileged "dom0" control VM.
  * op/target/arg are x1/x2/x3 from the caller's frame; returns the x0 result.

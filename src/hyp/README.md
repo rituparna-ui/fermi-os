@@ -44,6 +44,8 @@ QEMU is launched with `-m 9G`, so RAM spans `0x40000000 .. 0x280000000`.
 | VM2 RAM | `0x260000000 .. 0x264000000` (64 MiB) | heartbeat guest |
 | IPC producer RAM | `0x264000000` (16 MiB) | + shared page @ `0x266000000` |
 | IPC consumer RAM | `0x265000000` (16 MiB) | shares the same page |
+| … dom0 / vmtgt / crasher / hangguest / rng·blk·net·pci clients | `0x268000000 .. 0x276000000` | one 16–64 MiB region each |
+| SMP guest RAM | `0x276000000` (16 MiB) | **both** vCPUs share it (one stage-2) |
 
 The hypervisor links at `0x250000000` — **above** the guest's 8 GiB — so it
 never collides with pages the guest's PMM hands out, even with stage-2 off.
@@ -76,7 +78,8 @@ never collides with pages the guest's PMM hands out, even with stage-2 off.
 | `guest2/` | Tiny standalone EL1 guest (heartbeat printer; self-resets via PSCI) |
 | `ipc/` | EL1 guest run by 2 VMs (producer/consumer) for inter-VM shared memory |
 | `dom0/` | Privileged EL1 control guest driving the VMCTL management hypercall |
-| `*_blob.S` (`guest`, `guest2`, `ipc`, `dom0`) | Embed the flat guest images into the hyp |
+| `smpguest/` | 2-vCPU SMP guest: primary `CPU_ON`s a secondary, they ping-pong an SGI |
+| `*_blob.S` (`guest`, `guest2`, `ipc`, `dom0`, `smpguest`, …) | Embed the flat guest images into the hyp |
 
 ## How key subsystems work
 
@@ -393,9 +396,46 @@ The hypervisor emulates a per-VM PSCI interface (the guest's `hvc`/`smc`):
 VM2 demonstrates this: it self-issues `SYSTEM_RESET` every 5 heartbeats and its
 banner re-prints each time, while VM1 (FermiOS) runs uninterrupted.
 
+### SMP guests (multi-vCPU VMs)
+
+A VM can have more than one vCPU. Sibling vCPUs of one SMP VM share a single
+stage-2 (the same `VTTBR_EL2` / `VMID`, so an IPA maps to the same host PA for
+all of them — a real shared-memory SMP model) and a `group_id`, but each carries
+a distinct `MPIDR`/affinity. The siblings are still time-sliced onto the one
+physical CPU by the EL2 scheduler; "SMP" here means the *guest* sees multiple
+CPUs, not that the host has them.
+
+- **Per-vCPU affinity.** `MPIDR_EL1` is virtualised by `VMPIDR_EL2`, which is
+  reloaded on **every** world switch (`vcpu_load`) — otherwise siblings would all
+  read the same affinity. The primary is `0x80000000` (Aff0=0), the secondary
+  `0x80000001` (Aff0=1); bit 31 is RES1, U=0.
+- **`PSCI CPU_ON` (SMC64 `0xC4000003`).** `x1`=target affinity, `x2`=entry IPA,
+  `x3`=context_id. The hyp finds the in-group sibling whose affinity matches
+  (masking the U/MT/RES1 flag bits), brings it up at `entry` with `x0`=context_id
+  in EL1h, and marks it `online`. Returns `SUCCESS` / `ALREADY_ON` /
+  `INVALID_PARAMETERS`. A secondary starts `online=0` and is **never scheduled**
+  until `CPU_ON` (enforced in `pick_next` and `vcpu_wake_expired`).
+  `AFFINITY_INFO` (`0xC4000004`) reports ON/OFF.
+- **Inter-processor SGIs.** The HW virtual interface only delivers to the
+  *resident* vCPU, so a guest `ICC_SGI1R_EL1` write that targets a sibling must
+  be routed in software. We enable `ICH_HCR_EL2.TC` (Trap Common) **per-vCPU, for
+  SMP VMs only**; the trap decodes the SGI's `TargetList`/affinity/`IRM` and
+  injects the SGI INTID into each matching sibling (live List Register if it is
+  current, saved `lr[]` otherwise — waking blocked ones). Single-vCPU VMs leave
+  TC off, so their CPU-interface accesses still flow straight to hardware.
+- **The `ICC_PMR_EL1` caveat.** `TC` traps the *whole* common ICC register group,
+  not just `ICC_SGI1R_EL1` — including `ICC_PMR_EL1`. So for SMP vCPUs the hyp
+  also emulates `ICC_PMR_EL1`, forwarding it to `ICH_VMCR_EL2.VPMR`. (This is why
+  TC is scoped to SMP VMs: enabling it globally would fault every guest that
+  programs its priority mask during GIC bring-up.)
+
+`smpguest` demonstrates the whole path: the primary `CPU_ON`s the secondary, then
+the two ping-pong an SGI (the hyp routing it across the time-sliced siblings each
+bounce) while incrementing a counter in their shared RAM.
+
 ## Known limitations / future work
 
-- **PCI ECAM** is mapped straight-through; no vPCI model.
-- Single physical CPU only; no SMP guests.
-- The scheduler is round-robin with block-on-WFI; there is no priority or
-  weighting between VMs.
+- One physical CPU: guest vCPUs (including SMP siblings) are time-sliced, not
+  run in parallel.
+- The scheduler is weighted round-robin with block-on-WFI; there is no priority
+  inheritance or gang-scheduling of an SMP VM's vCPUs.

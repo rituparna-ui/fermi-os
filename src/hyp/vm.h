@@ -132,8 +132,11 @@ typedef struct hyp_trap_frame {
 #define PSCI_AFFINITY_INFO_FN64 0xC4000004ULL
 #define PSCI_FEATURES_FN   0x8400000AULL
 
-#define PSCI_SUCCESS        0
-#define PSCI_NOT_SUPPORTED  (-1)
+#define PSCI_SUCCESS            0
+#define PSCI_NOT_SUPPORTED      (-1)
+#define PSCI_INVALID_PARAMETERS (-2)
+#define PSCI_DENIED             (-3)
+#define PSCI_ALREADY_ON         (-4)
 
 /* C entry from hyp_vectors.S. */
 void hyp_dispatch(uint64_t type, hyp_trap_frame_t *f);

@@ -27,6 +27,10 @@
 #define ICH_LR_STATE_MASK    (3ULL << 62)
 
 #define ICH_HCR_EN           (1ULL << 0)
+/* TC (bit 10) = Trap Common: traps NS-EL1 writes to ICC_SGI0R/SGI1R/ASGI1R_EL1
+ * so the hypervisor can software-route inter-processor SGIs to sibling vCPUs
+ * (the HW virtual interface only delivers to the resident vCPU). */
+#define ICH_HCR_TC           (1ULL << 10)
 #define ICC_SRE_EL2_VAL      0xFULL /* Enable|DIB|DFB|SRE */
 #define ICH_VMCR_SEED        0xFF000002ULL
 
@@ -111,6 +115,11 @@ uint32_t vgic_num_lr(void) { return vgic_nr_lr; }
 /* Seed a fresh per-vCPU vGIC state: virtual interface enabled, Group1 + PMR
  * seeded, LRs empty, MMIO model zeroed. */
 void vgic_vcpu_reset(vcpu_vgic_t *g) {
+  /* TC (SGI trapping) is NOT seeded here: it is enabled per-vCPU only for SMP
+   * VMs (vgic_enable_sgi_trap), because TC traps the WHOLE "common" ICC group
+   * (incl. ICC_PMR_EL1), not just ICC_SGI1R_EL1. A single-vCPU VM has no
+   * sibling to SGI, so it keeps TC off and its ICC_* accesses flow straight to
+   * the HW virtual interface (no new traps -> no regression). */
   g->hcr = ICH_HCR_EN;
   g->vmcr = ICH_VMCR_SEED;
   g->ap0r0 = 0;
@@ -246,6 +255,28 @@ void vgic_inject_ppi(uint32_t intid) {
     }
   }
   /* No free LR: guest is behind on this periodic IRQ; drop silently. */
+}
+
+/* Enable SGI trapping (ICH_HCR_EL2.TC) for THIS vCPU's vGIC state. Only SMP
+ * vCPUs set this: TC traps the whole common ICC group (so the hyp can software-
+ * route ICC_SGI1R_EL1 to sibling vCPUs), which also catches ICC_PMR_EL1 — hence
+ * vgic_emulate_pmr below. Re-applied by vcpu_init_state after every reset. */
+void vgic_enable_sgi_trap(struct vcpu_vgic *g) { g->hcr |= ICH_HCR_TC; }
+
+/* Emulate a trapped ICC_PMR_EL1 access. TC traps the common ICC group, of which
+ * PMR is a member; forward it to the virtual interface priority mask
+ * ICH_VMCR_EL2.VPMR[31:24], updating BOTH the live register and the saved
+ * per-vCPU copy so a later world-switch save does not clobber it. */
+void vgic_emulate_pmr(struct vcpu_vgic *g, int is_write, uint64_t *val) {
+  uint64_t vmcr;
+  __asm__ __volatile__("mrs %0, ich_vmcr_el2" : "=r"(vmcr));
+  if (is_write) {
+    vmcr = (vmcr & ~(0xFFULL << 24)) | ((*val & 0xFFULL) << 24);
+    __asm__ __volatile__("msr ich_vmcr_el2, %0\n\tisb" ::"r"(vmcr));
+    g->vmcr = vmcr;
+  } else {
+    *val = (vmcr >> 24) & 0xFFULL;
+  }
 }
 
 void vgic_inject_to(struct vcpu_vgic *g, uint32_t intid) {

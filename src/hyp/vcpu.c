@@ -17,7 +17,7 @@
  * so the same guest IPA maps to different host PAs — true memory isolation.
  * ------------------------------------------------------------------------- */
 
-#define MAX_VCPUS 12
+#define MAX_VCPUS 14
 
 static vcpu_t vcpus[MAX_VCPUS];
 static int    nr_vcpus;
@@ -59,8 +59,13 @@ static void vcpu_init_state(vcpu_t *v) {
   v->fp.fpsr = 0;
   v->fp.fpcr = 0;
 
-  /* vGIC reset: virtual interface enabled, group1 + PMR seeded. */
+  /* vGIC reset: virtual interface enabled, group1 + PMR seeded. SMP vCPUs also
+   * enable SGI trapping (TC) so ICC_SGI1R_EL1 routes in software; this must be
+   * re-applied here because vgic_vcpu_reset clears hcr to the non-TC default. */
   vgic_vcpu_reset(&v->vgic);
+  if (v->is_smp) {
+    vgic_enable_sgi_trap(&v->vgic);
+  }
 
   /* vtimer reset: disarmed. */
   v->vtimer.cval = 0;
@@ -146,6 +151,115 @@ void vcpu_check_watchdogs(hyp_trap_frame_t *f) {
 
 vcpu_t *vcpu_by_id(int id) {
   return (id >= 0 && id < nr_vcpus) ? &vcpus[id] : (vcpu_t *)0;
+}
+
+/* --- SMP: secondary vCPUs, PSCI CPU_ON, SGI routing ----------------------- */
+
+vcpu_t *vcpu_alloc_secondary(vcpu_t *primary, const char *name, uint64_t mpidr) {
+  /* Reuse the normal allocator (kstack/struct/defaults), then override the
+   * fields that make it a SIBLING of `primary` rather than its own VM:
+   * share the stage-2 (vttbr_el2 + vmid) and image; distinct affinity; OFF. */
+  vcpu_t *s = vcpu_alloc(name, primary->entry_ipa, primary->vttbr_el2, 0,
+                         primary->img_src, primary->img_dst_pa, primary->img_size);
+  s->vmid = primary->vmid;          /* same VMID (vcpu_alloc auto-assigned one) */
+  s->ram_size = primary->ram_size;
+  s->group_id = primary->group_id;  /* sibling of the primary's VM group */
+  s->mpidr = mpidr;                 /* distinct affinity */
+  s->online = 0;                    /* powered OFF until PSCI CPU_ON */
+  s->runnable = 0;
+  /* Mark BOTH siblings SMP so each traps ICC_SGI1R_EL1 (TC) for SGI routing.
+   * The secondary's TC was just enabled by vcpu_alloc's vcpu_init_state-via-
+   * is_smp=0, so re-seed its vGIC now; the primary is re-seeded below. */
+  primary->is_smp = 1;
+  s->is_smp = 1;
+  vgic_enable_sgi_trap(&primary->vgic);
+  vgic_enable_sgi_trap(&s->vgic);
+  return s;
+}
+
+/* Affinity bits of an MPIDR/target value: Aff0[7:0],Aff1[15:8],Aff2[23:16],
+ * Aff3[39:32]. Mask off the flag bits [31:24] (U/MT/RES1) for comparison. */
+#define MPIDR_AFF_MASK 0xFF00FFFFFFULL
+
+/* Find the in-group sibling of `caller` whose affinity matches `target`. */
+static vcpu_t *find_sibling_by_aff(vcpu_t *caller, uint64_t target) {
+  for (int i = 0; i < nr_vcpus; i++) {
+    vcpu_t *v = &vcpus[i];
+    if (v->group_id != caller->group_id) continue;
+    if ((v->mpidr & MPIDR_AFF_MASK) == (target & MPIDR_AFF_MASK)) return v;
+  }
+  return (vcpu_t *)0;
+}
+
+int64_t vcpu_psci_cpu_on(uint64_t target_mpidr, uint64_t entry_ipa,
+                         uint64_t context_id) {
+  vcpu_t *t = find_sibling_by_aff(cur_vcpu, target_mpidr);
+  if (!t) {
+    return PSCI_INVALID_PARAMETERS;
+  }
+  if (t->online) {
+    return PSCI_ALREADY_ON;
+  }
+  /* Bring it up at the requested entry with context_id in x0. Re-init its
+   * resettable execution state from the clean reset baseline (MMU off, fresh
+   * vGIC/vtimer), then override entry + x0. Do NOT touch its shared stage-2. */
+  t->entry_ipa = entry_ipa;
+  t->x0_init = context_id;
+  vcpu_init_state(t);   /* sets gp.elr=entry, gp.x[0]=context_id, EL1h, online=1 */
+  t->online = 1;
+  t->runnable = 1;
+  hyp_puts("[SMP] CPU_ON: '");
+  hyp_puts(t->name);
+  hyp_puts("' online at entry ");
+  hyp_puthex(entry_ipa);
+  hyp_putc('\n');
+  return PSCI_SUCCESS;
+}
+
+int64_t vcpu_psci_affinity_info(uint64_t target_mpidr) {
+  vcpu_t *t = find_sibling_by_aff(cur_vcpu, target_mpidr);
+  if (!t) {
+    return PSCI_INVALID_PARAMETERS;
+  }
+  return (t->online && !t->dead) ? 0 /*ON*/ : 1 /*OFF*/;
+}
+
+void vcpu_sgi_route(uint64_t sgi1r) {
+  /* ICC_SGI1R_EL1 fields: TargetList[15:0], Aff1[23:16], INTID[27:24],
+   * Aff2[39:32], IRM[40], Aff3[55:48]. INTID is a 4-bit SGI (0..15). */
+  uint32_t intid = (uint32_t)((sgi1r >> 24) & 0xF);
+  int irm = (int)((sgi1r >> 40) & 0x1);
+  uint16_t target_list = (uint16_t)(sgi1r & 0xFFFF);
+  uint64_t aff1 = (sgi1r >> 16) & 0xFF;
+  uint64_t aff2 = (sgi1r >> 32) & 0xFF;
+  uint64_t aff3 = (sgi1r >> 48) & 0xFF;
+
+  for (int i = 0; i < nr_vcpus; i++) {
+    vcpu_t *t = &vcpus[i];
+    if (t->group_id != cur_vcpu->group_id || !t->online || t->dead) continue;
+
+    if (irm) {
+      /* Broadcast to all siblings EXCEPT self. */
+      if (t == cur_vcpu) continue;
+    } else {
+      /* Targeted: higher affinities must match; Aff0 selected by TargetList. */
+      uint64_t t_aff1 = (t->mpidr >> 8) & 0xFF;
+      uint64_t t_aff2 = (t->mpidr >> 16) & 0xFF;
+      uint64_t t_aff3 = (t->mpidr >> 32) & 0xFF;
+      uint64_t t_aff0 = t->mpidr & 0xFF;
+      if (t_aff1 != aff1 || t_aff2 != aff2 || t_aff3 != aff3) continue;
+      if (t_aff0 > 15 || !((target_list >> t_aff0) & 1)) continue;
+    }
+
+    /* Deliver like the doorbell: live LR if it's the current vCPU, else its
+     * saved LR; wake it if blocked. */
+    if (t == cur_vcpu) {
+      vgic_inject_ppi(intid);
+    } else {
+      vgic_inject_to(&t->vgic, intid);
+      t->runnable = 1;
+    }
+  }
 }
 
 int vcpu_count(void) { return nr_vcpus; }
@@ -277,6 +391,13 @@ vcpu_t *vcpu_alloc(const char *name, uint64_t entry_ipa, uint64_t vttbr,
   v->img_size = img_size;
   v->doorbell_target = -1; /* no peer unless wired up after alloc */
   v->weight = 1;           /* equal share by default (VMCTL_WEIGHT changes it) */
+  /* SMP defaults: each VM is its own group, single primary vCPU, affinity 0
+   * (bit31 RES1, U=0), online. A secondary is created via vcpu_alloc_secondary
+   * which overrides group_id/vttbr/vmid/mpidr and sets online=0. */
+  v->group_id = v->id;
+  v->mpidr = 0x80000000ULL;
+  v->is_smp = 0; /* upgraded to 1 by vcpu_alloc_secondary for SMP VMs */
+  v->online = 1;
 
   vcpu_init_state(v);
 
@@ -337,6 +458,10 @@ static void vcpu_load(vcpu_t *v) {
   vcpu_restore_fp(&v->fp);
   vgic_restore(&v->vgic);
   __asm__ __volatile__("msr vttbr_el2, %0\n\tisb" ::"r"(v->vttbr_el2));
+  /* Per-vCPU MPIDR: the guest reads its own affinity via MPIDR_EL1 (= VMPIDR_EL2
+   * at EL1). Set ONCE at boot today, so it MUST be reloaded per world switch or
+   * SMP siblings would all read the same affinity. */
+  __asm__ __volatile__("msr vmpidr_el2, %0" ::"r"(v->mpidr));
   /* Re-arm the EL2 physical timer (CNTHP) to this guest's shadow deadline. */
   vtimer_reprogram_current();
 }
@@ -407,7 +532,10 @@ void vcpu_sched_init(void) {
 static vcpu_t *pick_next(vcpu_t *cur) {
   for (int i = 1; i <= nr_vcpus; i++) {
     vcpu_t *cand = &vcpus[(cur->id + i) % nr_vcpus];
-    if (cand->runnable && !cand->dead && !cand->paused) return cand;
+    /* online: a PSCI-OFF secondary (online=0) must never be scheduled until
+     * CPU_ON, even though its runnable flag may be set by vcpu_init_state. */
+    if (cand->runnable && cand->online && !cand->dead && !cand->paused)
+      return cand;
   }
   return cur;
 }
@@ -453,7 +581,7 @@ int vcpu_wake_expired(void) {
 
   for (int i = 0; i < nr_vcpus; i++) {
     vcpu_t *v = &vcpus[i];
-    if (v->dead || v->paused) continue; /* paused VMs don't wake on their timer */
+    if (v->dead || v->paused || !v->online) continue; /* off/paused don't wake */
     if (vtimer_armed(v) && now >= v->vtimer.cval) {
       v->vtimer.pending = 1; /* latch ISTATUS; cleared on guest re-arm */
       if (v == cur_vcpu) {

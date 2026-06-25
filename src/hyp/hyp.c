@@ -75,9 +75,6 @@ __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l1[512
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_ram[512]; /* IPA 1-2 GiB (RAM)     */
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_dev[512]; /* IPA 0-1 GiB (devices) */
 
-extern uint8_t linux_stub[];
-extern uint8_t linux_stub_end[];
-
 /* The vCPUs and the index of the one currently running. In .hyp_tables
  * (NOLOAD); initialised explicitly in hyp_init(). */
 __attribute__((section(".hyp_tables"))) static vcpu_t vcpus[NUM_VCPUS];

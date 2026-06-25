@@ -16,6 +16,12 @@ use crate::virtio;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+const BUILTINS: &[&str] = &[
+    "help", "uptime", "version", "ps", "free", "meminfo", "ifconfig", "irqs",
+    "cat", "ping", "sleep", "kill", "echo", "balloon", "vlog", "cpuinfo",
+    "clear", "reboot", "ls", "run",
+];
+
 fn read_line(buf: &mut [u8]) -> usize {
     let mut len = 0;
     loop {
@@ -29,6 +35,26 @@ fn read_line(buf: &mut [u8]) -> usize {
                 if len > 0 {
                     len -= 1;
                     uart::puts("\x08 \x08"); // erase
+                }
+            }
+            0x09 => {
+                // Tab: complete the (single-word) command against BUILTINS.
+                let prefix = core::str::from_utf8(&buf[..len]).unwrap_or("");
+                if !prefix.is_empty() && !prefix.contains(' ') {
+                    let mut only: Option<&str> = None;
+                    let mut count = 0;
+                    for b in BUILTINS {
+                        if b.starts_with(prefix) {
+                            count += 1;
+                            only = Some(b);
+                        }
+                    }
+                    if count == 1 {
+                        let comp = only.unwrap();
+                        let rest = &comp.as_bytes()[prefix.len()..];
+                        let n = core::cmp::min(rest.len(), buf.len() - 1 - len);
+                        for &c in &rest[..n] { uart::putc(c); buf[len] = c; len += 1; }
+                    }
                 }
             }
             _ => {

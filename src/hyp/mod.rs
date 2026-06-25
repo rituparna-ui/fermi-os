@@ -27,6 +27,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 // EL2 exception vector table + el2_common save/restore trampoline.
 global_asm!(include_str!("vector_el2.S"));
+// Tiny second guest payload (M5a), copied into guest 1's RAM slice.
+global_asm!(include_str!("guest1.S"));
 
 // --- Stage-2 (VMSAv8-64) descriptor bits ------------------------------------
 // These differ from stage-1: no MAIR indirection (MemAttr[5:2] encodes the type
@@ -130,46 +132,136 @@ fn hyp_region() -> (u64, u64) {
     )
 }
 
-/// Per-vCPU control block. For Milestone 2 the single guest is co-resident at
-/// EL1, so this mostly tracks statistics and holds the slots a real world-switch
-/// (M5) will save/restore. Lives in hypervisor-private memory (`.hyp_tables`) so
-/// the guest cannot see or zero it.
+// vCPU lifecycle state.
+const VCPU_UNUSED: u32 = 0;
+const VCPU_READY: u32 = 1;
+const VCPU_RUNNING: u32 = 2;
+
+const NUM_VCPUS: usize = 2;
+
+/// Per-vCPU control block: everything needed to suspend a guest at EL2 and later
+/// resume it. Lives in hypervisor-private memory (`.hyp_tables`) so guests can
+/// neither see nor zero it. The GP regs come from / go to the EL2 trap frame;
+/// PC/PSTATE are ELR_EL2/SPSR_EL2; the EL1 system registers are saved from /
+/// restored to the live CPU on each world switch. The physical timer (CNTP_*)
+/// is deliberately NOT context-switched here — it stays owned by the primary
+/// guest, and its IRQs are injected as they arrive.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Vcpu {
     id: u64,
+    state: u32,
+
+    // Statistics.
     hvc_count: u64,
     sysreg_traps: u64,
     abort_count: u64,
-    virq_injected: u64, // virtual interrupts injected into the guest
-    // Reserved for M5 world-switch context (guest EL1 sysregs).
+    virq_injected: u64,
+
+    // Saved execution state.
+    regs: [u64; 31], // x0..x30
+    pc: u64,         // resume PC (ELR_EL2)
+    pstate: u64,     // resume PSTATE (SPSR_EL2)
+    vttbr: u64,      // stage-2 base | (VMID << 48)
+
+    // Saved EL1 system-register context.
     sp_el1: u64,
     elr_el1: u64,
     spsr_el1: u64,
     sctlr_el1: u64,
+    cpacr_el1: u64,
     ttbr0_el1: u64,
     ttbr1_el1: u64,
     tcr_el1: u64,
     mair_el1: u64,
+    amair_el1: u64,
     vbar_el1: u64,
+    contextidr_el1: u64,
+    tpidr_el1: u64,
+    tpidrro_el0: u64,
+    tpidr_el0: u64,
+    esr_el1: u64,
+    far_el1: u64,
+    par_el1: u64,
 }
 
+impl Vcpu {
+    const fn zeroed() -> Self {
+        Vcpu {
+            id: 0,
+            state: VCPU_UNUSED,
+            hvc_count: 0,
+            sysreg_traps: 0,
+            abort_count: 0,
+            virq_injected: 0,
+            regs: [0; 31],
+            pc: 0,
+            pstate: 0,
+            vttbr: 0,
+            sp_el1: 0,
+            elr_el1: 0,
+            spsr_el1: 0,
+            sctlr_el1: 0,
+            cpacr_el1: 0,
+            ttbr0_el1: 0,
+            ttbr1_el1: 0,
+            tcr_el1: 0,
+            mair_el1: 0,
+            amair_el1: 0,
+            vbar_el1: 0,
+            contextidr_el1: 0,
+            tpidr_el1: 0,
+            tpidrro_el0: 0,
+            tpidr_el0: 0,
+            esr_el1: 0,
+            far_el1: 0,
+            par_el1: 0,
+        }
+    }
+}
+
+/// The vCPUs and the index of the one currently running. In `.hyp_tables`
+/// (NOLOAD); initialised explicitly in `hyp_init`.
 #[link_section = ".hyp_tables"]
-static G_VCPU: SyncUnsafeCell<Vcpu> = SyncUnsafeCell::new(Vcpu {
-    id: 0,
-    hvc_count: 0,
-    sysreg_traps: 0,
-    abort_count: 0,
-    virq_injected: 0,
-    sp_el1: 0,
-    elr_el1: 0,
-    spsr_el1: 0,
-    sctlr_el1: 0,
-    ttbr0_el1: 0,
-    ttbr1_el1: 0,
-    tcr_el1: 0,
-    mair_el1: 0,
-    vbar_el1: 0,
-});
+static VCPUS: SyncUnsafeCell<[Vcpu; NUM_VCPUS]> = SyncUnsafeCell::new([Vcpu::zeroed(); NUM_VCPUS]);
+#[link_section = ".hyp_tables"]
+static CURRENT_VCPU: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
+
+// --- Guest 1: a tiny second guest with its own stage-2 + RAM slice -----------
+// The hole-punch in hyp_build_stage2 keeps this region invisible to guest 0.
+// Guest 1 runs with its stage-1 MMU off, so it sees IPA == PA over just this
+// slice; every other IPA is unmapped, sandboxing it.
+const GUEST1_RAM_SIZE: usize = 16 * 1024;
+#[link_section = ".hyp_tables"]
+static G1_L0: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
+#[link_section = ".hyp_tables"]
+static G1_L1: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
+#[link_section = ".hyp_tables"]
+static G1_L2: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
+#[link_section = ".hyp_tables"]
+static G1_L3: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
+
+/// Guest 1's RAM slice. 4 KiB-aligned so its stage-2 maps it cleanly.
+#[repr(C, align(4096))]
+struct Guest1Ram([u8; GUEST1_RAM_SIZE]);
+#[link_section = ".hyp_tables"]
+static GUEST1_RAM: SyncUnsafeCell<Guest1Ram> = SyncUnsafeCell::new(Guest1Ram([0; GUEST1_RAM_SIZE]));
+
+extern "C" {
+    static guest1_payload: u8;
+    static guest1_payload_end: u8;
+}
+
+/// Accessor for the running vCPU (mutable pointer). Single-core: only ever used
+/// from EL2 trap context, which cannot reenter.
+#[inline]
+fn cur_vcpu() -> *mut Vcpu {
+    // SAFETY (single-core): EL2 trap context has exclusive access.
+    unsafe {
+        let idx = *CURRENT_VCPU.get();
+        &mut (*VCPUS.get())[idx]
+    }
+}
 
 /// One-shot guard so an unexpected lower-EL abort dumps context once and then
 /// parks, instead of an endless re-fault spam loop. Lives in `.bss` (zeroed by
@@ -347,15 +439,12 @@ pub extern "C" fn hyp_init() {
 
     hyp_puts("\n[HYP] Fermi hypervisor online at EL2\n");
 
-    // Initialise the guest vCPU control block (NOLOAD memory => not zeroed).
+    // vCPU table starts empty; populated near the end of hyp_init once the
+    // stage-2 tables and guest 1 payload are in place (NOLOAD => not zeroed).
     // SAFETY (single-core, pre-guest): exclusive access during boot.
     unsafe {
-        let v = G_VCPU.get();
-        (*v).id = 0;
-        (*v).hvc_count = 0;
-        (*v).sysreg_traps = 0;
-        (*v).abort_count = 0;
-        (*v).virq_injected = 0;
+        *VCPUS.get() = [Vcpu::zeroed(); NUM_VCPUS];
+        *CURRENT_VCPU.get() = 0;
     }
 
     // Sanity: confirm we really are at EL2.
@@ -428,7 +517,190 @@ pub extern "C" fn hyp_init() {
         core::arch::asm!("isb");
     }
 
+    // Register the primary guest (Fermi) as vCPU 0 — its full context is
+    // captured lazily on its first yield — and create the tiny guest 1.
+    // SAFETY (single-core, pre-guest): exclusive access during boot.
+    unsafe {
+        let v0 = &mut (*VCPUS.get())[0];
+        v0.id = 0;
+        v0.state = VCPU_RUNNING;
+        v0.vttbr = phys_of(S2_L0.get()); // VMID 0
+        *CURRENT_VCPU.get() = 0;
+    }
+    hyp_create_guest1();
+    hyp_puts("[HYP] created guest1 (vCPU 1) with its own stage-2\n");
+
     hyp_puts("[HYP] stage-2 enabled (HCR_EL2.VM=1), dropping to EL1 guest...\n");
+}
+
+// --- world switch / vCPUs ----------------------------------------------------
+
+/// Save the live EL1 system-register context into `v`.
+/// # Safety
+/// Reads EL2-accessible EL1 sysregs; `v` must be a valid `Vcpu`.
+unsafe fn hyp_save_el1(v: *mut Vcpu) {
+    unsafe {
+        (*v).sp_el1 = mrs!("sp_el1");
+        (*v).elr_el1 = mrs!("elr_el1");
+        (*v).spsr_el1 = mrs!("spsr_el1");
+        (*v).sctlr_el1 = mrs!("sctlr_el1");
+        (*v).cpacr_el1 = mrs!("cpacr_el1");
+        (*v).ttbr0_el1 = mrs!("ttbr0_el1");
+        (*v).ttbr1_el1 = mrs!("ttbr1_el1");
+        (*v).tcr_el1 = mrs!("tcr_el1");
+        (*v).mair_el1 = mrs!("mair_el1");
+        (*v).amair_el1 = mrs!("amair_el1");
+        (*v).vbar_el1 = mrs!("vbar_el1");
+        (*v).contextidr_el1 = mrs!("contextidr_el1");
+        (*v).tpidr_el1 = mrs!("tpidr_el1");
+        (*v).tpidrro_el0 = mrs!("tpidrro_el0");
+        (*v).tpidr_el0 = mrs!("tpidr_el0");
+        (*v).esr_el1 = mrs!("esr_el1");
+        (*v).far_el1 = mrs!("far_el1");
+        (*v).par_el1 = mrs!("par_el1");
+    }
+}
+
+/// Restore `v`'s EL1 system-register context onto the live CPU.
+/// # Safety
+/// Writes EL1 sysregs from EL2; `v` must be a valid `Vcpu`.
+unsafe fn hyp_restore_el1(v: *mut Vcpu) {
+    unsafe {
+        msr!("sp_el1", (*v).sp_el1);
+        msr!("elr_el1", (*v).elr_el1);
+        msr!("spsr_el1", (*v).spsr_el1);
+        msr!("sctlr_el1", (*v).sctlr_el1);
+        msr!("cpacr_el1", (*v).cpacr_el1);
+        msr!("ttbr0_el1", (*v).ttbr0_el1);
+        msr!("ttbr1_el1", (*v).ttbr1_el1);
+        msr!("tcr_el1", (*v).tcr_el1);
+        msr!("mair_el1", (*v).mair_el1);
+        msr!("amair_el1", (*v).amair_el1);
+        msr!("vbar_el1", (*v).vbar_el1);
+        msr!("contextidr_el1", (*v).contextidr_el1);
+        msr!("tpidr_el1", (*v).tpidr_el1);
+        msr!("tpidrro_el0", (*v).tpidrro_el0);
+        msr!("tpidr_el0", (*v).tpidr_el0);
+        msr!("esr_el1", (*v).esr_el1);
+        msr!("far_el1", (*v).far_el1);
+        msr!("par_el1", (*v).par_el1);
+        core::arch::asm!("isb");
+    }
+}
+
+/// Round-robin to the next non-unused vCPU after `from`.
+fn hyp_pick_next(from: usize) -> usize {
+    // SAFETY (single-core): EL2 trap context.
+    unsafe {
+        for i in 1..=NUM_VCPUS {
+            let idx = (from + i) % NUM_VCPUS;
+            if (*VCPUS.get())[idx].state != VCPU_UNUSED {
+                return idx;
+            }
+        }
+    }
+    from
+}
+
+/// Cooperative world switch: suspend the running vCPU and resume the next. The
+/// outgoing GP regs come from / incoming GP regs go to the EL2 trap frame (which
+/// el2_common restores on eret). Each vCPU has a distinct VMID, so no stage-2
+/// TLB flush is needed when swapping VTTBR_EL2.
+fn hyp_world_switch(frame: *mut El2Frame) {
+    // SAFETY (single-core): EL2 trap context has exclusive access to the vCPU
+    // table and the trap frame.
+    unsafe {
+        let from = *CURRENT_VCPU.get();
+        let cur = &mut (*VCPUS.get())[from] as *mut Vcpu;
+
+        for i in 0..31 {
+            (*cur).regs[i] = (*frame).x[i];
+        }
+        (*cur).pc = mrs!("elr_el2");
+        (*cur).pstate = mrs!("spsr_el2");
+        (*cur).vttbr = mrs!("vttbr_el2");
+        hyp_save_el1(cur);
+        if (*cur).state == VCPU_RUNNING {
+            (*cur).state = VCPU_READY;
+        }
+
+        let next = hyp_pick_next(from);
+        if next == from {
+            (*cur).state = VCPU_RUNNING; // nobody else runnable: keep going
+            return;
+        }
+
+        let nv = &mut (*VCPUS.get())[next] as *mut Vcpu;
+        *CURRENT_VCPU.get() = next;
+        (*nv).state = VCPU_RUNNING;
+
+        for i in 0..31 {
+            (*frame).x[i] = (*nv).regs[i];
+        }
+        msr!("elr_el2", (*nv).pc);
+        msr!("spsr_el2", (*nv).pstate);
+        msr!("vttbr_el2", (*nv).vttbr);
+        core::arch::asm!("isb");
+        hyp_restore_el1(nv);
+    }
+}
+
+/// Build guest 1's stage-2: identity-map ONLY its RAM slice (IPA == PA over the
+/// slice), leaving every other IPA unmapped so the guest is sandboxed.
+fn hyp_build_guest1_stage2() {
+    let base = phys_of(GUEST1_RAM.get()); // physical == guest IPA
+    let pages = GUEST1_RAM_SIZE as u64 / PAGE_SIZE;
+    let gb = base / SIZE_1G;
+    let mb = (base % SIZE_1G) / SIZE_2M;
+    let first_page = (base % SIZE_2M) / PAGE_SIZE;
+
+    let l0 = G1_L0.get();
+    let l1 = G1_L1.get();
+    let l2 = G1_L2.get();
+    let l3 = G1_L3.get();
+
+    // SAFETY (single-core, pre-guest): hypervisor-private tables.
+    unsafe {
+        for i in 0..512 {
+            (*l0).0[i] = 0;
+            (*l1).0[i] = 0;
+            (*l2).0[i] = 0;
+            (*l3).0[i] = 0;
+        }
+        (*l0).0[0] = phys_of(l1) | S2_TABLE | S2_VALID;
+        (*l1).0[gb as usize] = phys_of(l2) | S2_TABLE | S2_VALID;
+        (*l2).0[mb as usize] = phys_of(l3) | S2_TABLE | S2_VALID;
+        for p in 0..pages {
+            let pa = base + p * PAGE_SIZE;
+            (*l3).0[(first_page + p) as usize] =
+                pa | S2_TABLE | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
+        }
+        core::arch::asm!("dsb ish");
+    }
+}
+
+fn hyp_create_guest1() {
+    hyp_build_guest1_stage2();
+
+    let payload = core::ptr::addr_of!(guest1_payload) as *const u8;
+    let payload_end = core::ptr::addr_of!(guest1_payload_end) as *const u8;
+    let base = phys_of(GUEST1_RAM.get());
+    // SAFETY (single-core, pre-guest): copy the PIC payload into guest 1's RAM
+    // slice; len is the linker-bounded payload size and fits in GUEST1_RAM_SIZE.
+    unsafe {
+        let len = payload_end as usize - payload as usize;
+        core::ptr::copy_nonoverlapping(payload, GUEST1_RAM.get() as *mut u8, len);
+
+        let v = &mut (*VCPUS.get())[1];
+        *v = Vcpu::zeroed();
+        v.id = 1;
+        v.state = VCPU_READY;
+        v.pc = base; // entry (IPA == PA)
+        v.pstate = 0x3c5; // EL1h, DAIF masked
+        v.sp_el1 = base + GUEST1_RAM_SIZE as u64;
+        v.vttbr = phys_of(G1_L0.get()) | (1 << 48); // VMID 1
+                                                    // EL1 sysregs left 0 => guest 1 runs with its stage-1 MMU off.
+    }
 }
 
 // --- traps -------------------------------------------------------------------
@@ -479,7 +751,7 @@ fn hyp_handle_hvc(frame: *mut El2Frame) {
 
     // SAFETY (single-core, pre-guest-concurrency): the vCPU block is touched
     // only from EL2 trap context, which cannot reenter on a single core.
-    let vcpu = G_VCPU.get();
+    let vcpu = cur_vcpu();
     unsafe { (*vcpu).hvc_count += 1 };
 
     let ret = match fn_id {
@@ -490,8 +762,13 @@ fn hyp_handle_hvc(frame: *mut El2Frame) {
         }
         HVC_PING => a1 + 1,
         HVC_VM_INFO => unsafe { (*vcpu).hvc_count },
-        // Cooperative yield is a no-op until the M5 world-switch scheduler.
-        HVC_YIELD => 0,
+        HVC_YIELD => {
+            // Cooperative world switch: save this vCPU, resume the next ready
+            // one. The frame's GP regs are rewritten in place, so we must NOT
+            // touch frame x0 afterwards — return immediately.
+            hyp_world_switch(frame);
+            return;
+        }
         // Introspection probe (test build): expose the hyp region base so the
         // guest can attempt — and be denied — an access to hypervisor memory.
         HVC_HYP_BASE => hyp_region().0,
@@ -525,7 +802,7 @@ fn hyp_handle_sysreg(frame: *mut El2Frame) {
     let is_read = iss & 0x1;
 
     // SAFETY (single-core): see hyp_handle_hvc.
-    unsafe { (*G_VCPU.get()).sysreg_traps += 1 };
+    unsafe { (*cur_vcpu()).sysreg_traps += 1 };
 
     // Decode by (op0,op1,crn,crm,op2). Pass real values through for the ID
     // registers Fermi actually consumes; any other ID register under TID3 is
@@ -561,7 +838,7 @@ fn hyp_handle_sysreg(frame: *mut El2Frame) {
 /// running. Any other abort is an unexpected (real) fault — dump and park.
 fn hyp_handle_abort(index: u64, frame: *mut El2Frame) {
     // SAFETY (single-core): see hyp_handle_hvc.
-    unsafe { (*G_VCPU.get()).abort_count += 1 };
+    unsafe { (*cur_vcpu()).abort_count += 1 };
 
     let esr = mrs!("esr_el2");
     let far = mrs!("far_el2");
@@ -667,8 +944,9 @@ fn hyp_handle_irq() {
 
     // SAFETY (single-core): see hyp_handle_hvc.
     let n = unsafe {
-        (*G_VCPU.get()).virq_injected += 1;
-        (*G_VCPU.get()).virq_injected
+        let v = cur_vcpu();
+        (*v).virq_injected += 1;
+        (*v).virq_injected
     };
     hyp_vgic_inject_hw(intid);
     // Priority drop on the physical interface (does not deactivate).
@@ -773,5 +1051,15 @@ pub fn guest_probe() {
                 "LEAK => isolation FAILED"
             }
         );
+
+        // Cooperative multi-VM demo: yield to guest 1 a few times. Each yield
+        // world-switches to the second guest, which prints "[g1]" and yields
+        // back. After the loop guest 0 keeps the CPU (no preemption yet — M5b).
+        kprintln!("[BOOT] cooperative multi-VM demo (guest0 <-> guest1):");
+        for i in 0..4 {
+            kprintln!("[BOOT][guest0] turn {}, yielding to guest1...", i);
+            hvc_call(HVC_YIELD, 0, 0, 0);
+        }
+        kprintln!("[BOOT][guest0] done yielding; resuming normal boot");
     }
 }

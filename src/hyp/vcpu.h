@@ -114,6 +114,12 @@ typedef struct vcpu {
                              * vs consumer). */
   int            doorbell_target; /* vCPU id to notify on HVC_FERMI_DOORBELL,
                                    * or -1 if this VM has no peer. */
+  int            privileged; /* 1 = may issue management hypercalls (VMCTL)
+                              * against other VMs — the "dom0" control domain. */
+  int            paused;     /* 1 = administratively paused (VMCTL_STOP); the
+                              * scheduler skips it and does NOT auto-resume it
+                              * on a timer wake (distinct from WFI-blocked). */
+  uint64_t       run_count;  /* times this vCPU has been scheduled in */
 } vcpu_t;
 
 /* The currently-running vCPU (set by the scheduler before each guest entry).
@@ -152,6 +158,16 @@ int vcpu_ring_doorbell(vcpu_t *from);
 
 /* Look up a vCPU by id (for wiring peers). */
 vcpu_t *vcpu_by_id(int id);
+
+/* Management hypercall (HVC_FERMI_VMCTL) from a privileged "dom0" control VM.
+ * op/target/arg are x1/x2/x3 from the caller's frame; returns the x0 result.
+ * `f` is the caller's live frame (needed if a RESET targets the caller itself).
+ * Rejects with VMCTL_EPERM unless cur_vcpu->privileged. */
+int64_t vcpu_vmctl(uint64_t op, uint64_t target, uint64_t arg,
+                   hyp_trap_frame_t *f);
+
+/* Total number of vCPUs. */
+int vcpu_count(void);
 
 /* True once a vCPU has been powered off (never runs again). */
 int vcpu_is_dead(const vcpu_t *v);

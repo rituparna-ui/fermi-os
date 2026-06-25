@@ -2,8 +2,9 @@
 
 A minimal **type-1 (bare-metal) hypervisor** for AArch64 that runs the existing
 FermiOS kernel — unmodified — as an EL1/EL0 guest, and runs several smaller
-guests alongside it (4 VMs total) with preemptive round-robin scheduling,
-per-VM stage-2 isolation, inter-VM shared memory, and per-VM PSCI lifecycle.
+guests alongside it (5 VMs total) with preemptive round-robin scheduling,
+per-VM stage-2 isolation, inter-VM shared memory + an event-channel doorbell,
+per-VM PSCI lifecycle, and a privileged dom0-style management plane.
 
 The hypervisor is a separate image from the guest. QEMU loads it via `-kernel`
 and enters it at **EL2**; it sets up virtualization and `eret`s down into the
@@ -74,7 +75,8 @@ never collides with pages the guest's PMM hands out, even with stage-2 off.
 | `vcpu.c` / `.h` / `vcpu_switch.S` | Per-vCPU context + EL2 round-robin scheduler |
 | `guest2/` | Tiny standalone EL1 guest (heartbeat printer; self-resets via PSCI) |
 | `ipc/` | EL1 guest run by 2 VMs (producer/consumer) for inter-VM shared memory |
-| `guest_blob.S`, `guest2_blob.S`, `ipc_blob.S` | Embed the flat guest images into the hyp |
+| `dom0/` | Privileged EL1 control guest driving the VMCTL management hypercall |
+| `*_blob.S` (`guest`, `guest2`, `ipc`, `dom0`) | Embed the flat guest images into the hyp |
 
 ## How key subsystems work
 
@@ -188,6 +190,21 @@ Notes captured the hard way: HVC and SMC are **symmetric** — neither advances
 `ELR_EL2` (only data/instruction aborts, trapped sysregs, and WFx need `+4`).
 The hyp is built `-mgeneral-regs-only` so its GPR-only trap frame can never
 clobber the guest's caller-saved q-registers.
+
+### Management plane (dom0 control domain)
+
+One guest (`dom0`) is marked **privileged** and may issue the `VMCTL` management
+hypercall (`HVC x0=0xFE110002`, op in x1, target vCPU id in x2) against the
+other VMs — the Xen-dom0 / libvirt-`virsh` model. Operations: `COUNT` (how many
+VMs), `STATE` (packed runnable/dead/vmid), `RUNS` (schedule count), and the
+lifecycle controls `RESET` / `STOP` (pause) / `START` (resume). Non-privileged
+VMs get `VMCTL_EPERM`. A paused VM (`vcpu_t.paused`) is skipped by the scheduler
+and is *not* auto-resumed by its timer (distinct from a WFI-blocked VM), so STOP
+genuinely suspends it until START.
+
+The dom0 guest runs a one-shot script: enumerate all VMs + print their state and
+run-count, then pause the heartbeat guest, resume it, and warm-reset the IPC
+producer — demonstrating live VM management. (`vcpu_vmctl` in vcpu.c.)
 
 ### VM lifecycle (PSCI)
 

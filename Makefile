@@ -18,10 +18,12 @@ HYP_TARGET := $(BUILD_DIR)/hyp.elf       # the HYPERVISOR (runs at EL2)
 S_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.S" -print)
 C_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.c" -print)
 
-# The HYPERVISOR image sources (EL2). Exclude the guest2/ and ipc/ subdirs —
-# those are standalone guests built separately to flat blobs, not linked in.
-HYP_S_SOURCES := $(shell find $(HYP_DIR) \( -path "$(HYP_DIR)/guest2" -o -path "$(HYP_DIR)/ipc" \) -prune -o -name "*.S" -print)
-HYP_C_SOURCES := $(shell find $(HYP_DIR) \( -path "$(HYP_DIR)/guest2" -o -path "$(HYP_DIR)/ipc" \) -prune -o -name "*.c" -print)
+# The HYPERVISOR image sources (EL2). Exclude the standalone guest subdirs —
+# those are built separately to flat blobs, not linked into the hyp.
+HYP_GUEST_DIRS := $(HYP_DIR)/guest2 $(HYP_DIR)/ipc $(HYP_DIR)/dom0
+HYP_PRUNE := $(foreach d,$(HYP_GUEST_DIRS),-path "$(d)" -o)
+HYP_S_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.S" -print)
+HYP_C_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.c" -print)
 
 # Object File Mapping
 # src/boot.S      -> build/boot.o
@@ -146,6 +148,19 @@ $(IPC_BIN): $(HYP_DIR)/ipc/ipc.S $(HYP_DIR)/ipc/linker_ipc.ld
 	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/ipc.elf $@
 
 $(BUILD_DIR)/hyp/ipc_blob.o: $(IPC_BIN)
+
+# dom0 control guest: a privileged standalone EL1 guest that drives the VMCTL
+# management hypercall. Built flat, embedded via dom0_blob.S.
+DOM0_BIN := $(BUILD_DIR)/dom0.bin
+$(DOM0_BIN): $(HYP_DIR)/dom0/dom0.S $(HYP_DIR)/dom0/linker_dom0.ld
+	@echo "DOM0 $@"
+	@mkdir -p $(dir $@)
+	@$(CC) -ffreestanding -nostdlib -nostartfiles -fno-pic \
+		-Wl,-T,$(HYP_DIR)/dom0/linker_dom0.ld -Wl,--build-id=none \
+		-o $(BUILD_DIR)/dom0.elf $(HYP_DIR)/dom0/dom0.S
+	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/dom0.elf $@
+
+$(BUILD_DIR)/hyp/dom0_blob.o: $(DOM0_BIN)
 
 # Hypervisor (EL2) — separate image, its own linker script.
 $(HYP_TARGET): $(HYP_OBJECTS)

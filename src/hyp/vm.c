@@ -143,6 +143,9 @@ static void handle_sync(uint64_t type, hyp_trap_frame_t *f) {
        * make it runnable. An event-channel-style notification — the peer takes
        * a virtual IRQ instead of polling. */
       f->regs[0] = (uint64_t)vcpu_ring_doorbell(cur_vcpu);
+    } else if (f->regs[0] == HVC_FERMI_VMCTL) {
+      /* Management hypercall from the privileged "dom0" control VM. */
+      f->regs[0] = (uint64_t)vcpu_vmctl(f->regs[1], f->regs[2], f->regs[3], f);
     } else {
       handle_psci(f);
     }

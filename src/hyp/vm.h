@@ -75,6 +75,28 @@ typedef struct hyp_trap_frame {
 /* --- Fermi hypercalls (vendor HVC ids in x0, outside the PSCI range) --- */
 #define HVC_FERMI_YIELD    0xFE110000ULL /* yield rest of time slice          */
 #define HVC_FERMI_DOORBELL 0xFE110001ULL /* notify peer VM (inject doorbell IRQ) */
+#define HVC_FERMI_VMCTL    0xFE110002ULL /* management op (privileged "dom0" VM)
+                                          *   x1 = op, x2 = target vCPU id,
+                                          *   x3 = arg/buffer IPA (op-specific).
+                                          *   ret in x0. */
+
+/* VMCTL operations (in x1). Results return in registers — no shared buffer, so
+ * no IPA translation is needed. */
+#define VMCTL_COUNT   0  /* -> x0 = number of vCPUs                           */
+#define VMCTL_STATE   1  /* x2=id; -> x0 = packed state (see VMCTL_ST_* below) */
+#define VMCTL_RUNS    2  /* x2=id; -> x0 = that VM's run_count                 */
+#define VMCTL_RESET   3  /* x2=id; warm-reset that VM (reload image, restart)  */
+#define VMCTL_STOP    4  /* x2=id; pause that VM (mark not-runnable)           */
+#define VMCTL_START   5  /* x2=id; resume that VM (mark runnable)              */
+
+/* VMCTL_STATE packed result in x0: bit0 runnable, bit1 dead, bits[15:8] vmid. */
+#define VMCTL_ST_RUNNABLE 0x1ULL
+#define VMCTL_ST_DEAD     0x2ULL
+#define VMCTL_ST_VMID(x)  (((x) >> 8) & 0xFF)
+
+#define VMCTL_OK       0
+#define VMCTL_EPERM   (-1) /* caller not privileged */
+#define VMCTL_EINVAL  (-2) /* bad target id / op    */
 
 /* Doorbell virtual interrupt INTID injected into the notified VM. An SPI
  * (>= 32) so it does not collide with the timer PPI (30). */

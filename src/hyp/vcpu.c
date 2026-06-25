@@ -16,7 +16,7 @@
  * so the same guest IPA maps to different host PAs — true memory isolation.
  * ------------------------------------------------------------------------- */
 
-#define MAX_VCPUS 4
+#define MAX_VCPUS 5
 
 static vcpu_t vcpus[MAX_VCPUS];
 static int    nr_vcpus;
@@ -83,6 +83,53 @@ void vcpu_poweroff_current(hyp_trap_frame_t *f) {
 
 vcpu_t *vcpu_by_id(int id) {
   return (id >= 0 && id < nr_vcpus) ? &vcpus[id] : (vcpu_t *)0;
+}
+
+int vcpu_count(void) { return nr_vcpus; }
+
+int64_t vcpu_vmctl(uint64_t op, uint64_t target, uint64_t arg,
+                   hyp_trap_frame_t *f) {
+  (void)arg;
+  /* Only the designated control domain may manage other VMs. */
+  if (!cur_vcpu->privileged) {
+    return VMCTL_EPERM;
+  }
+  if (op == VMCTL_COUNT) {
+    return (int64_t)nr_vcpus;
+  }
+
+  vcpu_t *t = vcpu_by_id((int)target);
+  if (!t) {
+    return VMCTL_EINVAL;
+  }
+  switch (op) {
+  case VMCTL_STATE: {
+    int64_t st = 0;
+    if (t->runnable) st |= VMCTL_ST_RUNNABLE;
+    if (t->dead)     st |= VMCTL_ST_DEAD;
+    st |= ((int64_t)t->vmid & 0xFF) << 8;
+    return st;
+  }
+  case VMCTL_RUNS:
+    return (int64_t)t->run_count;
+  case VMCTL_RESET:
+    if (t->dead) return VMCTL_EINVAL;
+    /* Reset is in-place if it targets the caller; here the control VM never
+     * resets itself, so t != cur_vcpu and f is unused for the target. */
+    vcpu_reset(t, (t == cur_vcpu) ? f : (hyp_trap_frame_t *)0);
+    return VMCTL_OK;
+  case VMCTL_STOP:
+    if (t == cur_vcpu) return VMCTL_EINVAL; /* don't pause the controller */
+    t->paused = 1;
+    return VMCTL_OK;
+  case VMCTL_START:
+    if (t->dead) return VMCTL_EINVAL;
+    t->paused = 0;
+    t->runnable = 1;
+    return VMCTL_OK;
+  default:
+    return VMCTL_EINVAL;
+  }
 }
 
 int vcpu_ring_doorbell(vcpu_t *from) {
@@ -152,6 +199,7 @@ void vcpu_reset(vcpu_t *v, hyp_trap_frame_t *f) {
 /* Restore the full guest context for `v` into the hardware. */
 static void vcpu_load(vcpu_t *v) {
   cur_vcpu = v;
+  v->run_count++;
   vcpu_restore_sysregs(&v->sys);
   vcpu_restore_fp(&v->fp);
   vgic_restore(&v->vgic);
@@ -190,7 +238,7 @@ static int vtimer_armed(const vcpu_t *v) {
 void hyp_cnthp_arm(void) {
   uint64_t deadline = sched_deadline;
   for (int i = 0; i < nr_vcpus; i++) {
-    if (!vcpus[i].dead && vtimer_armed(&vcpus[i]) &&
+    if (!vcpus[i].dead && !vcpus[i].paused && vtimer_armed(&vcpus[i]) &&
         vcpus[i].vtimer.cval < deadline) {
       deadline = vcpus[i].vtimer.cval;
     }
@@ -218,7 +266,7 @@ void vcpu_sched_init(void) {
 static vcpu_t *pick_next(vcpu_t *cur) {
   for (int i = 1; i <= nr_vcpus; i++) {
     vcpu_t *cand = &vcpus[(cur->id + i) % nr_vcpus];
-    if (cand->runnable && !cand->dead) return cand;
+    if (cand->runnable && !cand->dead && !cand->paused) return cand;
   }
   return cur;
 }
@@ -263,7 +311,7 @@ int vcpu_wake_expired(void) {
 
   for (int i = 0; i < nr_vcpus; i++) {
     vcpu_t *v = &vcpus[i];
-    if (v->dead) continue;
+    if (v->dead || v->paused) continue; /* paused VMs don't wake on their timer */
     if (vtimer_armed(v) && now >= v->vtimer.cval) {
       v->vtimer.pending = 1; /* latch ISTATUS; cleared on guest re-arm */
       if (v == cur_vcpu) {

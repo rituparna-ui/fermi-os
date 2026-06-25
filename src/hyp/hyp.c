@@ -88,11 +88,13 @@ __attribute__((noreturn)) void hyp_panic(const char *msg) {
 extern const uint8_t __guest_blob_start[];
 extern const uint8_t __guest_blob_end[];
 
-/* VM2 + IPC guest flat images, embedded in the hyp. */
+/* VM2 + IPC + dom0 guest flat images, embedded in the hyp. */
 extern const uint8_t __guest2_blob_start[];
 extern const uint8_t __guest2_blob_end[];
 extern const uint8_t __ipc_blob_start[];
 extern const uint8_t __ipc_blob_end[];
+extern const uint8_t __dom0_blob_start[];
+extern const uint8_t __dom0_blob_end[];
 
 /* Guest RAM regions in the top reserved GiB (hyp is at 0x250000000, its pool
  * grows up from ~0x250100000). Each region is 2 MiB-aligned and well clear of
@@ -103,6 +105,8 @@ extern const uint8_t __ipc_blob_end[];
 #define IPCC_HOST_RAM_BASE 0x265000000ULL /* IPC consumer       16 MiB */
 #define IPC_RAM_SIZE       0x01000000ULL
 #define IPC_SHARED_PA      0x266000000ULL /* shared page (both IPC VMs)  */
+#define DOM0_HOST_RAM_BASE 0x268000000ULL /* dom0 control domain  64 MiB */
+#define DOM0_RAM_SIZE      0x04000000ULL
 
 /* Copy a flat blob to a host physical destination (EL2 MMU off) and make it
  * coherent for guest instruction fetch. Used at boot and on warm reset. */
@@ -139,10 +143,12 @@ void hyp_main(void) {
   uint64_t vm1_size = (uint64_t)(__guest_blob_end - __guest_blob_start);
   uint64_t vm2_size = (uint64_t)(__guest2_blob_end - __guest2_blob_start);
   uint64_t ipc_size = (uint64_t)(__ipc_blob_end - __ipc_blob_start);
+  uint64_t dom0_size = (uint64_t)(__dom0_blob_end - __dom0_blob_start);
   hyp_copy_image(GUEST_ENTRY_IPA, __guest_blob_start, vm1_size);
   hyp_copy_image(VM2_HOST_RAM_BASE, __guest2_blob_start, vm2_size);
   hyp_copy_image(IPCP_HOST_RAM_BASE, __ipc_blob_start, ipc_size);
   hyp_copy_image(IPCC_HOST_RAM_BASE, __ipc_blob_start, ipc_size);
+  hyp_copy_image(DOM0_HOST_RAM_BASE, __dom0_blob_start, dom0_size);
   /* Zero the shared IPC page (its seqno starts at 0). */
   for (volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)IPC_SHARED_PA;
        p < (volatile uint64_t *)(uintptr_t)(IPC_SHARED_PA + 0x1000); p++) {
@@ -160,6 +166,7 @@ void hyp_main(void) {
   uint64_t vm2_l1 = s2_build_vm2(VM2_HOST_RAM_BASE, VM2_RAM_SIZE);
   uint64_t ipcp_l1 = s2_build_ipc(IPCP_HOST_RAM_BASE, IPC_RAM_SIZE, IPC_SHARED_PA);
   uint64_t ipcc_l1 = s2_build_ipc(IPCC_HOST_RAM_BASE, IPC_RAM_SIZE, IPC_SHARED_PA);
+  uint64_t dom0_l1 = s2_build_vm2(DOM0_HOST_RAM_BASE, DOM0_RAM_SIZE); /* private RAM + UART */
 
   /* GIC + timer virtualization. */
   hyp_gic_init();
@@ -207,7 +214,13 @@ void hyp_main(void) {
   prod->doorbell_target = (int)cons->id;
   cons->doorbell_target = (int)prod->id;
 
-  hyp_puts("[HYP] 4 vCPUs created. Starting EL2 scheduler.\n");
+  /* dom0: the privileged control domain. It may issue VMCTL hypercalls to
+   * enumerate/pause/resume/reset the other VMs. */
+  vcpu_t *dom0 = vcpu_alloc("dom0", GUEST_ENTRY_IPA, s2_make_vttbr(dom0_l1, 5), 0,
+                            __dom0_blob_start, DOM0_HOST_RAM_BASE, dom0_size);
+  dom0->privileged = 1;
+
+  hyp_puts("[HYP] 5 vCPUs created (incl. privileged dom0). Starting scheduler.\n");
   hyp_puts("--------------------------------------------------\n\n");
 
   vcpu_sched_init();  /* arm CNTHV scheduler tick */

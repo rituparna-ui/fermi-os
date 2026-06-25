@@ -182,6 +182,11 @@ void hyp_main(void) {
   /* Route physical IRQ/FIQ/SError to EL2, trap WFI/SMC, stage-2 on. */
   uint64_t hcr3 = HCR_EL2_M3, hcr;
   __asm__ __volatile__("msr hcr_el2, %0\n\tisb" ::"r"(hcr3));
+  /* HCR_EL2.VM 0->1 changes the translation regime: flush any stale
+   * stage-1-only TLB entries (combined stage-1+2 for this VMID) before the
+   * first guest entry. The TLB is empty at QEMU boot, but this is required by
+   * the architecture and correct on real hardware. */
+  __asm__ __volatile__("dsb ish\n\ttlbi vmalls12e1is\n\tdsb ish\n\tisb" ::: "memory");
   __asm__ __volatile__("mrs %0, hcr_el2" : "=r"(hcr));
   hyp_puts("[HYP] HCR_EL2 = ");
   hyp_puthex(hcr);

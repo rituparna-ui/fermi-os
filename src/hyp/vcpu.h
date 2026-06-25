@@ -45,9 +45,11 @@ typedef struct {
   uint64_t sp_el1;
   uint64_t elr_el1;
   uint64_t spsr_el1;
-  uint64_t esr_el1;
-  uint64_t far_el1;
-  uint64_t par_el1;
+  /* NOTE: ESR_EL1 / FAR_EL1 / PAR_EL1 are deliberately NOT part of the saved
+   * context. They are read-only exception-state registers (writes are
+   * CONSTRAINED UNPREDICTABLE / ignored) and are ephemeral — hardware rewrites
+   * them on the guest's next exception. A guest reads them immediately after
+   * an exception, before any world switch, so they never need preserving. */
 } vcpu_sysregs_t;
 
 /* FP/SIMD state (q0..q31 + FPSR/FPCR). Saved/restored by vcpu_switch.S.
@@ -76,8 +78,11 @@ typedef struct vcpu_vgic {
 
 /* Virtual timer per-vCPU state. */
 typedef struct {
-  uint64_t cval; /* shadow CNTP_CVAL_EL0 */
-  uint64_t ctl;  /* shadow CNTP_CTL_EL0  */
+  uint64_t cval;    /* shadow CNTP_CVAL_EL0 */
+  uint64_t ctl;     /* shadow CNTP_CTL_EL0 (ENABLE|IMASK bits)  */
+  int      pending; /* timer condition latched (ISTATUS) — set when CNTHP
+                     * fires, surfaced in CNTP_CTL reads, cleared when the
+                     * guest re-arms CNTP_CVAL/CNTP_TVAL. */
 } vcpu_vtimer_t;
 
 typedef struct vcpu {

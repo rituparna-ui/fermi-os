@@ -90,15 +90,18 @@ __attribute__((noreturn)) void vcpu_run_first(void) {
  * always arming it to the SOONER of {the running guest's vtimer deadline, the
  * next scheduler slice}. On each CNTHP fire the IRQ handler services whichever
  * deadline(s) elapsed. A coarse slice (~50 ms) keeps the round-robin visible. */
-#define SCHED_SLICE_TICKS (62500000ULL / 20) /* ~50 ms at 62.5 MHz */
+#define SCHED_SLICE_TICKS (62500000ULL / 100) /* ~10 ms at 62.5 MHz */
 
 static uint64_t sched_deadline; /* absolute CNTPCT of the next scheduler slice */
 
 /* Arm CNTHP to min(scheduler deadline, current guest's vtimer deadline). */
 void hyp_cnthp_arm(void) {
   uint64_t deadline = sched_deadline;
-  /* Fold in the running guest's vtimer deadline if armed + sooner. */
-  if (cur_vcpu && (cur_vcpu->vtimer.ctl & 1ULL) /*ENABLE*/) {
+  /* Fold in the running guest's vtimer deadline only if it is armed, NOT
+   * masked, and NOT already pending (a latched-but-unacked condition must not
+   * re-arm CNTHP or it would storm until the guest re-arms). */
+  if (cur_vcpu && (cur_vcpu->vtimer.ctl & 1ULL) /*ENABLE*/ &&
+      !(cur_vcpu->vtimer.ctl & 2ULL) /*IMASK*/ && !cur_vcpu->vtimer.pending) {
     uint64_t vt = cur_vcpu->vtimer.cval;
     if (vt < deadline) deadline = vt;
   }

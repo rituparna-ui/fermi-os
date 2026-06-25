@@ -13,7 +13,8 @@
 //   0 sctlr_el1   8 cpacr_el1   16 ttbr0_el1   24 ttbr1_el1   32 tcr_el1
 //  40 mair_el1   48 amair_el1   56 vbar_el1    64 contextidr_el1
 //  72 tpidr_el0  80 tpidrro_el0 88 tpidr_el1   96 sp_el0     104 sp_el1
-// 112 elr_el1   120 spsr_el1   128 esr_el1    136 far_el1    144 par_el1
+// 112 elr_el1   120 spsr_el1
+// (ESR_EL1/FAR_EL1/PAR_EL1 removed — read-only exception state, not context.)
 
 .section .text
 
@@ -61,9 +62,7 @@ vcpu_save_sysregs:
 	mrs	x1, sp_el1      ; str x1, [x0, #104]
 	mrs	x1, elr_el1     ; str x1, [x0, #112]
 	mrs	x1, spsr_el1    ; str x1, [x0, #120]
-	mrs	x1, esr_el1     ; str x1, [x0, #128]
-	mrs	x1, far_el1     ; str x1, [x0, #136]
-	mrs	x1, par_el1     ; str x1, [x0, #144]
+	// ESR_EL1/FAR_EL1/PAR_EL1 are read-only exception state — not saved.
 	ret
 
 .global vcpu_restore_sysregs
@@ -84,9 +83,7 @@ vcpu_restore_sysregs:
 	ldr	x1, [x0, #104] ; msr sp_el1, x1
 	ldr	x1, [x0, #112] ; msr elr_el1, x1
 	ldr	x1, [x0, #120] ; msr spsr_el1, x1
-	ldr	x1, [x0, #128] ; msr esr_el1, x1
-	ldr	x1, [x0, #136] ; msr far_el1, x1
-	ldr	x1, [x0, #144] ; msr par_el1, x1
+	// ESR_EL1/FAR_EL1/PAR_EL1 are read-only — not restored.
 	// Sysreg writes that affect translation/exception state need an ISB
 	// before the guest runs again.
 	isb

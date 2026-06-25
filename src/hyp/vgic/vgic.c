@@ -115,7 +115,9 @@ void vgic_vcpu_reset(vcpu_vgic_t *g) {
   g->vmcr = ICH_VMCR_SEED;
   g->ap0r0 = 0;
   g->ap1r0 = 0;
-  for (int i = 0; i < 16; i++) g->lr[i] = 0;
+  /* Zero only the implemented LRs (vgic_init must run first to set vgic_nr_lr).
+   * The lr[] array is statically sized 16 as an upper bound. */
+  for (uint32_t i = 0; i < vgic_nr_lr; i++) g->lr[i] = 0;
   g->gicd_ctlr = 0;
   g->gicd_isenabler0 = 0;
   g->gicr_igroupr0 = 0;
@@ -178,7 +180,6 @@ int vgic_mmio_is_target(uint64_t ipa) {
 
 void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
                        int size_bytes) {
-  (void)size_bytes;
   vcpu_vgic_t *vd = &cur_vcpu->vgic; /* per-VM distributor/redistributor model */
   uint64_t off;
   if (ipa >= GICR_IPA_BASE) {
@@ -187,8 +188,13 @@ void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
     off = ipa - GICD_IPA_BASE;
   }
 
+  /* Mask to the access width so sub-32-bit accesses don't contribute garbage
+   * upper bytes (esp. for the |= read-modify-write of the ISENABLER regs). */
+  uint32_t size_mask =
+      (size_bytes >= 4) ? 0xFFFFFFFFU : ((1U << (size_bytes * 8)) - 1U);
+
   if (is_write) {
-    uint32_t w = (uint32_t)*val;
+    uint32_t w = (uint32_t)*val & size_mask;
     switch (off) {
     case R_GICD_CTLR:        vd->gicd_ctlr = w & (GICD_CTLR_ARE_NS | GICD_CTLR_EN_G1NS); break;
     case R_GICD_ISENABLER0:  vd->gicd_isenabler0 |= w; break;
@@ -213,7 +219,7 @@ void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
   case R_GICR_SGI_ISENABLER0: r = vd->gicr_isenabler0; break;
   default: r = 0; break;
   }
-  *val = r;
+  *val = r & size_mask;
 }
 
 void vgic_inject_ppi(uint32_t intid) {

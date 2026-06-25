@@ -147,10 +147,11 @@ static void handle_sync(uint64_t type, hyp_trap_frame_t *f) {
 
   case EC_WF_TRAPPED:
     /* Guest WFI/WFE — the guest is idle. Skip the instruction so it re-checks
-     * for a pending vIRQ rather than re-trapping in a tight loop. We do NOT
-     * world-switch here: the preemptive CNTHP scheduler tick already shares the
-     * CPU fairly, and switching on every idle WFI starves a guest (like
-     * FermiOS) that idles between every timer tick. */
+     * for a pending vIRQ rather than re-trapping the same WFI. The preemptive
+     * CNTHP scheduler tick (and the guest's own folded vtimer deadline) shares
+     * the CPU; we do not world-switch on every WFI (that starves a guest like
+     * FermiOS that idles between ticks). Fairness vs. a pure-spin guest is a
+     * known limitation — see src/hyp/README.md. */
     advance_elr(f);
     break;
 
@@ -179,8 +180,11 @@ static void handle_irq(hyp_trap_frame_t *f) {
     uint64_t now;
     __asm__ __volatile__("mrs %0, cntpct_el0" : "=r"(now));
 
-    /* Guest vtimer deadline reached -> inject vINTID 30. */
-    if ((cur_vcpu->vtimer.ctl & 1ULL) && now >= cur_vcpu->vtimer.cval) {
+    /* Guest vtimer deadline reached -> inject vINTID 30. Only when ENABLE=1,
+     * IMASK=0, not already pending, and the comparator has actually fired. */
+    if ((cur_vcpu->vtimer.ctl & 1ULL) /*ENABLE*/ &&
+        !(cur_vcpu->vtimer.ctl & 2ULL) /*IMASK*/ &&
+        !cur_vcpu->vtimer.pending && now >= cur_vcpu->vtimer.cval) {
       vtimer_handle_host_irq();
     }
     /* Scheduler slice elapsed -> round-robin (this also re-arms CNTHP). */

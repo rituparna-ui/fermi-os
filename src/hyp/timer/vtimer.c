@@ -59,12 +59,18 @@ int vtimer_emulate_sysreg(hyp_trap_frame_t *f) {
   switch (op2) {
   case 0: /* CNTP_TVAL_EL0 (signed 32-bit = CVAL - now) */
     if (is_read) {
-      uint64_t tval = (vt->cval - now) & 0xFFFFFFFFULL;
-      if (rt != 31) f->regs[rt] = tval;
+      /* Saturate to the signed 32-bit range rather than wrapping: a deadline
+       * far in the future must not read back as a (negative) "already fired". */
+      int64_t delta = (int64_t)(vt->cval - now);
+      int32_t tval_s32 = (delta > 0x7FFFFFFFLL)    ? 0x7FFFFFFF
+                         : (delta < -(1LL << 31))  ? (int32_t)(-(1LL << 31))
+                                                   : (int32_t)delta;
+      if (rt != 31) f->regs[rt] = (uint64_t)(uint32_t)tval_s32;
     } else {
       uint64_t tval = (rt == 31) ? 0 : f->regs[rt];
       int32_t s = (int32_t)(uint32_t)tval;
       vt->cval = now + (uint64_t)(int64_t)s;
+      vt->pending = 0; /* re-arming clears the latched condition */
       vtimer_reprogram_current();
     }
     return 1;
@@ -72,7 +78,11 @@ int vtimer_emulate_sysreg(hyp_trap_frame_t *f) {
   case 1: /* CNTP_CTL_EL0 */
     if (is_read) {
       uint64_t ctl = vt->ctl & (CNT_CTL_ENABLE | CNT_CTL_IMASK);
-      if ((vt->ctl & CNT_CTL_ENABLE) && now >= vt->cval) {
+      /* ISTATUS reflects the latched condition (set when CNTHP fired and the
+       * vIRQ was injected) OR the live comparator. The guest's IRQ handler
+       * reads CNTP_CTL to confirm the timer fired — it must see ISTATUS=1. */
+      if (vt->pending ||
+          ((vt->ctl & CNT_CTL_ENABLE) && now >= vt->cval)) {
         ctl |= CNT_CTL_ISTATUS;
       }
       if (rt != 31) f->regs[rt] = ctl;
@@ -87,6 +97,7 @@ int vtimer_emulate_sysreg(hyp_trap_frame_t *f) {
       if (rt != 31) f->regs[rt] = vt->cval;
     } else {
       vt->cval = (rt == 31) ? 0 : f->regs[rt];
+      vt->pending = 0; /* re-arming clears the latched condition */
       vtimer_reprogram_current();
     }
     return 1;
@@ -95,10 +106,11 @@ int vtimer_emulate_sysreg(hyp_trap_frame_t *f) {
 }
 
 void vtimer_handle_host_irq(void) {
-  /* The current guest's vtimer deadline elapsed. Mark it disabled in the shadow
-   * (the guest re-arms by writing CNTP_CVAL/CTL, which traps back) and inject
-   * the virtual timer IRQ. CNTHP itself is re-armed by the caller via
-   * hyp_cnthp_arm() (folded with the scheduler deadline). */
-  cur_vcpu->vtimer.ctl &= ~CNT_CTL_ENABLE;
+  /* The current guest's vtimer deadline elapsed. LATCH the condition (pending)
+   * rather than clearing ENABLE — the guest's IRQ handler reads CNTP_CTL_EL0
+   * and must see ISTATUS=1 (clearing ENABLE would make it see a disabled
+   * timer). The guest clears the condition by re-arming CNTP_CVAL/CNTP_TVAL.
+   * CNTHP is re-armed by the caller via hyp_cnthp_arm(). */
+  cur_vcpu->vtimer.pending = 1;
   vgic_inject_ppi(VTIMER_GUEST_PPI);
 }

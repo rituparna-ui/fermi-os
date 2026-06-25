@@ -115,6 +115,30 @@ fn cmd_run(path: &str) {
     vfs::fd_table_destroy(t);
 }
 
+fn cmd_cp(src: &str, dst_name: &str) {
+    let node = vfs::resolve(src);
+    if node.is_null() {
+        kprintln!("cp: {}: not found", src);
+        return;
+    }
+    let t = vfs::fd_table_create();
+    let fd = vfs::fd_open(t, src);
+    let mut data = alloc::vec::Vec::new();
+    if fd >= 0 {
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = vfs::fd_read(t, fd, &mut chunk);
+            if n <= 0 { break; }
+            data.extend_from_slice(&chunk[..n as usize]);
+        }
+        vfs::fd_close(t, fd);
+    }
+    vfs::fd_table_destroy(t);
+    let ok = crate::fs::fat32::create(dst_name.as_bytes(), &data);
+    kprintln!("cp {} -> {} ({} bytes): {}", src, dst_name, data.len(),
+              if ok { "ok" } else { "failed" });
+}
+
 fn dispatch(line: &str) {
     let mut parts = line.split_whitespace();
     let cmd = match parts.next() {
@@ -138,6 +162,14 @@ fn dispatch(line: &str) {
         "ls" => {
             let path = if arg1.is_empty() { "/" } else { arg1 };
             kprint!("{}", vfs::list(path));
+        }
+        "cp" => {
+            let dst = parts.next().unwrap_or("");
+            if arg1.is_empty() || dst.is_empty() {
+                kprintln!("usage: cp <src-path> <dst-name.ext>");
+            } else {
+                cmd_cp(arg1, dst);
+            }
         }
         "cat" => {
             if arg1.is_empty() {

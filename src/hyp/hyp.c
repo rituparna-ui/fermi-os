@@ -80,6 +80,14 @@ __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_dev
 __attribute__((section(".hyp_tables"))) static vcpu_t vcpus[NUM_VCPUS];
 __attribute__((section(".hyp_tables"))) static int current_vcpu;
 __attribute__((section(".hyp_tables"))) static uint64_t g_switch_count;
+
+/* Captured Linux-guest console. The Linux PL011 is left unmapped in its
+ * stage-2, so its UART MMIO traps to EL2 and is emulated (hyp_emulate_pl011);
+ * output bytes are appended here and read back by Fermi via /proc. Linear
+ * capture (stops when full) — holds the boot log plus the first shell. */
+#define LCON_SZ (32 * 1024)
+__attribute__((section(".hyp_tables"))) static uint8_t g_lcon[LCON_SZ];
+__attribute__((section(".hyp_tables"))) static uint32_t g_lcon_len;
 /* CNTHP (EL2 physical timer) scheduling tick. */
 #define HYP_TIMER_INTID 26   /* PPI 26 = non-secure EL2 physical timer */
 #define HYP_QUANTUM_MS 100   /* preemption time-slice */
@@ -457,10 +465,11 @@ static void hyp_build_linux_stage2(void) {
         pa | S2_VALID | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
   }
 
-  /* PL011 UART: IPA 0x09000000 -> phys 0x09000000 (Device). */
-  uint64_t uart_idx = (0x09000000ULL % _1GB) / _2MB; /* = 72 */
-  lx_l2_dev[uart_idx] =
-      0x09000000ULL | S2_VALID | S2_AF | S2_AP_RW | S2_MEM_DEVICE;
+  /* NOTE: the PL011 UART (IPA 0x09000000) is deliberately NOT mapped here.
+   * Leaving it unmapped makes the guest's UART MMIO trap to EL2, where it is
+   * emulated and its output captured into g_lcon (see hyp_emulate_pl011),
+   * exposed to Fermi as /proc/linux_console — so the Linux console no longer
+   * interleaves with Fermi's on the shared serial. */
 
   __asm__ __volatile__("dsb ish");
 }
@@ -645,6 +654,20 @@ static void hyp_handle_hvc(el2_frame_t *f) {
   case HVC_VM_COUNT:
     ret = NUM_VCPUS;
     break;
+  case HVC_LCON_LEN:
+    ret = g_lcon_len;
+    break;
+  case HVC_LCON_GET: {
+    /* Return up to 8 console bytes starting at offset a1, packed little-endian
+     * (bytes past the end read as 0). */
+    ret = 0;
+    for (uint64_t k = 0; k < 8; k++) {
+      uint64_t idx = a1 + k;
+      if (idx < g_lcon_len)
+        ret |= (uint64_t)g_lcon[idx] << (k * 8);
+    }
+    break;
+  }
   case HVC_VM_STAT: {
     if (a1 >= NUM_VCPUS) {
       ret = (uint64_t)-1;
@@ -736,6 +759,42 @@ __attribute__((section(".hyp_tables"))) static struct {
   uint32_t gicr_ctlr;
 } g_vgic;
 
+/* Captured Linux-guest console (buffer declared with the other hypervisor
+ * globals near the top of this file). */
+
+#define PL011_LO 0x09000000ULL
+#define PL011_HI 0x09001000ULL
+
+/* Minimal emulated PL011 for the Linux guest. We only need: DR writes (capture
+ * output), a flag register that says "TX ready, RX empty", and the PrimeCell /
+ * peripheral ID registers so Linux's amba bus binds the pl011 driver (ttyAMA0).
+ * Input (RX) always reads empty — this console is output-only by design. */
+static int hyp_emulate_pl011(uint64_t ipa, int is_write, uint64_t *val) {
+  uint64_t off = ipa - PL011_LO;
+  if (is_write) {
+    if (off == 0x000) { /* DR: capture the byte */
+      if (g_lcon_len < LCON_SZ)
+        g_lcon[g_lcon_len++] = (uint8_t)*val;
+    }
+    /* all other registers (control, baud, IRQ mask, ...) accepted + ignored */
+    return 1;
+  }
+  switch (off) {
+  case 0x000: *val = 0; break;          /* DR: no input                      */
+  case 0x018: *val = 0x90; break;       /* FR: TXFE|RXFE (TX ready, RX empty) */
+  case 0xFE0: *val = 0x11; break;       /* PeriphID0                          */
+  case 0xFE4: *val = 0x10; break;       /* PeriphID1                          */
+  case 0xFE8: *val = 0x14; break;       /* PeriphID2 (=> id 0x..041011)       */
+  case 0xFEC: *val = 0x00; break;       /* PeriphID3                          */
+  case 0xFF0: *val = 0x0D; break;       /* PCellID0                           */
+  case 0xFF4: *val = 0xF0; break;       /* PCellID1                           */
+  case 0xFF8: *val = 0x05; break;       /* PCellID2                           */
+  case 0xFFC: *val = 0xB1; break;       /* PCellID3 (=> 0xB105F00D)           */
+  default: *val = 0; break;
+  }
+  return 1;
+}
+
 static int hyp_emulate_gic(uint64_t ipa, int is_write, uint64_t *val) {
   if (ipa >= GICD_LO && ipa < GICD_HI) {
     uint64_t off = ipa - GICD_LO;
@@ -807,9 +866,11 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
     return;
   }
 
-  /* Linux guest: emulate trapped GIC distributor/redistributor MMIO. */
+  /* Linux guest: emulate trapped GIC distributor/redistributor or PL011 MMIO. */
   if (current_vcpu == 1 &&
-      ((ipa >= GICD_LO && ipa < GICD_HI) || (ipa >= GICR_LO && ipa < GICR_HI))) {
+      ((ipa >= GICD_LO && ipa < GICD_HI) || (ipa >= GICR_LO && ipa < GICR_HI) ||
+       (ipa >= PL011_LO && ipa < PL011_HI))) {
+    int is_uart = (ipa >= PL011_LO && ipa < PL011_HI);
     vcpus[current_vcpu].mmio_emulated++;
     uint64_t isv = (esr >> 24) & 1;
     uint64_t sas = (esr >> 22) & 3;
@@ -819,9 +880,15 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
       uint64_t v = 0;
       if (wnr) {
         v = (srt == 31) ? 0 : frame->x[srt];
-        hyp_emulate_gic(ipa, 1, &v);
+        if (is_uart)
+          hyp_emulate_pl011(ipa, 1, &v);
+        else
+          hyp_emulate_gic(ipa, 1, &v);
       } else {
-        hyp_emulate_gic(ipa, 0, &v);
+        if (is_uart)
+          hyp_emulate_pl011(ipa, 0, &v);
+        else
+          hyp_emulate_gic(ipa, 0, &v);
         if (sas == 0)
           v &= 0xFF;
         else if (sas == 1)

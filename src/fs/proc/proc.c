@@ -249,6 +249,29 @@ static int read_vms(struct vnode *n, file_t *f, void *buf, size_t count) {
   return proc_read_via(gen_vms, f, buf, count);
 }
 
+/* /proc/linux_console — stream the Linux guest's captured console output from
+ * the hypervisor (via HVC_LCON_*). Unlike the other generators this is not
+ * capped at PROC_BUF_BYTES: it serves the whole buffer across successive
+ * reads using f->offset, so `cat` shows the full captured log. */
+static int read_linux_console(struct vnode *n, file_t *f, void *buf,
+                              size_t count) {
+  (void)n;
+  uint64_t len = hvc_call(HVC_LCON_LEN, 0, 0, 0);
+  if ((uint64_t)f->offset >= len)
+    return 0; /* EOF */
+  size_t remaining = (size_t)(len - (uint64_t)f->offset);
+  size_t to_copy = (count < remaining) ? count : remaining;
+  char *out = (char *)buf;
+  size_t done = 0;
+  while (done < to_copy) {
+    uint64_t packed = hvc_call(HVC_LCON_GET, (uint64_t)f->offset + done, 0, 0);
+    for (int k = 0; k < 8 && done < to_copy; k++, done++)
+      out[done] = (char)((packed >> (k * 8)) & 0xFF);
+  }
+  f->offset += to_copy;
+  return (int)to_copy;
+}
+
 static file_operations_t uptime_ops  = {.read = read_uptime,  .write = 0};
 static file_operations_t meminfo_ops = {.read = read_meminfo, .write = 0};
 static file_operations_t tasks_ops   = {.read = read_tasks,   .write = 0};
@@ -265,6 +288,7 @@ static file_operations_t cpuinfo_ops = {.read = read_cpuinfo, .write = 0};
 
 static file_operations_t version_ops = {.read = read_version, .write = 0};
 static file_operations_t vms_ops = {.read = read_vms, .write = 0};
+static file_operations_t linux_console_ops = {.read = read_linux_console, .write = 0};
 
 /* ------------------------------------------------------------------ */
 /* Init                                                                */
@@ -303,6 +327,7 @@ void proc_init(void) {
   
   register_file(proc, "version", &version_ops);
   register_file(proc, "vms",     &vms_ops);
+  register_file(proc, "linux_console", &linux_console_ops);
 
   uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, interrupts, netinfo, cmdline, version, balloon, cpuinfo, vms");
 }

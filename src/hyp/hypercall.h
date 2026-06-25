@@ -24,6 +24,8 @@
 #define HVC_HYP_BASE 5 /* () -> base IPA of the hypervisor-private region     */
 #define HVC_VM_COUNT 6 /* () -> number of vCPUs                                */
 #define HVC_VM_STAT 7  /* (id in x1, field in x2) -> stat value, or -1         */
+#define HVC_LCON_LEN 8 /* () -> bytes captured in the Linux console buffer     */
+#define HVC_LCON_GET 9 /* (offset in x1) -> up to 8 console bytes, packed LE   */
 
 /* Field selectors for HVC_VM_STAT. */
 #define VMSTAT_ID 0

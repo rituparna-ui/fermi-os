@@ -57,10 +57,11 @@ phys 0x240000000 .. 0x280000000  (9..10 GiB)  Linux guest's RAM (1 GiB)
   - The **Linux guest's 1 GiB window** is unmapped (its whole 1 GiB stage-2
     block is cleared), so Fermi cannot see or corrupt Linux's memory.
 - **Linux (vCPU 1)** gets a tiny stage-2 mapping **only** its own 1 GiB window
-  (guest IPA `0x40000000` → phys `0x240000000`, Normal) plus the PL011 UART
-  (IPA `0x09000000`, Device). Every other IPA is unmapped, sandboxing it. The
-  GIC region is deliberately left unmapped so Linux's GIC MMIO traps to EL2 for
-  emulation (§7).
+  (guest IPA `0x40000000` → phys `0x240000000`, Normal). Every other IPA is
+  unmapped, sandboxing it. The GIC region **and the PL011 UART** are left
+  unmapped so that the guest's GIC MMIO and console writes trap to EL2 for
+  emulation (§6, §7). Linux's console output is captured into a hypervisor
+  buffer rather than written to the shared serial (§10).
 
 The result is **bidirectional isolation**: neither guest can reach the other's
 RAM, and neither can reach the hypervisor's.
@@ -180,6 +181,11 @@ own registers and needs no context switch.
   (`PIDR2` ⇒ v3, `TYPER`, redistributor `WAKER` handshake / `Last` bit) and
   accepts the configuration writes. The data-abort ISS gives access size,
   direction, and register, so the load/store is emulated and `ELR_EL2` stepped.
+- **Emulated PL011 UART**: the Linux guest's UART is likewise unmapped and
+  emulated. DR writes are captured into a hypervisor ring buffer; the flag
+  register reports "TX ready, RX empty" and the PrimeCell/peripheral ID
+  registers are emulated so Linux's amba bus binds the pl011 driver (ttyAMA0).
+  The console is output-only by design (RX always empty); see §10.
 
 ---
 
@@ -236,6 +242,11 @@ VCPU NAME   STATE    HVC    SYSREG ABORT VIRQ   MMIO
 Fermi shows timer vIRQs and no MMIO (it drives the physical GIC directly); Linux
 shows PSCI hypercalls, virtual-timer vIRQs, and emulated GIC MMIO accesses.
 
+**`cat /proc/linux_console`** dumps the Linux guest's captured console output
+(its PL011 is emulated, so its output goes to a hypervisor buffer instead of the
+shared serial). This keeps Fermi's serial clean and interactive while still
+exposing Linux's full boot log and shell output on demand.
+
 ---
 
 ## 11. Reproducing
@@ -257,6 +268,9 @@ BusyBox shell interleaved on the same serial console.
 - The emulated GICv3 covers what Linux's boot path needs (PPIs via injection +
   distributor/redistributor identity reads); SPI routing for emulated devices is
   not modelled.
-- The Linux guest uses the real PL011 (shared with Fermi, so console output
-  interleaves) and has no virtio devices yet.
+- The Linux guest's PL011 is emulated and its output is captured to a
+  hypervisor buffer exposed as `/proc/linux_console` (output-only — RX reads
+  empty, so the Linux shell cannot currently be typed into). This keeps the
+  shared serial clean for Fermi; a truly separate *interactive* console would
+  need a second UART, which QEMU `virt` does not provide.
 - Requires an SCS-free guest kernel (see §9).

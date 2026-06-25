@@ -5,6 +5,7 @@
 use crate::kprintln;
 use crate::mm::mmu::KERNEL_VA_OFFSET;
 use crate::sched::{self, Task, TASK_READY, TASK_RUNNING};
+use crate::sync::SpinLock;
 use crate::{mrs, msr};
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +30,110 @@ static SECONDARY_BEATS: AtomicU64 = AtomicU64::new(0);
 static C1_A_BEATS: AtomicU64 = AtomicU64::new(0);
 static C1_B_BEATS: AtomicU64 = AtomicU64::new(0);
 static C1_TICKS: AtomicU64 = AtomicU64::new(0);
+
+// --- Shared SpinLock-protected work queue drained by BOTH cores ---
+const WQ_CAP: usize = 8192;
+struct WorkQ {
+    buf: [u32; WQ_CAP],
+    head: usize,
+    tail: usize,
+    len: usize,
+    enqueued: u64,
+}
+static WORKQ: SpinLock<WorkQ> = SpinLock::new(WorkQ {
+    buf: [0; WQ_CAP],
+    head: 0,
+    tail: 0,
+    len: 0,
+    enqueued: 0,
+});
+static C0_CNT: AtomicU64 = AtomicU64::new(0);
+static C0_SUM: AtomicU64 = AtomicU64::new(0);
+static C1_CNT: AtomicU64 = AtomicU64::new(0);
+static C1_SUM: AtomicU64 = AtomicU64::new(0);
+
+fn wq_enqueue(id: u32) -> bool {
+    let mut q = WORKQ.lock_irqsave();
+    if q.len == WQ_CAP {
+        return false;
+    }
+    let t = q.tail;
+    q.buf[t] = id;
+    q.tail = (t + 1) % WQ_CAP;
+    q.len += 1;
+    q.enqueued += 1;
+    true
+}
+fn wq_pop() -> Option<u32> {
+    let mut q = WORKQ.lock_irqsave();
+    if q.len == 0 {
+        return None;
+    }
+    let h = q.head;
+    let v = q.buf[h];
+    q.head = (h + 1) % WQ_CAP;
+    q.len -= 1;
+    Some(v)
+}
+
+/// Seed N jobs (ids 0..N). MUST be called single-threaded (before SMP bringup).
+pub fn wq_seed(n: u32) {
+    for i in 0..n {
+        wq_enqueue(i);
+    }
+}
+
+/// Process one job, attributing it to the calling core. Returns true if work
+/// was done. The SpinLock guarantees each job is dequeued by exactly one core.
+fn wq_consume(core0: bool) -> bool {
+    if let Some(id) = wq_pop() {
+        // Simulate per-job work OUTSIDE the lock so the two cores execute jobs
+        // genuinely in parallel (the lock only guards the brief dequeue).
+        let mut acc = id as u64;
+        for _ in 0..60_000u64 {
+            acc = acc.wrapping_add(1);
+            core::hint::spin_loop();
+        }
+        core::hint::black_box(acc);
+        if core0 {
+            C0_CNT.fetch_add(1, Ordering::Relaxed);
+            C0_SUM.fetch_add(id as u64, Ordering::Relaxed);
+        } else {
+            C1_CNT.fetch_add(1, Ordering::Relaxed);
+            C1_SUM.fetch_add(id as u64, Ordering::Relaxed);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Core 0 worker (a normal scheduled kernel task): drain the shared queue.
+pub extern "C" fn smp_core0_worker() {
+    loop {
+        let mut did = 0u32;
+        while wq_consume(true) {
+            did += 1;
+            if did > 64 {
+                break; // yield periodically so other core-0 tasks run
+            }
+        }
+        sched::sleep_ms(2);
+    }
+}
+
+/// (c0_cnt, c1_cnt, c0_sum, c1_sum, enqueued, remaining)
+pub fn wq_stats() -> (u64, u64, u64, u64, u64, usize) {
+    let q = WORKQ.lock_irqsave();
+    (
+        C0_CNT.load(Ordering::Relaxed),
+        C1_CNT.load(Ordering::Relaxed),
+        C0_SUM.load(Ordering::Relaxed),
+        C1_SUM.load(Ordering::Relaxed),
+        q.enqueued,
+        q.len,
+    )
+}
 // Core-1's "current task" pointer (only core 1 touches this).
 static mut C1_CUR: u64 = 0;
 
@@ -60,16 +165,23 @@ fn c1_schedule() {
 // Core-1 tasks are pure CPU loops with NO cooperative yield: only the
 // per-core timer interrupt rotates them. If both counters advance, the
 // secondary core is genuinely preempting.
+// Core-1's two preemptive tasks are now work-queue consumers: each pops jobs
+// from the shared SpinLock queue (attributing to core 1) and is preempted by
+// core 1's timer between iterations.
 extern "C" fn c1_task_a() {
     loop {
         C1_A_BEATS.fetch_add(1, Ordering::Relaxed);
-        for _ in 0..400_000u64 { core::hint::spin_loop(); }
+        if !wq_consume(false) {
+            for _ in 0..200_000u64 { core::hint::spin_loop(); }
+        }
     }
 }
 extern "C" fn c1_task_b() {
     loop {
         C1_B_BEATS.fetch_add(1, Ordering::Relaxed);
-        for _ in 0..400_000u64 { core::hint::spin_loop(); }
+        if !wq_consume(false) {
+            for _ in 0..200_000u64 { core::hint::spin_loop(); }
+        }
     }
 }
 

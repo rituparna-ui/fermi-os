@@ -67,6 +67,50 @@ impl<T> SpinLock<T> {
         }
         SpinGuard { lock: self }
     }
+
+    /// Lock while masking IRQs on the local core. Prevents same-core deadlock
+    /// where an interrupt (and preemption) occurs while the lock is held and
+    /// the preempting task tries to take the same lock. Safe across cores
+    /// (the other core simply spins on `locked`). The previous DAIF state is
+    /// restored when the guard drops.
+    pub fn lock_irqsave(&self) -> SpinGuardIrq<'_, T> {
+        let daif: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
+            core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+        }
+        while self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        SpinGuardIrq { lock: self, daif }
+    }
+}
+
+pub struct SpinGuardIrq<'a, T> {
+    lock: &'a SpinLock<T>,
+    daif: u64,
+}
+
+impl<'a, T> Deref for SpinGuardIrq<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+impl<'a, T> DerefMut for SpinGuardIrq<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+impl<'a, T> Drop for SpinGuardIrq<'a, T> {
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+        unsafe { core::arch::asm!("msr daif, {}", in(reg) self.daif, options(nomem, nostack)) };
+    }
 }
 
 impl<'a, T> Deref for SpinGuard<'a, T> {

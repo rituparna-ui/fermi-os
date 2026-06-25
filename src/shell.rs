@@ -146,6 +146,16 @@ fn dispatch(line: &str) {
             }
         }
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
+        "smptest" => {
+            let (c0, c1, s0, s1, enq, rem) = crate::smp::wq_stats();
+            let expect = if enq > 0 { enq * (enq - 1) / 2 } else { 0 };
+            kprintln!("shared work queue: {} enqueued, {} remaining", enq, rem);
+            kprintln!("  core0 processed: {} jobs (sum {})", c0, s0);
+            kprintln!("  core1 processed: {} jobs (sum {})", c1, s1);
+            kprintln!("  total {} jobs, checksum {} (expected {}) -> {}",
+                      c0 + c1, s0 + s1, expect,
+                      if c0 + c1 == enq && s0 + s1 == expect { "OK (no loss/dup)" } else { "MISMATCH" });
+        }
         "ps" => kprint!("{}", sched::render_tasks()),
         "free" | "meminfo" => cmd_free(),
         "ifconfig" => kprint!("{}", net::render_info()),

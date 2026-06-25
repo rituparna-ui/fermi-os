@@ -53,4 +53,9 @@ void hyp_dispatch(uint64_t type, hyp_trap_frame_t *frame);
 /* The dedicated EL2 vector table (defined in hyp_vectors.S). */
 extern char hyp_vector_table[];
 
+/* Milestone 3 smoke test: build a stage-2, load the trivial EL1 guest stub,
+ * world-switch into it, and verify the HVC exit + guest RAM write. No-op at
+ * EL1. Must run before the host timer is started (it uses no preemption). */
+void hyp_run_smoke_guest(void);
+
 #endif /* HYP_HYP_H */

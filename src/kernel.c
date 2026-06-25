@@ -828,6 +828,10 @@ void kernel_main() {
   sched_create_task("task_crash", task_crash);
   sched_create_kernel_task("netd", netd);
 
+  /* Milestone 3: run the trivial EL1 guest smoke test BEFORE the timer starts,
+   * so no preemption/IRQ-routing is involved (the guest exits via HVC). */
+  hyp_run_smoke_guest();
+
   timer_init();
   timer_start(TIMER_INTERVAL_MS);
 

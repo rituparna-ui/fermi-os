@@ -2,6 +2,11 @@
 
 Fermi OS is a bare-metal `aarch64 (ARMv8-A)` kernel built from scratch in `C` and assembly, targeting QEMU's `virt` machine with a Cortex-A72 processor.
 
+> **EL2 hypervisor:** this tree also contains a minimal type-1 hypervisor
+> (`src/hyp/`) that runs FermiOS — unmodified — as an EL1/EL0 guest, with
+> stage-2 translation, a virtual GICv3, a virtual timer, and multi-VM
+> round-robin scheduling. `make run` boots the hypervisor, which boots FermiOS
+> as its guest. See [`src/hyp/README.md`](src/hyp/README.md).
 
 ---
 

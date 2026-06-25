@@ -277,6 +277,26 @@ fn dispatch(line: &str) {
         "free" | "meminfo" => cmd_free(),
         "memtest" => cmd_memtest(parse_u64(arg1).unwrap_or(64).clamp(1, 512)),
         "ifconfig" => kprint!("{}", net::render_info()),
+        "arp" => {
+            if arg1.is_empty() {
+                kprint!("{}", net::render_arp());
+            } else {
+                let mut ip = [0u8; 4];
+                let mut ok = true;
+                for (i, part) in arg1.split('.').enumerate() {
+                    if i >= 4 { ok = false; break; }
+                    match parse_u64(part) { Some(v) if v <= 255 => ip[i] = v as u8, _ => { ok = false; } }
+                }
+                if !ok {
+                    kprintln!("usage: arp [a.b.c.d]");
+                } else if let Some(m) = net::arp_resolve(&ip) {
+                    kprintln!("{}.{}.{}.{} is {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                              ip[0],ip[1],ip[2],ip[3], m[0],m[1],m[2],m[3],m[4],m[5]);
+                } else {
+                    kprintln!("arp: no reply for {}.{}.{}.{}", ip[0],ip[1],ip[2],ip[3]);
+                }
+            }
+        }
         "irqs" => kprint!("{}", gic::render_interrupts()),
         "write" => {
             let rest: Vec<&str> = line.splitn(3, ' ').collect();

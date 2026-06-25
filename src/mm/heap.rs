@@ -221,7 +221,7 @@ pub fn kfree(ptr: usize) {
         return;
     }
     let block = ptr - BLOCK_HEADER_SIZE;
-    let mut h = HEAP.lock();
+    let h = HEAP.lock();
 
     if !h.addr_in_any_region(block) {
         uart::errorln("[HEAP] kfree: pointer outside heap regions!");

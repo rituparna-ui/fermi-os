@@ -1,5 +1,11 @@
 #![no_std]
 #![no_main]
+// The kernel exposes a deliberately complete, ported API surface (driver
+// register maps, stats getters, string helpers) that isn't all wired to a
+// caller yet, and the msr!/mrs! macros wrap asm in unsafe which the compiler
+// flags as redundant inside larger unsafe blocks. Allow both crate-wide.
+#![allow(dead_code)]
+#![allow(unused_unsafe)]
 //! Fermi OS — a bare-metal aarch64 (ARMv8-A) kernel, pure Rust + assembly.
 //!
 //! This is a progressive port of the original C+asm Fermi OS, built up in the
@@ -59,13 +65,6 @@ extern "C" fn netd() {
             kprintln!("[netd] ping seq={} no reply", seq);
         }
         seq = seq.wrapping_add(1);
-    }
-}
-
-extern "C" fn task_b() {
-    for i in 0..4 {
-        kprintln!("    [task_b] iteration {}", i);
-        sched::sleep_ms(500);
     }
 }
 

@@ -212,6 +212,22 @@ fn cmd_memtest(kb: u64) {
         before, during, after
     );
 }
+fn cmd_sysinfo() {
+    kprintln!("   ___ Fermi OS (Rust) ___");
+    kprintln!("  OS      : Fermi OS — bare-metal aarch64, pure Rust + asm");
+    kprintln!("  uptime  : {} s", timer::uptime_seconds());
+    kprintln!("  EL      : {} | timer {} Hz", crate::cpu::current_el(), timer::get_frequency());
+    let total = pmm::total_pages();
+    let used = pmm::used_pages();
+    kprintln!("  memory  : {} / {} MiB pages used, heap {} KiB free",
+              used * 4 / 1024, total * 4 / 1024, heap::free_bytes() / 1024);
+    let nd = net::render_info();
+    for line in nd.lines().take(3) {
+        kprintln!("  net     : {}", line);
+    }
+    kprintln!("  tasks   :");
+    kprint!("{}", sched::render_tasks());
+}
 
 fn dispatch(line: &str) {
     let mut parts = line.split_whitespace();
@@ -255,6 +271,7 @@ fn dispatch(line: &str) {
                       c0 + c1, s0 + s1, expect,
                       if c0 + c1 == enq && s0 + s1 == expect { "OK (no loss/dup)" } else { "MISMATCH" });
         }
+        "sysinfo" => cmd_sysinfo(),
         "ps" => kprint!("{}", sched::render_tasks()),
         "top" => cmd_top(),
         "free" | "meminfo" => cmd_free(),

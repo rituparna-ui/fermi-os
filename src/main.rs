@@ -201,10 +201,12 @@ pub extern "C" fn kmain() -> ! {
         fs::vfs::fd_table_destroy(t);
     }
 
-    // Scheduler + an EL0 user task and an EL1 kernel task.
+    // Scheduler + tasks: the interactive EL0 shell, a deliberate-crash task to
+    // exercise kill-on-fault, and the netd EL1 background pinger.
     sched::init();
-    sched::create_task("task_user", user::task_user);
-    sched::create_kernel_task("task_k", task_k);
+    sched::create_task("task_shell", user::task_shell);
+    sched::create_task("task_crash", user::task_crash);
+    sched::create_kernel_task("netd", netd);
 
     // Start the periodic timer: from here, timer IRQs drive preemption.
     exception::timer::init();
@@ -217,12 +219,32 @@ pub extern "C" fn kmain() -> ! {
     }
 }
 
-/// Demo EL1 kernel task: prints periodically forever (preempted by the timer).
-extern "C" fn task_k() {
+/// netd: an EL1 kernel daemon that periodically pings the slirp gateway and
+/// drains incoming RX. Runs at EL1 so it calls the net driver directly.
+extern "C" fn netd() {
+    kprintln!("[netd] starting (kernel-mode background pinger)");
+    let mut seq: u16 = 2; // seq 1 was sent during net::init
     loop {
-        kprintln!("[Task K] (kernel) running");
-        for _ in 0..2_000_000 {
-            core::hint::spin_loop();
+        sched::sleep_ms(5000);
+
+        // Drain anything that arrived while we slept.
+        let mut buf = [0u8; 256];
+        let mut drained = 0;
+        while drivers::virtio::net::rx_poll(&mut buf) > 0 {
+            drained += 1;
         }
+        if drained > 0 {
+            kprintln!("[netd] drained {} async frames before ping", drained);
+        }
+
+        let t0 = exception::timer::get_ticks();
+        let ttl = drivers::virtio::net::send_ping(seq);
+        if ttl >= 0 {
+            let t1 = exception::timer::get_ticks();
+            kprintln!("[netd] ping seq={} reply ttl={} in {} ticks", seq, ttl, t1 - t0);
+        } else {
+            kprintln!("[netd] ping seq={} — no reply", seq);
+        }
+        seq = seq.wrapping_add(1);
     }
 }

@@ -20,7 +20,7 @@ C_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.c" -p
 
 # The HYPERVISOR image sources (EL2). Exclude the standalone guest subdirs —
 # those are built separately to flat blobs, not linked into the hyp.
-HYP_GUEST_DIRS := $(HYP_DIR)/guest2 $(HYP_DIR)/ipc $(HYP_DIR)/dom0 $(HYP_DIR)/vmtgt $(HYP_DIR)/crasher $(HYP_DIR)/hangguest $(HYP_DIR)/rngclient $(HYP_DIR)/blkclient $(HYP_DIR)/netclient
+HYP_GUEST_DIRS := $(HYP_DIR)/guest2 $(HYP_DIR)/ipc $(HYP_DIR)/dom0 $(HYP_DIR)/vmtgt $(HYP_DIR)/crasher $(HYP_DIR)/hangguest $(HYP_DIR)/rngclient $(HYP_DIR)/blkclient $(HYP_DIR)/netclient $(HYP_DIR)/pciclient
 HYP_PRUNE := $(foreach d,$(HYP_GUEST_DIRS),-path "$(d)" -o)
 HYP_S_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.S" -print)
 HYP_C_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.c" -print)
@@ -233,6 +233,18 @@ $(NET_BIN): $(HYP_DIR)/netclient/netclient.S $(HYP_DIR)/netclient/linker_net.ld
 	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/netclient.elf $@
 
 $(BUILD_DIR)/hyp/netclient_blob.o: $(NET_BIN)
+
+# pciclient: enumerates the emulated virtual PCI bus over ECAM.
+PCI_BIN := $(BUILD_DIR)/pciclient.bin
+$(PCI_BIN): $(HYP_DIR)/pciclient/pciclient.S $(HYP_DIR)/pciclient/linker_pci.ld
+	@echo "PCICLIENT $@"
+	@mkdir -p $(dir $@)
+	@$(CC) -ffreestanding -nostdlib -nostartfiles -fno-pic \
+		-Wl,-T,$(HYP_DIR)/pciclient/linker_pci.ld -Wl,--build-id=none \
+		-o $(BUILD_DIR)/pciclient.elf $(HYP_DIR)/pciclient/pciclient.S
+	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/pciclient.elf $@
+
+$(BUILD_DIR)/hyp/pciclient_blob.o: $(PCI_BIN)
 
 # Hypervisor (EL2) — separate image, its own linker script.
 $(HYP_TARGET): $(HYP_OBJECTS)

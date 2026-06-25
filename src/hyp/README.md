@@ -278,6 +278,21 @@ it back. The `netclient/` guest posts an RX buffer, transmits a tagged frame,
 and verifies the looped-back tag each iteration. Three virtio devices
 (entropy + block + net) now coexist on the shared transport.
 
+### Virtual PCI bus (vPCI / ECAM)
+
+A minimal virtual PCI host bridge (`vpci/vpci.c`) emulated via stage-2 traps on
+a small ECAM window (`0x0A003000`, covering bus 0 / slot 0 / func 0). A guest
+enumerates the bus the standard way and configures the one device it finds —
+proving config-space access and BAR sizing, not just fixed MMIO. The emulated
+endpoint is a "fermi demo" device (vendor `0x1234`, device `0xBEEF`) with a
+single 64 KiB 32-bit memory BAR. The classic **BAR-sizing probe** works: the
+guest writes `0xFFFFFFFF` to BAR0 and reads back the size mask
+(`~(size-1) | type`), then programs a real base which the device latches; the
+Command register enables Memory Space + Bus Master. Config reads honour
+byte/halfword/word widths via sub-word masking. The `pciclient/` guest runs the
+full flow (scan → size → assign → enable) and prints the result. This is the
+PCI-discovery counterpart to the fixed-window virtio-mmio devices.
+
 ### Paravirtualized console (PV log)
 
 A guest can emit a log line through the hypervisor instead of poking the raw

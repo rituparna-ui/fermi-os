@@ -15,8 +15,23 @@ use crate::uart;
 use crate::virtio;
 use alloc::string::String;
 use alloc::vec::Vec;
+use crate::sync::Racy;
+
+static HISTORY: Racy<Vec<String>> = Racy::new(Vec::new());
+const HISTORY_MAX: usize = 16;
+
+fn redraw(cur_len: usize, new: &[u8]) {
+    for _ in 0..cur_len {
+        uart::puts("\x08 \x08");
+    }
+    for &c in new {
+        uart::putc(c);
+    }
+}
 
 fn read_line(buf: &mut [u8]) -> usize {
+    let hist = unsafe { HISTORY.get() };
+    let mut hidx = hist.len();
     let mut len = 0;
     loop {
         let c = uart::getc();
@@ -28,17 +43,53 @@ fn read_line(buf: &mut [u8]) -> usize {
             0x7f | 0x08 => {
                 if len > 0 {
                     len -= 1;
-                    uart::puts("\x08 \x08"); // erase
+                    uart::puts("\x08 \x08");
+                }
+            }
+            0x1b => {
+                // ESC [ A/B — history up/down.
+                if uart::getc() == b'[' {
+                    let d = uart::getc();
+                    let recalled: &[u8] = if d == b'A' {
+                        if hidx > 0 { hidx -= 1; }
+                        if hidx < hist.len() { hist[hidx].as_bytes() } else { b"" }
+                    } else if d == b'B' {
+                        if hidx < hist.len() { hidx += 1; }
+                        if hidx < hist.len() { hist[hidx].as_bytes() } else { b"" }
+                    } else {
+                        b""
+                    };
+                    if d == b'A' || d == b'B' {
+                        let n = core::cmp::min(recalled.len(), buf.len() - 1);
+                        redraw(len, &recalled[..n]);
+                        buf[..n].copy_from_slice(&recalled[..n]);
+                        len = n;
+                    }
                 }
             }
             _ => {
                 if len < buf.len() - 1 {
                     buf[len] = c;
                     len += 1;
-                    uart::putc(c); // echo
+                    uart::putc(c);
                 }
             }
         }
+    }
+}
+
+/// Append a command to the history ring.
+fn history_push(line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    let h = unsafe { HISTORY.get() };
+    if h.last().map(|s| s.as_str()) == Some(line) {
+        return; // skip consecutive duplicate
+    }
+    h.push(String::from(line));
+    if h.len() > HISTORY_MAX {
+        h.remove(0);
     }
 }
 
@@ -260,6 +311,12 @@ fn dispatch(line: &str) {
             }
         }
         "date" => kprintln!("{}", crate::rtc::format_now()),
+        "history" => {
+            let h = unsafe { HISTORY.get() };
+            for (i, c) in h.iter().enumerate() {
+                kprintln!("{:>3}  {}", i, c);
+            }
+        }
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
         "smptest" => {
             let (c0, c1, s0, s1, enq, rem) = crate::smp::wq_stats();
@@ -473,7 +530,8 @@ pub extern "C" fn shell_task() {
             continue;
         }
         let s = core::str::from_utf8(&line[..n]).unwrap_or("");
-        let _ = String::from(s); // ensure UTF-8 path
-        dispatch(s.trim());
+        let trimmed = s.trim();
+        history_push(trimmed);
+        dispatch(trimmed);
     }
 }

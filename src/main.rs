@@ -18,11 +18,13 @@ mod exception;
 mod mm;
 mod mmio;
 mod panic;
+mod pci;
 mod print;
 mod sched;
 mod strings;
 mod syscall;
 mod sync;
+mod virtio;
 mod uart;
 
 /// Timer-tick hook to wake sleeping tasks.
@@ -101,6 +103,15 @@ pub extern "C" fn kernel_main() -> ! {
     // GICv3 + generic timer (10ms tick). Enables IRQs.
     exception::gic::init();
     exception::timer::init();
+
+    // PCI enumeration + VirtIO RNG.
+    pci::enumerate_bus();
+    virtio::rng::init();
+    {
+        let mut buf = [0u8; 16];
+        let n = virtio::rng::read(&mut buf);
+        kprintln!("[boot] rng_read {} bytes: {:02x?}", n, &buf[..]);
+    }
 
     // Scheduler + a couple of preemptive EL1 demo tasks.
     sched::init();

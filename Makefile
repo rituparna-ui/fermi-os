@@ -9,11 +9,18 @@ LD := $(CROSS_COMPILE)ld
 SRC_DIR := src
 BUILD_DIR := build
 USER_DIR  := user
-TARGET := $(BUILD_DIR)/kernel.elf
+HYP_DIR   := $(SRC_DIR)/hyp
+TARGET := $(BUILD_DIR)/kernel.elf       # the GUEST (FermiOS, runs at EL1/EL0)
+HYP_TARGET := $(BUILD_DIR)/hyp.elf       # the HYPERVISOR (runs at EL2)
 
-# File discovery - find all .c and .S files in src
-S_SOURCES := $(shell find $(SRC_DIR) -name "*.S")
-C_SOURCES := $(shell find $(SRC_DIR) -name "*.c")
+# File discovery — the GUEST is every .c/.S under src EXCEPT src/hyp (the
+# hypervisor is a separate image and must never be linked into the guest).
+S_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.S" -print)
+C_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.c" -print)
+
+# The HYPERVISOR image sources (EL2).
+HYP_S_SOURCES := $(shell find $(HYP_DIR) -name "*.S")
+HYP_C_SOURCES := $(shell find $(HYP_DIR) -name "*.c")
 
 # Object File Mapping
 # src/boot.S      -> build/boot.o
@@ -21,7 +28,13 @@ C_SOURCES := $(shell find $(SRC_DIR) -name "*.c")
 S_OBJECTS := $(patsubst $(SRC_DIR)/%.S, $(BUILD_DIR)/%.o, $(S_SOURCES))
 C_OBJECTS := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(C_SOURCES))
 OBJECTS := $(S_OBJECTS) $(C_OBJECTS)
-DEPS    := $(OBJECTS:.o=.d)
+
+# Hypervisor objects land under build/hyp/ (mirrors src/hyp/).
+HYP_S_OBJECTS := $(patsubst $(SRC_DIR)/%.S, $(BUILD_DIR)/%.o, $(HYP_S_SOURCES))
+HYP_C_OBJECTS := $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(HYP_C_SOURCES))
+HYP_OBJECTS := $(HYP_S_OBJECTS) $(HYP_C_OBJECTS)
+
+DEPS    := $(OBJECTS:.o=.d) $(HYP_OBJECTS:.o=.d)
 
 # User-space binaries packaged onto the FAT32 disk and exec()'d at runtime.
 # Each user/<name>.S compiles into user/<name>.elf (linked at USER_TEXT_BASE
@@ -46,12 +59,21 @@ CFLAGS := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 -mstrict-a
 ASFLAGS := -g -MMD -MP
 LDFLAGS := -nostdlib -g -T linker.ld
 
+# Hypervisor image: same freestanding flags, its own include dir + linker script.
+HYP_CFLAGS  := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 \
+               -mstrict-align -fno-pic -MMD -MP -I $(HYP_DIR)
+HYP_LDFLAGS := -nostdlib -g -T $(HYP_DIR)/linker_hyp.ld
+
 # QEMU Config
 DISK_IMG := $(BUILD_DIR)/disk.img
 DISK_SIZE := 1G
 
-QEMU_CPU := cortex-a72
-QEMU_MACHINE := virt,gic-version=3 -m 8G
+# EL2 hypervisor mode: '-cpu max' implements FEAT_VHE, stage-2, GICv3 virt and
+# CNTVOFF; 'virtualization=on' makes QEMU '-kernel' enter at EL2. RAM is 9 GiB so
+# the hyp image at PA 0x250000000 lives ABOVE the guest's 8 GiB (0x40000000..
+# 0x240000000) — no hyp/guest collision even with stage-2 off.
+QEMU_CPU := max
+QEMU_MACHINE := virt,gic-version=3,virtualization=on -m 9G
 QEMU_DEVICES := -netdev user,id=n0 \
 	-device virtio-net-pci,netdev=n0,disable-legacy=on \
 	-device virtio-rng-pci,disable-legacy=on \
@@ -61,25 +83,46 @@ QEMU_DEVICES := -netdev user,id=n0 \
 	-device virtio-serial-pci,disable-legacy=on \
 	-device virtconsole,chardev=vc \
 	-device virtio-balloon-pci,disable-legacy=on
-# QEMU_MACHINE := virt,gic-version=3,virtualization=on -m 8G
-# QEMU_MACHINE := virt,gic-version=3,virtualization=on,secure=on -m 8G
 QEMU_BASE := qemu-system-aarch64 -machine $(QEMU_MACHINE) -nographic -cpu $(QEMU_CPU) $(QEMU_DEVICES)
 
-QEMU_FLAGS_RUN   := -kernel $(TARGET)
-QEMU_FLAGS_DEBUG := -kernel $(TARGET) -s -S
+# '-kernel' loads the HYPERVISOR (entered at EL2). The GUEST FermiOS ELF is
+# placed by '-device loader' at its physical link addresses (0x40000000+); the
+# hyp's eret lands on the guest _start there. QEMU honours the ELF's own
+# PhysAddr fields for a loader ELF.
+GUEST_LOADER := -device loader,file=$(TARGET),force-raw=off
+QEMU_FLAGS_RUN   := -kernel $(HYP_TARGET) $(GUEST_LOADER)
+QEMU_FLAGS_DEBUG := -kernel $(HYP_TARGET) $(GUEST_LOADER) -s -S
 
 .PHONY: all run debug clean gdb tmux disk dump_dts compile_commands.json
 
 
-all: $(TARGET)
+all: $(TARGET) $(HYP_TARGET)
 
-# TARGET depends on all .o files
+# Guest (FermiOS, EL1/EL0) — links all non-hyp .o files.
 $(TARGET): $(OBJECTS)
 	@echo "LD  $@"
 	@mkdir -p $(dir $@)
 	@$(LD) $(LDFLAGS) -o $@ $^
 
-# Compile all .c files
+# Hypervisor (EL2) — separate image, its own linker script.
+$(HYP_TARGET): $(HYP_OBJECTS)
+	@echo "LD  $@ (hypervisor, EL2)"
+	@mkdir -p $(dir $@)
+	@$(LD) $(HYP_LDFLAGS) -o $@ $^
+
+# Hypervisor objects (compiled with HYP_CFLAGS). Listed BEFORE the generic
+# src rules so make prefers these more-specific patterns for src/hyp/*.
+$(BUILD_DIR)/hyp/%.o: $(SRC_DIR)/hyp/%.c
+	@echo "CC $< (hyp)"
+	@mkdir -p $(dir $@)
+	@$(CC) $(HYP_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/hyp/%.o: $(SRC_DIR)/hyp/%.S
+	@echo "AS  $< (hyp)"
+	@mkdir -p $(dir $@)
+	@$(CC) $(HYP_CFLAGS) -x assembler-with-cpp -c $< -o $@
+
+# Compile all guest .c files
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
 	@echo "CC $<"
 	@mkdir -p $(dir $@)

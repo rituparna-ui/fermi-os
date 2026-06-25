@@ -29,6 +29,7 @@ mod net;
 mod panic;
 mod pci;
 mod print;
+mod rtc;
 mod sched;
 mod shell;
 mod strings;

@@ -97,6 +97,7 @@ timer `CNTHP` (PPI 26) instead.
 | M17 | Unified **HVC hypercall ABI** (`hvc/`): SMCCC-style numbered services (VERSION/PUTC/VM_INFO/YIELD/DOORBELL) with PSCI folded in. |
 | M18 | **Guest→host security audit** (adversarially verified): fixed a guest-reachable vGIC NULL-deref host-DoS + an LR-count OOB; the rest of the trap surface verified sound. |
 | M19 | **Paravirt block device:** a guest reads the real host disk via block hypercalls, with its buffer IPA safely stage-2-translated (DMA-equivalent). |
+| M20 | **Paravirt network device:** a guest does a real NIC round-trip (MAC query + ARP to the gateway + RX of the reply) via net hypercalls. |
 
 The default hypervisor build runs **two** interactive FermiOS guests (M14);
 `Ctrl-X` cycles console focus. Build with `-DHYP_RUN_DEMOS` to run the

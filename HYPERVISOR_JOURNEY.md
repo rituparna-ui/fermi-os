@@ -317,10 +317,17 @@ qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on -m 8G \
   a host buffer, and drives the physical virtio-blk. Verified: the guest read
   sector 0 and printed `eb58906d6b66732e` — the real FAT32 boot sector.
 
-## 11. What's next (not yet built)
+- **M20 — paravirtualized network device (done):** the M19 pattern applied to
+  the NIC. NET_MAC / NET_TX / NET_RX / NET_ARP hypercalls; the hypervisor
+  stage-2-translates the guest's frame buffer and drives the real virtio-net.
+  Verified: the guest printed `M2R0040` — it queried the real MAC and received a
+  0x40-byte ARP reply from the slirp gateway (10.0.2.2), a full guest-driven
+  round-trip.
 
-- Paravirt net/console (same hypercall pattern as M19 block), a non-FermiOS
-  guest, and dynamic VM lifecycle (create/destroy at runtime).
+## 12. What's next (not yet built)
+
+- A non-FermiOS guest (needs a DTB + broader device emulation) and dynamic VM
+  lifecycle (create/destroy at runtime).
 
 ---
 

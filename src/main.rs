@@ -12,6 +12,7 @@ extern crate alloc;
 mod klib;
 #[macro_use]
 mod arch;
+mod exception;
 mod mm;
 mod panic;
 
@@ -51,6 +52,10 @@ pub extern "C" fn early_init() {
 
     // MMU is on now — absolute-VA data resolves via TTBR1 even at physical PC.
     arch::cpu::print_current_el();
+
+    // Install the exception vector table (VBAR_EL1).
+    exception::init();
+
     // Self-tests run while TTBR0 is still the boot identity table.
     mm::mmu::run_tests(l1_phys);
 
@@ -63,6 +68,9 @@ pub extern "C" fn early_init() {
 pub extern "C" fn kmain() -> ! {
     // Route all device MMIO through the TTBR1 upper half from here on.
     klib::mmio::switch_to_upper(mm::consts::KERNEL_VA_OFFSET as usize);
+
+    // Re-point VBAR_EL1 at the upper-half vector table.
+    exception::init_upper();
 
     // Relocate the PMM bitmap pointer to its upper-half virtual address.
     mm::pmm::relocate_upper();
@@ -87,6 +95,13 @@ pub extern "C" fn kmain() -> ! {
         }
         kprintln!("[ALLOC] Vec demo: {:?}", v.as_slice());
     }
+
+    // Exception self-test: a BRK is the one synchronous exception the dispatch
+    // handles and resumes from (ELR += 4). Surviving it proves the vector table
+    // is installed and the save/restore path round-trips correctly.
+    kprintln!("[EXC TEST] Triggering BRK #0 ...");
+    unsafe { core::arch::asm!("brk #0") };
+    kprintln!("[EXC TEST] Survived BRK — vector table works.");
 
     kprintln!("[KERNEL] Ready! Entering idle loop.");
     loop {

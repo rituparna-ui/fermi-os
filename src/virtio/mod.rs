@@ -6,6 +6,8 @@ pub mod virtqueue;
 pub mod rng;
 pub mod blk;
 pub mod net;
+pub mod console;
+pub mod balloon;
 
 use crate::kprintln;
 use crate::pci::{self, PciDevice};
@@ -100,4 +102,56 @@ pub fn parse_capabilities(dev: &PciDevice, caps: &mut VirtioPciCaps) {
         }
         cap_ptr = next;
     }
+}
+
+use crate::mmio;
+
+/// Run the reset->ack->driver->features->FEATURES_OK handshake.
+/// Accepts `accept_lo & device_feat_lo` plus VIRTIO_F_VERSION_1 (required).
+/// Returns the accepted low feature word on success.
+pub fn handshake(base: usize, accept_lo: u32) -> Option<u32> {
+    mmio::write8(base + VIRTIO_COMMON_STATUS, VIRTIO_STATUS_RESET);
+    dsb_sy();
+    while mmio::read8(base + VIRTIO_COMMON_STATUS) != VIRTIO_STATUS_RESET {}
+    let mut status = mmio::read8(base + VIRTIO_COMMON_STATUS);
+    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_ACKNOWLEDGE);
+    dsb_sy();
+    status = mmio::read8(base + VIRTIO_COMMON_STATUS);
+    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_DRIVER);
+    dsb_sy();
+
+    mmio::write32(base + VIRTIO_COMMON_DFSELECT, 0);
+    dsb_sy();
+    let feat_lo = mmio::read32(base + VIRTIO_COMMON_DF);
+    mmio::write32(base + VIRTIO_COMMON_DFSELECT, 1);
+    dsb_sy();
+    let feat_hi = mmio::read32(base + VIRTIO_COMMON_DF);
+    if feat_hi & 0x01 == 0 {
+        return None; // no VIRTIO_F_VERSION_1
+    }
+    let guest_lo = feat_lo & accept_lo;
+    mmio::write32(base + VIRTIO_COMMON_GFSELECT, 0);
+    dsb_sy();
+    mmio::write32(base + VIRTIO_COMMON_GF, guest_lo);
+    dsb_sy();
+    mmio::write32(base + VIRTIO_COMMON_GFSELECT, 1);
+    dsb_sy();
+    mmio::write32(base + VIRTIO_COMMON_GF, 0x01);
+    dsb_sy();
+
+    status = mmio::read8(base + VIRTIO_COMMON_STATUS);
+    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_FEATURES_OK);
+    dsb_sy();
+    status = mmio::read8(base + VIRTIO_COMMON_STATUS);
+    if status & VIRTIO_STATUS_FEATURES_OK == 0 {
+        return None;
+    }
+    Some(guest_lo)
+}
+
+/// Set DRIVER_OK on a device.
+pub fn set_driver_ok(base: usize) {
+    let status = mmio::read8(base + VIRTIO_COMMON_STATUS);
+    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_DRIVER_OK);
+    dsb_sy();
 }

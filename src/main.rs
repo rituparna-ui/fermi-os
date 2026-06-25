@@ -123,6 +123,14 @@ pub extern "C" fn kernel_main() -> ! {
     }
     virtio::net::init();
     net::bringup();
+    virtio::console::init();
+    virtio::balloon::init();
+    {
+        let (a, t) = virtio::balloon::status();
+        let inf = virtio::balloon::inflate(64);
+        let (a2, _) = virtio::balloon::status();
+        kprintln!("[boot] balloon: actual {}->{} (inflated {}), host_target {}", a, a2, inf, t);
+    }
 
     // Scheduler + a couple of preemptive EL1 demo tasks.
     sched::init();

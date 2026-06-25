@@ -17,7 +17,7 @@
 
 pub mod hypercall;
 
-use crate::mm::consts::{SIZE_1G, SIZE_512G};
+use crate::mm::consts::{PAGE_SIZE, SIZE_1G, SIZE_2M, SIZE_512G};
 use crate::mm::pmm;
 use crate::mrs;
 use crate::msr;
@@ -83,13 +83,38 @@ static EL2_STACK: El2Stack = El2Stack([0; 8192]);
 
 // Stage-2 page tables. 4 KiB granule, 48-bit IPA input (T0SZ=16, start at L0),
 // 40-bit PA output. 1 GiB blocks at L1, so the whole 0..1 TiB IPA space is
-// described by exactly three tables — no L2/L3 needed at this milestone.
+// described by three tables; two more split the one 1 GiB block holding
+// hypervisor RAM down to 4 KiB so we can punch an isolation hole (M3).
 #[link_section = ".hyp_tables"]
 static S2_L0: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
 #[link_section = ".hyp_tables"]
 static S2_L1_LOW: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512])); // 0..512 GiB
 #[link_section = ".hyp_tables"]
 static S2_L1_HIGH: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512])); // 512G..1 TiB
+
+// Split tables for the 1 GiB region containing hypervisor-private RAM: L2 splits
+// that 1 GiB into 512 x 2 MiB; L3 splits the one 2 MiB block holding
+// [__hyp_start, __hyp_end) into 512 x 4 KiB, with the hyp pages left invalid.
+#[link_section = ".hyp_tables"]
+static S2_L2_SPLIT: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
+#[link_section = ".hyp_tables"]
+static S2_L3_SPLIT: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
+
+extern "C" {
+    /// Hypervisor-private region bounds (linker symbols, see `linker.ld`). Their
+    /// addresses taken pre-MMU/at EL2 are physical == guest IPA (identity map).
+    static __hyp_start: u8;
+    static __hyp_end: u8;
+}
+
+/// Physical/IPA base of `[__hyp_start, __hyp_end)`.
+#[inline]
+fn hyp_region() -> (u64, u64) {
+    (
+        core::ptr::addr_of!(__hyp_start) as u64,
+        core::ptr::addr_of!(__hyp_end) as u64,
+    )
+}
 
 /// Per-vCPU control block. For Milestone 2 the single guest is co-resident at
 /// EL1, so this mostly tracks statistics and holds the slots a real world-switch
@@ -244,6 +269,47 @@ fn hyp_build_stage2() {
             (*l1_high).0[i as usize] = pa | S2_VALID | S2_AF | S2_AP_RW | S2_MEM_DEVICE;
         }
 
+        // --- Isolation: deny the guest any stage-2 mapping of hypervisor RAM ---
+        //
+        // The hypervisor's private region [__hyp_start, __hyp_end) lives inside
+        // one 1 GiB block of RAM. Split that block: 1 GiB -> 512 x 2 MiB
+        // (s2_l2_split), and the single 2 MiB block that contains the region ->
+        // 512 x 4 KiB (s2_l3_split). Then mark the 4 KiB pages covering the hyp
+        // region invalid. The hardware table walker reaches these split tables
+        // via VTTBR physical addresses, so unmapping them from the guest IPA
+        // view is safe.
+        let (hs, he) = hyp_region();
+        let gb_idx = hs / SIZE_1G; // which s2_l1_low entry
+        let region_base = gb_idx * SIZE_1G;
+        let mb_idx = (hs - region_base) / SIZE_2M; // 2 MiB block within region
+        let mb_base = region_base + mb_idx * SIZE_2M;
+
+        let l2_split = S2_L2_SPLIT.get();
+        let l3_split = S2_L3_SPLIT.get();
+
+        // L2 split: identity 2 MiB blocks for the whole 1 GiB RAM region.
+        for b in 0..512u64 {
+            let pa = region_base + b * SIZE_2M;
+            (*l2_split).0[b as usize] =
+                pa | S2_VALID | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
+        }
+
+        // L3 split: identity 4 KiB pages for the 2 MiB block holding the hyp
+        // region, with the hyp pages left invalid (unmapped). Page descriptors
+        // at L3 use bits[1:0]=11 (S2_TABLE encoding).
+        for p in 0..512u64 {
+            let pa = mb_base + p * PAGE_SIZE;
+            (*l3_split).0[p as usize] = if pa >= (hs & !(PAGE_SIZE - 1)) && pa < he {
+                0 // hole: hypervisor-private, guest has no access
+            } else {
+                pa | S2_TABLE | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL
+            };
+        }
+
+        // Splice the split tables in, replacing the original 1 GiB block.
+        (*l2_split).0[mb_idx as usize] = phys_of(l3_split) | S2_TABLE | S2_VALID;
+        (*l1_low).0[gb_idx as usize] = phys_of(l2_split) | S2_TABLE | S2_VALID;
+
         core::arch::asm!("dsb ish");
     }
 }
@@ -291,8 +357,14 @@ pub extern "C" fn hyp_init() {
         msr!("cnthctl_el2", cnthctl);
     }
 
-    // Stage-2 translation tables.
+    // Stage-2 translation tables (with the hypervisor's own RAM unmapped).
     hyp_build_stage2();
+    let (hs, he) = hyp_region();
+    hyp_puts("[HYP] isolated hyp region [");
+    hyp_puthex(hs);
+    hyp_puts(", ");
+    hyp_puthex(he);
+    hyp_puts(") from guest stage-2\n");
 
     // VTCR_EL2: 4 KiB granule, 48-bit IPA (T0SZ=16, SL0=2 => start at L0),
     // 40-bit PA output (PS=2 => 1 TiB), inner-shareable WB walks.
@@ -386,6 +458,9 @@ fn hyp_handle_hvc(frame: *mut El2Frame) {
         HVC_VM_INFO => unsafe { (*vcpu).hvc_count },
         // Cooperative yield is a no-op until the M5 world-switch scheduler.
         HVC_YIELD => 0,
+        // Introspection probe (test build): expose the hyp region base so the
+        // guest can attempt — and be denied — an access to hypervisor memory.
+        HVC_HYP_BASE => hyp_region().0,
         _ => {
             hyp_puts("[HYP] unknown hypercall fn=");
             hyp_puthex(fn_id);
@@ -446,33 +521,66 @@ fn hyp_handle_sysreg(frame: *mut El2Frame) {
     }
 }
 
-/// Lower-EL abort. Real per-guest stage-2 management and isolation arrive in M3;
-/// for now dump the fault context once and park, so we never spin in a silent
-/// re-fault loop.
-fn hyp_handle_abort(index: u64) -> ! {
+/// Lower-EL abort. If the guest faulted trying to reach hypervisor-private
+/// memory, that's our isolation boundary doing its job: report it, poison the
+/// destination register on a read, and step over the access so the guest keeps
+/// running. Any other abort is an unexpected (real) fault — dump and park.
+fn hyp_handle_abort(index: u64, frame: *mut El2Frame) {
     // SAFETY (single-core): see hyp_handle_hvc.
     unsafe { (*G_VCPU.get()).abort_count += 1 };
 
     let esr = mrs!("esr_el2");
+    let far = mrs!("far_el2");
     let hpfar = mrs!("hpfar_el2");
-    let ipa = (hpfar >> 4) << 12; // HPFAR[43:4] = IPA[51:12]
+    let ipa_page = (hpfar >> 4) << 12; // HPFAR[43:4] = IPA[51:12]
+    let ipa = ipa_page | (far & 0xFFF);
 
-    hyp_puts("\n[HYP] *** unexpected lower-EL abort *** vector=");
-    hyp_puthex(index);
-    hyp_puts(" EC=");
-    hyp_puthex((esr >> ESR_EC_SHIFT) & ESR_EC_MASK);
-    hyp_puts("\n      ESR_EL2=");
-    hyp_puthex(esr);
-    hyp_puts(" ELR_EL2=");
-    hyp_puthex(mrs!("elr_el2"));
-    hyp_puts("\n      FAR_EL2=");
-    hyp_puthex(mrs!("far_el2"));
-    hyp_puts(" faulting IPA=");
-    hyp_puthex(ipa);
-    hyp_puts("\n[HYP] parking CPU for inspection.\n");
-    loop {
-        unsafe { core::arch::asm!("wfi") };
+    let (hs, he) = hyp_region();
+
+    if ipa_page >= (hs & !0xFFF) && ipa_page < he {
+        let isv = (esr >> 24) & 1; // instruction syndrome valid
+        let srt = ((esr >> 16) & 0x1F) as usize; // destination register
+        let wnr = (esr >> 6) & 1; // write (1) vs read (0)
+
+        hyp_puts("\n[HYP] ISOLATION: blocked guest ");
+        hyp_puts(if wnr != 0 { "write to" } else { "read from" });
+        hyp_puts(" hyp memory IPA=");
+        hyp_puthex(ipa);
+        hyp_puts("\n");
+
+        if wnr == 0 && isv != 0 && srt != 31 {
+            set_frame_x(frame, srt, 0); // poison value for the blocked read
+        }
+
+        // Step past the faulting instruction so the guest keeps running.
+        // SAFETY: advancing ELR_EL2; EL2 register, no memory effect.
+        unsafe {
+            msr!("elr_el2", mrs!("elr_el2") + 4);
+        }
+        return;
     }
+
+    // Not the isolation boundary — a real, unexpected fault. Dump once and park
+    // (the DUMPED guard keeps a re-fault from spamming the log).
+    if !DUMPED.swap(true, Ordering::Relaxed) {
+        hyp_puts("\n[HYP] *** unexpected lower-EL abort *** vector=");
+        hyp_puthex(index);
+        hyp_puts(" EC=");
+        hyp_puthex((esr >> ESR_EC_SHIFT) & ESR_EC_MASK);
+        hyp_puts("\n      ESR_EL2=");
+        hyp_puthex(esr);
+        hyp_puts(" ELR_EL2=");
+        hyp_puthex(mrs!("elr_el2"));
+        hyp_puts("\n      FAR_EL2=");
+        hyp_puthex(far);
+        hyp_puts(" faulting IPA=");
+        hyp_puthex(ipa);
+        hyp_puts("\n[HYP] parking CPU for inspection.\n");
+        loop {
+            unsafe { core::arch::asm!("wfi") };
+        }
+    }
+    hyp_puts("[HYP] unhandled EL2 exception (continuing)\n\n");
 }
 
 /// Dispatcher for EL2 exceptions. `index` is the vector slot (0..15); 8 = sync
@@ -484,14 +592,7 @@ pub extern "C" fn el2_dispatch(index: u64, frame: *mut El2Frame) {
     match ec {
         EC_HVC64 => hyp_handle_hvc(frame),
         EC_SYSREG => hyp_handle_sysreg(frame),
-        EC_DABT_LOWER | EC_IABT_LOWER => {
-            // Dump once then park (the helper diverges). The DUMPED guard keeps
-            // a re-fault from spamming, matching the M1 behavior.
-            if !DUMPED.swap(true, Ordering::Relaxed) {
-                hyp_handle_abort(index);
-            }
-            hyp_puts("[HYP] unhandled EL2 exception (continuing)\n\n");
-        }
+        EC_DABT_LOWER | EC_IABT_LOWER => hyp_handle_abort(index, frame),
         _ => {
             hyp_puts("\n[HYP] unhandled EL2 exception: vector=");
             hyp_puthex(index);
@@ -533,6 +634,27 @@ pub fn guest_probe() {
         kprintln!(
             "[BOOT]   HVC_VM_INFO  -> {} hypercalls served",
             hvc_call(HVC_VM_INFO, 0, 0, 0)
+        );
+
+        // Isolation probe: ask the hypervisor where its private memory lives,
+        // then deliberately try to read it. Stage-2 must block this — the read
+        // should trap to EL2 and come back poisoned (0) rather than leaking hyp
+        // state. Runs while TTBR0 still identity-maps the low half, so the
+        // guest VA == IPA and the stage-2 hole takes the fault.
+        let hyp_base = hvc_call(HVC_HYP_BASE, 0, 0, 0);
+        kprintln!(
+            "[BOOT] poking hypervisor memory at {:#x} (must be blocked)...",
+            hyp_base
+        );
+        let leaked = read_volatile(hyp_base as *const u64);
+        kprintln!(
+            "[BOOT]   read back {:#x} ({})",
+            leaked,
+            if leaked == 0 {
+                "0 => stage-2 isolation held"
+            } else {
+                "LEAK => isolation FAILED"
+            }
         );
     }
 }

@@ -13,6 +13,7 @@ pub const HVC_PUTC: u64 = 1; // (char in x1) -> 0 ; paravirt console putc
 pub const HVC_PING: u64 = 2; // (val in x1) -> val + 1 ; liveness / echo
 pub const HVC_VM_INFO: u64 = 3; // () -> hypercalls serviced for this vCPU
 pub const HVC_YIELD: u64 = 4; // () -> 0 ; cooperative yield (stub until M5)
+pub const HVC_HYP_BASE: u64 = 5; // () -> base IPA of the hypervisor-private region
 
 pub const HYP_ABI_VERSION: u64 = 0x0001_0000; // 1.0
 pub const HVC_ERR_BADCALL: u64 = u64::MAX; // unknown function ID

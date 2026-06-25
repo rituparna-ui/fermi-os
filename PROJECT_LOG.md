@@ -1,62 +1,57 @@
 # Fermi OS — C → Rust Port: Project Log
 
 This document records **everything done in this effort and why**: the goal, the
-porting strategy, every subsystem milestone, the bare-metal-Rust pitfalls we
-hit and fixed, the full set of feature branches, and how each piece was
-verified.
+porting strategy, every subsystem milestone, the bare-metal-Rust pitfalls hit
+and fixed, the full set of feature branches, and how each piece was verified.
+
+> Status at last update: pure-Rust kernel boots to an interactive `fermi>`
+> shell; networking spans ARP/IPv4/ICMP/DHCP/DNS/UDP/**TCP**/**NTP**; SMP
+> foundation runs a second core (MMU + atomics + its own task scheduler).
+> ~35 branches pushed to `github.com/rituparna-ui/fermi-os`.
 
 ---
 
 ## 1. Goal
 
-Convert the original **Fermi OS** — a bare-metal `aarch64` (ARMv8-A) kernel
-written in C + assembly, targeting QEMU's `virt` machine (Cortex-A72) — into a
-**pure Rust + aarch64 assembly** kernel, working through the original git
-history *commit by commit / subsystem by subsystem*, building and **boot-testing
-in QEMU at every milestone**.
+Convert the original **Fermi OS** — a bare-metal `aarch64` (ARMv8-A) kernel in
+C + assembly for QEMU's `virt` machine (Cortex-A72) — into a **pure Rust +
+aarch64 assembly** kernel, working through the original git history *subsystem
+by subsystem*, building and **boot-testing in QEMU at every milestone**.
 
 The original was ~150 KB of C across 143 commits. The result is **pure Rust
-(~7k lines) + 4 hand-written assembly files**, with zero C remaining, that boots
-to an interactive `fermi>` shell.
+(~7k lines) + 4 hand-written assembly files**, zero C, booting to a shell.
 
 ---
 
 ## 2. Why this approach
 
-- **Follow the commit history as a curriculum.** The original built itself up
-  in a natural dependency order (boot → UART → PMM → MMU → heap → exceptions →
-  GIC/timer → scheduler → syscalls → userspace → PCI/VirtIO → FS → net → shell).
-  Porting in that same order meant each layer had its dependencies already in
-  place and could be verified immediately.
-- **Build + boot-test every milestone.** Rather than port everything then
-  debug, each subsystem was compiled and run in QEMU, grepping the serial
-  output for proof it worked. This caught the bare-metal-Rust pitfalls (below)
-  early, at the layer that introduced them.
-- **Keep assembly only where it must be.** Boot, exception vectors, context
-  switch, and the embedded user program are assembly; everything else is Rust.
-- **Work on a branch.** All work is on `rust-port` (and feature branches off
-  it); the original C history stays intact on the other branch and is fully
-  recoverable.
+- **Follow the commit history as a curriculum.** The original built up in a
+  natural dependency order; porting in that order meant each layer's
+  dependencies were already present and verifiable immediately.
+- **Build + boot-test every milestone.** Each subsystem was compiled and run in
+  QEMU, grepping serial output for proof. This surfaced the bare-metal-Rust
+  pitfalls (§6) early, at the layer that caused them.
+- **Assembly only where it must be**: boot, exception vectors, context switch,
+  embedded user program, secondary-core entry.
+- **Branch-based**: all work on `rust-port` and feature branches off it; the C
+  history stays intact and recoverable on the original branch.
 
 ---
 
 ## 3. Toolchain / build / run
 
-- `rustc` 1.85.0 stable, target **`aarch64-unknown-none`** (tier-2, precompiled
-  core/alloc — no `build-std` needed).
-- `qemu-system-aarch64`, `clang` + `ld.lld` (to build user ELF binaries),
-  `mkfs.fat` + `mtools` (to build the FAT32 disk image).
-- Build: `cargo build` → `target/aarch64-unknown-none/debug/kernel`.
-- Disk: `make disk` → `build/disk.img` (FAT32 + seed files + user ELFs).
-- Run: `make run` (or `cargo run`) launches QEMU with virtio rng/blk/net/
-  console/balloon attached and drops you at the `fermi>` shell.
-- The QEMU runner lives in `.cargo/config.toml`; the `Makefile` is a thin
-  wrapper around cargo + disk creation.
+- `rustc` 1.85.0 stable, target **`aarch64-unknown-none`** (precompiled
+  core/alloc — no `build-std`).
+- `qemu-system-aarch64`, `clang` + `ld.lld` (user ELF binaries), `mkfs.fat` +
+  `mtools` (FAT32 disk).
+- `cargo build` → `target/aarch64-unknown-none/debug/kernel`.
+- `make disk` → `build/disk.img` (FAT32 + seed files + user ELFs).
+- `make run` / `cargo run` → QEMU with virtio rng/blk/net/console/balloon
+  (and `-smp 2`) → `fermi>` shell.
 
-**Critical QEMU detail:** virtio devices must be attached with
-`disable-legacy=on` so they present *modern* PCI device IDs (blk `0x1042`,
-net `0x1041`, etc.). Without it they are transitional (`0x1001`/`0x1000`) and
-the modern-only drivers won't bind.
+**Critical QEMU detail:** virtio devices need `disable-legacy=on` to present
+*modern* PCI device IDs (blk `0x1042`, net `0x1041`); otherwise they're
+transitional (`0x1001`/`0x1000`) and the modern-only drivers won't bind.
 
 ---
 
@@ -64,180 +59,157 @@ the modern-only drivers won't bind.
 
 ```
 src/
-  main.rs              crate root: no_std/no_main, global_asm!(boot.S),
-                       early_init() + kernel_main(), panic handler, demo tasks
-  boot.S               reset entry: FP enable, physical stack/BSS, MMU jump
-  cpu.rs               mrs!/msr! macros, current_el, CPU id + PMU (/proc/cpuinfo)
-  mmio.rs              VA-offset-routed MMIO (0 pre-MMU, KERNEL_VA_OFFSET after)
-  uart.rs              PL011 driver + Device-safe pre-MMU log helpers
-  print.rs             core::fmt over UART: kprint!/kprintln! (+ cross-core lock)
-  sync.rs              SpinLock<T> (post-MMU) and Racy<T> (pre-MMU, lock-free)
-  panic.rs             kernel_panic: sysreg dump + halt
-  strings.rs           BufWriter (ksnprintf!) + cstr helpers
-  mm/
-    pmm.rs             bitmap physical page allocator (8 GiB)
-    mmu.rs             3-level page tables, identity map, TTBR0/TTBR1, ASIDs,
-                       higher-half, user-table walker/mapper, secondary enable
-    heap.rs            first-fit kernel heap + #[global_allocator] + stats
-  exception.rs         trap-frame vector table, ESR/DFSC decode, dispatch,
-                       per-class trap stats; submodules:
-    exception/vector.S   full GPR + ELR/SPSR/ESR/FAR trap frame
-    exception/gic.rs     GICv3 bringup, SPI routing, per-INTID counters
-    exception/timer.rs   ARM generic timer (drift-free CNTP_CVAL tick)
-  sched/
-    mod.rs             preemptive round-robin scheduler, Task, fork/exec,
-                       sleep, kill, stats, make_kernel_task
-    switch.S           context_switch (GPR+FP), EL0/EL1 trampolines, fork_return
-    user_prog.S        embedded EL0 program (fork → child exec)
-  syscall.rs           SVC dispatch (read/write/open/close/lseek/exit/yield/
-                       sleep/getpid/uptime/net_ping/kill/fork/exec/getrandom)
-  pci.rs               PCI ECAM enumeration, BAR assignment, INTx→GIC INTID
-  virtio/
-    mod.rs             VirtIO PCI transport: caps, handshake, status
-    virtqueue.rs       split virtqueue: desc/avail/used, submit/poll
-    rng.rs blk.rs net.rs console.rs balloon.rs   the five drivers
-  net.rs               ARP, IPv4, ICMP, DHCP, DNS, UDP, TCP, netd
-  fs/
-    vfs.rs             vnode tree, path resolution, fd table, device dispatch
-    devices.rs         /dev/{console,null,zero,rng,vcons,blk}
-    fat32.rs           FAT32 read + create, VFS lazy lookup, dir listing
-    proc.rs            /proc synthetic fs (uptime/meminfo/tasks/interrupts/...)
-  shell.rs             interactive shell + builtins
-  smp.rs               secondary-core bringup + core-1 scheduler
-  smp.S                secondary entry trampoline
+  main.rs        crate root: no_std/no_main, global_asm!(boot.S),
+                 early_init() (pre-MMU) + kernel_main() (higher half),
+                 panic handler, demo tasks (netd, EL0 user, shell)
+  boot.S         reset: FP enable, physical stack/BSS, early_init, jump to high
+  cpu.rs         mrs!/msr!, current_el, CPU id + PMU, PSCI system_reset
+  mmio.rs        VA-offset-routed MMIO (0 pre-MMU, KERNEL_VA_OFFSET after)
+  uart.rs        PL011 + Device-safe pre-MMU log helpers
+  print.rs       core::fmt over UART; kprint!/kprintln! + IRQ-safe cross-core lock
+  sync.rs        SpinLock<T> (post-MMU) and Racy<T> (pre-MMU, lock-free)
+  panic.rs       kernel_panic: sysreg dump + halt
+  strings.rs     BufWriter (ksnprintf!) + cstr helpers
+  mm/pmm.rs      bitmap physical page allocator (8 GiB) + relocate_upper
+  mm/mmu.rs      3-level tables, identity + higher-half, TTBR0/TTBR1, ASIDs,
+                 user-table walker/mapper, secondary-core MMU enable
+  mm/heap.rs     first-fit heap + #[global_allocator] + alloc stats
+  exception.rs   trap-frame vectors, ESR/DFSC decode, dispatch, trap stats
+    exception/vector.S  full GPR + ELR/SPSR/ESR/FAR trap frame
+    exception/gic.rs    GICv3 bringup + SPI routing + per-INTID counters
+    exception/timer.rs  ARM generic timer (drift-free CNTP_CVAL tick)
+  sched/mod.rs   round-robin scheduler, Task, fork/exec, sleep, kill, stats,
+                 make_kernel_task / raw_context_switch (for SMP)
+    sched/switch.S    context_switch (GPR+FP), EL0/EL1 trampolines, fork_return
+    sched/user_prog.S embedded EL0 program (stack-grow probe, fork, child exec)
+  syscall.rs     SVC dispatch: read/write/open/close/lseek/exit/yield/sleep/
+                 getpid/uptime/net_ping/kill/fork/exec/getrandom
+  pci.rs         PCI ECAM enumeration, BAR assignment, INTx -> GIC INTID
+  virtio/mod.rs  VirtIO PCI transport: caps, handshake, status
+    virtio/virtqueue.rs  split virtqueue
+    virtio/{rng,blk,net,console,balloon}.rs  the five drivers
+  net.rs         ARP+cache, IPv4, ICMP, DHCP, DNS, UDP, TCP, NTP, netd
+  fs/vfs.rs      vnode tree, path resolution, fd table, device dispatch
+    fs/devices.rs   /dev/{console,null,zero,rng,vcons,blk}
+    fs/fat32.rs     FAT32 read + create + dir-list + usage, VFS lazy lookup
+    fs/proc.rs      /proc synthetic fs
+  shell.rs       interactive shell: history, tab-complete, ~35 builtins
+  smp.rs / smp.S secondary-core bringup + MMU enable + cooperative scheduler
 ```
 
 ---
 
-## 5. Milestones (what & why)
+## 5. Milestones (what & why) — branch `rust-port`
 
-Each was committed separately on `rust-port` and boot-verified.
+Each committed separately and boot-verified.
 
-1. **Scaffold + UART** — `no_std` cargo kernel, `boot.S` via `global_asm!`,
-   linker script, PL011 UART + MMIO, panic handler. *Proves the toolchain and
-   boots in QEMU.*
-2. **Exception level** — `mrs!`/`msr!` macros, read/print `CurrentEL` (EL1).
-3. **PMM** — bitmap page allocator over 8 GiB; first-fit + contiguous.
-4. **MMU + higher-half** — 3-level page tables (4 KiB granule, 48-bit VA),
-   identity map for TTBR0, `+KERNEL_VA_OFFSET` for TTBR1, enable MMU+caches,
-   then relink at `0xFFFF000040000000` and **jump the kernel to the upper half**
-   so TTBR0 is free for per-task user mappings. *This is what makes EL0
-   userspace with per-task address spaces possible.*
-5. **Heap** — first-fit allocator (split/coalesce/grow), wired as the Rust
-   `#[global_allocator]` so `alloc::{Vec,Box,String}` work kernel-wide.
-6. **Exceptions** — full trap-frame vector table, ESR/DFSC decode, kernel panic.
-7. **GICv3 + timer** — interrupt controller bringup + drift-free 10 ms tick.
-8. **strings/printf** — `core::fmt` already replaces `uart_printf`; added a
-   `ksnprintf!` fixed-buffer formatter + cstr helpers.
-9. **Scheduler** — preemptive round-robin, per-task kernel stacks, `sleep`,
-   `context_switch` saving GPRs **and FP (d8–d15)**.
-10. **Syscalls + EL0** — `context_switch` swaps TTBR0; EL0 drop trampoline
-    (`eret`); SVC dispatch; an embedded EL0 program.
-11. **PCI + VirtIO + virtqueue** — ECAM enumeration, modern transport, split
-    virtqueue, verified by the RNG driver returning DMA'd random bytes.
-12. **VirtIO drivers** — RNG, block, net, console, balloon (all five).
-13. **VFS + FAT32 + devices + fd table** — vnode tree, path resolution,
-    per-process fd table (fd 0/1/2 → /dev/console), FAT32 read+create.
-14. **Networking** — ARP, IPv4, ICMP (verified ping ttl=255), DHCP, `netd`.
-15. **/proc** — synthetic fs regenerated from live kernel state.
-16. **ELF64 loader + fork + exec** — loads ET_EXEC from FAT32, runs at EL0;
-    `fork()` deep-copies the address space (child resumes with `x0=0`),
-    `exec()` replaces the image.
+1. **Scaffold + UART** — no_std cargo kernel, boot.S, PL011 + MMIO, panic.
+2. **Exception level** — mrs!/msr!, read/print CurrentEL.
+3. **PMM** — bitmap allocator over 8 GiB (single + contiguous).
+4. **MMU + higher-half** — 3-level tables, TTBR0 identity + TTBR1 high, enable,
+   then relink at `0xFFFF000040000000` and jump the kernel to the upper half so
+   TTBR0 is free for per-task user mappings (basis for EL0 userspace).
+5. **Heap** — first-fit + `#[global_allocator]` (Vec/Box/String work).
+6. **Exceptions** — trap-frame vectors, ESR/DFSC decode, kernel panic.
+7. **GICv3 + timer** — interrupt controller + drift-free 10 ms tick.
+8. **strings/printf** — `ksnprintf!` + cstr helpers (core::fmt = uart_printf).
+9. **Scheduler** — preemptive round-robin, sleep, FP-saving context switch.
+10. **Syscalls + EL0** — TTBR0 swap, eret trampoline, SVC dispatch, EL0 prog.
+11. **PCI + VirtIO + virtqueue** — verified by RNG DMA.
+12. **VirtIO drivers** — rng, blk, net, console, balloon.
+13. **VFS + FAT32 + devices + fd table** — fd 0/1/2 → /dev/console.
+14. **Networking** — ARP, IPv4, ICMP ping, DHCP, netd.
+15. **/proc** — synthetic fs from live state.
+16. **ELF64 + fork + exec** — load from FAT32, run at EL0; fork copies the
+    address space; exec replaces the image.
 17. **Shell** — interactive line editor + builtins.
-18. **Cleanup** — removed all C, rewrote README + Makefile, CI smoke test.
+18. **Cleanup + CI** — removed all C, README/Makefile, QEMU boot smoke test.
 
 ---
 
-## 6. Bare-metal-Rust pitfalls we hit (and fixed)
+## 6. Bare-metal-Rust pitfalls hit (and fixed)
 
-These are the things the C original never faced — diagnosed via QEMU output and
-an early diagnostic exception handler. **Each was a real bug found by testing.**
+Real bugs found by testing — things the C original never faced:
 
-- **Atomics fault before the MMU is on.** All RAM is Device-typed pre-MMU, and
-  exclusive load/store (LDXR/STXR — backing `compare_exchange`/`SpinLock`)
-  is illegal there → fault. Fix: a lock-free `Racy<T>` cell for pre-MMU state;
-  `SpinLock` only after the MMU is on.
-- **`core::fmt` faults before the MMU is on.** It copies digit pairs with a
-  2-byte unaligned `copy_nonoverlapping`, and unaligned accesses fault on
-  Device memory. Fix: pre-MMU code logs via simple aligned `uart` helpers;
-  `kprintln!` only after the MMU is on.
-- **FP/SIMD trap (ESR EC=0x7).** LLVM uses SIMD registers in `core::fmt` and
-  `memcpy`, but `CPACR_EL1.FPEN` defaults to *trap*. Fix: enable FP in `boot.S`
-  before any Rust runs. (This was the cause of mysterious early "hangs".)
-- **Pre-MMU absolute-address relocations.** A `match`-returning-`&str` builds a
-  table of *absolute* (high-VA) pointers via relocations, which fault before the
-  MMU is on. Inline `&str` literals use PC-relative `adrp/add` (→ physical) and
-  are fine. Fix: keep pre-MMU code free of such constructs (moved
-  `print_current_el` to the post-jump path).
-- **`context_switch` must save FP callee-saved regs (d8–d15)**, since the
-  kernel uses FP/SIMD (via `core::fmt`); otherwise tasks corrupt each other.
-- **TCP checksum + buffer reuse.** `build_tcp` reused the frame buffer without
-  zeroing the checksum field — the SYN only worked because the buffer started
-  zeroed; later segments checksummed over stale bytes. Plus slirp needs an
-  explicit ACK to finalize the handshake before relaying data.
-- **GICv3 SPI delivery.** Device (SPI) interrupts need `GICD_IGROUPR` (Group1),
-  `GICD_IPRIORITYR`, and `GICD_IROUTER` configured — the initial GIC bringup
-  only set up PPIs, so *no* device IRQ could fire until this was fixed.
+- **Atomics fault pre-MMU.** Exclusive LDXR/STXR (backing
+  `compare_exchange`/`SpinLock`) is illegal on Device memory → use a lock-free
+  `Racy<T>` before the MMU; `SpinLock` after.
+- **`core::fmt` faults pre-MMU.** Unaligned 2-byte digit copies fault on Device
+  memory → simple `uart` logging before the MMU; `kprintln!` after.
+- **FP/SIMD trap (ESR EC=0x7).** LLVM uses SIMD in core::fmt/memcpy →
+  enable `CPACR_EL1.FPEN` in `boot.S` before any Rust. (Cause of early "hangs".)
+- **Pre-MMU absolute relocations.** `match`-returning-`&str` builds a high-VA
+  pointer table that faults pre-MMU; inline `&str` literals are PC-relative
+  (→ physical) and fine.
+- **context_switch must save d8–d15** (kernel uses FP via core::fmt).
+- **TCP checksum + buffer reuse** — frame buffer's checksum field wasn't zeroed
+  before recompute; and slirp needs an explicit ACK to finalize the handshake.
+- **GICv3 SPI delivery** — SPIs need IGROUPR/IPRIORITYR/IROUTER configured;
+  the initial bringup only did PPIs, so no device IRQ could fire.
 
 ---
 
-## 7. Feature branches (off `rust-port`)
+## 7. Feature branches (all pushed, boot-verified)
 
-Each is an independent branch, individually built, **boot-verified in QEMU**,
-committed, and pushed to `github.com/rituparna-ui/fermi-os`. (`net-dns`/`net-tcp`
-and the `smp-*` chain are stacked where one depends on another.)
+`rust-port` is the base. `net-dns`→`net-tcp`/`net-ntp` and the `smp-*` chain are
+stacked (one depends on another); the rest branch directly off `rust-port`.
 
 | Branch | What & why | Verified by |
 |---|---|---|
-| `rust-port` | Complete C→Rust port + IRQ-driven net + CI (the base) | full boot-to-shell |
-| `feat/shell-fileops` | `write` (FAT32 create) + `hexdump` — basic file tooling | write→cat→hexdump |
-| `feat/proc-cpuinfo` | CPU id (MIDR/cache/ISA features) + `/proc/cpuinfo` + PMU cycles | Cortex-A72 detected |
-| `feat/blk-irq` | Interrupt-driven block device — proves the GIC SPI fix generalizes | blk SPI counted |
-| `feat/shell-top` | `top` dashboard (uptime/mem/tasks/irqs) | live overview |
-| `feat/sched-stats` | Per-task CPU-time accounting (TICKS in `ps`) | idle accrues ticks |
-| `feat/net-ping-stats` | `ping [count]` with RTT + loss | 3/3, ~127 µs |
-| `feat/reboot-psci` | Real reboot via PSCI `SYSTEM_RESET` | banner prints twice |
+| `rust-port` | Complete C→Rust port + IRQ-driven net + CI (base) | full boot-to-shell |
+| `feat/shell-fileops` | `write` (FAT32 create) + `hexdump` | write→cat→hexdump |
+| `feat/proc-cpuinfo` | CPU id + `/proc/cpuinfo` + PMU cycles | Cortex-A72 |
+| `feat/blk-irq` | Interrupt-driven block device | blk SPI counted |
+| `feat/shell-top` | `top` dashboard | live overview |
+| `feat/sched-stats` | Per-task CPU ticks in `ps` | idle accrues ticks |
+| `feat/net-ping-stats` | `ping [count]` RTT + loss | 3/3, ~127 µs |
+| `feat/reboot-psci` | Real reboot (PSCI SYSTEM_RESET) | banner twice |
 | `feat/shell-rand` | `rand [n]` via VirtIO RNG | distinct bytes |
-| `feat/sched-ctxt` | Context-switch counter in `ps` | count grows |
-| `feat/elf-argv` | `argv` passing to ELF programs (aarch64 startup stack) | echoes its arg |
-| `feat/syscall-irq-unmask` | Unmask IRQs in syscall dispatch (correctness) | no regression |
-| `feat/smp` | Secondary-core bringup via PSCI `CPU_ON` | core1 MPIDR reported |
-| `feat/rtc` | PL031 RTC + `date` (epoch→UTC) | matches host time |
-| `feat/shell-cp` | `cp` (VFS read → FAT32 create) | copy round-trips |
-| `feat/net-dns` | UDP DNS resolver + `resolve` | example.com → real IP |
-| `feat/shell-memtest` | Allocator stress self-test | PASS, heap reclaims |
+| `feat/sched-ctxt` | Context-switch counter | count grows |
+| `feat/elf-argv` | `argv` to ELF programs | echoes arg |
+| `feat/syscall-irq-unmask` | Unmask IRQs in syscall dispatch | no regression |
+| `feat/smp` | Secondary bringup (PSCI CPU_ON) | core1 MPIDR |
+| `feat/rtc` | PL031 RTC + `date` | matches host time |
+| `feat/shell-cp` | `cp` (VFS read → FAT32 create) | round-trips |
+| `feat/net-dns` | UDP DNS resolver + `resolve` | real IP |
+| `feat/shell-memtest` | Allocator stress test | PASS, reclaims |
 | `feat/exception-stats` | Per-class trap counters + `traps` | svc/irq counts |
-| `feat/shell-sysinfo` | `sysinfo` summary | combined overview |
-| `feat/sys-getrandom` | `SYS_GETRANDOM` syscall + user hex ELF | distinct random hex |
-| `feat/smp-heartbeat` | Secondary runs a continuous heartbeat | counter advances |
-| `feat/net-arp` | General ARP cache + `arp [ip]` | resolves gateway/DNS MAC |
-| `feat/heap-stats` | Alloc/free/peak counters + `heapstat` | 90/45/peak shown |
-| `feat/shell-history` | Command history + up/down-arrow recall | up-arrow re-runs |
-| `feat/shell-tabcomplete` | TAB completion of builtins | `ver`+TAB → version |
-| `feat/shell-blk` | Raw sector I/O (`blkdump`/`blkwrite` via /dev/blk) | sector round-trip |
-| `feat/shell-wc` | `wc` line/word/byte count | 2 14 73 on HELLO.TXT |
+| `feat/shell-sysinfo` | `sysinfo` summary | combined view |
+| `feat/sys-getrandom` | `SYS_GETRANDOM` + user hex ELF | distinct hex |
+| `feat/smp-heartbeat` | Secondary continuous heartbeat | counter advances |
+| `feat/net-arp` | ARP cache + `arp [ip]` | resolves MACs |
+| `feat/heap-stats` | Alloc/free/peak + `heapstat` | 90/45/peak |
+| `feat/shell-history` | History + arrow-key recall | up-arrow re-runs |
+| `feat/shell-tabcomplete` | TAB completes builtins | ver+TAB→version |
+| `feat/shell-blk` | Raw sector I/O (blkdump/blkwrite) | sector round-trip |
+| `feat/shell-wc` | `wc` line/word/byte | 2 14 73 |
 | `feat/shell-stat` | `stat` vnode metadata | type/size/cluster |
-| `feat/net-tcp` | **Minimal TCP client + `http <host>`** — fetches real pages | HTTP/1.1 200 OK |
-| `feat/smp-mmu` | **Secondary enters higher half with MMU + atomics + vectors** | concurrent kprintln |
+| `feat/net-tcp` | **TCP client + `http`** (fetches real pages) | HTTP/1.1 200 OK |
+| `feat/smp-mmu` | **Secondary in higher half (MMU+atomics+vectors)** | concurrent kprintln |
 | `feat/smp-print-lock` | IRQ-safe cross-core print lock (atomic lines) | clean SMP output |
-| `feat/smp-tasks` | **Cooperative multitasking on the secondary core** | 2 core-1 tasks advance |
+| `feat/smp-tasks` | **Cooperative multitasking on core 1** | 2 core-1 tasks advance |
+| `feat/shell-df` | Disk capacity + FAT32 usage (`df`) | 16MiB; 8/4084 clusters |
+| `feat/net-ntp` | **SNTP client + `ntp`** (network time) | matches real time |
+| `feat/shell-uname` | `uname [-a]` | system id |
+| `docs/project-log` | This document | — |
 
-### Headline results
-- **TCP**: `http example.com` opens a real TCP connection through slirp and
-  prints `HTTP/1.1 200 OK / Content-Type: text/html`.
+### Headline verified results
+- **TCP**: `http example.com` → `HTTP/1.1 200 OK / Content-Type: text/html` over
+  a real TCP connection through slirp.
 - **DNS**: `resolve example.com` → a real Cloudflare IP.
-- **SMP**: a second core enters the higher half with the MMU on, runs real
-  kernel code (verified by *interleaved* concurrent `kprintln` before the print
-  lock), uses atomics, and runs **two of its own tasks** via `context_switch`.
+- **NTP**: `ntp` → `time.google.com` network time matching the host clock.
+- **SMP**: a second core enters the higher half (MMU on), uses atomics, and runs
+  **two of its own tasks** via `context_switch` (concurrent with core 0's
+  shell). Cross-core `kprintln` interleaving (before the print lock) was direct
+  evidence of true concurrent execution.
 
 ---
 
 ## 8. Networking stack (built incrementally)
 
-ARP → IPv4 → ICMP (ping) → DHCP (DISCOVER/OFFER/REQUEST) → DNS (UDP) →
-ARP cache → **TCP** (handshake, GET, data, FIN). The kernel can resolve a
-hostname and fetch a web page over a real TCP connection (via QEMU slirp,
-which forwards to the host network).
+ARP (+ cache) → IPv4 → ICMP (ping) → DHCP → DNS (UDP) → **TCP** (handshake,
+GET, data, FIN — fetches web pages) → **NTP** (SNTP, network time). All outbound
+traffic goes through QEMU slirp, which forwards to the host network.
 
 ---
 
@@ -245,44 +217,55 @@ which forwards to the host network).
 
 A working **foundation** for symmetric multiprocessing:
 - `smp` — PSCI `CPU_ON` brings up core 1.
-- `smp-mmu` — core 1 enables the MMU (reusing the primary's page tables),
-  jumps to the higher half, installs exception vectors, and runs real high-VA
-  kernel code with **atomics**.
-- `smp-print-lock` — an IRQ-safe spinlock serializes `kprintln!` across cores.
-- `smp-tasks` — core 1 runs **its own cooperative scheduler** over an idle
-  context plus two tasks, switching via `context_switch`. Allocations happen
-  only during the serialized bringup window (core 0 waits on `SECONDARY_UP`),
-  so the unlocked PMM is never touched concurrently.
+- `smp-mmu` — core 1 enables the MMU (reusing the primary's tables), jumps to
+  the higher half, installs exception vectors, runs real high-VA code + atomics.
+- `smp-print-lock` — IRQ-safe spinlock serializes `kprintln!` across cores.
+- `smp-tasks` — core 1 runs **its own cooperative scheduler** (idle + 2 tasks)
+  via `context_switch`. All allocation happens during the serialized bringup
+  window (core 0 waits on `SECONDARY_UP`), so the unlocked PMM isn't touched
+  concurrently; afterwards core 1 only does atomic work.
 
-**Not yet done (remaining big-ticket):** *symmetric* scheduling where arbitrary
-tasks migrate between cores. That needs a per-core `current`, a `SpinLock`-
-protected shared run queue (migrating off the single-core `Racy` globals),
-per-core GIC redistributor + timer for preemption, and IPIs for cross-core
-wakeups — a focused effort best done with this foundation in place.
+**Remaining big-ticket:** *symmetric* scheduling with task migration between
+cores — needs a per-core `current`, a `SpinLock`-protected shared run queue
+(migrating off the single-core `Racy` globals), per-core GIC redistributor +
+timer for preemption, and IPIs for cross-core wakeups. A focused effort, best
+done with this foundation in place.
 
 ---
 
 ## 10. Deferred / known limitations
 
-- **Symmetric SMP scheduling** (above) — only the foundation + cooperative
-  per-core scheduling exist.
-- **TCP** is a one-shot client (no retransmission, windowing, or listen).
-- **Cosmetic**: under QEMU `-nographic`, the very first console input byte of a
+- **Symmetric SMP scheduling** (above).
+- **TCP** is a one-shot client (no retransmission/windowing/listen).
+- **NTP** default host is `time.google.com` (the pool.ntp.org anycast didn't
+  respond through slirp); outbound UDP to arbitrary ports may be filtered in
+  some environments.
+- **Cosmetic**: under QEMU `-nographic`, the first console input byte of a
   session can be eaten by the stdio mux (a harness artifact, not a kernel bug).
-- No C user libc — user programs are written directly in aarch64 assembly
-  against the raw syscall ABI.
+- No C user libc — user programs are aarch64 assembly against the raw syscall ABI.
 
 ---
 
 ## 11. How everything was verified
 
-Every milestone and feature was run in QEMU and confirmed by grepping the serial
-output for concrete evidence (e.g., `MMU TEST] TTBR1 Upper Half: PASS`,
-`PING reply from 10.0.2.2 ttl=255`, `HTTP/1.1 200 OK`, `hello from a loaded
-ELF64 binary`, the `fermi>` prompt). The CI workflow (`.github/workflows/ci.yml`)
-codifies this: it builds the kernel + disk, boots in QEMU, and asserts the
-kernel reached the MMU / driver / networking / ELF / shell milestones.
+Every milestone/feature was run in QEMU and confirmed by grepping serial output
+for concrete evidence (`MMU TEST] TTBR1 Upper Half: PASS`, `PING reply ... ttl=255`,
+`HTTP/1.1 200 OK`, `network time = ...`, `hello from a loaded ELF64`, the
+`fermi>` prompt, two-core task counters advancing). CI (`.github/workflows/
+ci.yml`) builds the kernel + disk, boots in QEMU, and asserts the MMU / driver /
+networking / ELF / shell milestones.
 
-The discovery of *real bugs during bring-up* (the FP trap, the TCP checksum
-buffer-reuse, the GICv3 SPI routing, the pre-MMU relocation hazard) is itself
-evidence the implementation is genuinely exercised end-to-end, not stubbed.
+The discovery of *real bugs during bring-up* (FP trap, TCP checksum buffer
+reuse, GICv3 SPI routing, pre-MMU relocation hazard, FAT32 16-bit sector count)
+is itself evidence the implementation is genuinely exercised end-to-end.
+
+---
+
+## 12. Suggested integration order
+
+1. Merge `rust-port` first (carries the GICv3 SPI-delivery fix the others rely on).
+2. Then independent feature branches in any order.
+3. Stacked chains: `net-dns` → `net-tcp` / `net-ntp`; `smp` → `smp-heartbeat`
+   → `smp-mmu` → `smp-print-lock` → `smp-tasks`.
+4. Trivial conflicts only: overlapping shell `dispatch` arms / help text, the
+   `ps` renderer, and the `ProcKind` enum (`proc-cpuinfo` adds a variant).

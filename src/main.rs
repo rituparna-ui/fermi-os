@@ -6,6 +6,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 #[macro_use]
 mod klib;
 #[macro_use]
@@ -70,6 +72,21 @@ pub extern "C" fn kmain() -> ! {
     let sp: u64;
     unsafe { core::arch::asm!("mov {}, sp", out(reg) sp) };
     kprintln!("[KERNEL] Stack Pointer: {:#x}", sp);
+
+    // CPU identification + PMU (ported later as a fuller module); for now the
+    // heap is the next subsystem.
+    mm::heap::init();
+    mm::heap::run_tests();
+
+    // Sanity-check the global allocator: alloc:: is now usable kernel-wide.
+    {
+        use alloc::vec::Vec;
+        let mut v: Vec<u32> = Vec::new();
+        for i in 0..8 {
+            v.push(i * i);
+        }
+        kprintln!("[ALLOC] Vec demo: {:?}", v.as_slice());
+    }
 
     kprintln!("[KERNEL] Ready! Entering idle loop.");
     loop {

@@ -4,5 +4,6 @@
 #![allow(dead_code)]
 
 pub mod consts;
+pub mod heap;
 pub mod mmu;
 pub mod pmm;

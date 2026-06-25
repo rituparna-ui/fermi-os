@@ -112,6 +112,14 @@ pub extern "C" fn kernel_main() -> ! {
         let n = virtio::rng::read(&mut buf);
         kprintln!("[boot] rng_read {} bytes: {:02x?}", n, &buf[..]);
     }
+    virtio::blk::init();
+    if virtio::blk::is_ready() {
+        let mut sec = alloc::vec![0u8; 512];
+        if virtio::blk::read(0, &mut sec) {
+            let marker = core::str::from_utf8(&sec[..16]).unwrap_or("?");
+            kprintln!("[boot] blk sector0[0..16] = {:?}", marker);
+        }
+    }
 
     // Scheduler + a couple of preemptive EL1 demo tasks.
     sched::init();

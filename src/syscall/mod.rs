@@ -43,6 +43,9 @@ pub const SYS_READDIR: u64 = 16;
 /// mkdir(path): create a directory. Returns 0 on success, -1 on failure
 /// (bad path, parent missing, or already exists). Extends the original ABI.
 pub const SYS_MKDIR: u64 = 17;
+/// rm(path): remove a file or empty directory. Returns 0 on success, -1 on
+/// failure (not found, or non-empty directory). Extends the original ABI.
+pub const SYS_RM: u64 = 18;
 
 pub const BALLOON_OP_INFLATE: u64 = 0;
 pub const BALLOON_OP_DEFLATE: u64 = 1;
@@ -193,6 +196,12 @@ pub fn dispatch(frame: &mut TrapFrame) {
             // arg0 = path under the FAT32 mount, e.g. "/mnt/fat32/SUB".
             ret = match user_str(arg0).and_then(fat32_relative) {
                 Some(rel) if crate::fs::fat32::mkdir(rel.as_bytes()) => 0,
+                _ => -1,
+            };
+        }
+        SYS_RM => {
+            ret = match user_str(arg0).and_then(fat32_relative) {
+                Some(rel) if crate::fs::fat32::remove(rel.as_bytes()) => 0,
                 _ => -1,
             };
         }

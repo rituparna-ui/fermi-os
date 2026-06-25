@@ -354,6 +354,90 @@ fn dir_add_entry(v: &Volume, dir_cluster: u32, entry: &[u8; DIR_ENTRY_SIZE]) -> 
     false
 }
 
+/// Free a cluster chain starting at `first_cluster` by zeroing each FAT entry.
+/// A first_cluster of 0 (empty file) is a no-op.
+fn free_chain(v: &Volume, first_cluster: u32) -> bool {
+    let mut cluster = first_cluster;
+    while (2..FAT32_EOC).contains(&cluster) {
+        let next = fat_next(v, cluster);
+        if !fat_write(v, cluster, 0) {
+            return false;
+        }
+        cluster = next;
+    }
+    true
+}
+
+/// Mark the entry named `target` in `dir_cluster` as deleted (name[0] = 0xE5).
+fn dir_mark_deleted(v: &Volume, dir_cluster: u32, target: &[u8; 11]) -> bool {
+    let mut cluster = dir_cluster;
+    let mut buf = [0u8; SECTOR];
+    while cluster < FAT32_EOC {
+        let base = cluster_to_sector(v, cluster);
+        for s in 0..v.sectors_per_cluster {
+            if !blk::read((base + s) as u64, &mut buf) {
+                return false;
+            }
+            let mut off = 0;
+            while off < SECTOR {
+                let e = &buf[off..off + DIR_ENTRY_SIZE];
+                if e[0] == 0x00 {
+                    return false; // end of directory; not found
+                }
+                if e[0] != 0xE5 && e[11] != ATTR_LFN && (e[11] & ATTR_VOLUME_ID) == 0
+                    && e[0..11] == target[..]
+                {
+                    buf[off] = 0xE5; // mark free
+                    return blk::write((base + s) as u64, &buf);
+                }
+                off += DIR_ENTRY_SIZE;
+            }
+        }
+        cluster = fat_next(v, cluster);
+    }
+    false
+}
+
+/// Returns true if directory `dir_cluster` has no real entries other than
+/// `.` and `..` (used to refuse removing a non-empty directory).
+fn dir_is_empty(v: &Volume, dir_cluster: u32) -> bool {
+    dir_nth_name(v, dir_cluster, 0)
+        .map(|n| {
+            // Index 0 is always "."; check there's no third real entry.
+            let _ = n;
+            dir_nth_name(v, dir_cluster, 2).is_none()
+        })
+        .unwrap_or(true)
+}
+
+/// Remove a file or empty directory at `path`. Frees its cluster chain and
+/// marks the directory entry deleted. Refuses to remove a non-empty directory.
+/// Returns true on success.
+pub fn remove(path: &[u8]) -> bool {
+    let v = vol();
+    if !v.mounted {
+        return false;
+    }
+    let (dir_cluster, name83) = match resolve_parent(&v, path) {
+        Some(p) => p,
+        None => return false,
+    };
+    let (first_cluster, _size, attr) = match dir_lookup(&v, dir_cluster, &name83) {
+        Some(e) => e,
+        None => return false,
+    };
+
+    // Refuse to remove a non-empty directory (only . and .. allowed).
+    if attr & ATTR_DIRECTORY != 0 && !dir_is_empty(&v, first_cluster) {
+        return false;
+    }
+
+    if !free_chain(&v, first_cluster) {
+        return false;
+    }
+    dir_mark_deleted(&v, dir_cluster, &name83)
+}
+
 /// Write `data` across a cluster chain, one sector at a time (read-modify-write
 /// for the final partial sector).
 fn cluster_write_data(v: &Volume, first_cluster: u32, data: &[u8]) -> bool {
@@ -529,6 +613,19 @@ pub fn mkdir(path: &[u8]) -> bool {
 
 pub fn root_cluster() -> u32 {
     vol().root_cluster
+}
+
+/// True if `path` resolves to an existing on-disk entry (bypasses the VFS
+/// cache — reads the directory fresh). Useful for verifying create/remove.
+pub fn exists(path: &[u8]) -> bool {
+    let v = vol();
+    if !v.mounted {
+        return false;
+    }
+    match resolve_parent(&v, path) {
+        Some((dir, name83)) => dir_lookup(&v, dir, &name83).is_some(),
+        None => false,
+    }
 }
 
 // --- VFS integration --------------------------------------------------------

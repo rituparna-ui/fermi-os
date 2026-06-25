@@ -432,6 +432,23 @@ fn fat32_stress() {
         "[FAT32 SUBDIR] mkdir RDIR + create RDIR/INNER.TXT + read: {}",
         if ok { "PASS" } else { "FAIL" }
     );
+
+    // Remove test: create a never-looked-up file (avoiding VFS cache), confirm
+    // it exists on disk, remove it, confirm it's gone, and confirm the freed
+    // slot/clusters can be reused by re-creating it. Uses the cache-bypassing
+    // exists() so it's idempotent and unaffected by VFS vnode caching.
+    let _ = fs::fat32::remove(b"RMTEST.TXT"); // clean slate if a prior run left it
+    let made = fs::fat32::create(b"RMTEST.TXT", b"to be removed\n");
+    let present = fs::fat32::exists(b"RMTEST.TXT");
+    let removed = fs::fat32::remove(b"RMTEST.TXT");
+    let gone = !fs::fat32::exists(b"RMTEST.TXT");
+    let remade = fs::fat32::create(b"RMTEST.TXT", b"again\n");
+    let _ = fs::fat32::remove(b"RMTEST.TXT"); // leave the disk clean
+    let rm_ok = made && present && removed && gone && remade;
+    kprintln!(
+        "[FAT32 RM] create+exists+remove+gone+recreate: {}",
+        if rm_ok { "PASS" } else { "FAIL" }
+    );
 }
 
 /// fd-table stress: open the max number of fds, confirm the table rejects the

@@ -327,6 +327,22 @@ static void hyp_restore_el1(vcpu_t *v) {
   __asm__ __volatile__("isb");
 }
 
+/* Per-guest vGIC state save/restore. */
+static void hyp_save_vgic(vcpu_t *v) {
+  __asm__ __volatile__("mrs %0, ich_lr0_el2" : "=r"(v->ich_lr[0]));
+  __asm__ __volatile__("mrs %0, ich_lr1_el2" : "=r"(v->ich_lr[1]));
+  v->ich_vmcr = MRS(ich_vmcr_el2);
+  v->ich_ap1r0 = MRS(ich_ap1r0_el2);
+}
+
+static void hyp_restore_vgic(vcpu_t *v) {
+  __asm__ __volatile__("msr ich_lr0_el2, %0" ::"r"(v->ich_lr[0]));
+  __asm__ __volatile__("msr ich_lr1_el2, %0" ::"r"(v->ich_lr[1]));
+  MSR(ich_vmcr_el2, v->ich_vmcr);
+  MSR(ich_ap1r0_el2, v->ich_ap1r0);
+  __asm__ __volatile__("isb");
+}
+
 /* Round-robin to the next non-unused vCPU after `from`. */
 static int hyp_pick_next(int from) {
   for (int i = 1; i <= NUM_VCPUS; i++) {
@@ -350,6 +366,7 @@ static void hyp_world_switch(el2_frame_t *f) {
   cur->pstate = MRS(spsr_el2);
   cur->vttbr = MRS(vttbr_el2);
   hyp_save_el1(cur);
+  hyp_save_vgic(cur);
   if (cur->state == VCPU_RUNNING)
     cur->state = VCPU_READY;
 
@@ -370,6 +387,7 @@ static void hyp_world_switch(el2_frame_t *f) {
   MSR(vttbr_el2, nv->vttbr);
   __asm__ __volatile__("isb");
   hyp_restore_el1(nv);
+  hyp_restore_vgic(nv);
 }
 
 /* Build guest 1's stage-2: identity-map ONLY its RAM slice (IPA == PA over
@@ -615,26 +633,49 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
  * interrupt — no maintenance interrupt needed. Only the timer PPI is in play
  * for this guest, so a single in-flight LR is the normal case; we scan LR0/LR1
  * for robustness. */
-static void hyp_vgic_inject_hw(uint32_t intid) {
-  uint64_t lr = ((uint64_t)intid) |                       /* vINTID [31:0]   */
-                (((uint64_t)intid) << ICH_LR_PINTID_SHIFT) | /* pINTID       */
-                (0ULL << ICH_LR_PRIO_SHIFT) |             /* priority 0      */
+/* Which vCPU owns a given physical INTID. The primary guest (vCPU 0) owns
+ * the device/timer interrupts it programmed; extend this map as guests gain
+ * their own interrupt sources. */
+static int hyp_intid_owner(uint32_t intid) {
+  (void)intid;
+  return 0;
+}
+
+/* Inject a hardware-linked virtual interrupt into `target`'s vGIC. If the
+ * target is the running vCPU we write a live list register; otherwise we
+ * stash it in the target's saved LR state, to be loaded when it is resumed.
+ * HW=1 ties the vINTID to the physical one so the guest's own EOI deactivates
+ * the physical interrupt. */
+static void hyp_vgic_inject(int target, uint32_t intid) {
+  uint64_t lr = ((uint64_t)intid) |
+                (((uint64_t)intid) << ICH_LR_PINTID_SHIFT) |
                 ICH_LR_GROUP1 | ICH_LR_HW | ICH_LR_STATE_PENDING;
 
-  uint64_t lr0, lr1;
-  __asm__ __volatile__("mrs %0, ich_lr0_el2" : "=r"(lr0));
-  if ((lr0 >> 62) == 0) { /* State == Invalid => free */
-    __asm__ __volatile__("msr ich_lr0_el2, %0" ::"r"(lr));
-    return;
+  if (target == current_vcpu) {
+    uint64_t lr0, lr1;
+    __asm__ __volatile__("mrs %0, ich_lr0_el2" : "=r"(lr0));
+    if ((lr0 >> 62) == 0) {
+      __asm__ __volatile__("msr ich_lr0_el2, %0" ::"r"(lr));
+      return;
+    }
+    __asm__ __volatile__("mrs %0, ich_lr1_el2" : "=r"(lr1));
+    if ((lr1 >> 62) == 0) {
+      __asm__ __volatile__("msr ich_lr1_el2, %0" ::"r"(lr));
+      return;
+    }
+    __asm__ __volatile__("msr ich_lr0_el2, %0" ::"r"(lr)); /* fallback */
+  } else {
+    vcpu_t *v = &vcpus[target];
+    if ((v->ich_lr[0] >> 62) == 0) {
+      v->ich_lr[0] = lr;
+      return;
+    }
+    if ((v->ich_lr[1] >> 62) == 0) {
+      v->ich_lr[1] = lr;
+      return;
+    }
+    v->ich_lr[0] = lr; /* fallback */
   }
-  __asm__ __volatile__("mrs %0, ich_lr1_el2" : "=r"(lr1));
-  if ((lr1 >> 62) == 0) {
-    __asm__ __volatile__("msr ich_lr1_el2, %0" ::"r"(lr));
-    return;
-  }
-  /* No free LR (shouldn't happen with a single timer source): overwrite LR0
-   * as a best-effort fallback. */
-  __asm__ __volatile__("msr ich_lr0_el2, %0" ::"r"(lr));
 }
 
 /* Physical IRQ taken at EL2 (HCR_EL2.IMO). Ack on the physical CPU interface,
@@ -660,16 +701,18 @@ static void hyp_handle_irq(el2_frame_t *frame) {
     return;
   }
 
-  vcpu_t *cur = &vcpus[current_vcpu];
-  cur->virq_injected++;
-  hyp_vgic_inject_hw(intid);
-  __asm__ __volatile__("msr icc_eoir1_el1, %0" ::"r"(iar)); /* priority drop */
+  int owner = hyp_intid_owner(intid);
+  uint64_t n = ++vcpus[owner].virq_injected;
+  hyp_vgic_inject(owner, intid);
+  __asm__ __volatile__("msr icc_eoir1_el1, %0" ::"r"(iar));
 
-  if (cur->virq_injected <= 3) {
+  if (n <= 3) {
     hyp_puts("[HYP] injected hw vIRQ intid=");
     hyp_puthex(intid);
+    hyp_puts(" -> vCPU ");
+    hyp_puthex((uint64_t)owner);
     hyp_puts(" (count=");
-    hyp_puthex(cur->virq_injected);
+    hyp_puthex(n);
     hyp_puts(")\n");
   }
 }

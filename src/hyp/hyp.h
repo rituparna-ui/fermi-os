@@ -97,6 +97,11 @@ typedef struct {
   uint64_t vbar_el1, contextidr_el1;
   uint64_t tpidr_el1, tpidrro_el0, tpidr_el0;
   uint64_t esr_el1, far_el1, par_el1;
+
+  /* Per-guest vGIC (virtual CPU interface) state. */
+  uint64_t ich_lr[2];   /* list registers 0..1 (pending/active vIRQs)        */
+  uint64_t ich_vmcr;    /* virtual machine control (group enables, vPMR)     */
+  uint64_t ich_ap1r0;   /* group-1 active priorities                          */
 } vcpu_t;
 
 /* Configure EL2 and stage-2, install the EL2 vector table. Called once from

@@ -270,9 +270,10 @@ void hyp_init(void) {
   MSR(ich_hcr_el2, ICH_HCR_EN);              /* enable virtual CPU interface */
   __asm__ __volatile__("isb");
 
-  /* Enable stage-2, pin EL1 to AArch64, trap guest ID-register reads
-   * (TID3), and route physical IRQs to EL2 (IMO) so we can inject vIRQs. */
-  MSR(hcr_el2, HCR_RW | HCR_VM | HCR_TID3 | HCR_IMO);
+  /* Enable stage-2, pin EL1 to AArch64, and route physical IRQs to EL2 (IMO)
+   * so we can inject vIRQs. (TID3 ID-register trapping from the M2 demo is
+   * left off here — guests, including Linux, read ID registers natively.) */
+  MSR(hcr_el2, HCR_RW | HCR_VM | HCR_IMO);
   __asm__ __volatile__("isb");
 
   /* Register the primary guest (Fermi) as vCPU 0 — its full context is
@@ -498,11 +499,12 @@ static void hyp_tick_init(void) {
   while (mmio_read32(GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP) {
   }
 
-  /* PPI 26 -> Group1 NS, then enable it (ISENABLER is write-1-to-set). */
+  /* PPI 26 (CNTHP, scheduler tick) and PPI 27 (CNTV, the Linux guest's
+   * virtual timer) -> Group1 NS, enabled. */
   uint32_t grp = mmio_read32(GICR_IGROUPR0);
-  grp |= (1u << HYP_TIMER_INTID);
+  grp |= (1u << HYP_TIMER_INTID) | (1u << 27);
   mmio_write32(GICR_IGROUPR0, grp);
-  mmio_write32(GICR_ISENABLER0, (1u << HYP_TIMER_INTID));
+  mmio_write32(GICR_ISENABLER0, (1u << HYP_TIMER_INTID) | (1u << 27));
 }
 
 /* Arm CNTHP_EL2 to fire one quantum from now. */
@@ -708,6 +710,61 @@ static void hyp_handle_sysreg(el2_frame_t *f) {
   MSR(elr_el2, MRS(elr_el2) + 4);
 }
 
+/* Minimal emulated GICv3 distributor + redistributor for the Linux guest.
+ * The guest's GIC MMIO region is intentionally NOT mapped in its stage-2, so
+ * accesses trap to EL2 and land here. We only need enough to satisfy Linux's
+ * gic-v3 probe: report the right version/typer, complete the redistributor
+ * WAKER handshake, and accept (mostly ignore) the configuration writes —
+ * actual interrupt delivery for the guest's timer is done by the hypervisor
+ * injecting virtual interrupts through the list registers. */
+#define GICD_LO 0x08000000ULL
+#define GICD_HI 0x08010000ULL
+#define GICR_LO 0x080A0000ULL
+#define GICR_HI 0x080C0000ULL
+
+__attribute__((section(".hyp_tables"))) static struct {
+  uint32_t gicd_ctlr;
+  uint32_t gicr_ctlr;
+} g_vgic;
+
+static int hyp_emulate_gic(uint64_t ipa, int is_write, uint64_t *val) {
+  if (ipa >= GICD_LO && ipa < GICD_HI) {
+    uint64_t off = ipa - GICD_LO;
+    if (is_write) {
+      if (off == 0x000)
+        g_vgic.gicd_ctlr = (uint32_t)*val;
+      /* enables / priorities / routing: accepted and ignored */
+    } else {
+      switch (off) {
+      case 0x000: *val = g_vgic.gicd_ctlr; break;          /* GICD_CTLR     */
+      case 0x004: *val = (1u << 0) | (9u << 19); break;    /* TYPER: 64 INTID, IDbits=9 */
+      case 0x008: *val = 0x0000043bUL; break;              /* IIDR (ARM)    */
+      case 0xFFE8: *val = 0x30; break;                     /* PIDR2 => GICv3 */
+      default: *val = 0; break;
+      }
+    }
+    return 1;
+  }
+  if (ipa >= GICR_LO && ipa < GICR_HI) {
+    uint64_t off = ipa - GICR_LO; /* RD frame at 0, SGI frame at 0x10000 */
+    if (is_write) {
+      if (off == 0x000)
+        g_vgic.gicr_ctlr = (uint32_t)*val;
+      /* WAKER and per-PPI config: accepted and ignored */
+    } else {
+      switch (off) {
+      case 0x0000: *val = g_vgic.gicr_ctlr; break;         /* GICR_CTLR     */
+      case 0x0008: *val = (1ULL << 4); break;              /* TYPER: Last=1, aff=0 */
+      case 0x0014: *val = 0; break;                        /* WAKER: not asleep */
+      case 0xFFE8: *val = 0x30; break;                     /* PIDR2 => GICv3 */
+      default: *val = 0; break;
+      }
+    }
+    return 1;
+  }
+  return 0;
+}
+
 /* Lower-EL abort. If the guest faulted trying to reach hypervisor-private
  * memory, that's our isolation boundary doing its job: report it, poison the
  * destination register on a read, and step over the access so the guest keeps
@@ -742,6 +799,48 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
     return;
   }
 
+  /* Linux guest: emulate trapped GIC distributor/redistributor MMIO. */
+  if (current_vcpu == 1 &&
+      ((ipa >= GICD_LO && ipa < GICD_HI) || (ipa >= GICR_LO && ipa < GICR_HI))) {
+    uint64_t isv = (esr >> 24) & 1;
+    uint64_t sas = (esr >> 22) & 3;
+    uint64_t srt = (esr >> 16) & 0x1F;
+    uint64_t wnr = (esr >> 6) & 1;
+    if (isv) {
+      uint64_t v = 0;
+      if (wnr) {
+        v = (srt == 31) ? 0 : frame->x[srt];
+        hyp_emulate_gic(ipa, 1, &v);
+      } else {
+        hyp_emulate_gic(ipa, 0, &v);
+        if (sas == 0)
+          v &= 0xFF;
+        else if (sas == 1)
+          v &= 0xFFFF;
+        else if (sas == 2)
+          v &= 0xFFFFFFFF;
+        if (srt != 31)
+          frame->x[srt] = v;
+      }
+    }
+    MSR(elr_el2, MRS(elr_el2) + 4); /* step past the trapped instruction */
+    return;
+  }
+
+  /* Linux guest hit an unhandled fault: reap it (keeping the primary guest
+   * and hypervisor alive), logging where it died. */
+  if (current_vcpu == 1) {
+    hyp_puts("\n[HYP] Linux guest unhandled abort: IPA=");
+    hyp_puthex(ipa);
+    hyp_puts(" ESR=");
+    hyp_puthex(esr);
+    hyp_puts(" ELR=");
+    hyp_puthex(MRS(elr_el2));
+    hyp_puts("\n");
+    hyp_vcpu_exit(frame);
+    return;
+  }
+
   hyp_puts("\n[HYP] *** unexpected lower-EL abort *** vector=");
   hyp_puthex(index);
   hyp_puts(" EC=");
@@ -771,7 +870,10 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
  * the device/timer interrupts it programmed; extend this map as guests gain
  * their own interrupt sources. */
 static int hyp_intid_owner(uint32_t intid) {
-  (void)intid;
+  /* CNTV (PPI 27) is the Linux guest's virtual timer; everything else
+   * (notably the primary guest's CNTP, INTID 30) belongs to vCPU 0. */
+  if (intid == 27)
+    return 1;
   return 0;
 }
 

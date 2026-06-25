@@ -490,6 +490,13 @@ pub extern "C" fn task_crash() {
     sys_exit();
 }
 
+/// Minimal EL0 task that exits immediately — used by the task-churn stress
+/// test to exercise per-task address-space teardown, ASID recycling, and
+/// resource reaping.
+pub extern "C" fn task_noop() {
+    sys_exit();
+}
+
 /// Original simple EL0 demo task (kept for the boot smoke test).
 pub extern "C" fn task_user() {
     print(b"[user] hello from EL0 via SYS_WRITE!\n");

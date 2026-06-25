@@ -128,6 +128,12 @@ fn name_str(name: &[u8; 16]) -> &str {
     core::str::from_utf8(&name[..len]).unwrap_or("?")
 }
 
+/// Tasks whose create/reap logging is suppressed (the churn stress test spawns
+/// many of these and would otherwise flood the console).
+fn quiet_task(name: &str) -> bool {
+    name == "churnkid"
+}
+
 #[inline]
 fn irq_save() -> u64 {
     let daif: u64;
@@ -348,13 +354,17 @@ pub fn create_task(name: &str, entry: TaskEntry) -> i64 {
         enqueue(t);
         irq_restore(daif);
 
-        kprintln!(
-            "[SCHED] Created EL0 task {} '{}' | kstack: {:#x} | user_entry: {:#x}",
-            (*t).pid,
-            name,
-            kstack_top,
-            user_entry
-        );
+        // The churn stress test creates many short-lived tasks; stay quiet for
+        // them so the log (and the interactive shell) isn't flooded.
+        if !quiet_task(name) {
+            kprintln!(
+                "[SCHED] Created EL0 task {} '{}' | kstack: {:#x} | user_entry: {:#x}",
+                (*t).pid,
+                name,
+                kstack_top,
+                user_entry
+            );
+        }
         (*t).pid as i64
     }
 }
@@ -426,7 +436,9 @@ pub extern "C" fn task_exit() {
     let cur = current();
     // SAFETY (single-core): cur is the running task.
     unsafe {
-        kprintln!("[SCHED] Task {} '{}' exiting", (*cur).pid, name_str(&(*cur).name));
+        if !quiet_task(name_str(&(*cur).name)) {
+            kprintln!("[SCHED] Task {} '{}' exiting", (*cur).pid, name_str(&(*cur).name));
+        }
         (*cur).state = TaskState::Dead;
     }
     schedule();
@@ -566,7 +578,9 @@ pub fn reap() {
             }
             (*DEAD_LIST.get()) = (*dead).next;
 
-            kprintln!("[SCHED] Reaping task {} '{}'", (*dead).pid, name_str(&(*dead).name));
+            if !quiet_task(name_str(&(*dead).name)) {
+                kprintln!("[SCHED] Reaping task {} '{}'", (*dead).pid, name_str(&(*dead).name));
+            }
 
             if (*dead).stack_phys != 0 {
                 pmm::free_pages((*dead).stack_phys, TASK_STACK_PAGES);

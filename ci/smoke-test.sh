@@ -69,6 +69,7 @@ require "[DHCP] Lease ACK"
 require "PING reply from 10.0.2.2"
 require "[FAT32 TEST] /mnt/fat32/HELLO.TXT"
 require "[FAT32 TEST] create+read RUSTW.TXT round-trip: PASS"
+require "[CHURN TEST] PASS"
 require "[KERNEL] Ready!"
 
 echo "Checking for failures:"

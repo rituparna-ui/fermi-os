@@ -239,6 +239,11 @@ pub extern "C" fn kmain() -> ! {
     sched::create_task("task_shell", user::task_shell);
     sched::create_task("task_crash", user::task_crash);
     sched::create_kernel_task("netd", netd);
+    // Task-churn stress test (EL1 kernel task): rapidly creates + reaps EL0
+    // tasks and checks the PMM free-page count returns to baseline, flushing
+    // out leaks / use-after-free in address-space teardown + ASID recycling.
+    // Created last so it doesn't perturb the other tasks' pids.
+    sched::create_kernel_task("churn", churn_test);
 
     // Start the periodic timer: from here, timer IRQs drive preemption.
     exception::timer::init();
@@ -249,6 +254,51 @@ pub extern "C" fn kmain() -> ! {
         sched::reap();
         unsafe { core::arch::asm!("wfi") };
     }
+}
+
+/// Task-churn stress test. Runs as an EL1 kernel task so it can drive the
+/// scheduler directly. Creates many short-lived EL0 tasks in batches; each
+/// task allocates a kernel stack + user page tables + user stack + fd table and
+/// frees them all on exit/reap. If teardown leaks (or double-frees), the PMM
+/// free-page count drifts. We compare against a baseline taken after the first
+/// batch has fully settled (so one-time allocations like the heap's lazy growth
+/// don't count as a leak).
+extern "C" fn churn_test() {
+    const ROUNDS: u32 = 6;
+    const BATCH: u32 = 8;
+
+    // Let the initial task set settle before measuring (yield, don't sleep —
+    // sleep_ms logs and would flood the console / disturb the shell test).
+    for _ in 0..50 {
+        sched::r#yield();
+    }
+
+    let mut baseline: u64 = 0;
+    for round in 0..ROUNDS {
+        for _ in 0..BATCH {
+            sched::create_task("churnkid", user::task_noop);
+        }
+        // Yield until the batch has run, exited, and been reaped. The noop
+        // tasks exit on first schedule; yielding repeatedly drains them, and
+        // reap() frees their resources.
+        for _ in 0..40 {
+            sched::reap();
+            sched::r#yield();
+        }
+        let free = mm::pmm::free_pages_count();
+        if round == 0 {
+            baseline = free; // first round absorbs any one-time settling
+        }
+    }
+
+    let final_free = mm::pmm::free_pages_count();
+    let leaked = baseline as i64 - final_free as i64;
+    if leaked == 0 {
+        kprintln!("[CHURN TEST] PASS: no page leak across {} task creations", ROUNDS * BATCH);
+    } else {
+        kprintln!("[CHURN TEST] FAIL: leaked {} pages across churn", leaked);
+    }
+    sched::task_exit();
 }
 
 /// netd: an EL1 kernel daemon that periodically pings the slirp gateway and

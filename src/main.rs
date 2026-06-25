@@ -120,6 +120,7 @@ pub extern "C" fn kernel_main() -> ! {
     // GICv3 + generic timer (10ms tick). Enables IRQs.
     exception::gic::init();
     exception::timer::init();
+    exception::timer::set_callback(|| {}); // silence default per-tick log
 
     // PCI enumeration + VirtIO RNG.
     pci::enumerate_bus();
@@ -169,24 +170,6 @@ pub extern "C" fn kernel_main() -> ! {
     fs::vfs::create_node(mnt, "fat32", fs::vfs::VnodeType::Dir);
     fs::fat32::vfs_mount("/mnt/fat32");
     fs::proc::mount();
-    // FAT32 write path: create a file, then read it back through the VFS.
-    {
-        let ok = fs::fat32::create(b"RUST.TXT", b"Written by the Rust FAT32 write path!\n");
-        kprintln!("[boot] fat32 create RUST.TXT: {}", if ok { "ok" } else { "FAIL" });
-        let t = fs::vfs::fd_table_create();
-        let fd = fs::vfs::fd_open(t, "/mnt/fat32/RUST.TXT");
-        if fd >= 0 {
-            let mut b = [0u8; 64];
-            let n = fs::vfs::fd_read(t, fd, &mut b);
-            let txt = core::str::from_utf8(&b[..n.max(0) as usize]).unwrap_or("?");
-            kprintln!("[boot] readback RUST.TXT ({} bytes):", n);
-            crate::kprint!("{}", txt);
-            fs::vfs::fd_close(t, fd);
-        } else {
-            kprintln!("[boot] readback: could not open RUST.TXT");
-        }
-        fs::vfs::fd_table_destroy(t);
-    }
     {
         let t = fs::vfs::fd_table_create();
         for path in ["/proc/uptime", "/proc/meminfo", "/proc/version"].iter() {

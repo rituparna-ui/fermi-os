@@ -228,6 +228,16 @@ own registers and needs no context switch.
   minimal MBR, so Linux's `virtio_blk` driver (a module from the initramfs)
   registers `/dev/vda` with the right size and its partition scan detects
   `vda1` — confirming correct block reads.
+- **Emulated virtio-net (virtio-mmio)**: a network device (DeviceID 1) at IPA
+  `0x0a000400` (IRQ SPI 4 / INTID 36) exposing `eth0`, with two virtqueues
+  (0 = RX guest←host, 1 = TX guest→host) and a `VIRTIO_NET_F_MAC` address. The
+  hypervisor is the **link peer**: on a TX `QueueNotify` it gathers the guest's
+  ethernet frame (skipping the 12-byte virtio-net header) and, for an ARP
+  request or ICMP echo addressed to the hypervisor host `10.0.0.1`, builds a
+  reply (recomputing IP/ICMP checksums) and delivers it on the RX queue,
+  injecting the device SPI. Verified: the guest's `virtio_net` driver (a module
+  from the initramfs) brings up `eth0`, and `ping 10.0.0.1` gets ICMP echo
+  replies (2/2, 0% loss) — exercising the full two-queue TX+RX path.
 
 ---
 

@@ -96,4 +96,13 @@
 		reg = <0x0 0x0a000200 0x0 0x200>;
 		interrupts = <0 3 4>;
 	};
+
+	/* Emulated virtio-net (virtio-mmio, device id 1) => eth0. The hypervisor
+	 * acts as the link peer: it answers ARP + ICMP echo so the guest can ping
+	 * a hypervisor-emulated host. IRQ SPI 4 => INTID 36. */
+	virtio_net@a000400 {
+		compatible = "virtio,mmio";
+		reg = <0x0 0x0a000400 0x0 0x200>;
+		interrupts = <0 4 4>;
+	};
 };

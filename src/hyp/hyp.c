@@ -916,6 +916,281 @@ static int hyp_emulate_vblk(uint64_t ipa, int is_write, uint64_t *val) {
   return 1;
 }
 
+/* ------------------------- emulated virtio-net ----------------------------- */
+/* A virtio-mmio (version 2) network device (DeviceID 1) => eth0. It has two
+ * virtqueues (0 = RX guest<-host, 1 = TX guest->host). The hypervisor is the
+ * link peer: on TX it parses the guest's ethernet frame and, for an ARP request
+ * or ICMP echo addressed to OUR_IP, builds a reply and delivers it on the RX
+ * queue. So the guest can `ping` a hypervisor-emulated host end-to-end. */
+#define VNET_LO 0x0a000400ULL
+#define VNET_HI 0x0a000600ULL
+#define VNET_INTID 36 /* DT: virtio_net interrupts = <0 4 4> => SPI 4 => 36 */
+#define VRING_F_NEXT 1
+#define VNET_HDR_LEN 12 /* sizeof(struct virtio_net_hdr_v1) with VERSION_1 */
+
+static const uint8_t OUR_MAC[6] = {0x52, 0x54, 0x00, 0xfe, 0x7b, 0x01};
+static const uint8_t OUR_IP[4] = {10, 0, 0, 1};
+
+struct vnet_q {
+  uint32_t num, ready;
+  uint64_t desc, avail, used;
+  uint16_t last_avail;
+};
+__attribute__((section(".hyp_tables"))) static struct {
+  uint32_t status;
+  uint32_t dev_feat_sel, drv_feat_sel;
+  uint32_t int_status;
+  uint32_t q_sel;
+  struct vnet_q q[2]; /* 0 = RX, 1 = TX */
+  uint32_t tx_seen, rx_sent;
+} g_vnet;
+__attribute__((section(".hyp_tables"))) static uint8_t g_net_tx[2048];
+__attribute__((section(".hyp_tables"))) static uint8_t g_net_rx[2048];
+
+/* RFC1071 ones-complement checksum over network-order bytes. */
+static uint16_t in_csum(const uint8_t *p, uint32_t len) {
+  uint32_t sum = 0;
+  for (uint32_t i = 0; i + 1 < len; i += 2)
+    sum += ((uint32_t)p[i] << 8) | p[i + 1];
+  if (len & 1)
+    sum += (uint32_t)p[len - 1] << 8;
+  while (sum >> 16)
+    sum = (sum & 0xffff) + (sum >> 16);
+  return (uint16_t)~sum;
+}
+
+/* Gather a descriptor chain into buf; returns bytes copied. */
+static uint32_t vnet_gather(struct vq_desc *desc, uint16_t head, uint32_t qnum,
+                            uint8_t *buf, uint32_t maxlen) {
+  uint32_t total = 0;
+  uint16_t idx = head;
+  for (int guard = 0; guard < 128; guard++) {
+    struct vq_desc *d = &desc[idx];
+    uint8_t *p = lx_gpa(d->addr);
+    if (p)
+      for (uint32_t i = 0; i < d->len && total < maxlen; i++)
+        buf[total++] = p[i];
+    if (!(d->flags & VRING_F_NEXT))
+      break;
+    idx = d->next;
+    if (idx >= qnum)
+      break;
+  }
+  return total;
+}
+
+/* Scatter buf into a (device-writable) descriptor chain; returns bytes written. */
+static uint32_t vnet_scatter(struct vq_desc *desc, uint16_t head, uint32_t qnum,
+                             const uint8_t *buf, uint32_t len) {
+  uint32_t total = 0;
+  uint16_t idx = head;
+  for (int guard = 0; guard < 128; guard++) {
+    struct vq_desc *d = &desc[idx];
+    uint8_t *p = lx_gpa(d->addr);
+    if (p)
+      for (uint32_t i = 0; i < d->len && total < len; i++)
+        p[i] = buf[total++];
+    if (total >= len || !(d->flags & VRING_F_NEXT))
+      break;
+    idx = d->next;
+    if (idx >= qnum)
+      break;
+  }
+  return total;
+}
+
+/* Deliver a single ethernet frame (already in g_net_rx + VNET_HDR_LEN) of
+ * length framelen to the guest's RX queue. Returns 1 if delivered. */
+static int hyp_vnet_rx_submit(uint32_t framelen) {
+  struct vnet_q *q = &g_vnet.q[0];
+  if (!q->ready || !q->desc || !q->avail || !q->used || q->num == 0)
+    return 0;
+  struct vq_desc *desc = lx_gpa(q->desc);
+  volatile uint16_t *avail = lx_gpa(q->avail);
+  volatile uint16_t *used16 = lx_gpa(q->used);
+  if (!desc || !avail || !used16)
+    return 0;
+  if (q->last_avail == avail[1])
+    return 0; /* no RX buffer posted -> drop */
+  uint16_t head = avail[2 + (q->last_avail % q->num)];
+  if (head >= q->num)
+    return 0;
+
+  /* virtio_net_hdr_v1: zeroed, num_buffers = 1 (offset 10). */
+  for (int i = 0; i < VNET_HDR_LEN; i++)
+    g_net_rx[i] = 0;
+  g_net_rx[10] = 1;
+  uint32_t total = VNET_HDR_LEN + framelen;
+  uint32_t w = vnet_scatter(desc, head, q->num, g_net_rx, total);
+
+  volatile uint32_t *ur = (volatile uint32_t *)(used16 + 2);
+  uint16_t uidx = used16[1];
+  uint16_t us = uidx % q->num;
+  ur[us * 2 + 0] = head;
+  ur[us * 2 + 1] = w;
+  __asm__ __volatile__("dsb ish");
+  used16[1] = uidx + 1;
+  q->last_avail++;
+  g_vnet.rx_sent++;
+  return 1;
+}
+
+/* Parse one guest TX ethernet frame and, if it's an ARP request or ICMP echo
+ * for OUR_IP, build a reply into g_net_rx+VNET_HDR_LEN and submit it on RX. */
+static void hyp_vnet_handle_frame(const uint8_t *f, uint32_t len) {
+  if (len < 14)
+    return;
+  uint8_t *r = &g_net_rx[VNET_HDR_LEN];
+  uint16_t eth = ((uint16_t)f[12] << 8) | f[13];
+
+  if (eth == 0x0806 && len >= 42) { /* ARP */
+    const uint8_t *a = f + 14;
+    uint16_t oper = ((uint16_t)a[6] << 8) | a[7];
+    const uint8_t *tpa = a + 24;
+    if (oper != 1 || tpa[0] != OUR_IP[0] || tpa[1] != OUR_IP[1] ||
+        tpa[2] != OUR_IP[2] || tpa[3] != OUR_IP[3])
+      return;
+    const uint8_t *sha = a + 8, *spa = a + 14;
+    /* ethernet */
+    for (int i = 0; i < 6; i++) r[i] = sha[i];        /* dst = requester */
+    for (int i = 0; i < 6; i++) r[6 + i] = OUR_MAC[i];/* src = us        */
+    r[12] = 0x08; r[13] = 0x06;
+    /* arp reply */
+    uint8_t *ra = r + 14;
+    ra[0] = 0; ra[1] = 1;            /* htype ethernet */
+    ra[2] = 0x08; ra[3] = 0x00;      /* ptype IPv4     */
+    ra[4] = 6; ra[5] = 4;            /* hlen, plen     */
+    ra[6] = 0; ra[7] = 2;            /* oper = reply   */
+    for (int i = 0; i < 6; i++) ra[8 + i] = OUR_MAC[i];
+    for (int i = 0; i < 4; i++) ra[14 + i] = OUR_IP[i];
+    for (int i = 0; i < 6; i++) ra[18 + i] = sha[i];
+    for (int i = 0; i < 4; i++) ra[24 + i] = spa[i];
+    hyp_vnet_rx_submit(42);
+    return;
+  }
+
+  if (eth == 0x0800 && len >= 14 + 20) { /* IPv4 */
+    const uint8_t *ip = f + 14;
+    uint32_t ihl = (ip[0] & 0x0f) * 4;
+    uint16_t iplen = ((uint16_t)ip[2] << 8) | ip[3];
+    uint8_t proto = ip[9];
+    const uint8_t *sip = ip + 12, *dip = ip + 16;
+    if (proto != 1 || ihl < 20 || (uint32_t)14 + iplen > len)
+      return;
+    if (dip[0] != OUR_IP[0] || dip[1] != OUR_IP[1] || dip[2] != OUR_IP[2] ||
+        dip[3] != OUR_IP[3])
+      return;
+    const uint8_t *icmp = ip + ihl;
+    if (icmp[0] != 8) /* echo request */
+      return;
+    uint32_t framelen = 14 + iplen;
+    if (framelen > sizeof(g_net_rx) - VNET_HDR_LEN)
+      return;
+    for (uint32_t i = 0; i < framelen; i++) /* start from the request */
+      r[i] = f[i];
+    /* swap ethernet src/dst */
+    for (int i = 0; i < 6; i++) { r[i] = f[6 + i]; r[6 + i] = OUR_MAC[i]; }
+    /* swap IP src/dst, reset TTL, recompute header checksum */
+    uint8_t *rip = r + 14;
+    for (int i = 0; i < 4; i++) { rip[12 + i] = dip[i]; rip[16 + i] = sip[i]; }
+    rip[8] = 64;            /* TTL */
+    rip[10] = rip[11] = 0;  /* checksum field */
+    uint16_t ic = in_csum(rip, ihl);
+    rip[10] = ic >> 8; rip[11] = ic & 0xff;
+    /* ICMP: echo reply, recompute checksum */
+    uint8_t *ricmp = rip + ihl;
+    uint32_t icmplen = iplen - ihl;
+    ricmp[0] = 0;                 /* type = echo reply */
+    ricmp[2] = ricmp[3] = 0;      /* checksum field    */
+    uint16_t cc = in_csum(ricmp, icmplen);
+    ricmp[2] = cc >> 8; ricmp[3] = cc & 0xff;
+    hyp_vnet_rx_submit(framelen);
+    return;
+  }
+}
+
+static void hyp_vnet_tx(void) {
+  struct vnet_q *q = &g_vnet.q[1];
+  if (!q->ready || !q->desc || !q->avail || !q->used || q->num == 0)
+    return;
+  struct vq_desc *desc = lx_gpa(q->desc);
+  volatile uint16_t *avail = lx_gpa(q->avail);
+  volatile uint16_t *used16 = lx_gpa(q->used);
+  if (!desc || !avail || !used16)
+    return;
+  uint16_t aidx = avail[1];
+  int worked = 0;
+  while (q->last_avail != aidx) {
+    uint16_t head = avail[2 + (q->last_avail % q->num)];
+    if (head >= q->num)
+      break;
+    uint32_t n = vnet_gather(desc, head, q->num, g_net_tx, sizeof(g_net_tx));
+
+    volatile uint32_t *ur = (volatile uint32_t *)(used16 + 2);
+    uint16_t uidx = used16[1];
+    uint16_t us = uidx % q->num;
+    ur[us * 2 + 0] = head;
+    ur[us * 2 + 1] = n;
+    __asm__ __volatile__("dsb ish");
+    used16[1] = uidx + 1;
+    q->last_avail++;
+    worked = 1;
+    g_vnet.tx_seen++;
+    if (n > VNET_HDR_LEN)
+      hyp_vnet_handle_frame(g_net_tx + VNET_HDR_LEN, n - VNET_HDR_LEN);
+  }
+  if (worked) {
+    __asm__ __volatile__("dsb ish");
+    g_vnet.int_status |= 1;
+    hyp_vgic_inject_ex(1 /* Linux */, VNET_INTID, 0 /* SW */);
+  }
+}
+
+static int hyp_emulate_vnet(uint64_t ipa, int is_write, uint64_t *val) {
+  uint64_t off = ipa - VNET_LO;
+  uint32_t s = g_vnet.q_sel < 2 ? g_vnet.q_sel : 0;
+  if (is_write) {
+    switch (off) {
+    case 0x014: g_vnet.dev_feat_sel = (uint32_t)*val; break;
+    case 0x024: g_vnet.drv_feat_sel = (uint32_t)*val; break;
+    case 0x030: g_vnet.q_sel = (uint32_t)*val; break;
+    case 0x038: g_vnet.q[s].num = (uint32_t)*val; break;
+    case 0x044: g_vnet.q[s].ready = (uint32_t)*val; break;
+    case 0x050: if ((uint32_t)*val == 1) hyp_vnet_tx(); break; /* QueueNotify */
+    case 0x064: g_vnet.int_status &= ~(uint32_t)*val; break;
+    case 0x070: g_vnet.status = (uint32_t)*val; break;
+    case 0x080: g_vnet.q[s].desc = (g_vnet.q[s].desc & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x084: g_vnet.q[s].desc = (g_vnet.q[s].desc & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    case 0x090: g_vnet.q[s].avail = (g_vnet.q[s].avail & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x094: g_vnet.q[s].avail = (g_vnet.q[s].avail & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    case 0x0a0: g_vnet.q[s].used = (g_vnet.q[s].used & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x0a4: g_vnet.q[s].used = (g_vnet.q[s].used & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    default: break;
+    }
+    return 1;
+  }
+  if (off >= 0x100 && off < 0x106) { /* config: MAC address */
+    *val = OUR_MAC[off - 0x100];
+    return 1;
+  }
+  switch (off) {
+  case 0x000: *val = 0x74726976; break;       /* Magic                       */
+  case 0x004: *val = 2; break;                /* Version 2                   */
+  case 0x008: *val = 1; break;                /* DeviceID 1 = network        */
+  case 0x00c: *val = 0x554d4551; break;       /* VendorID                    */
+  case 0x010: /* DeviceFeatures: VIRTIO_NET_F_MAC (bit5) + VERSION_1 (bit32) */
+    *val = (g_vnet.dev_feat_sel == 1) ? (1u << 0) : (1u << 5);
+    break;
+  case 0x034: *val = 256; break;              /* QueueNumMax                 */
+  case 0x044: *val = g_vnet.q[s].ready; break;
+  case 0x060: *val = g_vnet.int_status; break;
+  case 0x070: *val = g_vnet.status; break;
+  case 0x0fc: *val = 0; break;                /* ConfigGeneration            */
+  default: *val = 0; break;
+  }
+  return 1;
+}
+
 /* ------------------------------- traps ------------------------------------ */
 
 static const char *ec_name(uint64_t ec) {
@@ -1180,13 +1455,12 @@ static int hyp_emulate_pl011(uint64_t ipa, int is_write, uint64_t *val) {
           lrx_push_str("\x1b[1;1R"); /* cursor at row 1, col 1 */
           if (!demo_done) {
             demo_done = 1;
-            /* Exercise virtio-blk end-to-end through the shell:
-             *  - read sector 0 -> the seeded signature (read path),
-             *  - write "FERMIWR" to sector 2 and read it back (write path). */
+            /* Exercise the emulated devices through the shell: read the
+             * virtio-blk signature, then bring up eth0 and ping the
+             * hypervisor-emulated host (10.0.0.1) over virtio-net. */
             lrx_push_str(
-                "head -c 16 /dev/vda; echo FERMIWR | dd of=/dev/vda bs=512 "
-                "seek=2 2>/dev/null; dd if=/dev/vda bs=512 skip=2 2>/dev/null "
-                "| head -c 7; echo\n");
+                "head -c 16 /dev/vda; ifconfig eth0 10.0.0.2 up; "
+                "ping -c 2 10.0.0.1; echo NETDONE\n");
           }
           hyp_uart_rx_kick();
         }
@@ -1311,10 +1585,12 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
       ((ipa >= GICD_LO && ipa < GICD_HI) || (ipa >= GICR_LO && ipa < GICR_HI) ||
        (ipa >= PL011_LO && ipa < PL011_HI) ||
        (ipa >= VIRTIO_LO && ipa < VIRTIO_HI) ||
-       (ipa >= VBLK_LO && ipa < VBLK_HI))) {
+       (ipa >= VBLK_LO && ipa < VBLK_HI) ||
+       (ipa >= VNET_LO && ipa < VNET_HI))) {
     int is_uart = (ipa >= PL011_LO && ipa < PL011_HI);
     int is_virtio = (ipa >= VIRTIO_LO && ipa < VIRTIO_HI);
     int is_vblk = (ipa >= VBLK_LO && ipa < VBLK_HI);
+    int is_vnet = (ipa >= VNET_LO && ipa < VNET_HI);
     vcpus[current_vcpu].mmio_emulated++;
     uint64_t isv = (esr >> 24) & 1;
     uint64_t sas = (esr >> 22) & 3;
@@ -1330,6 +1606,8 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
           hyp_emulate_virtio(ipa, 1, &v);
         else if (is_vblk)
           hyp_emulate_vblk(ipa, 1, &v);
+        else if (is_vnet)
+          hyp_emulate_vnet(ipa, 1, &v);
         else
           hyp_emulate_gic(ipa, 1, &v);
       } else {
@@ -1339,6 +1617,8 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
           hyp_emulate_virtio(ipa, 0, &v);
         else if (is_vblk)
           hyp_emulate_vblk(ipa, 0, &v);
+        else if (is_vnet)
+          hyp_emulate_vnet(ipa, 0, &v);
         else
           hyp_emulate_gic(ipa, 0, &v);
         if (sas == 0)

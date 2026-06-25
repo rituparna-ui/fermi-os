@@ -279,6 +279,22 @@ is exposed via a new `VMSTAT_WFI` and shown as `idle-yields` in `/proc/vms`.
 world-switches, 362 idle-yields`) while Linux still boots and reads `/dev/vda`,
 with no anomalies.
 
+### Emulated virtio-net + ping (the hypervisor as link peer)
+*Why:* give the guest a network interface — the most visible new capability —
+while staying self-contained (no dependency on Fermi's NIC or QEMU slirp). A
+virtio-mmio network device (DeviceID 1) at IPA `0x0a000400` (SPI 4 / INTID 36)
+exposing `eth0`. Unlike rng/blk this needs **two virtqueues** (0 = RX, 1 = TX),
+so the register model tracks the selected queue. The hypervisor itself is the
+*other end of the wire*: on a TX notify it gathers the guest's ethernet frame
+(skipping the 12-byte `virtio_net_hdr_v1`) and, for an ARP request or ICMP echo
+to `10.0.0.1`, crafts a reply — reusing small in-hypervisor ARP/IPv4/ICMP +
+RFC1071-checksum helpers — and scatters it into a posted RX buffer, injecting
+the device SPI. `virtio_net.ko` (plus `failover`/`net_failover`) is shipped in
+the initramfs. *Verified, first try:* `ifconfig eth0 10.0.0.2 up; ping -c 2
+10.0.0.1` returns `2 packets transmitted, 2 packets received, 0% packet loss`
+with `ttl=64` (the value the hypervisor stamps), exercising the complete
+two-queue TX+RX path. No anomalies.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)
@@ -310,8 +326,9 @@ under preemptive scheduling**:
 - **vCPU 0:** Fermi OS itself, unmodified, to its interactive EL0 shell.
 - **vCPU 1:** an unmodified aarch64 **Linux 5.4** kernel — to a BusyBox userspace
   shell — with an emulated **GICv3**, **virtual timer**, a **captured+interactive
-  console** (`/proc/linux_console`), an emulated **virtio-rng**, and an emulated
-  **virtio-blk `/dev/vda`** (partition `vda1` detected).
+  console** (`/proc/linux_console`), an emulated **virtio-rng**, an emulated
+  **virtio-blk `/dev/vda`** (partition `vda1` detected), and an emulated
+  **virtio-net `eth0`** (can `ping` the hypervisor host `10.0.0.1`).
 - **vCPU 2:** a tiny isolated bare-metal payload (visible via `/proc/vms`).
 
 Full per-guest context is switched: GP regs, PC/PSTATE, the EL1 system-register

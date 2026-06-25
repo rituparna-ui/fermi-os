@@ -71,6 +71,11 @@ VRNG_KO="$(find "$WORK/mod" -name 'virtio-rng.ko' | head -1)"
 [ -n "$VRNG_KO" ] || { echo "[stage] ERROR: virtio-rng.ko not found" >&2; exit 1; }
 VBLK_KO="$(find "$WORK/mod" -name 'virtio_blk.ko' | head -1)"
 [ -n "$VBLK_KO" ] || { echo "[stage] ERROR: virtio_blk.ko not found" >&2; exit 1; }
+# virtio_net plus its dependency chain (failover <- net_failover <- virtio_net)
+VNET_KO="$(find "$WORK/mod" -name 'virtio_net.ko' | head -1)"
+[ -n "$VNET_KO" ] || { echo "[stage] ERROR: virtio_net.ko not found" >&2; exit 1; }
+NETFO_KO="$(find "$WORK/mod" -name 'net_failover.ko' | head -1)"
+FO_KO="$(find "$WORK/mod" -name 'failover.ko' | head -1)"
 
 echo "[stage] building initramfs..."
 IR="$WORK/ir"
@@ -78,6 +83,9 @@ mkdir -p "$IR/bin" "$IR/proc" "$IR/sys" "$IR/dev"
 cp "$BB" "$IR/bin/busybox"; chmod +x "$IR/bin/busybox"
 cp "$VRNG_KO" "$IR/virtio-rng.ko"
 cp "$VBLK_KO" "$IR/virtio_blk.ko"
+cp "$VNET_KO" "$IR/virtio_net.ko"
+[ -n "$NETFO_KO" ] && cp "$NETFO_KO" "$IR/net_failover.ko"
+[ -n "$FO_KO" ] && cp "$FO_KO" "$IR/failover.ko"
 cat > "$IR/init" <<'INIT'
 #!/bin/busybox sh
 /bin/busybox mount -t proc proc /proc 2>/dev/null
@@ -88,6 +96,10 @@ cat > "$IR/init" <<'INIT'
 # enough. They bind to the hypervisor's emulated virtio-mmio devices.
 /bin/busybox insmod /virtio-rng.ko 2>/dev/null && echo "[init] loaded virtio-rng driver"
 /bin/busybox insmod /virtio_blk.ko 2>/dev/null && echo "[init] loaded virtio_blk driver"
+# virtio_net needs failover <- net_failover first.
+/bin/busybox insmod /failover.ko 2>/dev/null
+/bin/busybox insmod /net_failover.ko 2>/dev/null
+/bin/busybox insmod /virtio_net.ko 2>/dev/null && echo "[init] loaded virtio_net driver"
 echo ""
 echo "==================================================="
 echo "  Linux userspace is ALIVE on the Fermi hypervisor!"

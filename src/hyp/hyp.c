@@ -1176,7 +1176,13 @@ static int hyp_emulate_pl011(uint64_t ipa, int is_write, uint64_t *val) {
           lrx_push_str("\x1b[1;1R"); /* cursor at row 1, col 1 */
           if (!demo_done) {
             demo_done = 1;
-            lrx_push_str("echo HVTEST_OK; head -c 16 /dev/vda; echo\n");
+            /* Exercise virtio-blk end-to-end through the shell:
+             *  - read sector 0 -> the seeded signature (read path),
+             *  - write "FERMIWR" to sector 2 and read it back (write path). */
+            lrx_push_str(
+                "head -c 16 /dev/vda; echo FERMIWR | dd of=/dev/vda bs=512 "
+                "seek=2 2>/dev/null; dd if=/dev/vda bs=512 skip=2 2>/dev/null "
+                "| head -c 7; echo\n");
           }
           hyp_uart_rx_kick();
         }

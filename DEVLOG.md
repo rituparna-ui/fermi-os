@@ -343,9 +343,11 @@ Pushed to `git@github.com:rituparna-ui/fermi-os.git`:
   identity distributor reads + software SPI injection for emulated devices); full
   SPI routing/priority for arbitrary devices isn't modelled.
 - Requires an **SCS-free** guest kernel (the staging script fetches one).
-- **virtio-blk is not yet a root disk** (it's a readable/writable `/dev/vda`
-  verified via partition scan). A real root-fs (`root=/dev/vda` with an ext2
-  image) would be the natural next step.
+- **virtio-blk is not yet a root disk** — it's a verified read/write `/dev/vda`
+  (reads confirmed via the partition scan detecting `vda1`; writes confirmed by a
+  shell round-trip: writing `FERMIWR` to sector 2 and reading it back). A real
+  root-fs (`root=/dev/vda` with an ext2/ext4 image) is the natural next step, but
+  needs a larger disk backing than the current 256 KiB hyp-private RAM disk.
 - Building a custom kernel here is blocked by host disk space.
 
 ---

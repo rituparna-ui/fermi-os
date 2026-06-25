@@ -15,6 +15,7 @@ mod arch;
 mod exception;
 mod mm;
 mod panic;
+mod sched;
 
 use core::arch::global_asm;
 
@@ -103,14 +104,41 @@ pub extern "C" fn kmain() -> ! {
     unsafe { core::arch::asm!("brk #0") };
     kprintln!("[EXC TEST] Survived BRK — vector table works.");
 
-    // Interrupt controller + periodic timer. Once the timer is started, IRQs
-    // fire through the GIC into the exception dispatch IRQ arm.
+    // Interrupt controller. (Timer is started after the scheduler is up so the
+    // first preemption has tasks to choose from.)
     exception::gic::init();
+
+    // Scheduler + a couple of demo kernel tasks (mirrors the original boot).
+    sched::init();
+    sched::create_task("task_a", task_a);
+    sched::create_task("task_b", task_b);
+
+    // Start the periodic timer: from here, timer IRQs drive preemption.
     exception::timer::init();
     exception::timer::start(exception::timer::TIMER_INTERVAL_MS);
 
-    kprintln!("[KERNEL] Ready! Entering idle loop (timer IRQs active).");
+    kprintln!("[KERNEL] Ready! Entering idle loop (preemptive scheduling active).");
     loop {
+        sched::reap();
         unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+/// Demo task: prints a few iterations, yielding between each, then exits.
+extern "C" fn task_a() {
+    for i in 0..5 {
+        kprintln!("[Task A] iteration {}", i);
+        sched::r#yield();
+    }
+    kprintln!("[Task A] done! exiting");
+}
+
+/// Demo task: prints periodically forever (preempted by the timer).
+extern "C" fn task_b() {
+    loop {
+        kprintln!("[Task B] running");
+        for _ in 0..1_000_000 {
+            core::hint::spin_loop();
+        }
     }
 }

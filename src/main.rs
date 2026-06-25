@@ -303,7 +303,47 @@ extern "C" fn churn_test() {
     heap_stress();
     fd_stress();
     fat32_stress();
+    asid_wrap_stress();
     sched::task_exit();
+}
+
+/// ASID-wraparound stress (risk R3): seed the ASID counter near the 16-bit max
+/// so the next few task creations cross 65535→(flush all TLBs)→1, then create
+/// EL0 tasks across that boundary, drain + reap them, and assert: the counter
+/// actually wrapped, the kernel survived the global TLBI, and no pages leaked.
+/// Reaching this naturally would need 65535 task creations.
+fn asid_wrap_stress() {
+    let free_before = mm::pmm::free_pages_count();
+
+    // Seed just below the wrap. asid_alloc() hands out 65534, 65535, then
+    // wraps to 1 — so creating ~4 tasks crosses the boundary.
+    sched::force_next_asid(65534);
+
+    for _ in 0..4 {
+        sched::create_task("churnkid", user::task_noop);
+    }
+    for _ in 0..40 {
+        sched::reap();
+        sched::r#yield();
+    }
+
+    let wrapped = sched::peek_next_asid() < 100; // reset to a small value
+    let free_after = mm::pmm::free_pages_count();
+    let leaked = free_before as i64 - free_after as i64;
+
+    if wrapped && leaked == 0 {
+        kprintln!(
+            "[ASID WRAP] PASS: crossed 65535->1 (now {}), TLB flushed, no leak",
+            sched::peek_next_asid()
+        );
+    } else {
+        kprintln!(
+            "[ASID WRAP] FAIL: wrapped={} next_asid={} leaked={}",
+            wrapped,
+            sched::peek_next_asid(),
+            leaked
+        );
+    }
 }
 
 /// FAT32 multi-file stress: create many files (enough to push the root dir past

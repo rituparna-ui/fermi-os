@@ -149,6 +149,21 @@ fn irq_restore(daif: u64) {
     unsafe { core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack)) };
 }
 
+/// Seed the ASID counter — TEST-ONLY, used by the ASID-wrap stress test to
+/// drive `asid_alloc` across the 65535→1 boundary without creating 65535 real
+/// tasks. Not used in normal operation.
+pub fn force_next_asid(v: u16) {
+    // SAFETY (single-core): the ASID counter is touched only on the creation
+    // path; the test calls this with IRQs effectively quiescent for it.
+    unsafe { *NEXT_ASID.get() = v };
+}
+
+/// Read the current ASID counter (test/diagnostics).
+pub fn peek_next_asid() -> u16 {
+    // SAFETY (single-core): plain read of a scalar cell.
+    unsafe { *NEXT_ASID.get() }
+}
+
 /// Allocate a fresh ASID in [1, 65535]; flush all TLBs on wraparound.
 pub fn asid_alloc() -> u16 {
     // SAFETY (single-core): boot/creation path; ASID counter touched only here.

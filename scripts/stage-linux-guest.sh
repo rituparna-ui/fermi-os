@@ -81,6 +81,7 @@ echo "[stage] building initramfs..."
 IR="$WORK/ir"
 mkdir -p "$IR/bin" "$IR/proc" "$IR/sys" "$IR/dev"
 cp "$BB" "$IR/bin/busybox"; chmod +x "$IR/bin/busybox"
+cp "$BB" "$GUEST/busybox" # exposed so 'make' can build the ext4 root disk image
 cp "$VRNG_KO" "$IR/virtio-rng.ko"
 cp "$VBLK_KO" "$IR/virtio_blk.ko"
 cp "$VNET_KO" "$IR/virtio_net.ko"
@@ -100,6 +101,16 @@ cat > "$IR/init" <<'INIT'
 /bin/busybox insmod /failover.ko 2>/dev/null
 /bin/busybox insmod /net_failover.ko 2>/dev/null
 /bin/busybox insmod /virtio_net.ko 2>/dev/null && echo "[init] loaded virtio_net driver"
+# Pivot to the real root filesystem on the hypervisor's virtio-blk disk. The
+# drivers above are already in the kernel, so we can mount /dev/vda and
+# switch_root into it (rdinit-style; virtio_blk is a module, hence the pivot
+# from initramfs rather than a built-in root= mount).
+/bin/busybox mkdir -p /newroot
+if /bin/busybox mount -t ext4 /dev/vda /newroot 2>/dev/null; then
+	echo "[init] mounted /dev/vda as ext4; switching root -> /sbin/init"
+	exec /bin/busybox switch_root /newroot /sbin/init
+fi
+echo "[init] no ext4 root on /dev/vda; staying in initramfs"
 echo ""
 echo "==================================================="
 echo "  Linux userspace is ALIVE on the Fermi hypervisor!"

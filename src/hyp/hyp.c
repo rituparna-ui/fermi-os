@@ -140,7 +140,8 @@ static void lrx_push_str(const char *s) {
 static void hyp_uart_rx_kick(void);
 /* CNTHP (EL2 physical timer) scheduling tick. */
 #define HYP_TIMER_INTID 26   /* PPI 26 = non-secure EL2 physical timer */
-#define HYP_QUANTUM_MS 100   /* preemption time-slice */
+#define HYP_QUANTUM_MS 10    /* preemption time-slice (short: keeps cross-vCPU
+                              * IPI / stop_machine latency low for SMP guests) */
 __attribute__((section(".hyp_tables"))) static uint64_t g_quantum_ticks;
 
 static void hyp_create_linux_guest(void);
@@ -1564,8 +1565,7 @@ static int hyp_emulate_pl011(uint64_t ipa, int is_write, uint64_t *val) {
              * virtio-blk signature, then bring up eth0 and ping the
              * hypervisor-emulated host (10.0.0.1) over virtio-net. */
             lrx_push_str(
-                "nproc; mkdir -p /mnt; mount -t ext4 /dev/vda /mnt && "
-                "cat /mnt/hello.txt; ifconfig eth0 10.0.0.2 up; "
+                "nproc; cat /etc/motd; ifconfig eth0 10.0.0.2 up; "
                 "ping -c 1 10.0.0.1; echo ALLDONE\n");
           }
           hyp_uart_rx_kick();

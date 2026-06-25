@@ -113,9 +113,13 @@ context-switched — see §6.
 ## 4. Scheduling
 
 The hypervisor owns the **EL2 physical timer** `CNTHP_EL2` (PPI / INTID 26),
-armed for a 100 ms quantum. On each tick the hypervisor world-switches between
+armed for a 10 ms quantum. On each tick the hypervisor world-switches between
 runnable vCPUs round-robin — no guest cooperation required. The scheduler
-generalizes to N vCPUs; the picker simply skips `UNUSED` ones.
+generalizes to N vCPUs; the picker simply skips `UNUSED` ones. (The quantum is
+deliberately short: an SGI/IPI injected into a *descheduled* vCPU is only
+delivered when that vCPU next runs, so a long quantum starves cross-core IPIs.
+`stop_machine` — used by guest module loading — is the canary: with a 100 ms
+quantum it soft-locked; 10 ms keeps SMP IPI latency low.)
 
 A guest can also yield cooperatively via `HVC_YIELD`, and can remove itself via
 PSCI `SYSTEM_OFF` (§7), after which it is never scheduled again.
@@ -237,8 +241,9 @@ own registers and needs no context switch.
   and neither guest can see the backing directly. On `QueueNotify` the
   hypervisor walks each request's descriptor chain (16-byte out-header → data →
   status) and reads/writes the image. Verified: Linux's `virtio_blk` driver (a
-  module from the initramfs) registers `/dev/vda`, and the guest **mounts it as
-  ext4 and reads real files** (`EXT4-fs (vda): mounted filesystem`).
+  module from the initramfs) registers `/dev/vda`, the initramfs mounts it and
+  **`switch_root`s into it**, so the guest runs with this disk as its **ext4
+  root filesystem** (`ROOTFS_ON_VDA`).
 - **Emulated virtio-net (virtio-mmio)**: a network device (DeviceID 1) at IPA
   `0x0a000400` (IRQ SPI 4 / INTID 36) exposing `eth0`, with two virtqueues
   (0 = RX guest←host, 1 = TX guest→host) and a `VIRTIO_NET_F_MAC` address. The

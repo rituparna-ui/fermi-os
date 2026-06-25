@@ -150,15 +150,20 @@ $(GUEST_DTB): guest.dts
 	@mkdir -p $(BUILD_DIR)
 	@dtc -I dts -O dtb -o $@ $< 2>/dev/null
 
-# Build the 8 MiB ext4 image that backs the guest's virtio-blk (/dev/vda).
-# Uses mke2fs -d to populate from a directory (no loop mount); runs in the
-# build container where e2fsprogs supports -d.
-$(GUEST_DISK):
+# Build the 8 MiB ext4 image that backs the guest's virtio-blk (/dev/vda) and
+# serves as the guest's ROOT filesystem (the initramfs switch_roots into it).
+# Populated with busybox + an init + applet symlinks via mke2fs -d (no loop
+# mount); runs in the build container where e2fsprogs supports -d. Requires
+# guest/busybox (produced by scripts/stage-linux-guest.sh).
+$(GUEST_DISK): guest/busybox scripts/rootfs-init.sh
 	@echo "  GEN $(GUEST_DISK)"
-	@DR=$$(mktemp -d) && mkdir -p $$DR/dir1 && \
-	  echo "Hello from a real ext4 filesystem served by Fermi-HV virtio-blk!" > $$DR/hello.txt && \
-	  echo "Fermi-OS EL2 hypervisor - SMP Linux guest with virtio rng/blk/net." > $$DR/motd && \
-	  echo "nested file on the hypervisor disk" > $$DR/dir1/deep.txt && \
+	@DR=$$(mktemp -d) && \
+	  mkdir -p $$DR/bin $$DR/sbin $$DR/proc $$DR/sys $$DR/dev $$DR/etc $$DR/root $$DR/mnt && \
+	  cp guest/busybox $$DR/bin/busybox && chmod +x $$DR/bin/busybox && \
+	  for a in sh mount umount cat echo ls uname nproc ping ifconfig mkdir ln sleep head ps cp dmesg hostname; do \
+	    ln -sf busybox $$DR/bin/$$a ; done && \
+	  cp scripts/rootfs-init.sh $$DR/sbin/init && chmod +x $$DR/sbin/init && \
+	  echo "Fermi-HV ext4 ROOT filesystem on /dev/vda — you are running off the hypervisor disk." > $$DR/etc/motd && \
 	  mke2fs -F -q -t ext4 -d $$DR $@ 8M && rm -rf $$DR
 	@echo "DTC $@"
 

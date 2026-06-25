@@ -344,6 +344,26 @@ from a directory, no loop mount) in the build container via a Makefile rule
 virtio-blk!") — all while SMP (`nproc` 2) and `ping` work concurrently. No
 anomalies.
 
+### True root disk — switch_root into /dev/vda (+ an SMP scheduling fix)
+*Why:* finish the root-disk story — make `/dev/vda` Linux's actual root, not
+just a mountable extra. The ext4 image is built as a full busybox rootfs (init,
+applet symlinks, `/etc/motd`); the initramfs `/init` loads `virtio_blk`, mounts
+`/dev/vda`, and `exec switch_root /newroot /sbin/init`. (`virtio_blk` is a
+module, so the pivot must come from the initramfs rather than a built-in
+`root=` mount.)
+*The bug it surfaced:* the first attempt soft-locked — `watchdog: BUG: soft
+lockup - CPU#0 stuck for 23s` in `finit_module`. Module loading uses
+`stop_machine`, which needs *both* vCPUs synchronized; with a 100 ms quantum on
+one physical CPU, the cross-core IPI that wakes the other CPU's stopper thread
+arrived too late and CPU0 spun. Fix: shorten the scheduler quantum to **10 ms**,
+so an SGI injected into a descheduled core is delivered within ~one short slice.
+This not only fixed the lockup but sped the whole boot ~7× (IPI-heavy paths
+dominate). *Verified:* `[init] mounted /dev/vda as ext4; switching root`,
+`ROOTFS_ON_VDA: running from the ext4 root on /dev/vda`, the on-disk `/etc/motd`
+printed by the pivoted init, then `nproc` 2 + `ping` working from the disk root.
+No soft lockup, no anomalies. Lesson: time-sliced SMP guests are pathologically
+sensitive to IPI latency — `stop_machine` is the canary.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)
@@ -376,9 +396,9 @@ under preemptive scheduling**:
 - **vCPU 1:** an unmodified aarch64 **Linux 5.4** kernel — to a BusyBox userspace
   shell — with an emulated **GICv3**, **virtual timer**, a **captured+interactive
   console** (`/proc/linux_console`), an emulated **virtio-rng**, an emulated
-  **virtio-blk `/dev/vda`** (an 8 MiB ext4 image the guest mounts and reads),
-  and an emulated **virtio-net `eth0`** (can `ping` the hypervisor host
-  `10.0.0.1`).
+  **virtio-blk `/dev/vda`** that serves as Linux's **ext4 root filesystem**
+  (the initramfs `switch_root`s into it), and an emulated **virtio-net `eth0`**
+  (can `ping` the hypervisor host `10.0.0.1`).
 - **vCPU 2:** Linux's **second core** (SMP secondary), brought online by the boot
   CPU via PSCI `CPU_ON`; `nproc` reports 2.
 
@@ -423,10 +443,10 @@ Pushed to `git@github.com:rituparna-ui/fermi-os.git`:
   identity distributor reads + software SPI injection for emulated devices); full
   SPI routing/priority for arbitrary devices isn't modelled.
 - Requires an **SCS-free** guest kernel (the staging script fetches one).
-- **virtio-blk is mountable but not yet the root device** — `/dev/vda` is an
-  8 MiB ext4 image the guest mounts and reads files from (reads/writes both
-  exercised). Making it the actual root (`root=/dev/vda` via an initramfs
-  `switch_root`, since `virtio_blk` is a module) is the remaining step.
+- **virtio-blk is the guest's root device.** `/dev/vda` is an 8 MiB ext4 image
+  containing a busybox rootfs; the initramfs loads `virtio_blk`, mounts it, and
+  `switch_root`s into it, so Linux runs entirely from the hypervisor's emulated
+  disk (`ROOTFS_ON_VDA`). Reads and writes are both exercised.
 - Building a custom kernel here is blocked by host disk space.
 
 ---

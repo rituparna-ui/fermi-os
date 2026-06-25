@@ -11,6 +11,7 @@ use core::panic::PanicInfo;
 // Boot stub: sets up the stack, zeroes BSS, and calls `rust_main`.
 global_asm!(include_str!("boot.S"));
 
+mod cpu;
 mod mmio;
 mod uart;
 
@@ -22,6 +23,7 @@ pub extern "C" fn rust_main() -> ! {
     uart::println("================================");
     uart::println("  Fermi OS (Rust) is booting");
     uart::println("================================");
+    cpu::print_current_el();
     uart::puts("UART base: ");
     uart::puthex(uart::UART_BASE as u64);
     uart::putc(b'\n');

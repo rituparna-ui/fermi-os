@@ -109,8 +109,16 @@ pub extern "C" fn kmain() -> ! {
     // first preemption has tasks to choose from.)
     exception::gic::init();
 
-    // PCI bus enumeration (device drivers attach next).
+    // PCI bus enumeration + VirtIO device drivers.
     drivers::pci::enumerate_bus();
+    drivers::virtio::rng::init();
+
+    // RNG smoke test: pull a few random bytes.
+    {
+        let mut buf = [0u8; 16];
+        let n = drivers::virtio::rng::read(&mut buf);
+        kprintln!("[RNG TEST] got {} bytes: {:02x?}", n, &buf[..]);
+    }
 
     // Scheduler + a couple of demo kernel tasks (mirrors the original boot).
     sched::init();

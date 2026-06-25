@@ -142,9 +142,28 @@ pub extern "C" fn kmain() -> ! {
     drivers::virtio::console::init();
     drivers::virtio::balloon::init();
 
-    // Virtual filesystem + device nodes.
+    // CPU identification + PMU (now in the upper half; core::fmt safe).
+    arch::cpu::cpu_init();
+
+    // Virtual filesystem + device nodes + /proc.
     fs::vfs::init();
     fs::devices::register();
+    fs::proc::init();
+
+    // /proc smoke test: read /proc/cpuinfo through the fd path.
+    {
+        let t = fs::vfs::fd_table_create();
+        let fd = fs::vfs::fd_open(t, "/proc/cpuinfo");
+        let mut buf = [0u8; 512];
+        let n = fs::vfs::fd_read(t, fd, buf.as_mut_ptr(), buf.len());
+        if n > 0 {
+            if let Ok(s) = core::str::from_utf8(&buf[..n as usize]) {
+                kprintln!("[PROC TEST] /proc/cpuinfo:\n{}", s);
+            }
+        }
+        fs::vfs::fd_close(t, fd);
+        fs::vfs::fd_table_destroy(t);
+    }
 
     // VFS smoke test: open /dev/rng and read through the fd path.
     {

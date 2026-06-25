@@ -65,6 +65,10 @@ void vgic_vcpu_reset(struct vcpu_vgic *g);
 void vgic_save(struct vcpu_vgic *g);
 void vgic_restore(const struct vcpu_vgic *g);
 
+/* Inject a pending Group1 interrupt into a NON-current vCPU's SAVED vGIC state,
+ * presented when it is next restored. Used to signal a peer VM (doorbell). */
+void vgic_inject_to(struct vcpu_vgic *g, uint32_t intid);
+
 /* Select which per-vCPU GICD/GICR software model vgic_mmio_emulate() acts on. */
 void vgic_set_current(struct vcpu_vgic *g);
 

@@ -254,3 +254,21 @@ int vgic_inject_hw(uint32_t intid) {
   }
   return 0; /* no free LR */
 }
+
+/* Inject a pending Group1 interrupt into a NON-current vCPU's SAVED vGIC state
+ * (its lr[] shadow), so it is presented when that vCPU is next restored. Used to
+ * signal a peer VM (inter-VM doorbell) while another VM is running. */
+void vgic_inject_to(vcpu_vgic_t *g, uint32_t intid) {
+  for (int i = 0; i < 16; i++) {
+    if ((g->lr[i] & ICH_LR_STATE_MASK) != 0 &&
+        (uint32_t)(g->lr[i] & 0xFFFFFFFFULL) == intid) {
+      return; /* already pending for this INTID */
+    }
+  }
+  for (int i = 0; i < 16; i++) {
+    if ((g->lr[i] & ICH_LR_STATE_MASK) == 0) {
+      g->lr[i] = lr_pending(intid);
+      return;
+    }
+  }
+}

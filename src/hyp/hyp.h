@@ -102,4 +102,10 @@ void hyp_run_multi_interactive(void);
  * No-op at EL1; runs before the host timer. */
 void hyp_run_shm_doorbell(void);
 
+/* Milestone 16: interrupt-driven inter-VM doorbell. The producer's doorbell
+ * hypercall injects a virtual SPI into the peer (consumer) guest's vGIC; the
+ * consumer takes the IRQ, reads the shared page in its handler, and EOIs.
+ * No-op at EL1; runs before the host timer. */
+void hyp_run_doorbell_irq(void);
+
 #endif /* HYP_HYP_H */

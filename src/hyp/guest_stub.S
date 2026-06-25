@@ -178,6 +178,110 @@ shm_consumer:
 guest_shm_end:
 
 // ---------------------------------------------------------------------------
+// Interrupt-driven doorbell guests (milestone 16). Same shared page at IPA
+// 0x50000000. The PRODUCER (x0=0) writes the counter + rings the doorbell HVC.
+// The CONSUMER (x0=1) installs a minimal EL1 IRQ vector table, enables the
+// GICv3 CPU interface, unmasks IRQs and WFIs; when the hypervisor injects the
+// doorbell SPI (INTID 40) the consumer's IRQ handler acks it, reads the shared
+// counter, prints 'D<hex>', and EOIs. This proves the full inter-VM virtual-IRQ
+// delivery path (peer-injected SPI, not the timer).
+//
+// VBAR_EL1 is set via PC-relative `adr` to the (2 KiB-aligned) vector table in
+// this same blob, so no fixed IPA / precise blob layout is required.
+.section .text.guest, "ax"
+.balign 16
+.global guest_db_start
+guest_db_start:
+	mov	x12, x0			// role
+	movz	x9,  #0x0000
+	movk	x9,  #0x0900, lsl #16	// UART
+	movz	x11, #0x0000
+	movk	x11, #0x5000, lsl #16	// shared page
+	cbnz	x12, db_consumer
+
+db_producer:
+	ldr	x10, [x11]
+	add	x10, x10, #1
+	str	x10, [x11]		// publish counter
+	ldr	x13, [x11, #8]
+	add	x13, x13, #1
+	str	x13, [x11, #8]		// doorbell seq
+	dsb	ish
+	mov	w14, #'P'
+	str	w14, [x9]
+	movz	x0, #0x0001
+	movk	x0, #0xF000, lsl #16	// doorbell hypercall 0xF0000001
+	hvc	#0
+	hvc	#0			// yield
+	b	db_producer
+
+db_consumer:
+	adr	x0, db_vectors		// PC-relative -> runtime IPA of the table
+	msr	vbar_el1, x0
+	isb
+	mrs	x0, S3_0_C12_C12_5	// ICC_SRE_EL1
+	orr	x0, x0, #1		// SRE
+	msr	S3_0_C12_C12_5, x0
+	isb
+	mov	x0, #0xFF
+	msr	S3_0_C4_C6_0, x0	// ICC_PMR_EL1 = 0xFF (allow all priorities)
+	mov	x0, #1
+	msr	S3_0_C12_C12_7, x0	// ICC_IGRPEN1_EL1 = 1 (enable Group1)
+	isb
+	msr	daifclr, #2		// unmask IRQ
+db_idle:
+	wfi
+	b	db_idle
+.global guest_db_end
+guest_db_end:
+
+// EL1 vector table for the consumer. 16 entries x 0x80B. The vCPU runs at EL1h
+// (SP_ELx), so the IRQ we care about is "Current EL with SP_ELx, IRQ" = entry
+// index 5, at offset 0x280.
+.balign 0x800
+db_vectors:
+	.balign 0x80
+	b	.			// 0x000 cur-EL SP0  sync
+	.balign 0x80
+	b	.			// 0x080 cur-EL SP0  irq
+	.balign 0x80
+	b	.			// 0x100 cur-EL SP0  fiq
+	.balign 0x80
+	b	.			// 0x180 cur-EL SP0  serror
+	.balign 0x80
+	b	.			// 0x200 cur-EL SPx  sync
+	.balign 0x80
+				// 0x280 cur-EL SPx  IRQ  <-- the doorbell lands here
+	mov	x9, xzr
+	movz	x9, #0x0000
+	movk	x9, #0x0900, lsl #16	// UART
+	mrs	x8, S3_0_C12_C12_0	// ICC_IAR1_EL1 (ack) -> x8 = vINTID
+	movz	x11, #0x0000
+	movk	x11, #0x5000, lsl #16
+	ldr	x10, [x11]		// read shared counter
+	ldr	x16, [x11, #16]		// shared[2] = "handled" count
+	add	x16, x16, #1
+	str	x16, [x11, #16]		// record that the handler ran
+	dsb	ish
+	mov	w14, #'D'
+	str	w14, [x9]
+	and	x15, x10, #0xF
+	cmp	x15, #10
+	b.lt	3f
+	add	x15, x15, #('a' - 10)
+	b	4f
+3:	add	x15, x15, #'0'
+4:	str	w15, [x9]
+	msr	S3_0_C12_C12_1, x8	// ICC_EOIR1_EL1 (EOI the acked INTID)
+	eret
+	.balign 0x80
+	b	.			// 0x300 cur-EL SPx  fiq
+	.balign 0x80
+	b	.			// 0x380 cur-EL SPx  serror
+.global guest_db_vectors_end
+guest_db_vectors_end:
+
+// ---------------------------------------------------------------------------
 // Interactive echo EL1 guest (milestone 12). A tiny PL011 "shell": prints a
 // banner + prompt, then loops reading a char (poll FR.RXFE, read DR) and
 // echoing it back, re-printing the prompt after a newline. Proves the vuart RX

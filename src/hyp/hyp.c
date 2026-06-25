@@ -1345,3 +1345,139 @@ void hyp_run_shm_doorbell(void) {
     pmm_free_pages(ram[i], SHM_RAM_SIZE / 0x1000);
   }
 }
+
+/* ---- Milestone 16: interrupt-driven inter-VM doorbell ---- */
+
+extern char guest_db_start[];
+extern char guest_db_end[];
+extern char guest_db_vectors_end[];
+
+#define DB_DOORBELL_SPI 40   /* virtual SPI delivered to the consumer */
+
+void hyp_run_doorbell_irq(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M16: interrupt-driven inter-VM doorbell (SPI injection)");
+
+  uintptr_t shared = pmm_allocate_page();
+  if (!shared) {
+    return;
+  }
+  uint64_t *shared_kva = (uint64_t *)PHYS_TO_VIRT((uint64_t)shared);
+  shared_kva[0] = 0; /* counter */
+  shared_kva[1] = 0; /* doorbell seq */
+  shared_kva[2] = 0; /* consumer IRQ-handler run count */
+  __asm__ __volatile__("dsb ish" ::: "memory");
+
+  static stage2_t s2[SHM_COUNT];
+  static vcpu_t vc[SHM_COUNT];
+  uintptr_t ram[SHM_COUNT];
+  /* The whole blob spans guest_db_start .. guest_db_vectors_end (code + the
+   * 2 KiB-aligned vector table). */
+  uint64_t len = (uint64_t)(guest_db_vectors_end - guest_db_start);
+
+  vgic_init();
+  gic_enable_irq(HYP_CNTHP_PPI);
+
+  for (int i = 0; i < SHM_COUNT; i++) {
+    ram[i] = pmm_allocate_pages(SHM_RAM_SIZE / 0x1000);
+    if (!ram[i] || !stage2_create(&s2[i], (uint32_t)(i + 1))) {
+      return;
+    }
+    stage2_map(&s2[i], GUEST_ENTRY_IPA, (uint64_t)ram[i], SHM_RAM_SIZE, 0);
+    stage2_map(&s2[i], UART_BASE, UART_BASE, 0x1000, /*device=*/1);
+    stage2_map(&s2[i], SHM_IPA, (uint64_t)shared, 0x1000, /*device=*/0);
+
+    uint64_t kva = PHYS_TO_VIRT((uint64_t)ram[i]);
+    for (uint64_t b = 0; b < len; b++) {
+      ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)guest_db_start)[b];
+    }
+    guest_sync_icache(kva, (len + 0xFFF) & ~0xFFFULL);
+
+    for (int r = 0; r < 31; r++) vc[i].x[r] = 0;
+    vc[i].x[0] = (uint64_t)i; /* 0 = producer, 1 = consumer */
+    vc[i].pc = GUEST_ENTRY_IPA;
+    vc[i].pstate = 0x3C5;
+    vc[i].sp_el1 = GUEST_ENTRY_IPA + SHM_RAM_SIZE;
+    vc[i].vttbr = stage2_vttbr(&s2[i]);
+    vc[i].hcr_extra = HCR_IMO; /* CNTHP preempts the WFI consumer */
+    vc[i].vmid = (uint32_t)(i + 1);
+    vc[i].id = (uint32_t)i;
+    vc[i].name = (i == 0) ? "producer" : "consumer";
+    vgic_vcpu_reset(&vc[i].vgic);
+    vuart_init(&vc[i].vuart, vc[i].name);
+  }
+
+  uint64_t freq;
+  __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
+  uint64_t slice = freq / 200; /* 5 ms quantum */
+
+  uint64_t host_daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(host_daif));
+  __asm__ __volatile__("msr daifset, #3");
+
+  int started[SHM_COUNT] = {0, 0};
+  uint64_t doorbells = 0;
+  /* Run enough slices for several producer->consumer rounds. */
+  for (int s = 0; s < 12; s++) {
+    int cur = s % SHM_COUNT;
+    vcpu_t *v = &vc[cur];
+    if (started[cur]) {
+      vcpu_restore_el1(&v->el1);
+      vcpu_restore_fp(&v->fp);
+      vgic_restore(&v->vgic);
+    }
+    vgic_set_current(&v->vgic);
+
+    cnthp_arm(slice);
+    int slice_done = 0;
+    long guard = 200000;
+    while (!slice_done && guard-- > 0) {
+      vcpu_enter(v);
+      if (v->exit_reason == HYP_EXC_IRQ) {
+        uint64_t intid = gic_ack_irq();
+        if (intid == HYP_CNTHP_PPI) {
+          cnthp_disarm();
+          gic_end_irq(intid);
+          slice_done = 1;
+        } else if (intid != GIC_INTID_NO_PENDING) {
+          gic_end_irq(intid);
+        }
+      } else if (v->exit_reason == HYP_EXC_SYNC && ESR_EC_OF(v->esr) == 0x16) {
+        if (v->x[0] == SHM_DOORBELL) {
+          /* Producer rang the doorbell: inject the virtual SPI into the
+           * CONSUMER's saved vGIC so it is presented when the consumer runs. */
+          doorbells++;
+          vgic_inject_to(&vc[1].vgic, DB_DOORBELL_SPI);
+          v->x[0] = 0;
+        }
+        /* plain yield HVC or post-doorbell HVC: end the producer's slice */
+        slice_done = 1;
+      } else if (!df_service_exit(v)) {
+        slice_done = 1;
+      }
+    }
+    cnthp_disarm();
+    vuart_flush(&v->vuart);
+    vcpu_save_el1(&v->el1);
+    vcpu_save_fp(&v->fp);
+    vgic_save(&v->vgic);
+    started[cur] = 1;
+  }
+
+  __asm__ __volatile__("msr daif, %0" ::"r"(host_daif));
+  uint64_t handled = shared_kva[2]; /* consumer bumps this in its IRQ handler */
+  uart_println("");
+  uart_printf("[HYP] doorbells rung=%u, consumer IRQ-handler runs=%u\n",
+              doorbells, handled);
+  int ok = (doorbells >= 1) && (handled >= 1);
+  uart_println(ok ? "[HYP] M16: PASS (peer-injected SPI delivered to guest IRQ handler)"
+                  : "[HYP] M16: FAIL");
+
+  pmm_free_page(shared);
+  for (int i = 0; i < SHM_COUNT; i++) {
+    pmm_free_pages(ram[i], SHM_RAM_SIZE / 0x1000);
+  }
+}

@@ -404,6 +404,12 @@ void hyp_boot_fermios_guest(void) {
   /* Enable the virtual GIC interface (one-time). */
   vgic_init();
 
+  /* Enable the guest's EL1 physical-timer PPI (30) on the REAL redistributor.
+   * The guest's own gic_enable_irq(30) only touched our vGIC software model, so
+   * without this the physical CNTP IRQ never reaches EL2 to be injected. With
+   * IMO routing it now exits the guest to EL2, where we inject vINTID 30. */
+  gic_enable_irq(30);
+
   static vcpu_t v;
   for (int i = 0; i < 31; i++) {
     v.x[i] = 0;
@@ -425,6 +431,7 @@ void hyp_boot_fermios_guest(void) {
    * Bounded so a guest fault loop can't hang the host. */
   long max_exits = 100000;
   uint64_t mmio_count = 0;
+  uint64_t irq_count = 0;
   while (max_exits-- > 0) {
     vcpu_enter(&v);
     uint64_t ec = ESR_EC_OF(v.esr);
@@ -485,6 +492,7 @@ void hyp_boot_fermios_guest(void) {
         }
         gic_end_irq(intid);
       }
+      irq_count++;
       continue;
     }
 

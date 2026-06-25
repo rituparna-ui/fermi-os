@@ -843,9 +843,9 @@ void kernel_main() {
   /* Milestone 9: round-robin two isolated heartbeat EL1 guests. */
   hyp_run_multi_guest_demo();
 
-  /* Milestone 8: boot the real (reduced-RAM) FermiOS as an EL1 guest and
-   * run it (it ticks indefinitely, so keep this last). */
-  hyp_boot_fermios_guest();
+  /* Milestone 9c: preemptively time-slice TWO full FermiOS guests with full
+   * per-vCPU context save/restore. (Supersedes the single-guest M8 boot.) */
+  hyp_run_dual_fermios();
 #endif
 
   timer_init();

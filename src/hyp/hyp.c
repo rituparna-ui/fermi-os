@@ -621,3 +621,161 @@ void hyp_run_multi_guest_demo(void) {
     pmm_free_pages(ram[i], MG_RAM_SIZE / 0x1000);
   }
 }
+
+/* ---- Milestone 9c: preemptively round-robin two full FermiOS guests ---- */
+
+#define DF_COUNT     2
+#define DF_RAM_SIZE  (128ULL * 1024 * 1024)
+#define DF_SLICES    8         /* total scheduler slices to run */
+
+/* Service a single guest exit that is NOT a scheduler tick (MMIO, guest timer,
+ * HVC). Returns 1 to keep running this guest, 0 if it hit something fatal. */
+static int df_service_exit(vcpu_t *v) {
+  uint64_t ec = ESR_EC_OF(v->esr);
+
+  if (v->exit_reason == HYP_EXC_SYNC && ec == 0x24) {
+    uint64_t ipa = ((v->hpfar >> 4) << 12) | (v->far & 0xFFF);
+    if (vgic_mmio_is_target(ipa)) {
+      uint64_t iss = v->esr & 0x1FFFFFFULL;
+      if (!((iss >> 24) & 1)) return 0;
+      int is_write = (int)((iss >> 6) & 1);
+      int srt = (int)((iss >> 16) & 0x1F);
+      int sf = (int)((iss >> 15) & 1);
+      int size_bytes = 1 << (int)((iss >> 22) & 3);
+      uint64_t val = 0;
+      if (is_write) {
+        val = (srt == 31) ? 0 : v->x[srt];
+        vgic_mmio_emulate(ipa, 1, &val, size_bytes);
+      } else {
+        vgic_mmio_emulate(ipa, 0, &val, size_bytes);
+        if (srt != 31) v->x[srt] = sf ? val : (val & 0xFFFFFFFFULL);
+      }
+      return 1;
+    }
+    if (pci_absent_is_target(ipa)) {
+      return hyp_emulate_mmio(v, 0xFFFFFFFFFFFFFFFFULL);
+    }
+    return 0; /* real stage-2 fault */
+  }
+
+  if (v->exit_reason == HYP_EXC_SYNC && ec == 0x16) {
+    /* Guest HVC (e.g. PSCI). Ignore for the demo and resume past it
+     * (ELR_EL2 already points past the hvc). */
+    return 1;
+  }
+
+  /* Any other sync exit kills this guest's slice. */
+  return 0;
+}
+
+void hyp_run_dual_fermios(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M9c: preemptively round-robin TWO full FermiOS guests");
+
+  static stage2_t s2[DF_COUNT];
+  static vcpu_t vc[DF_COUNT];
+  uintptr_t ram[DF_COUNT];
+  uint64_t blob_len = (uint64_t)(__guest_blob_end - __guest_blob_start);
+
+  vgic_init();
+  gic_enable_irq(30); /* guest EL1 phys-timer PPI on the real redistributor */
+
+  for (int i = 0; i < DF_COUNT; i++) {
+    ram[i] = pmm_allocate_pages(DF_RAM_SIZE / 0x1000);
+    if (!ram[i] || !stage2_create(&s2[i], (uint32_t)(i + 1))) {
+      uart_errorln("[HYP] M9c: setup failed");
+      return;
+    }
+    stage2_map(&s2[i], GUEST_ENTRY_IPA, (uint64_t)ram[i], DF_RAM_SIZE, 0);
+    stage2_map(&s2[i], UART_BASE, UART_BASE, 0x1000, 1);
+
+    uint64_t kva = PHYS_TO_VIRT((uint64_t)ram[i]);
+    for (uint64_t b = 0; b < blob_len; b++) {
+      ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)__guest_blob_start)[b];
+    }
+    guest_sync_icache(kva, (blob_len + 0xFFF) & ~0xFFFULL);
+
+    for (int r = 0; r < 31; r++) vc[i].x[r] = 0;
+    vc[i].pc = GUEST_ENTRY_IPA;
+    vc[i].pstate = 0x3C5;
+    vc[i].sp_el1 = 0;
+    vc[i].vttbr = stage2_vttbr(&s2[i]);
+    vc[i].hcr_extra = HCR_IMO;
+    vc[i].vmid = (uint32_t)(i + 1);
+    vc[i].id = (uint32_t)i;
+    vc[i].name = (i == 0) ? "vm0" : "vm1";
+    vgic_vcpu_reset(&vc[i].vgic);
+  }
+
+  uint64_t freq;
+  __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
+  uint64_t slice = freq / 50; /* 20 ms scheduler quantum */
+
+  uint64_t host_daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(host_daif));
+  __asm__ __volatile__("msr daifset, #3");
+
+  /* First-run flag: a vCPU's EL1/FP context is only valid to restore after it
+   * has run once. We restore-on-switch; the very first entry of each uses the
+   * fresh reset state already in the hardware bank when it boots MMU-off. */
+  int started[DF_COUNT] = {0, 0};
+  int cur_id = 0;
+
+  for (int s = 0; s < DF_SLICES; s++) {
+    vcpu_t *v = &vc[cur_id];
+
+    /* Restore this guest's saved context (skip the very first time it runs). */
+    if (started[cur_id]) {
+      vcpu_restore_el1(&v->el1);
+      vcpu_restore_fp(&v->fp);
+      vgic_restore(&v->vgic);
+    }
+    vgic_set_current(&v->vgic);
+
+    uart_printf("\n[HYP] >>> slice %u: scheduling %s (pc=%x) >>>\n",
+                (uint64_t)s, v->name, v->pc);
+
+    /* Run this guest until the scheduler quantum (CNTHP, PPI 26) expires. */
+    cnthp_arm(slice);
+    int slice_done = 0;
+    long guard = 200000;
+    while (!slice_done && guard-- > 0) {
+      vcpu_enter(v);
+      if (v->exit_reason == HYP_EXC_IRQ) {
+        uint64_t intid = gic_ack_irq();
+        if (intid == HYP_CNTHP_PPI) {
+          cnthp_disarm();
+          gic_end_irq(intid);
+          slice_done = 1;          /* quantum expired -> switch guests */
+        } else {
+          if (intid == 30) vgic_inject_ppi(30); /* guest's own timer */
+          if (intid != GIC_INTID_NO_PENDING) gic_end_irq(intid);
+        }
+      } else if (!df_service_exit(v)) {
+        uint64_t ipa = ((v->hpfar >> 4) << 12) | (v->far & 0xFFF);
+        uart_printf("[HYP] %s fatal exit reason=%u EC=%x pc=%x IPA=%x\n",
+                    v->name, v->exit_reason, ESR_EC_OF(v->esr), v->pc, ipa);
+        slice_done = 1;
+      }
+    }
+    cnthp_disarm();
+
+    /* Save this guest's context out before switching away. */
+    vcpu_save_el1(&v->el1);
+    vcpu_save_fp(&v->fp);
+    vgic_save(&v->vgic);
+    started[cur_id] = 1;
+
+    cur_id = (cur_id + 1) % DF_COUNT; /* round-robin */
+  }
+
+  __asm__ __volatile__("msr daif, %0" ::"r"(host_daif));
+  uart_println("\n[HYP] M9c: both FermiOS guests time-sliced; returning to host");
+
+  for (int i = 0; i < DF_COUNT; i++) {
+    pmm_free_pages(ram[i], DF_RAM_SIZE / 0x1000);
+  }
+}

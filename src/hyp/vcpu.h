@@ -25,7 +25,10 @@ typedef struct vcpu_el1 {
   uint64_t sctlr, cpacr, ttbr0, ttbr1, tcr, mair, amair, vbar;
   uint64_t contextidr, tpidr_el0, tpidrro_el0, tpidr_el1;
   uint64_t sp_el0, elr_el1, spsr_el1, esr_el1, far_el1, par_el1;
-  uint64_t cntv_cval, cntv_ctl, cntkctl;
+  /* The guest uses the EL1 PHYSICAL timer (CNTP) via passthrough; two guests
+   * share the one CNTP, so its compare/control are context-switched here.
+   * cntkctl_el1 is a guest EL1 reg (via _EL12). */
+  uint64_t cntp_cval, cntp_ctl, cntkctl;
 } vcpu_el1_t;
 
 /* FP/SIMD bank: q0..q31 (512B) + FPSR + FPCR. 16-byte aligned for q stores. */

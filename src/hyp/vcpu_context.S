@@ -38,8 +38,11 @@ vcpu_save_el1:
 	mrs	x1, esr_el12        ; str x1, [x0, #120]
 	mrs	x1, far_el12        ; str x1, [x0, #128]
 	mrs	x1, par_el1         ; str x1, [x0, #136]
-	mrs	x1, cntv_cval_el02  ; str x1, [x0, #144]
-	mrs	x1, cntv_ctl_el02   ; str x1, [x0, #152]
+	// NOTE: the guest EL1 PHYSICAL timer (CNTP) is deliberately NOT saved here.
+	// Under VHE in host context (TGE=1) CNTP_*_EL0 can alias the EL2 physical
+	// timer (CNTHP) that the hypervisor scheduler itself uses, so touching it
+	// from the C save/restore path is unsafe. Each guest re-arms its own CNTP
+	// during its slice (TGE=0); ticks are injected to whichever guest is live.
 	mrs	x1, cntkctl_el12    ; str x1, [x0, #160]
 	ret
 
@@ -63,8 +66,6 @@ vcpu_restore_el1:
 	ldr	x1, [x0, #120] ; msr esr_el12, x1
 	ldr	x1, [x0, #128] ; msr far_el12, x1
 	ldr	x1, [x0, #136] ; msr par_el1, x1
-	ldr	x1, [x0, #144] ; msr cntv_cval_el02, x1
-	ldr	x1, [x0, #152] ; msr cntv_ctl_el02, x1
 	ldr	x1, [x0, #160] ; msr cntkctl_el12, x1
 	isb
 	ret

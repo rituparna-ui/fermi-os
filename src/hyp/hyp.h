@@ -75,4 +75,9 @@ void hyp_boot_fermios_guest(void);
  * timer starts. */
 void hyp_run_multi_guest_demo(void);
 
+/* Milestone 9c: preemptively round-robin TWO full FermiOS guests, each with its
+ * own VMID/stage-2/RAM/vGIC, time-sliced on the EL2 physical timer with full
+ * per-vCPU context save/restore. No-op at EL1; runs before the host timer. */
+void hyp_run_dual_fermios(void);
+
 #endif /* HYP_HYP_H */

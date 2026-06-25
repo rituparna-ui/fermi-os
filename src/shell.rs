@@ -252,6 +252,32 @@ fn cmd_grep(pattern: &str, path: &str) {
     kprintln!("grep: {} matching line(s)", matches);
 }
 
+fn cmd_append(path: &str, text: &str) {
+    use alloc::vec::Vec;
+    let mut data: Vec<u8> = Vec::new();
+    let existed = !vfs::resolve(path).is_null();
+    if existed {
+        let t = vfs::fd_table_create();
+        let fd = vfs::fd_open(t, path);
+        if fd >= 0 {
+            let mut b = [0u8; 256];
+            loop {
+                let n = vfs::fd_read(t, fd, &mut b);
+                if n <= 0 { break; }
+                data.extend_from_slice(&b[..n as usize]);
+            }
+            vfs::fd_close(t, fd);
+        }
+        vfs::fd_table_destroy(t);
+    }
+    data.extend_from_slice(text.as_bytes());
+    data.push(b'\n');
+    let name = path.rsplit('/').next().unwrap_or("");
+    if existed { vfs::unlink(path); }
+    let ok = crate::fs::fat32::create(name.as_bytes(), &data);
+    kprintln!("append {}: {} ({} bytes)", path, if ok { "ok" } else { "failed" }, data.len());
+}
+
 fn cmd_write(name: &str, text: &str) {
     // Create a root-level FAT32 file from a string (newline-terminated).
     let mut data = alloc::vec::Vec::new();
@@ -613,6 +639,11 @@ fn dispatch(line: &str) {
         "http" => {
             if arg1.is_empty() { kprintln!("usage: http <host>"); }
             else if !net::http_get(arg1) { kprintln!("http: failed"); }
+        }
+        "append" => {
+            let rest: Vec<&str> = line.splitn(3, ' ').collect();
+            if rest.len() < 3 { kprintln!("usage: append <path> <text>"); }
+            else { cmd_append(rest[1], rest[2]); }
         }
         "mv" => {
             let rest: Vec<&str> = line.splitn(3, ' ').collect();

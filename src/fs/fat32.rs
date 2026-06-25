@@ -398,6 +398,12 @@ pub fn create(name: &[u8], data: &[u8]) -> bool {
     if !v.mounted {
         return false;
     }
+    // Overwrite semantics: if a file of this name already exists, remove it
+    // first (free its chain + mark its entry deleted) so we don't leave a
+    // duplicate directory entry.
+    if dir_find_loc(v.root_cluster, &to_83(name)).is_some() {
+        delete(name);
+    }
     let bytes_per_cluster = v.sectors_per_cluster * SECTOR as u32;
     let clusters_needed = if data.is_empty() {
         0

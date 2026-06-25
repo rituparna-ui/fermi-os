@@ -160,7 +160,7 @@ pub fn is_ready() -> bool {
 static BLK_LOCK: SpinLock<()> = SpinLock::new(());
 
 fn rw(sector: u64, buf_pa: u64, write: bool) -> bool {
-    let _guard = BLK_LOCK.lock();
+    let _guard = BLK_LOCK.lock_irqsave();
     let blk = unsafe { BLK.get() };
     if !blk.ready {
         return false;

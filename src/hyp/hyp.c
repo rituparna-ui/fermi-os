@@ -1309,6 +1309,10 @@ void hyp_run_shm_doorbell(void) {
   uint64_t doorbells = 0;
   for (int round = 0; round < SHM_ROUNDS; round++) {
     for (int i = 0; i < SHM_COUNT; i++) {
+      /* Select this guest's vGIC model before running it, so a guest MMIO trap
+       * into the (emulated) GICD/GICR window is serviced against the right
+       * per-vCPU state rather than a stale/NULL `cur`. */
+      vgic_set_current(&vc[i].vgic);
       /* Each guest runs until it yields via a plain HVC; the producer also
        * issues a doorbell HVC which we count + acknowledge. */
       int yielded = 0;

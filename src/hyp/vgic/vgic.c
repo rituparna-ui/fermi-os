@@ -83,7 +83,12 @@ void vgic_init(void) {
 
   uint64_t vtr;
   __asm__ __volatile__("mrs %0, ich_vtr_el2" : "=r"(vtr));
-  vgic_nr_lr = (uint32_t)((vtr & 0x1F) + 1);
+  vgic_nr_lr = (uint32_t)((vtr & 0x1F) + 1); /* ICH_VTR_EL2.ListRegs is 1..32 */
+  /* The per-vCPU LR shadow (vcpu_vgic_t.lr[]) is fixed at 16 entries; clamp so
+   * vgic_save/restore/inject never iterate past it on hardware with >16 LRs. */
+  if (vgic_nr_lr > 16) {
+    vgic_nr_lr = 16;
+  }
 
   for (uint32_t i = 0; i < vgic_nr_lr; i++) {
     lr_write(i, 0);
@@ -123,6 +128,17 @@ int vgic_mmio_is_target(uint64_t ipa) {
 
 void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
                        int size_bytes) {
+  /* Fail-safe: never dereference a NULL per-vCPU model. The caller is supposed
+   * to vgic_set_current() before servicing a guest's GICD/GICR MMIO trap; if it
+   * somehow did not, a guest access to the (unmapped, trapping) vGIC window
+   * would otherwise NULL-deref at EL2 and crash the host. Treat it as "no
+   * device": reads return 0, writes are dropped. */
+  if (!cur) {
+    if (!is_write && val) {
+      *val = 0;
+    }
+    return;
+  }
   uint64_t off = (ipa >= GICR_IPA_BASE) ? (ipa - GICR_IPA_BASE)
                                         : (ipa - GICD_IPA_BASE);
   uint32_t size_mask =

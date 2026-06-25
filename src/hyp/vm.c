@@ -24,10 +24,17 @@ static const char *ec_name(uint64_t ec) {
   }
 }
 
-__attribute__((noreturn)) static void hyp_fatal_trap(uint64_t type,
-                                                     hyp_trap_frame_t *f) {
+/* An unhandled trap FROM A GUEST (lower EL). Report it, then fault-isolate the
+ * offending VM (reboot just it, or power it off past its fault budget) and let
+ * the rest of the machine keep running — instead of panicking the whole box.
+ * Returns after rewriting the live frame; the vector exit erets into the
+ * rebooted guest or the next VM. (Traps from EL2 itself are real hypervisor
+ * bugs and still panic — see the current-EL vector stubs / handle_irq.) */
+static void hyp_fatal_trap(uint64_t type, hyp_trap_frame_t *f) {
   uint64_t ec = ESR_EC(f->esr);
-  hyp_puts("\n[HYP][TRAP] type=");
+  hyp_puts("\n[HYP][TRAP] guest '");
+  hyp_puts(cur_vcpu->name);
+  hyp_puts("' type=");
   hyp_puthex(type);
   hyp_puts(" EC=");
   hyp_puthex(ec);
@@ -42,7 +49,7 @@ __attribute__((noreturn)) static void hyp_fatal_trap(uint64_t type,
   hyp_puts(" HPFAR_EL2=");
   hyp_puthex(f->hpfar);
   hyp_putc('\n');
-  hyp_panic("unhandled guest trap");
+  vcpu_fault_isolate(f); /* reboot/kill just this VM; machine stays up */
 }
 
 /* Advance ELR_EL2 past the trapped (4-byte AArch64) instruction. Used for
@@ -95,6 +102,8 @@ static void handle_data_abort(uint64_t type, hyp_trap_frame_t *f) {
     hyp_puthex(ipa);
     hyp_putc('\n');
     hyp_fatal_trap(type, f);
+    return; /* fault-isolated: f now belongs to the rebooted/next VM — must NOT
+            * fall through and keep emulating against it. */
   }
 
   uint64_t esr = f->esr;
@@ -106,6 +115,7 @@ static void handle_data_abort(uint64_t type, hyp_trap_frame_t *f) {
     hyp_puthex(ipa);
     hyp_putc('\n');
     hyp_fatal_trap(type, f);
+    return;
   }
 
   int is_write = (int)ISS_WNR(esr);

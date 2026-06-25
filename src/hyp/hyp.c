@@ -98,6 +98,8 @@ extern const uint8_t __dom0_blob_start[];
 extern const uint8_t __dom0_blob_end[];
 extern const uint8_t __vmtgt_blob_start[];
 extern const uint8_t __vmtgt_blob_end[];
+extern const uint8_t __crasher_blob_start[];
+extern const uint8_t __crasher_blob_end[];
 
 /* Guest RAM regions in the top reserved GiB (hyp is at 0x250000000, its pool
  * grows up from ~0x250100000). Each region is 2 MiB-aligned and well clear of
@@ -112,6 +114,8 @@ extern const uint8_t __vmtgt_blob_end[];
 #define DOM0_RAM_SIZE      0x04000000ULL
 #define VMTGT_HOST_RAM_BASE 0x26C000000ULL /* migration target     64 MiB */
 #define VMTGT_RAM_SIZE      0x04000000ULL
+#define CRASH_HOST_RAM_BASE 0x270000000ULL /* fault-isolation crasher 16 MiB */
+#define CRASH_RAM_SIZE      0x01000000ULL
 
 /* Copy a flat blob to a host physical destination (EL2 MMU off) and make it
  * coherent for guest instruction fetch. Used at boot and on warm reset. */
@@ -156,6 +160,8 @@ void hyp_main(void) {
   hyp_copy_image(IPCC_HOST_RAM_BASE, __ipc_blob_start, ipc_size);
   hyp_copy_image(DOM0_HOST_RAM_BASE, __dom0_blob_start, dom0_size);
   hyp_copy_image(VMTGT_HOST_RAM_BASE, __vmtgt_blob_start, vmtgt_size);
+  uint64_t crash_size = (uint64_t)(__crasher_blob_end - __crasher_blob_start);
+  hyp_copy_image(CRASH_HOST_RAM_BASE, __crasher_blob_start, crash_size);
   /* Zero the shared IPC page (its seqno starts at 0). */
   for (volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)IPC_SHARED_PA;
        p < (volatile uint64_t *)(uintptr_t)(IPC_SHARED_PA + 0x1000); p++) {
@@ -175,6 +181,7 @@ void hyp_main(void) {
   uint64_t ipcc_l1 = s2_build_ipc(IPCC_HOST_RAM_BASE, IPC_RAM_SIZE, IPC_SHARED_PA);
   uint64_t dom0_l1 = s2_build_vm2(DOM0_HOST_RAM_BASE, DOM0_RAM_SIZE); /* private RAM + UART */
   uint64_t vmtgt_l1 = s2_build_vm2(VMTGT_HOST_RAM_BASE, VMTGT_RAM_SIZE);
+  uint64_t crash_l1 = s2_build_vm2(CRASH_HOST_RAM_BASE, CRASH_RAM_SIZE);
 
   /* GIC + timer virtualization. */
   hyp_gic_init();
@@ -239,7 +246,13 @@ void hyp_main(void) {
                              __vmtgt_blob_start, VMTGT_HOST_RAM_BASE, vmtgt_size);
   vmtgt->ram_size = VMTGT_RAM_SIZE;
 
-  hyp_puts("[HYP] 6 vCPUs created (incl. privileged dom0 + migration target). Starting scheduler.\n");
+  /* crasher (id 6, VMID 7): deliberately faults to demonstrate per-VM fault
+   * isolation — the hyp reboots only it, the other 6 VMs keep running. */
+  vcpu_t *crasher = vcpu_alloc("crasher", GUEST_ENTRY_IPA, s2_make_vttbr(crash_l1, 7), 0,
+                               __crasher_blob_start, CRASH_HOST_RAM_BASE, crash_size);
+  crasher->ram_size = CRASH_RAM_SIZE;
+
+  hyp_puts("[HYP] 7 vCPUs created (incl. dom0, migration target, crasher). Starting scheduler.\n");
   hyp_puts("--------------------------------------------------\n\n");
 
   snapshot_init();    /* reserve the VM snapshot slot */

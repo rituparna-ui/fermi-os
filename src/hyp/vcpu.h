@@ -137,7 +137,15 @@ typedef struct vcpu {
   uint64_t       run_count;  /* times this vCPU has been scheduled in */
   uint64_t       cpu_ticks;  /* total CNTPCT ticks this vCPU has run (for
                               * proportional-share accounting / VMCTL_CPUTIME) */
+  uint32_t       fault_count; /* unhandled EL2 traps this VM has caused; after
+                               * VCPU_FAULT_MAX the hypervisor stops rebooting
+                               * it and powers it off (avoids a reset loop). */
 } vcpu_t;
+
+/* Reboot-on-fault budget: after this many unhandled traps, kill instead of
+ * rebooting (a guest that faults immediately on every restart would otherwise
+ * spin the hypervisor forever). */
+#define VCPU_FAULT_MAX 3
 
 /* The currently-running vCPU (set by the scheduler before each guest entry).
  * vtimer / vgic emulation use this to find their per-VM state. */
@@ -167,6 +175,13 @@ void vcpu_reset(vcpu_t *v, hyp_trap_frame_t *f);
 /* Power off the current VM (PSCI SYSTEM_OFF): mark it permanently dead and
  * switch to another runnable VM. If it is the last one, the hypervisor halts. */
 void vcpu_poweroff_current(hyp_trap_frame_t *f);
+
+/* Fault-isolate the CURRENT VM after an unhandled EL2 trap: instead of panicking
+ * the whole machine, reboot just this VM (warm-reset in place) — or, once it has
+ * exceeded VCPU_FAULT_MAX reboots, power it off — and let the others keep
+ * running. `f` is the faulting VM's live trap frame. Does not return to the
+ * faulting instruction. */
+void vcpu_fault_isolate(hyp_trap_frame_t *f);
 
 /* Ring the doorbell from `from` to its configured peer: inject DOORBELL_INTID
  * into the peer (live List Register if it is current, saved state otherwise)

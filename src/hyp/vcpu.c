@@ -17,7 +17,7 @@
  * so the same guest IPA maps to different host PAs — true memory isolation.
  * ------------------------------------------------------------------------- */
 
-#define MAX_VCPUS 6
+#define MAX_VCPUS 7
 
 static vcpu_t vcpus[MAX_VCPUS];
 static int    nr_vcpus;
@@ -80,6 +80,34 @@ void vcpu_poweroff_current(hyp_trap_frame_t *f) {
     hyp_panic("last VM powered off — nothing left to run");
   }
   switch_to(next, f);
+}
+
+void vcpu_fault_isolate(hyp_trap_frame_t *f) {
+  vcpu_t *v = cur_vcpu;
+  v->fault_count++;
+
+  /* Fault budget exceeded -> stop rebooting this VM and power it off, so a
+   * guest that faults immediately on every restart can't spin the hypervisor.
+   * Also power off if there is no pristine image to reboot from. */
+  if (v->fault_count > VCPU_FAULT_MAX || !v->img_src || !v->img_size) {
+    hyp_puts("[FAULT] VM '");
+    hyp_puts(v->name);
+    hyp_puts("' exceeded fault budget — powering it off\n");
+    vcpu_poweroff_current(f); /* marks dead + switches away (does not return) */
+    return;
+  }
+
+  /* Reboot just this VM (warm-reset in place: reloads its pristine image,
+   * re-inits state, and rewrites the live trap frame `f` so the vector exit
+   * erets into the fresh guest). The other VMs are untouched. */
+  hyp_puts("[FAULT] rebooting faulted VM '");
+  hyp_puts(v->name);
+  hyp_puts("' (fault ");
+  hyp_puthex(v->fault_count);
+  hyp_puts(" of ");
+  hyp_puthex(VCPU_FAULT_MAX);
+  hyp_puts(")\n");
+  vcpu_reset(v, f);
 }
 
 vcpu_t *vcpu_by_id(int id) {

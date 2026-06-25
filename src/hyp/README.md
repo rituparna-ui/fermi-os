@@ -234,6 +234,24 @@ the bytes tagged with the VM name (`[guest2] ...`), and returns the count. This
 is the virtio-console / Xen-console paravirtualised-device pattern: the host
 multiplexes and attributes guest output. VM2's heartbeats use it.
 
+### Per-VM fault isolation
+
+An unhandled trap from a guest (a stage-2 fault on an unmapped IPA, an
+unrecognised sync exception, etc.) no longer panics the whole machine. Instead
+`hyp_fatal_trap` reports it and calls `vcpu_fault_isolate`, which **reboots just
+the offending VM** (warm-reset in place) — or, once it exceeds `VCPU_FAULT_MAX`
+reboots, **powers it off** (so a guest that faults immediately on every restart
+can't spin the hypervisor). Every other VM keeps running. This is the EL2 analog
+of FermiOS killing a faulting EL0 task. Traps from EL2 itself are real
+hypervisor bugs and still panic. The `crasher/` guest demonstrates it: it
+dereferences an unmapped IPA, gets rebooted 3× then powered off, while FermiOS,
+dom0, and the IPC pair run on undisturbed.
+
+> Subtlety worth recording: once `hyp_fatal_trap` *returns* (it used to be
+> `noreturn`/panic), the data-abort handler must `return` immediately after it —
+> otherwise it falls through and keeps emulating against the *rebooted* VM's
+> freshly-restored trap frame, corrupting it.
+
 ### VM snapshot / restore (checkpoint + rollback)
 
 dom0 can checkpoint a guest's *complete* state and roll it back later

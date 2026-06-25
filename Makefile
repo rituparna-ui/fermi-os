@@ -20,7 +20,7 @@ C_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.c" -p
 
 # The HYPERVISOR image sources (EL2). Exclude the standalone guest subdirs —
 # those are built separately to flat blobs, not linked into the hyp.
-HYP_GUEST_DIRS := $(HYP_DIR)/guest2 $(HYP_DIR)/ipc $(HYP_DIR)/dom0 $(HYP_DIR)/vmtgt
+HYP_GUEST_DIRS := $(HYP_DIR)/guest2 $(HYP_DIR)/ipc $(HYP_DIR)/dom0 $(HYP_DIR)/vmtgt $(HYP_DIR)/crasher
 HYP_PRUNE := $(foreach d,$(HYP_GUEST_DIRS),-path "$(d)" -o)
 HYP_S_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.S" -print)
 HYP_C_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.c" -print)
@@ -173,6 +173,18 @@ $(VMTGT_BIN): $(HYP_DIR)/vmtgt/vmtgt.S $(HYP_DIR)/vmtgt/linker_vmtgt.ld
 	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/vmtgt.elf $@
 
 $(BUILD_DIR)/hyp/vmtgt_blob.o: $(VMTGT_BIN)
+
+# crasher guest: deliberately faults, to demonstrate per-VM fault isolation.
+CRASHER_BIN := $(BUILD_DIR)/crasher.bin
+$(CRASHER_BIN): $(HYP_DIR)/crasher/crasher.S $(HYP_DIR)/crasher/linker_crasher.ld
+	@echo "CRASHER $@"
+	@mkdir -p $(dir $@)
+	@$(CC) -ffreestanding -nostdlib -nostartfiles -fno-pic \
+		-Wl,-T,$(HYP_DIR)/crasher/linker_crasher.ld -Wl,--build-id=none \
+		-o $(BUILD_DIR)/crasher.elf $(HYP_DIR)/crasher/crasher.S
+	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/crasher.elf $@
+
+$(BUILD_DIR)/hyp/crasher_blob.o: $(CRASHER_BIN)
 
 # Hypervisor (EL2) — separate image, its own linker script.
 $(HYP_TARGET): $(HYP_OBJECTS)

@@ -120,6 +120,22 @@ pub extern "C" fn kmain() -> ! {
         kprintln!("[RNG TEST] got {} bytes: {:02x?}", n, &buf[..]);
     }
 
+    drivers::virtio::blk::init();
+
+    // BLK round-trip test: write a sector, read it back, compare.
+    {
+        use drivers::virtio::blk::VIRTIO_BLK_SECTOR_SIZE;
+        let mut wbuf = [0u8; VIRTIO_BLK_SECTOR_SIZE];
+        for (i, b) in wbuf.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let mut rbuf = [0u8; VIRTIO_BLK_SECTOR_SIZE];
+        let wrote = drivers::virtio::blk::write(1, &wbuf);
+        let read = drivers::virtio::blk::read(1, &mut rbuf);
+        let ok = wrote && read && wbuf == rbuf;
+        kprintln!("[BLK TEST] write+read sector 1 round-trip: {}", if ok { "PASS" } else { "FAIL" });
+    }
+
     // Scheduler + a couple of demo kernel tasks (mirrors the original boot).
     sched::init();
     sched::create_task("task_a", task_a);

@@ -4,11 +4,9 @@
 //! negotiation → FEATURES_OK → queue setup → DRIVER_OK), then serves entropy
 //! via a single read-only virtqueue and a DMA bounce buffer.
 
-use crate::arch::cpu::dsb_sy;
 use crate::drivers::pci;
 use crate::drivers::virtio::virtqueue::{Virtqueue, VirtqAvail, VirtqDesc, VirtqUsed, VIRTQ_DESC_F_WRITE, VIRTQ_MAX_SIZE};
 use crate::drivers::virtio::*;
-use crate::klib::mmio;
 use crate::klib::sync::SpinLock;
 use crate::klib::uart::Uart;
 use crate::kprintln;
@@ -122,7 +120,8 @@ pub fn init() {
         return;
     }
 
-    if !virtio_init_sequence(base) {
+    // RNG has no device-specific features; accept only VIRTIO_F_VERSION_1.
+    if device_init_handshake(base, "RNG", 0).is_none() {
         return;
     }
 
@@ -145,10 +144,7 @@ pub fn init() {
         return;
     }
 
-    // DRIVER_OK.
-    let status = mmio::read8(base + VIRTIO_COMMON_STATUS);
-    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_DRIVER_OK);
-    dsb_sy();
+    set_driver_ok(base);
     kprintln!("[RNG] DRIVER_OK set");
 
     *RNG.lock() = Some(RngDevice {
@@ -156,66 +152,4 @@ pub fn init() {
         vq,
         ready: true,
     });
-}
-
-/// Run the standard VirtIO device init handshake on the common-cfg at `base`,
-/// negotiating only VIRTIO_F_VERSION_1. Returns false on failure.
-/// Shared shape with all VirtIO drivers; the RNG has no device-specific
-/// features.
-fn virtio_init_sequence(base: usize) -> bool {
-    // Reset.
-    kprintln!("[RNG][VIRTIO-INIT][1] Reset Device");
-    mmio::write8(base + VIRTIO_COMMON_STATUS, VIRTIO_STATUS_RESET);
-    dsb_sy();
-    while mmio::read8(base + VIRTIO_COMMON_STATUS) != VIRTIO_STATUS_RESET {}
-    kprintln!("[RNG][VIRTIO-INIT][1] Reset Device Complete");
-
-    // ACK.
-    kprintln!("[RNG][VIRTIO-INIT][2] Ack");
-    let mut status = mmio::read8(base + VIRTIO_COMMON_STATUS);
-    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_ACKNOWLEDGE);
-    dsb_sy();
-
-    // DRIVER.
-    kprintln!("[RNG][VIRTIO-INIT][3] Driver Status");
-    status = mmio::read8(base + VIRTIO_COMMON_STATUS);
-    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_DRIVER);
-    dsb_sy();
-
-    // Feature negotiation.
-    kprintln!("[RNG][VIRTIO-INIT][4] Negotiate Features");
-    mmio::write32(base + VIRTIO_COMMON_DFSELECT, 0);
-    dsb_sy();
-    let feat_lo = mmio::read32(base + VIRTIO_COMMON_DF);
-    kprintln!(" Device features[0]: {:#x}", feat_lo);
-    mmio::write32(base + VIRTIO_COMMON_DFSELECT, 1);
-    dsb_sy();
-    let feat_hi = mmio::read32(base + VIRTIO_COMMON_DF);
-    kprintln!(" Device features[1]: {:#x}", feat_hi);
-
-    // Accept only VIRTIO_F_VERSION_1 (bit 32 == feat_hi bit 0).
-    let guest_lo = 0u32;
-    let guest_hi = feat_hi & 0x01;
-    mmio::write32(base + VIRTIO_COMMON_GFSELECT, 0);
-    dsb_sy();
-    mmio::write32(base + VIRTIO_COMMON_GF, guest_lo);
-    dsb_sy();
-    mmio::write32(base + VIRTIO_COMMON_GFSELECT, 1);
-    dsb_sy();
-    mmio::write32(base + VIRTIO_COMMON_GF, guest_hi);
-    dsb_sy();
-    kprintln!(" Accepted Features: lo={:#x} hi={:#x}", guest_lo, guest_hi);
-
-    // FEATURES_OK + verify.
-    status = mmio::read8(base + VIRTIO_COMMON_STATUS);
-    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_FEATURES_OK);
-    dsb_sy();
-    status = mmio::read8(base + VIRTIO_COMMON_STATUS);
-    if status & VIRTIO_STATUS_FEATURES_OK == 0 {
-        Uart.errorln("[RNG] FEATURES_OK failed");
-        return false;
-    }
-    kprintln!("[RNG] Status: {:#x}", status);
-    kprintln!("[RNG] FEATURES_OK !");
-    true
 }

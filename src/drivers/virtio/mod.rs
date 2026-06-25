@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+pub mod blk;
 pub mod rng;
 pub mod virtqueue;
 
@@ -102,6 +103,78 @@ fn populate_capability(dev: &PciDevice, caps: &mut VirtioPciCaps, cap_ptr: u8) {
         4 => caps.device_cfg = cap_addr,
         _ => {}
     }
+}
+
+/// Run the common VirtIO device init handshake on the common-cfg at `base`:
+/// reset → ack → driver → feature negotiation → FEATURES_OK. `extra_features_hi`
+/// lets a driver accept device-specific feature bits in the high word
+/// (VIRTIO_F_VERSION_1 = bit 0 of the high word is always added). `tag` is a
+/// short driver name used for logging. Returns the negotiated high features on
+/// success, or None on failure.
+pub fn device_init_handshake(
+    base: usize,
+    tag: &str,
+    extra_features_hi: u32,
+) -> Option<u32> {
+    use crate::arch::cpu::dsb_sy;
+    use crate::klib::mmio;
+
+    // Reset and wait for it to take.
+    mmio::write8(base + VIRTIO_COMMON_STATUS, VIRTIO_STATUS_RESET);
+    dsb_sy();
+    while mmio::read8(base + VIRTIO_COMMON_STATUS) != VIRTIO_STATUS_RESET {}
+
+    // ACK + DRIVER.
+    let mut status = mmio::read8(base + VIRTIO_COMMON_STATUS);
+    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_ACKNOWLEDGE);
+    dsb_sy();
+    status = mmio::read8(base + VIRTIO_COMMON_STATUS);
+    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_DRIVER);
+    dsb_sy();
+
+    // Read device features.
+    mmio::write32(base + VIRTIO_COMMON_DFSELECT, 0);
+    dsb_sy();
+    let feat_lo = mmio::read32(base + VIRTIO_COMMON_DF);
+    mmio::write32(base + VIRTIO_COMMON_DFSELECT, 1);
+    dsb_sy();
+    let feat_hi = mmio::read32(base + VIRTIO_COMMON_DF);
+    kprintln!("[{}] device features: lo={:#x} hi={:#x}", tag, feat_lo, feat_hi);
+
+    // Accept VIRTIO_F_VERSION_1 (high bit 0) plus any requested extra high bits
+    // the device actually offers.
+    let guest_lo = 0u32;
+    let guest_hi = (feat_hi & 0x01) | (feat_hi & extra_features_hi);
+    mmio::write32(base + VIRTIO_COMMON_GFSELECT, 0);
+    dsb_sy();
+    mmio::write32(base + VIRTIO_COMMON_GF, guest_lo);
+    dsb_sy();
+    mmio::write32(base + VIRTIO_COMMON_GFSELECT, 1);
+    dsb_sy();
+    mmio::write32(base + VIRTIO_COMMON_GF, guest_hi);
+    dsb_sy();
+    kprintln!("[{}] accepted features: lo={:#x} hi={:#x}", tag, guest_lo, guest_hi);
+
+    // FEATURES_OK + verify it stuck.
+    status = mmio::read8(base + VIRTIO_COMMON_STATUS);
+    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_FEATURES_OK);
+    dsb_sy();
+    status = mmio::read8(base + VIRTIO_COMMON_STATUS);
+    if status & VIRTIO_STATUS_FEATURES_OK == 0 {
+        Uart.errorln("[VIRTIO] FEATURES_OK failed");
+        return None;
+    }
+    kprintln!("[{}] FEATURES_OK (status={:#x})", tag, status);
+    Some(guest_hi)
+}
+
+/// Set DRIVER_OK on the device at common-cfg `base`.
+pub fn set_driver_ok(base: usize) {
+    use crate::arch::cpu::dsb_sy;
+    use crate::klib::mmio;
+    let status = mmio::read8(base + VIRTIO_COMMON_STATUS);
+    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_DRIVER_OK);
+    dsb_sy();
 }
 
 /// Walk the device's capability list, resolving VirtIO config windows.

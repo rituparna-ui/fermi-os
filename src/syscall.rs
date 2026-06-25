@@ -35,6 +35,11 @@ fn current_fds() -> *mut FdTable {
 }
 
 pub fn syscall_dispatch(frame: &mut TrapFrame) {
+    // SVC entry masks IRQs (PSTATE.I). Unmask here so a long-running or
+    // blocking syscall (sleep, future wfi-backed read) doesn't starve the
+    // timer/scheduler. The trap-frame SPSR (restored on eret) is unchanged,
+    // so EL0 resumes with its own interrupt state.
+    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
     let num = frame.regs[8];
     let a0 = frame.regs[0];
     let a1 = frame.regs[1];

@@ -154,6 +154,16 @@ fn dispatch(line: &str) {
                 kprintln!("ping: no reply");
             }
         }
+        "resolve" => {
+            if arg1.is_empty() {
+                kprintln!("usage: resolve <hostname>");
+            } else {
+                match net::resolve(arg1) {
+                    Some(ip) => kprintln!("{} -> {}.{}.{}.{}", arg1, ip[0], ip[1], ip[2], ip[3]),
+                    None => kprintln!("resolve: {}: no answer", arg1),
+                }
+            }
+        }
         "sleep" => {
             if let Some(ms) = parse_u64(arg1) {
                 sched::sleep_ms(ms);

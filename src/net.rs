@@ -487,6 +487,133 @@ pub fn render_info() -> alloc::string::String {
     s
 }
 
+fn encode_qname(host: &str, out: &mut [u8]) -> usize {
+    let mut p = 0;
+    for label in host.split('.') {
+        if label.is_empty() {
+            continue;
+        }
+        out[p] = label.len() as u8;
+        p += 1;
+        out[p..p + label.len()].copy_from_slice(label.as_bytes());
+        p += label.len();
+    }
+    out[p] = 0;
+    p += 1;
+    p
+}
+
+fn parse_dns_a(dns: &[u8]) -> Option<[u8; 4]> {
+    if dns.len() < 12 {
+        return None;
+    }
+    let ancount = ((dns[6] as u16) << 8) | dns[7] as u16;
+    if ancount == 0 {
+        return None;
+    }
+    let mut p = 12;
+    // skip question QNAME
+    while p < dns.len() && dns[p] != 0 {
+        if dns[p] & 0xC0 == 0xC0 {
+            p += 1;
+            break;
+        }
+        p += dns[p] as usize + 1;
+    }
+    p += 1; // zero label
+    p += 4; // qtype + qclass
+    for _ in 0..ancount {
+        if p >= dns.len() {
+            break;
+        }
+        if dns[p] & 0xC0 == 0xC0 {
+            p += 2;
+        } else {
+            while p < dns.len() && dns[p] != 0 {
+                p += dns[p] as usize + 1;
+            }
+            p += 1;
+        }
+        if p + 10 > dns.len() {
+            break;
+        }
+        let atype = ((dns[p] as u16) << 8) | dns[p + 1] as u16;
+        let rdlen = ((dns[p + 8] as u16) << 8) | dns[p + 9] as u16;
+        p += 10;
+        if atype == 1 && rdlen == 4 && p + 4 <= dns.len() {
+            return Some([dns[p], dns[p + 1], dns[p + 2], dns[p + 3]]);
+        }
+        p += rdlen as usize;
+    }
+    None
+}
+
+fn ensure_gateway_mac() -> bool {
+    if state().have_gateway_mac {
+        return true;
+    }
+    send_arp_probe();
+    let mut rx = [0u8; 256];
+    let dl = timer::get_ticks() + 100;
+    while timer::get_ticks() < dl {
+        let n = net::rx_poll(&mut rx);
+        if n > 0 {
+            parse_arp_reply(&rx[..n as usize]);
+            if state().have_gateway_mac {
+                return true;
+            }
+        }
+        idle_wait();
+    }
+    state().have_gateway_mac
+}
+
+/// Resolve a hostname to an IPv4 address via slirp's DNS (10.0.2.3:53).
+pub fn resolve(host: &str) -> Option<[u8; 4]> {
+    if !ensure_gateway_mac() {
+        return None;
+    }
+    let gw_mac = state().gateway_mac;
+    let src_ip = state().my_ip;
+    let dns_ip = [10u8, 0, 2, 3];
+
+    let mut q = [0u8; 300];
+    q[0] = 0x12;
+    q[1] = 0x34; // id
+    q[2] = 0x01; // RD
+    q[5] = 1; // qdcount = 1
+    let mut qlen = 12;
+    qlen += encode_qname(host, &mut q[12..]);
+    q[qlen + 1] = 1; // qtype = A
+    q[qlen + 3] = 1; // qclass = IN
+    qlen += 4;
+
+    let mut frame = [0u8; 400];
+    let flen = udp_build(&mut frame, &gw_mac, &src_ip, &dns_ip, 0x3535, 53, &q[..qlen]);
+    net::tx(&frame[..flen]);
+
+    let mut rx = [0u8; 600];
+    let dl = timer::get_ticks() + 300;
+    while timer::get_ticks() < dl {
+        let n = net::rx_poll(&mut rx);
+        if n as usize >= 14 + 20 + 8 && rx[12] == 0x08 && rx[13] == 0x00 {
+            let ip = &rx[14..];
+            if ip[9] == 17 {
+                let ihl = (ip[0] & 0xF) as usize * 4;
+                let udp = &ip[ihl..];
+                let sport = ((udp[0] as u16) << 8) | udp[1] as u16;
+                if sport == 53 {
+                    if let Some(a) = parse_dns_a(&udp[8..(n as usize - 14 - ihl)]) {
+                        return Some(a);
+                    }
+                }
+            }
+        }
+        idle_wait();
+    }
+    None
+}
+
 /// SYS_NET_PING backend: ensure gateway MAC (ARP), send one ping, wait for the
 /// echo reply, and return its TTL (or -1).
 pub fn ping(seq: u16) -> i64 {

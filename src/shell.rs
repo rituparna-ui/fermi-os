@@ -209,10 +209,8 @@ fn dispatch(line: &str) {
         }
         "clear" => kprint!("\x1b[2J\x1b[H"),
         "reboot" => {
-            kprintln!("(reboot not wired; halting)");
-            loop {
-                unsafe { core::arch::asm!("wfi") };
-            }
+            kprintln!("rebooting via PSCI...");
+            crate::cpu::system_reset();
         }
         _ => kprintln!("unknown command: {} (try 'help')", cmd),
     }

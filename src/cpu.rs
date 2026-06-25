@@ -39,6 +39,17 @@ pub fn el_name(el: u8) -> &'static str {
     }
 }
 
+/// Reset the machine via PSCI SYSTEM_RESET (QEMU virt conduit = HVC).
+pub fn system_reset() -> ! {
+    unsafe {
+        core::arch::asm!("hvc #0", in("x0") 0x8400_0009u64, options(nomem, nostack));
+    }
+    // Should not return; park if it does.
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
 pub fn print_current_el() {
     crate::uart::puts("Current Exception Level: ");
     crate::uart::println(el_name(current_el()));

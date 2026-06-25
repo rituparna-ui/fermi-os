@@ -2,6 +2,7 @@
 #define HYP_VCPU_H
 
 #include <stdint.h>
+#include "vuart/vuart.h"
 
 /* ---------------------------------------------------------------------------
  * Per-vCPU state for the FermiOS VHE hypervisor.
@@ -69,6 +70,7 @@ typedef struct vcpu {
   vcpu_el1_t  el1;   /* guest EL1 sysreg bank (via _EL12)             */
   vcpu_fp_t   fp;    /* q0-q31 + FPSR/FPCR                            */
   vcpu_vgic_t vgic;  /* virtual GIC interface state                   */
+  vuart_t     vuart; /* virtual PL011 console                         */
 
   /* ---- bookkeeping (not touched by asm) ---- */
   uint32_t vmid;

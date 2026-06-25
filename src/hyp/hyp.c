@@ -635,6 +635,26 @@ static int df_service_exit(vcpu_t *v) {
 
   if (v->exit_reason == HYP_EXC_SYNC && ec == 0x24) {
     uint64_t ipa = ((v->hpfar >> 4) << 12) | (v->far & 0xFFF);
+
+    if (vuart_is_target(ipa)) {
+      uint64_t iss = v->esr & 0x1FFFFFFULL;
+      if (!((iss >> 24) & 1)) return 0;
+      int is_write = (int)((iss >> 6) & 1);
+      int srt = (int)((iss >> 16) & 0x1F);
+      int sf = (int)((iss >> 15) & 1);
+      int size_bytes = 1 << (int)((iss >> 22) & 3);
+      uint64_t val = 0;
+      if (is_write) {
+        val = (srt == 31) ? 0 : v->x[srt];
+        vuart_emulate(&v->vuart, ipa, 1, &val, size_bytes);
+      } else {
+        vuart_emulate(&v->vuart, ipa, 0, &val, size_bytes);
+        if (srt != 31) v->x[srt] = sf ? val : (val & 0xFFFFFFFFULL);
+      }
+      v->pc += 4;
+      return 1;
+    }
+
     if (vgic_mmio_is_target(ipa)) {
       uint64_t iss = v->esr & 0x1FFFFFFULL;
       if (!((iss >> 24) & 1)) return 0;
@@ -650,6 +670,7 @@ static int df_service_exit(vcpu_t *v) {
         vgic_mmio_emulate(ipa, 0, &val, size_bytes);
         if (srt != 31) v->x[srt] = sf ? val : (val & 0xFFFFFFFFULL);
       }
+      v->pc += 4;
       return 1;
     }
     if (pci_absent_is_target(ipa)) {
@@ -689,8 +710,10 @@ void hyp_run_dual_fermios(void) {
       uart_errorln("[HYP] M9c: setup failed");
       return;
     }
+    /* Guest RAM only. The PL011 UART is left stage-2-UNMAPPED so the guest's
+     * console MMIO traps to the per-guest virtual UART (vuart) instead of the
+     * shared physical device. */
     stage2_map(&s2[i], GUEST_ENTRY_IPA, (uint64_t)ram[i], DF_RAM_SIZE, 0);
-    stage2_map(&s2[i], UART_BASE, UART_BASE, 0x1000, 1);
 
     uint64_t kva = PHYS_TO_VIRT((uint64_t)ram[i]);
     for (uint64_t b = 0; b < blob_len; b++) {
@@ -708,6 +731,7 @@ void hyp_run_dual_fermios(void) {
     vc[i].id = (uint32_t)i;
     vc[i].name = (i == 0) ? "vm0" : "vm1";
     vgic_vcpu_reset(&vc[i].vgic);
+    vuart_init(&vc[i].vuart, vc[i].name);
   }
 
   uint64_t freq;
@@ -762,6 +786,10 @@ void hyp_run_dual_fermios(void) {
       }
     }
     cnthp_disarm();
+
+    /* Flush any partial console line so it is attributed to this guest and
+     * does not bleed into the next guest's output. */
+    vuart_flush(&v->vuart);
 
     /* Save this guest's context out before switching away. */
     vcpu_save_el1(&v->el1);

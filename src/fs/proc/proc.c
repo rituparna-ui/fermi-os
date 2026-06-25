@@ -11,6 +11,7 @@
 #include "vfs/vfs.h"
 #include "balloon/balloon.h"
 #include "cpu/cpu.h"
+#include "hyp/hypercall.h"
 
 /* Each /proc file regenerates its content on every read out of live
  * kernel state. The caller-provided buf is filled with bytes
@@ -158,6 +159,38 @@ static int gen_cpuinfo(char *buf, size_t buflen) {
   return cpu_render_info(buf, buflen);
 }
 
+/* /proc/vms — live hypervisor / vCPU state, queried over the hypercall ABI.
+ * Generated at EL1, which is allowed to issue HVC; the EL0 shell just cats
+ * the file. If no hypervisor is present beneath us the HVCs are inert on
+ * QEMU and the table reports a single vCPU with zero counters. */
+static int gen_vms(char *buf, size_t buflen) {
+  uint64_t count = hvc_call(HVC_VM_COUNT, 0, 0, 0);
+  uint64_t switches = hvc_call(HVC_VM_STAT, 0, VMSTAT_SWITCHES, 0);
+
+  size_t pos = 0;
+  int n = ksnprintf(buf, buflen,
+                    "Fermi hypervisor (EL2): %u vCPUs, %u world-switches\n"
+                    "VCPU STATE    HVCALLS SYSREG ABORT VIRQS\n"
+                    "---- -------- ------- ------ ----- -----\n",
+                    count, switches);
+  pos += (n < 0) ? 0 : (size_t)n;
+
+  for (uint64_t i = 0; i < count && pos < buflen; i++) {
+    uint64_t st = hvc_call(HVC_VM_STAT, i, VMSTAT_STATE, 0);
+    const char *sn = (st == 2) ? "RUNNING" : (st == 1) ? "READY  " : "UNUSED ";
+    int w = ksnprintf(buf + pos, buflen - pos,
+                      "%u    %s %u %u %u %u\n", i, sn,
+                      hvc_call(HVC_VM_STAT, i, VMSTAT_HVC, 0),
+                      hvc_call(HVC_VM_STAT, i, VMSTAT_SYSREG, 0),
+                      hvc_call(HVC_VM_STAT, i, VMSTAT_ABORT, 0),
+                      hvc_call(HVC_VM_STAT, i, VMSTAT_VIRQ, 0));
+    if (w > 0) {
+      pos += (size_t)w;
+    }
+  }
+  return (int)pos;
+}
+
 
 
 /* ------------------------------------------------------------------ */
@@ -209,6 +242,11 @@ static int read_version(struct vnode *n, file_t *f, void *buf, size_t count) {
   return proc_read_via(gen_version, f, buf, count);
 }
 
+static int read_vms(struct vnode *n, file_t *f, void *buf, size_t count) {
+  (void)n;
+  return proc_read_via(gen_vms, f, buf, count);
+}
+
 static file_operations_t uptime_ops  = {.read = read_uptime,  .write = 0};
 static file_operations_t meminfo_ops = {.read = read_meminfo, .write = 0};
 static file_operations_t tasks_ops   = {.read = read_tasks,   .write = 0};
@@ -224,6 +262,7 @@ static file_operations_t cpuinfo_ops = {.read = read_cpuinfo, .write = 0};
 
 
 static file_operations_t version_ops = {.read = read_version, .write = 0};
+static file_operations_t vms_ops = {.read = read_vms, .write = 0};
 
 /* ------------------------------------------------------------------ */
 /* Init                                                                */
@@ -261,6 +300,7 @@ void proc_init(void) {
   register_file(proc, "cpuinfo", &cpuinfo_ops);
   
   register_file(proc, "version", &version_ops);
+  register_file(proc, "vms",     &vms_ops);
 
-  uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, interrupts, netinfo, cmdline, version, balloon, cpuinfo");
+  uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, interrupts, netinfo, cmdline, version, balloon, cpuinfo, vms");
 }

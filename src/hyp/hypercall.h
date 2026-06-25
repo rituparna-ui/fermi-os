@@ -20,8 +20,19 @@
 #define HVC_PUTC 1    /* (char in x1) -> 0 ; paravirt console putc            */
 #define HVC_PING 2    /* (val in x1) -> val + 1 ; liveness / echo            */
 #define HVC_VM_INFO 3 /* () -> number of hypercalls serviced for this vCPU    */
-#define HVC_YIELD 4   /* () -> 0 ; cooperative yield (stub until M5)          */
+#define HVC_YIELD 4   /* () -> 0 ; cooperative yield                          */
 #define HVC_HYP_BASE 5 /* () -> base IPA of the hypervisor-private region     */
+#define HVC_VM_COUNT 6 /* () -> number of vCPUs                                */
+#define HVC_VM_STAT 7  /* (id in x1, field in x2) -> stat value, or -1         */
+
+/* Field selectors for HVC_VM_STAT. */
+#define VMSTAT_ID 0
+#define VMSTAT_STATE 1     /* 0=unused, 1=ready, 2=running */
+#define VMSTAT_HVC 2
+#define VMSTAT_SYSREG 3
+#define VMSTAT_ABORT 4
+#define VMSTAT_VIRQ 5
+#define VMSTAT_SWITCHES 6  /* global world-switch count (same for all ids) */
 
 #define HYP_ABI_VERSION 0x00010000ULL      /* 1.0 */
 #define HVC_ERR_BADCALL ((uint64_t)-1)     /* unknown function ID */

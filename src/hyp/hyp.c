@@ -82,6 +82,7 @@ extern uint8_t guest1_payload_end[];
  * (NOLOAD); initialised explicitly in hyp_init(). */
 __attribute__((section(".hyp_tables"))) static vcpu_t vcpus[NUM_VCPUS];
 __attribute__((section(".hyp_tables"))) static int current_vcpu;
+__attribute__((section(".hyp_tables"))) static uint64_t g_switch_count;
 /* CNTHP (EL2 physical timer) scheduling tick. */
 #define HYP_TIMER_INTID 26   /* PPI 26 = non-secure EL2 physical timer */
 #define HYP_QUANTUM_MS 100   /* preemption time-slice */
@@ -421,6 +422,7 @@ static void hyp_world_switch(el2_frame_t *f) {
   vcpu_t *nv = &vcpus[next];
   current_vcpu = next;
   nv->state = VCPU_RUNNING;
+  g_switch_count++;
 
   for (int i = 0; i < 31; i++)
     f->x[i] = nv->regs[i];
@@ -533,6 +535,7 @@ static void hyp_world_switch(el2_frame_t *f);
 static void hyp_handle_hvc(el2_frame_t *f) {
   uint64_t fn = f->x[0];
   uint64_t a1 = f->x[1];
+  uint64_t a2 = f->x[2];
   uint64_t ret;
   vcpu_t *cur = &vcpus[current_vcpu];
 
@@ -563,6 +566,27 @@ static void hyp_handle_hvc(el2_frame_t *f) {
      * guest can attempt — and be denied — an access to hypervisor memory. */
     ret = (uint64_t)__hyp_start;
     break;
+  case HVC_VM_COUNT:
+    ret = NUM_VCPUS;
+    break;
+  case HVC_VM_STAT: {
+    if (a1 >= NUM_VCPUS) {
+      ret = (uint64_t)-1;
+      break;
+    }
+    vcpu_t *t = &vcpus[a1];
+    switch (a2) {
+    case VMSTAT_ID:       ret = t->id; break;
+    case VMSTAT_STATE:    ret = (uint64_t)t->state; break;
+    case VMSTAT_HVC:      ret = t->hvc_count; break;
+    case VMSTAT_SYSREG:   ret = t->sysreg_traps; break;
+    case VMSTAT_ABORT:    ret = t->abort_count; break;
+    case VMSTAT_VIRQ:     ret = t->virq_injected; break;
+    case VMSTAT_SWITCHES: ret = g_switch_count; break;
+    default:              ret = (uint64_t)-1; break;
+    }
+    break;
+  }
   default:
     hyp_puts("[HYP] unknown hypercall fn=");
     hyp_puthex(fn);

@@ -115,6 +115,23 @@ fn cmd_run(path: &str) {
     vfs::fd_table_destroy(t);
 }
 
+fn cmd_sysinfo() {
+    kprintln!("   ___ Fermi OS (Rust) ___");
+    kprintln!("  OS      : Fermi OS — bare-metal aarch64, pure Rust + asm");
+    kprintln!("  uptime  : {} s", timer::uptime_seconds());
+    kprintln!("  EL      : {} | timer {} Hz", crate::cpu::current_el(), timer::get_frequency());
+    let total = pmm::total_pages();
+    let used = pmm::used_pages();
+    kprintln!("  memory  : {} / {} MiB pages used, heap {} KiB free",
+              used * 4 / 1024, total * 4 / 1024, heap::free_bytes() / 1024);
+    let nd = net::render_info();
+    for line in nd.lines().take(3) {
+        kprintln!("  net     : {}", line);
+    }
+    kprintln!("  tasks   :");
+    kprint!("{}", sched::render_tasks());
+}
+
 fn dispatch(line: &str) {
     let mut parts = line.split_whitespace();
     let cmd = match parts.next() {
@@ -131,6 +148,7 @@ fn dispatch(line: &str) {
         }
         "uptime" => kprintln!("up {} ms ({} s)", timer::uptime_ms(), timer::uptime_seconds()),
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
+        "sysinfo" => cmd_sysinfo(),
         "ps" => kprint!("{}", sched::render_tasks()),
         "free" | "meminfo" => cmd_free(),
         "ifconfig" => kprint!("{}", net::render_info()),

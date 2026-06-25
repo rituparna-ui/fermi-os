@@ -238,6 +238,7 @@ pub extern "C" fn kmain() -> ! {
     sched::init();
     sched::create_task("task_shell", user::task_shell);
     sched::create_task("task_crash", user::task_crash);
+    sched::create_task("task_forker", user::task_forker);
     sched::create_kernel_task("netd", netd);
     // Task-churn stress test (EL1 kernel task): rapidly creates + reaps EL0
     // tasks and checks the PMM free-page count returns to baseline, flushing

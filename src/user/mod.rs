@@ -479,6 +479,40 @@ fn copy_cstr(dst: &mut [u8], src: &[u8]) -> usize {
     n + 1
 }
 
+/// EL0 task that forks repeatedly to stress the fork path (688-byte trap-frame
+/// copy + fork_return + per-child address space). Each child verifies it sees
+/// pid 0 from fork and exits; the parent counts successful forks and reports.
+/// Resource leaks would show up in the churn task's page-leak check.
+pub extern "C" fn task_forker() {
+    const N: u64 = 16;
+    let mut ok = 0u64;
+    for _ in 0..N {
+        let r = sys_fork();
+        // child / parent / error reads clearer as a chain than a signed match.
+        #[allow(clippy::comparison_chain)]
+        if r == 0 {
+            // Child: distinct address space; touch the stack, then exit.
+            let mut scratch = [0u8; 256];
+            for (i, b) in scratch.iter_mut().enumerate() {
+                *b = i as u8;
+            }
+            core::hint::black_box(&scratch);
+            sys_exit();
+        } else if r > 0 {
+            ok += 1;
+        }
+        // Give the child a chance to run/exit before the next fork.
+        sys_yield();
+    }
+    print_uint(b"[FORK STRESS] parent forked ", ok, b" children");
+    print(if ok == N {
+        b" PASS\n" as &[u8]
+    } else {
+        b" FAIL\n"
+    });
+    sys_exit();
+}
+
 /// EL0 task that deliberately faults (unmapped write) to exercise the
 /// kill-on-fault path; the kernel should kill only this task.
 pub extern "C" fn task_crash() {

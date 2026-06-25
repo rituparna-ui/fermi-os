@@ -44,6 +44,13 @@ int net_tx(const void *frame, uint32_t len) {
     return -1;
   }
 
+  /* No virtio-net device was found at init (e.g. running as a hypervisor guest
+   * with no NIC passed through): the TX virtqueue rings are NULL. Fail cleanly
+   * instead of dereferencing them. */
+  if (!net_dev.tx_vq.desc) {
+    return -1;
+  }
+
   memset(&tx_hdr, 0, sizeof(tx_hdr));
 
   struct virtq_seg segs[2] = {

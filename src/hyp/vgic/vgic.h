@@ -41,6 +41,12 @@ void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val, int size_bytes
  * live virtual interface via a free List Register. */
 void vgic_inject_ppi(uint32_t intid);
 
+/* Inject a HARDWARE-mapped (HW=1) pending interrupt: the guest's virtual EOI
+ * deactivates the PHYSICAL source automatically. Use for a passed-through
+ * level-triggered physical IRQ (e.g. the guest's EL1 timer, PPI 30) so the
+ * caller must NOT physically EOI it. Returns 1 if injected. */
+int vgic_inject_hw(uint32_t intid);
+
 /* --- Per-vCPU vGIC state (multi-guest, M9) ------------------------------ */
 struct vcpu_vgic; /* defined in vcpu.h */
 

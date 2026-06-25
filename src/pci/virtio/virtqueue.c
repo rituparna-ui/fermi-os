@@ -79,6 +79,12 @@ int virtqueue_setup(uintptr_t base, uint16_t queue_idx, struct virtqueue *vq,
 
 void virtqueue_submit(struct virtqueue *vq, uint64_t buf_pa, uint32_t len,
                       uint16_t flags) {
+  /* An uninitialised queue (device never found — e.g. running as a hypervisor
+   * guest with no virtio device passed through) has NULL rings. Drop the
+   * request instead of dereferencing them. */
+  if (!vq || !vq->desc || vq->size == 0) {
+    return;
+  }
   uint16_t idx = vq->free_head;
   vq->free_head = (idx + 1) % vq->size;
 
@@ -96,6 +102,9 @@ void virtqueue_submit(struct virtqueue *vq, uint64_t buf_pa, uint32_t len,
 }
 
 void virtqueue_notify(struct virtqueue *vq) {
+  if (!vq || !vq->desc) {
+    return;
+  }
   // VirtIO 1.x §4.1.4.4 mandates a 16-bit write to the notify register
   // (without VIRTIO_F_NOTIFICATION_DATA). The device looks up the queue
   // from the notify_addr's offset, so the data value isn't actually used
@@ -109,6 +118,9 @@ void virtqueue_notify(struct virtqueue *vq) {
 #define VIRTQUEUE_POLL_MAX_SPINS 10000000u
 
 uint32_t virtqueue_poll(struct virtqueue *vq) {
+  if (!vq || !vq->desc || !vq->used) {
+    return 0;
+  }
   /* Busy wait until device increments used.idx, with a timeout so a wedged
    * device cannot hang the kernel forever. */
   uint32_t spins = 0;
@@ -129,6 +141,9 @@ uint32_t virtqueue_poll(struct virtqueue *vq) {
 
 uint16_t virtqueue_submit_chain(struct virtqueue *vq,
                                 const struct virtq_seg *segs, uint16_t n) {
+  if (!vq || !vq->desc || vq->size == 0) {
+    return 0;
+  }
   uint16_t head = vq->free_head;
 
   for (uint16_t i = 0; i < n; i++) {

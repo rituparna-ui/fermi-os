@@ -197,9 +197,21 @@ void vgic_restore(const vcpu_vgic_t *g) {
   __asm__ __volatile__("msr ich_hcr_el2, %0\n\tisb" ::"r"(g->hcr));
 }
 
+#define ICH_LR_HW (1ULL << 61)
+
 static uint64_t lr_pending(uint32_t intid) {
   return ICH_LR_STATE_PENDING | ICH_LR_GROUP1 |
          (0xA0ULL << ICH_LR_PRIO_SHIFT) | (uint64_t)intid;
+}
+
+/* HW-mapped pending LR: vINTID and pINTID both = intid. When the guest EOIs the
+ * virtual interrupt, the GIC deactivates the PHYSICAL interrupt automatically —
+ * so a passed-through level-triggered timer does not need (and must not get) a
+ * physical EOI/deactivate from EL2. pINTID is field [44:32]. */
+static uint64_t lr_pending_hw(uint32_t intid) {
+  return ICH_LR_STATE_PENDING | ICH_LR_HW | ICH_LR_GROUP1 |
+         (0x00ULL << ICH_LR_PRIO_SHIFT) |
+         ((uint64_t)intid << 32) | (uint64_t)intid;
 }
 
 void vgic_inject_ppi(uint32_t intid) {
@@ -214,4 +226,24 @@ void vgic_inject_ppi(uint32_t intid) {
     }
   }
   /* No free LR - guest behind on a periodic IRQ; drop. */
+}
+
+/* Inject a HARDWARE-mapped pending interrupt (for a passed-through physical
+ * IRQ such as the guest's EL1 timer). Returns 1 if injected (caller must NOT
+ * physically EOI the source), 0 if already in flight / no free LR. */
+int vgic_inject_hw(uint32_t intid) {
+  for (uint32_t i = 0; i < vgic_nr_lr; i++) {
+    uint64_t lr = lr_read(i);
+    if ((lr & ICH_LR_STATE_MASK) != 0 &&
+        (uint32_t)(lr & 0xFFFFFFFFULL) == intid) {
+      return 0; /* already pending/active for this INTID */
+    }
+  }
+  for (uint32_t i = 0; i < vgic_nr_lr; i++) {
+    if ((lr_read(i) & ICH_LR_STATE_MASK) == 0) {
+      lr_write(i, lr_pending_hw(intid));
+      return 1;
+    }
+  }
+  return 0; /* no free LR */
 }

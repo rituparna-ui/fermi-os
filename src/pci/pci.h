@@ -19,7 +19,15 @@
 
 #define MAX_PCI_DEVICES 16
 
+/* QEMU 'virt' exposes a single PCI bus. When this image is built as a guest of
+ * the Fermi hypervisor (GUEST_BUILD), the ECAM is trap-emulated, so scanning
+ * all 256 buses costs ~65K EL2 traps before reaching the scheduler. The guest
+ * therefore scans only bus 0; the bare-metal host build keeps the full range. */
+#ifdef GUEST_BUILD
+#define MAX_PCI_BUS 1
+#else
 #define MAX_PCI_BUS 256
+#endif
 #define MAX_PCI_SLOT 32
 #define MAX_PCI_FUNC 8
 

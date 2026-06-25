@@ -302,7 +302,69 @@ extern "C" fn churn_test() {
 
     heap_stress();
     fd_stress();
+    fat32_stress();
     sched::task_exit();
+}
+
+/// FAT32 multi-file stress: create many files (enough to push the root dir past
+/// its first 16-entry sector), then read each back and verify contents. Catches
+/// bugs in dir_add_entry's multi-sector walk, cluster allocation, and the
+/// read-back path. Runs at EL1 via the kernel VFS API.
+fn fat32_stress() {
+    use fs::vfs;
+    const N: usize = 30;
+
+    let t = vfs::fd_table_create();
+    if t.is_null() {
+        kprintln!("[FAT32 STRESS] FAIL: fd table");
+        return;
+    }
+
+    let mut created = 0;
+    let mut verified = 0;
+    for i in 0..N {
+        // 8.3 name: STRESSNN  (NN = 00..29), unique per file.
+        let name = [
+            b'S', b'T', b'R', b'S',
+            b'0' + (i / 10) as u8,
+            b'0' + (i % 10) as u8,
+        ];
+        // Distinct payload per file so a mixed-up read is caught.
+        let payload = [b'A' + (i % 26) as u8; 40];
+        if fs::fat32::create(&name, &payload) {
+            created += 1;
+        }
+    }
+
+    // Read each back via the VFS path and compare.
+    for i in 0..N {
+        let mut path = [0u8; 32];
+        // "/mnt/fat32/STRSNN" (8.3 -> on-disk name has no dot here; uppercase)
+        let prefix = b"/mnt/fat32/STRS";
+        path[..prefix.len()].copy_from_slice(prefix);
+        path[prefix.len()] = b'0' + (i / 10) as u8;
+        path[prefix.len() + 1] = b'0' + (i % 10) as u8;
+        let plen = prefix.len() + 2;
+        let path_str = core::str::from_utf8(&path[..plen]).unwrap_or("");
+        let fd = vfs::fd_open(t, path_str);
+        if fd < 0 {
+            continue;
+        }
+        let mut buf = [0u8; 64];
+        let n = vfs::fd_read(t, fd, buf.as_mut_ptr(), buf.len());
+        vfs::fd_close(t, fd);
+        let expect = b'A' + (i % 26) as u8;
+        if n == 40 && buf[..40].iter().all(|&b| b == expect) {
+            verified += 1;
+        }
+    }
+    vfs::fd_table_destroy(t);
+
+    if created == N && verified == N {
+        kprintln!("[FAT32 STRESS] PASS: created + verified {} files", N);
+    } else {
+        kprintln!("[FAT32 STRESS] FAIL: created={} verified={} of {}", created, verified, N);
+    }
 }
 
 /// fd-table stress: open the max number of fds, confirm the table rejects the

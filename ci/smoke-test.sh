@@ -73,6 +73,7 @@ require "[CHURN TEST] PASS"
 require "[HEAP STRESS] PASS"
 require "[FD STRESS] PASS"
 require "[FORK STRESS] parent forked 16 children PASS"
+require "[FAT32 STRESS] PASS: created + verified 30 files"
 require "[KERNEL] Ready!"
 
 echo "Checking for failures:"

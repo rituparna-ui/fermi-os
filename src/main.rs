@@ -148,6 +148,27 @@ pub extern "C" fn kernel_main() -> ! {
         fs::vfs::fd_table_destroy(t);
     }
 
+    // FAT32 mount under /mnt/fat32 + read a seed file through the VFS.
+    fs::fat32::mount();
+    let mnt = fs::vfs::create_node(fs::vfs::resolve("/"), "mnt", fs::vfs::VnodeType::Dir);
+    fs::vfs::create_node(mnt, "fat32", fs::vfs::VnodeType::Dir);
+    fs::fat32::vfs_mount("/mnt/fat32");
+    {
+        let t = fs::vfs::fd_table_create();
+        let fd = fs::vfs::fd_open(t, "/mnt/fat32/HELLO.TXT");
+        if fd >= 0 {
+            let mut b = [0u8; 128];
+            let n = fs::vfs::fd_read(t, fd, &mut b);
+            let txt = core::str::from_utf8(&b[..n.max(0) as usize]).unwrap_or("?");
+            kprintln!("[boot] cat /mnt/fat32/HELLO.TXT ({} bytes):", n);
+            crate::kprint!("{}", txt);
+            fs::vfs::fd_close(t, fd);
+        } else {
+            kprintln!("[boot] could not open /mnt/fat32/HELLO.TXT");
+        }
+        fs::vfs::fd_table_destroy(t);
+    }
+
     // Scheduler + a couple of preemptive EL1 demo tasks.
     sched::init();
     sched::create_task("task_a", task_a);

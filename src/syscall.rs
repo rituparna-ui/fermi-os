@@ -23,6 +23,8 @@ pub const SYS_LSEEK: u64 = 8;
 pub const SYS_UPTIME: u64 = 9;
 pub const SYS_NET_PING: u64 = 10;
 pub const SYS_KILL: u64 = 11;
+pub const SYS_FORK: u64 = 12;
+pub const SYS_EXEC: u64 = 13;
 
 fn user_ptr_ok(ptr: u64, len: u64) -> bool {
     ptr != 0 && ptr.checked_add(len).map_or(false, |end| end <= USER_STACK_TOP)
@@ -82,6 +84,39 @@ pub fn syscall_dispatch(frame: &mut TrapFrame) {
         SYS_UPTIME => timer::uptime_ms() as i64,
         SYS_NET_PING => crate::net::ping(a0 as u16),
         SYS_KILL => sched::kill(a0 as u64),
+        SYS_FORK => sched::fork(frame as *mut TrapFrame),
+        SYS_EXEC => {
+            // a0 = path (user C-string). Read the ELF from the filesystem.
+            if !user_ptr_ok(a0, 1) {
+                -1
+            } else if let Some(path) = unsafe { strings::cstr_as_str(a0 as *const u8) } {
+                let node = vfs::resolve(path);
+                if node.is_null() {
+                    -1
+                } else {
+                    let t = vfs::fd_table_create();
+                    let fd = vfs::fd_open(t, path);
+                    let mut data: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+                    if fd >= 0 {
+                        let mut chunk = [0u8; 512];
+                        loop {
+                            let n = vfs::fd_read(t, fd, &mut chunk);
+                            if n <= 0 { break; }
+                            data.extend_from_slice(&chunk[..n as usize]);
+                        }
+                        vfs::fd_close(t, fd);
+                    }
+                    vfs::fd_table_destroy(t);
+                    if data.is_empty() {
+                        -1
+                    } else {
+                        sched::exec_image(frame as *mut TrapFrame, &data)
+                    }
+                }
+            } else {
+                -1
+            }
+        }
         SYS_EXIT => {
             kprintln!("[SYS] exit({})", a0 as i64);
             sched::task_exit(); // does not return

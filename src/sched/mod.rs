@@ -51,6 +51,7 @@ extern "C" {
     fn context_switch(prev: *mut Task, next: *mut Task);
     fn task_trampoline();
     fn user_trampoline();
+    fn fork_return();
     static user_prog_start: u8;
     static user_prog_end: u8;
 }
@@ -338,6 +339,190 @@ pub fn spawn_elf(name: &str, elf_bytes: &[u8]) -> i64 {
     }
     s.next_pid += 1;
     kprintln!("[SCHED] Spawned ELF task {} '{}' entry={:#x}", pid, name, img.entry);
+    pid as i64
+}
+
+/// exec() — replace the current EL0 task's image with a freshly-loaded ELF.
+/// On success this does not "return" in the usual sense: it rewrites the trap
+/// frame so the syscall epilogue erets into the new program. Returns -1 on
+/// failure (caller keeps running its old image).
+pub fn exec_image(frame: *mut crate::exception::TrapFrame, elf_bytes: &[u8]) -> i64 {
+    let s = unsafe { SCHED.get() };
+    let cur = s.current;
+    if cur.is_null() || frame.is_null() {
+        return -1;
+    }
+    // Build the new address space first; keep the old one until we succeed.
+    let l0_new = mmu::create_user_tables();
+    if l0_new == 0 {
+        return -1;
+    }
+    let img = match crate::elf::load(elf_bytes, l0_new) {
+        Some(i) => i,
+        None => {
+            mmu::free_user_tables(l0_new);
+            return -1;
+        }
+    };
+    let ustack_new = pmm::allocate_pages(mmu::USER_STACK_PAGES);
+    let ustack_size = mmu::USER_STACK_PAGES * PAGE_SIZE;
+    let ustack_base = mmu::USER_STACK_TOP - ustack_size;
+    mmu::map_user_range(l0_new, ustack_base, ustack_new, mmu::USER_STACK_PAGES,
+        mmu::PTE_AP_RW_EL0 | mmu::PTE_UXN | mmu::PTE_PXN | mmu::pte_attridx(1));
+
+    unsafe {
+        // Free the OLD image (kernel runs in TTBR1, so this is safe).
+        if (*cur).user_l0 != 0 {
+            mmu::free_user_tables((*cur).user_l0);
+        }
+        for i in 0..(*cur).exec_count as usize {
+            if (*cur).exec_phys[i] != 0 {
+                pmm::free_pages((*cur).exec_phys[i], (*cur).exec_pages[i]);
+            }
+        }
+        if (*cur).utext_phys != 0 {
+            pmm::free_page((*cur).utext_phys);
+            (*cur).utext_phys = 0;
+        }
+        if (*cur).ustack_phys != 0 {
+            pmm::free_pages((*cur).ustack_phys, mmu::USER_STACK_PAGES);
+        }
+
+        // Install the new image on the current task.
+        (*cur).user_l0 = l0_new;
+        (*cur).ttbr0 = mmu::ttbr_pack(l0_new, (*cur).pid as u16);
+        (*cur).ustack_phys = ustack_new;
+        (*cur).user_sp = mmu::USER_STACK_TOP;
+        (*cur).exec_count = img.region_count as u32;
+        for i in 0..img.region_count {
+            (*cur).exec_phys[i] = img.regions[i].phys;
+            (*cur).exec_pages[i] = img.regions[i].pages;
+        }
+
+        // Switch TTBR0 to the new address space now.
+        crate::msr!(ttbr0_el1, (*cur).ttbr0);
+        core::arch::asm!("dsb ish", "isb", "tlbi vmalle1", "dsb ish", "isb");
+
+        // Reset SP_EL0 and rewrite the trap frame to eret into the new entry.
+        crate::msr!(sp_el0, mmu::USER_STACK_TOP);
+        let f = &mut *frame;
+        for r in f.regs.iter_mut() {
+            *r = 0;
+        }
+        f.elr = img.entry;
+        f.spsr = 0; // EL0t
+    }
+    kprintln!("[EXEC] pid {} replaced image, entry={:#x}", unsafe { (*cur).pid }, img.entry);
+    0
+}
+
+/// fork() — duplicate the calling EL0 task. Child gets its own copy of the
+/// user text + stack, a fresh address space, and resumes inside the same SVC
+/// with x0 = 0. Returns the child pid to the parent, -1 on failure.
+pub fn fork(frame: *mut crate::exception::TrapFrame) -> i64 {
+    let s = unsafe { SCHED.get() };
+    let parent = s.current;
+    if parent.is_null() || frame.is_null() {
+        return -1;
+    }
+    // Only EL0 tasks with a user image can be forked in this model.
+    let (p_utext, p_ustack, p_user_sp) = unsafe {
+        ((*parent).utext_phys, (*parent).ustack_phys, (*parent).user_sp)
+    };
+    if p_utext == 0 || p_ustack == 0 {
+        uart::errorln("[FORK] caller has no user image");
+        return -1;
+    }
+
+    let t = kmalloc(core::mem::size_of::<Task>()) as *mut Task;
+    if t.is_null() {
+        return -1;
+    }
+    unsafe { core::ptr::write_bytes(t as *mut u8, 0, core::mem::size_of::<Task>()) };
+
+    let kstack_phys = pmm::allocate_pages(TASK_STACK_PAGES);
+    if kstack_phys == 0 {
+        kfree(t as usize);
+        return -1;
+    }
+    let kstack_va = phys_to_virt(kstack_phys);
+    let kstack_top = kstack_va + TASK_STACK_PAGES * PAGE_SIZE;
+    unsafe { core::ptr::write_bytes(kstack_va as *mut u8, 0, (TASK_STACK_PAGES * PAGE_SIZE) as usize) };
+
+    let l0 = mmu::create_user_tables();
+    if l0 == 0 {
+        pmm::free_pages(kstack_phys, TASK_STACK_PAGES);
+        kfree(t as usize);
+        return -1;
+    }
+
+    // Child's own copy of the user text page (RO+EL0X), mapped at USER_TEXT_BASE.
+    let utext_child = pmm::allocate_page();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            phys_to_virt(p_utext) as *const u8,
+            phys_to_virt(utext_child) as *mut u8,
+            PAGE_SIZE as usize,
+        );
+    }
+    mmu::map_user_range(l0, mmu::USER_TEXT_BASE, utext_child, 1,
+        mmu::PTE_AP_RO_EL0 | mmu::PTE_PXN | mmu::pte_attridx(1));
+
+    // Child's own copy of the user stack (RW), mapped below USER_STACK_TOP.
+    let ustack_child = pmm::allocate_pages(mmu::USER_STACK_PAGES);
+    let ustack_size = mmu::USER_STACK_PAGES * PAGE_SIZE;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            phys_to_virt(p_ustack) as *const u8,
+            phys_to_virt(ustack_child) as *mut u8,
+            ustack_size as usize,
+        );
+    }
+    let ustack_base = mmu::USER_STACK_TOP - ustack_size;
+    mmu::map_user_range(l0, ustack_base, ustack_child, mmu::USER_STACK_PAGES,
+        mmu::PTE_AP_RW_EL0 | mmu::PTE_UXN | mmu::PTE_PXN | mmu::pte_attridx(1));
+
+    // Copy the 288-byte trap frame to the child kstack; child sees x0 = 0.
+    let child_frame = (kstack_top - 288) as *mut u8;
+    unsafe {
+        core::ptr::copy_nonoverlapping(frame as *const u8, child_frame, 288);
+        *(child_frame as *mut u64) = 0; // regs[0] = 0 in child
+    }
+    // context_switch frame (160B) below it; x30 = fork_return.
+    let switch_frame = (child_frame as usize - 160) as *mut u64;
+    let pid = s.next_pid;
+    unsafe {
+        core::ptr::write_bytes(switch_frame as *mut u8, 0, 160);
+        *switch_frame.add(11) = fork_return as usize as u64; // x30
+        (*t).sp = switch_frame as u64;
+        (*t).ttbr0 = mmu::ttbr_pack(l0, pid as u16);
+        (*t).pid = pid;
+        (*t).state = TASK_READY;
+        (*t).stack_phys = kstack_phys;
+        (*t).user_sp = p_user_sp;
+        (*t).ustack_phys = ustack_child;
+        (*t).utext_phys = utext_child;
+        (*t).user_l0 = l0;
+        (*t).fds = crate::fs::vfs::fd_table_create() as u64;
+        // name = parent + "+f"
+        copy_name(&mut (*t).name, name_str(&*parent));
+        let mut nlen = 0;
+        while nlen < 16 && (*t).name[nlen] != 0 { nlen += 1; }
+        if nlen + 2 < 16 {
+            (*t).name[nlen] = b'+';
+            (*t).name[nlen + 1] = b'f';
+            (*t).name[nlen + 2] = 0;
+        }
+        let cur = s.current;
+        let mut tail = cur;
+        while (*tail).next != cur as u64 {
+            tail = (*tail).next as *mut Task;
+        }
+        (*tail).next = t as u64;
+        (*t).next = cur as u64;
+    }
+    s.next_pid += 1;
+    kprintln!("[FORK] parent {} -> child {}", unsafe { (*parent).pid }, pid);
     pid as i64
 }
 

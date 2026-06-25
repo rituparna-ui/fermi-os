@@ -26,7 +26,7 @@ Only four hand-written assembly files remain (everything else is Rust):
 - **Scheduling & processes** — preemptive round-robin scheduler, per-task
   kernel stacks, tick-based `sleep`, EL1 kernel tasks and **EL0 user tasks**
   with per-task address spaces; SVC syscall dispatch
-  (`read/write/open/close/lseek/exit/yield/sleep/getpid/uptime/net_ping/kill`).
+  (`read/write/open/close/lseek/exit/yield/sleep/getpid/uptime/net_ping/kill/fork/exec`).
 - **PCI & VirtIO** — PCI ECAM enumeration + BAR assignment, modern VirtIO PCI
   transport, split virtqueue, and drivers for **RNG, block, net, console, and
   balloon**.
@@ -70,9 +70,14 @@ FAT32 image as `HELLO.ELF`. The kernel's ELF64 loader maps its PT_LOAD segments
 (W^X) into a fresh user address space and runs it at EL0 — both automatically at
 boot and interactively via the shell's `run /mnt/fat32/HELLO.ELF`.
 
+Process control: `fork()` deep-copies the calling task into a new address
+space (child resumes in the same SVC with `x0 = 0`); `exec()` replaces the
+current image with an ELF loaded from the filesystem. The embedded EL0 demo
+forks and the child `exec()`s `HELLO.ELF`.
+
 ## Deferred from the original
 
-- `fork`/`exec` **syscalls** + a user libc (the ELF loader and run-from-disk are
-  done; process self-replacement and duplication are not wired).
+- A C user libc (user programs here are written directly in aarch64 assembly
+  against the raw syscall ABI).
 - FAT32 create/write (read path only).
 - Demand-paged user-stack growth (a user stack fault currently kills the task).

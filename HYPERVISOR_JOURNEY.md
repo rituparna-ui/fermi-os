@@ -273,19 +273,26 @@ qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on -m 8G \
   VHE-capable QEMU (≥ 4.0); diagnosing the silent E2H drop on 3.1.0 was the first
   real win.
 
-## 9. What's next (not yet built)
+## 9. M14 & M15 (done)
 
-- **M14 — unified multi-guest interactive console:** run two FermiOS guests
-  *live and preemptively* and switch console focus between their shells. (The
-  multi-guest scheduler must become each guest's timer source via soft vINTID-30
-  injection per slice, instead of the shared physical PPI 30, to avoid a
-  cross-guest Active-state conflict.)
-- **M15 — inter-VM shared memory + doorbell:** a shared stage-2 page between two
-  guests plus an HVC doorbell that injects a vIRQ into the peer — a real para-virt
-  primitive.
-- Further out: a general HVC hypercall ABI, virtio passthrough (real guest
-  disk/net), a non-FermiOS guest, dynamic VM lifecycle, and a guest→host security
-  audit.
+- **M14 — unified multi-guest interactive console (done):** two FermiOS guests
+  run *live and preemptively* and you switch console focus between their shells
+  with `Ctrl-X`. The multi-guest scheduler became each guest's timer source
+  (soft vINTID-30 injection per slice, gated on the guest enabling the timer),
+  instead of the shared physical PPI 30, to avoid a cross-guest Active-state
+  conflict; guests run with `IMO` so the CNTHP scheduler tick preempts them.
+- **M15 — inter-VM shared memory + doorbell (done):** one host page mapped into
+  both guests' stage-2 at the same IPA, plus a doorbell hypercall
+  (`hvc x0=0xF0000001`) the hypervisor recognises and counts. A producer guest
+  writes the shared page + rings; a consumer guest reads it back (verified
+  `PC1PC2…PC6`, counter==doorbell_seq).
+
+## 10. What's next (not yet built)
+
+- Wire the M15 doorbell to inject an SPI into the peer's vGIC (interrupt-driven
+  consumer instead of polling).
+- A general HVC hypercall ABI, virtio passthrough (real guest disk/net), a
+  non-FermiOS guest, dynamic VM lifecycle, and a guest→host security audit.
 
 ---
 

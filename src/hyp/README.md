@@ -90,9 +90,21 @@ timer `CNTHP` (PPI 26) instead.
 | M11 | PSCI provider (guest warm reboot / power-off). |
 | M12 | Interactive guest console (host input routed to a guest, bidirectional). |
 | M13 | A real unmodified FermiOS runs as a **fully interactive** EL1 guest — its EL0 shell responds to typed `help`/`uptime`/`ps`. |
+| M14 | **Two** FermiOS guests run preemptively **and** interactively at once; `Ctrl-X` switches console focus between their shells. |
+| M15 | Inter-VM shared memory + a doorbell hypercall (a para-virt primitive). |
 
-The default hypervisor build runs the interactive FermiOS guest; build with
-`-DHYP_RUN_DEMOS` to run the M3/M4/M9a/M11/M9c self-tests first.
+The default hypervisor build runs **two** interactive FermiOS guests (M14);
+`Ctrl-X` cycles console focus. Build with `-DHYP_RUN_DEMOS` to run the
+M3/M4/M9a/M11/M15/M9c self-tests first.
+
+### M14: the hypervisor as the guest timer source
+
+Two guests can't share the single physical EL1 timer (PPI 30) via the M13
+HW-mapped-LR trick — the shared physical Active state would block the peer. So
+in M14 the **hypervisor itself is each guest's timer**: it soft-injects vINTID
+30 (a `HW=0` LR) once per scheduler slice, gated on the guest having enabled the
+timer PPI (`vgic_intid_enabled(30)`, i.e. past `gic_init`). Guests run with
+`IMO` so the EL2 scheduler tick (CNTHP, PPI 26) preempts them even in `WFI`.
 
 ### The guest-timer interrupt: HW-mapped List Registers
 
@@ -118,8 +130,11 @@ so config reads return "no device" without trapping.
 - Guest virtio is not passed through (PCI config space is emulated as "no
   device"), so a guest has no block/net/console virtio — its drivers detect the
   absence and no-op.
-- The interactive path runs one guest; the multi-guest scheduler (M9c) uses
-  separate VMs. A unified "interactive + preemptive multi-guest" console
-  (switch focus between live guest shells) is future work.
+- The M15 doorbell counts/acknowledges the hypercall and the shared page is
+  genuinely cross-mapped; wiring the doorbell to inject an SPI into the peer's
+  vGIC (so the consumer takes an interrupt instead of polling) is a small
+  extension.
 - The world switch shares one EL2 stack frame, so the serial scheduler is not
   reentrant across nested guest exits (fine as used).
+- Further out: a general HVC hypercall ABI, real virtio passthrough, a
+  non-FermiOS guest, dynamic VM lifecycle, and a guest→host security audit.

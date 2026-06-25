@@ -146,7 +146,9 @@ pub fn init() {
         return;
     }
 
-    set_driver_ok(base);
+    if !set_driver_ok(base) {
+        return;
+    }
     kprintln!("[RNG] DRIVER_OK set");
 
     *RNG.lock() = Some(RngDevice {

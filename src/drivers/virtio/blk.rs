@@ -135,7 +135,9 @@ pub fn init() {
         return;
     }
 
-    set_driver_ok(base);
+    if !set_driver_ok(base) {
+        return;
+    }
     kprintln!("[BLK] DRIVER_OK set");
 
     // Capacity (u64 sectors) from device config.

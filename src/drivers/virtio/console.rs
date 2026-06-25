@@ -172,7 +172,9 @@ pub fn init() {
         return;
     }
 
-    set_driver_ok(base);
+    if !set_driver_ok(base) {
+        return;
+    }
     *CONSOLE.lock() = Some(ConsoleDevice { tx_vq, ready: true });
     kprintln!("[CONSOLE] DRIVER_OK; tx-only path live");
 

@@ -927,7 +927,9 @@ pub fn init() {
         return;
     }
 
-    set_driver_ok(base);
+    if !set_driver_ok(base) {
+        return;
+    }
     kprintln!("[NET] DRIVER_OK set");
 
     let mut dev = NetDevice {

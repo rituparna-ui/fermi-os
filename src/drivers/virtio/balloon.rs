@@ -262,7 +262,9 @@ pub fn init() {
         return;
     }
 
-    set_driver_ok(base);
+    if !set_driver_ok(base) {
+        return;
+    }
 
     let mut device = BalloonDevice {
         inflate_vq,

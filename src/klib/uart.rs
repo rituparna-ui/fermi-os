@@ -7,6 +7,7 @@
 //! give the same ergonomics.
 
 use crate::klib::mmio;
+use crate::klib::sync::SpinLockIrqSafe;
 use core::fmt::{self, Write};
 
 const UART_BASE: usize = 0x0900_0000;
@@ -20,6 +21,16 @@ const UART_ICR: usize = UART_BASE + 0x44; // interrupt clear register
 
 const FR_TXFF: u32 = 1 << 5; // transmit FIFO full
 const FR_RXFE: u32 = 1 << 4; // receive FIFO empty
+
+/// Serializes whole UART output operations. The PL011 is written from both task
+/// context (sys_write/console_write, IRQs unmasked) and IRQ context (kprintln
+/// from the timer handler); without this, a tick can interleave bytes mid-write
+/// into UART_DR, garbling the log. IRQ-safe so a tick can't deadlock by spinning
+/// on a lock the preempted task holds. Held only at the top-level entry points
+/// (`_print`, the line helpers, `write_locked`); the raw `putc`/`puts`/`putX`
+/// primitives stay lock-free so they're callable while the lock is held (no
+/// re-entrant double-lock).
+static UART_LOCK: SpinLockIrqSafe<()> = SpinLockIrqSafe::new(());
 
 /// Zero-sized handle to the PL011. All state lives in the device registers.
 pub struct Uart;
@@ -64,17 +75,29 @@ impl Uart {
         }
     }
 
-    /// Write a string followed by a newline.
+    /// Write a string followed by a newline (atomic w.r.t. other UART output).
     pub fn println(&self, s: &str) {
+        let _g = UART_LOCK.lock();
         self.puts(s);
         self.putc(b'\n');
     }
 
-    /// Write an `[ERROR!]:`-prefixed line.
+    /// Write an `[ERROR!]:`-prefixed line (atomic w.r.t. other UART output).
     pub fn errorln(&self, s: &str) {
+        let _g = UART_LOCK.lock();
         self.puts("[ERROR!]: ");
         self.puts(s);
         self.putc(b'\n');
+    }
+
+    /// Write raw bytes atomically (single lock acquisition). Used by the
+    /// `/dev/console` write path so a task's console output isn't interleaved
+    /// with an IRQ-context `kprintln!`.
+    pub fn write_locked(&self, bytes: &[u8]) {
+        let _g = UART_LOCK.lock();
+        for &b in bytes {
+            self.putc(b);
+        }
     }
 
     /// Print `value` as `0x`-prefixed hexadecimal (leading zeros trimmed).
@@ -149,7 +172,11 @@ pub fn init() {
 /// Internal: used by the `kprint!` macros.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    // The UART is stateless (a ZST over fixed MMIO), so a fresh handle is fine.
+    // Lock once for the whole formatted write so multi-fragment output (and any
+    // concurrent task-context console write) can't interleave. write_str stays
+    // lock-free, so the held lock isn't re-entered. The UART is a ZST over fixed
+    // MMIO, so a fresh handle is fine.
+    let _g = UART_LOCK.lock();
     let _ = Uart.write_fmt(args);
 }
 

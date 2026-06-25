@@ -99,7 +99,7 @@ SHLOG="$(mktemp /tmp/fermi-ci-shell.XXXXXX.log)"
 trap 'rm -f "$DISK" "$VCONS" "$LOG" "$SHLOG"' EXIT
 echo "Driving the EL0 shell..."
 # Leading newlines absorb the first-byte-eaten race on QEMU stdin.
-printf '\n\npid\nmkdir /mnt/fat32/CIDIR\nls /mnt/fat32\nrm /mnt/fat32/CIDIR\nfork\nballoon inflate 4\nballoon\nhexdump /mnt/fat32/HELLO.TXT\nexec /mnt/fat32/HELLO.ELF a b\nexit\n' | \
+printf '\n\npid\nirqs\nmkdir /mnt/fat32/CIDIR\nls /mnt/fat32\nrm /mnt/fat32/CIDIR\nfork\nballoon inflate 4\nballoon\nhexdump /mnt/fat32/HELLO.TXT\nexec /mnt/fat32/HELLO.ELF a b\nexit\n' | \
 	timeout 45 qemu-system-aarch64 \
 		-machine virt,gic-version=3 -cpu cortex-a72 -m 8G -nographic \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on \
@@ -122,6 +122,7 @@ shell_require() {
 echo "Checking shell builtins:"
 shell_require "Welcome to the Fermi shell"
 shell_require "pid = 1"
+shell_require "timer (PPI)"                    # /proc/interrupts read (no deadlock)
 shell_require "mkdir: ok"                     # mkdir created a directory
 shell_require "rm: ok"                        # rm removed it
 shell_require "HELLO.TXT"                     # ls listed the FAT32 dir

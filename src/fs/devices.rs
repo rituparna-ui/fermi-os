@@ -25,10 +25,10 @@ fn console_read(_n: *mut Vnode, _f: *mut File, buf: *mut u8, count: usize) -> i6
 }
 
 fn console_write(_n: *mut Vnode, _f: *mut File, buf: *const u8, count: usize) -> i64 {
-    let uart = Uart;
-    for i in 0..count {
-        unsafe { uart.putc(buf.add(i).read()) };
-    }
+    // Write atomically so a task's console output isn't byte-interleaved with an
+    // IRQ-context kprintln!.
+    let slice = unsafe { core::slice::from_raw_parts(buf, count) };
+    Uart.write_locked(slice);
     count as i64
 }
 

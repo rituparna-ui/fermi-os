@@ -183,8 +183,12 @@ pub fn device_init_handshake(base: usize, tag: &str, extra_features_hi: u32) -> 
     Some(guest_hi)
 }
 
-/// Set DRIVER_OK on the device at common-cfg `base`.
-pub fn set_driver_ok(base: usize) {
+/// Set DRIVER_OK on the device at common-cfg `base` and verify it stuck.
+/// Returns false if the device cleared the bit (rejecting the setup), per
+/// VirtIO 1.0 §3.1.1 — callers must abort device bring-up on false rather than
+/// issuing I/O to a device that refused DRIVER_OK.
+#[must_use]
+pub fn set_driver_ok(base: usize) -> bool {
     use crate::arch::cpu::dsb_sy;
     use crate::klib::mmio;
     let status = mmio::read8(base + VIRTIO_COMMON_STATUS);
@@ -193,6 +197,12 @@ pub fn set_driver_ok(base: usize) {
         status | VIRTIO_STATUS_DRIVER_OK,
     );
     dsb_sy();
+    let status = mmio::read8(base + VIRTIO_COMMON_STATUS);
+    if status & VIRTIO_STATUS_DRIVER_OK == 0 {
+        Uart.errorln("[VIRTIO] DRIVER_OK rejected by device");
+        return false;
+    }
+    true
 }
 
 /// Walk the device's capability list, resolving VirtIO config windows.

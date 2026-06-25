@@ -6,7 +6,7 @@
 //! and per-INTID counters for `/proc/interrupts`.
 
 use crate::klib::mmio;
-use crate::klib::sync::SpinLock;
+use crate::klib::sync::SpinLockIrqSafe;
 use crate::kprintln;
 use crate::msr;
 
@@ -109,7 +109,11 @@ pub fn end_irq(intid: u64) {
 // Per-INTID counters for /proc/interrupts. 256 entries cover the QEMU virt
 // machine's SGI/PPI/SPI range; INTIDs >= 256 are silently not counted.
 const GIC_COUNTERS_MAX: usize = 256;
-static IRQ_COUNTS: SpinLock<[u64; GIC_COUNTERS_MAX]> = SpinLock::new([0; GIC_COUNTERS_MAX]);
+// IRQ-safe: locked from the IRQ dispatch path (count_irq) and from task context
+// (render_interrupts via `cat /proc/interrupts`). A plain SpinLock deadlocks
+// single-core if a tick lands while a /proc read holds it.
+static IRQ_COUNTS: SpinLockIrqSafe<[u64; GIC_COUNTERS_MAX]> =
+    SpinLockIrqSafe::new([0; GIC_COUNTERS_MAX]);
 
 /// Count an acknowledged interrupt (call after ack so spurious 1023 is skipped).
 pub fn count_irq(intid: u32) {

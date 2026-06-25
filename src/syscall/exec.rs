@@ -138,7 +138,13 @@ pub fn sys_exec(arg_path: u64, arg_argv: u64, frame: &mut TrapFrame) -> i64 {
     // 5. Map the user stack into the new user_l0.
     let stack_flags = pte_attridx(1) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN;
     let stack_user_base = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
-    mmu::map_user_range(new_l0, stack_user_base, stack_phys, USER_STACK_PAGES, stack_flags);
+    mmu::map_user_range(
+        new_l0,
+        stack_user_base,
+        stack_phys,
+        USER_STACK_PAGES,
+        stack_flags,
+    );
 
     kprintln!(
         "[EXEC] Task {} '{}' loading {} ({} bytes, {} region(s), entry {:#x})",

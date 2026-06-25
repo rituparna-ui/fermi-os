@@ -5,7 +5,9 @@
 //! via a single read-only virtqueue and a DMA bounce buffer.
 
 use crate::drivers::pci;
-use crate::drivers::virtio::virtqueue::{Virtqueue, VirtqAvail, VirtqDesc, VirtqUsed, VIRTQ_DESC_F_WRITE, VIRTQ_MAX_SIZE};
+use crate::drivers::virtio::virtqueue::{
+    VirtqAvail, VirtqDesc, VirtqUsed, Virtqueue, VIRTQ_DESC_F_WRITE, VIRTQ_MAX_SIZE,
+};
 use crate::drivers::virtio::*;
 use crate::klib::sync::SpinLock;
 use crate::klib::uart::Uart;

@@ -155,8 +155,7 @@ impl Heap {
                         let remaining = (*current).size - size;
                         if remaining > BLOCK_HEADER_SIZE + HEAP_MIN_BLOCK_SIZE {
                             // Split: [hdr|alloc][new_hdr|remaining free].
-                            let new_block = (current as *mut u8)
-                                .add(BLOCK_HEADER_SIZE + size)
+                            let new_block = (current as *mut u8).add(BLOCK_HEADER_SIZE + size)
                                 as *mut BlockHeader;
                             (*new_block).size = remaining - BLOCK_HEADER_SIZE;
                             (*new_block).is_free = 1;
@@ -222,8 +221,7 @@ impl Heap {
                     && !(*current).next.is_null()
                     && (*(*current).next).is_free == 1
                 {
-                    let end_of_current =
-                        current as usize + BLOCK_HEADER_SIZE + (*current).size;
+                    let end_of_current = current as usize + BLOCK_HEADER_SIZE + (*current).size;
                     if end_of_current != (*current).next as usize {
                         break; // gap — can't safely merge
                     }
@@ -368,7 +366,11 @@ pub fn print_info() {
 }
 
 fn test_result(name: &str, pass: bool) {
-    kprintln!("[HEAP TEST] {}: {}", name, if pass { "PASS" } else { "FAIL" });
+    kprintln!(
+        "[HEAP TEST] {}: {}",
+        name,
+        if pass { "PASS" } else { "FAIL" }
+    );
 }
 
 /// Run the heap self-tests (mirrors the C `heap_run_tests`).
@@ -454,7 +456,8 @@ unsafe impl GlobalAlloc for KernelAllocator {
         // Recover the original payload pointer stored just before `ptr`.
         // SAFETY: `ptr` came from `alloc` above, which stored the raw pointer in
         // the preceding usize slot.
-        let raw = unsafe { ((ptr as usize - core::mem::size_of::<usize>()) as *const usize).read() };
+        let raw =
+            unsafe { ((ptr as usize - core::mem::size_of::<usize>()) as *const usize).read() };
         kfree(raw as *mut u8);
     }
 }

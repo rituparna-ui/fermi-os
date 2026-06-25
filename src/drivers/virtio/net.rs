@@ -48,9 +48,18 @@ struct Align64<T>(T);
 struct Align16<T>(T);
 
 const DESC_INIT: RingDesc = RingDesc(
-    [VirtqDesc { addr: 0, len: 0, flags: 0, next: 0 }; VIRTQ_MAX_SIZE],
+    [VirtqDesc {
+        addr: 0,
+        len: 0,
+        flags: 0,
+        next: 0,
+    }; VIRTQ_MAX_SIZE],
 );
-const AVAIL_INIT: RingAvail = RingAvail(VirtqAvail { flags: 0, idx: 0, ring: [0; VIRTQ_MAX_SIZE] });
+const AVAIL_INIT: RingAvail = RingAvail(VirtqAvail {
+    flags: 0,
+    idx: 0,
+    ring: [0; VIRTQ_MAX_SIZE],
+});
 const USED_INIT: RingUsed = RingUsed(VirtqUsed {
     flags: 0,
     idx: 0,
@@ -106,7 +115,11 @@ fn tx_locked(dev: &mut NetDevice, frame: &[u8]) -> i64 {
         let hdr = core::ptr::addr_of_mut!(TX_HDR.0) as *mut u8;
         core::ptr::write_bytes(hdr, 0, 12);
         let segs = [
-            VirtqSeg { pa: virt_to_phys(hdr as u64), len: NET_HDR_LEN, flags: VIRTQ_DESC_F_NONE },
+            VirtqSeg {
+                pa: virt_to_phys(hdr as u64),
+                len: NET_HDR_LEN,
+                flags: VIRTQ_DESC_F_NONE,
+            },
             VirtqSeg {
                 pa: virt_to_phys(frame.as_ptr() as u64),
                 len: frame.len() as u32,
@@ -178,7 +191,8 @@ fn rx_poll_locked(dev: &mut NetDevice, dst: &mut [u8]) -> i64 {
         if to_copy > 0 {
             // SAFETY: RX_BUFS[buf_idx] holds the device-written frame.
             unsafe {
-                let src = (core::ptr::addr_of!(RX_BUFS.0[buf_idx]) as *const u8).add(NET_HDR_LEN as usize);
+                let src = (core::ptr::addr_of!(RX_BUFS.0[buf_idx]) as *const u8)
+                    .add(NET_HDR_LEN as usize);
                 core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), to_copy);
             }
         }
@@ -246,7 +260,12 @@ fn parse_arp_reply(dev: &mut NetDevice, frame: &[u8]) {
     let m = dev.gateway_mac;
     kprintln!(
         "[NET] Learned gateway MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        m[0], m[1], m[2], m[3], m[4], m[5]
+        m[0],
+        m[1],
+        m[2],
+        m[3],
+        m[4],
+        m[5]
     );
 }
 
@@ -313,10 +332,14 @@ fn send_arp_probe_locked(dev: &mut NetDevice) -> i64 {
     f[12] = 0x08;
     f[13] = 0x06; // ARP
     let a = &mut f[14..];
-    a[0] = 0x00; a[1] = 0x01; // HTYPE Ethernet
-    a[2] = 0x08; a[3] = 0x00; // PTYPE IPv4
-    a[4] = 6; a[5] = 4; // HLEN / PLEN
-    a[6] = 0x00; a[7] = 0x01; // request
+    a[0] = 0x00;
+    a[1] = 0x01; // HTYPE Ethernet
+    a[2] = 0x08;
+    a[3] = 0x00; // PTYPE IPv4
+    a[4] = 6;
+    a[5] = 4; // HLEN / PLEN
+    a[6] = 0x00;
+    a[7] = 0x01; // request
     a[8..14].copy_from_slice(&dev.mac);
     a[14..18].copy_from_slice(&dev.my_ip);
     a[24..28].copy_from_slice(&dev.gateway_ip);
@@ -376,7 +399,11 @@ pub fn get_info(out: &mut [u8]) -> usize {
             let _ = write!(
                 w,
                 "link:       {}\n",
-                if d.link_status & S_LINK_UP != 0 { "UP" } else { "DOWN" }
+                if d.link_status & S_LINK_UP != 0 {
+                    "UP"
+                } else {
+                    "DOWN"
+                }
             );
             let ip = d.my_ip;
             let nm = d.subnet_mask;
@@ -402,7 +429,11 @@ pub fn get_info(out: &mut [u8]) -> usize {
             } else {
                 let _ = write!(w, "gw_mac:     (unknown)\n");
             }
-            let _ = write!(w, "rx_packets: {}\ntx_packets: {}\n", d.rx_packets, d.tx_packets);
+            let _ = write!(
+                w,
+                "rx_packets: {}\ntx_packets: {}\n",
+                d.rx_packets, d.tx_packets
+            );
         }
         None => {
             let _ = write!(w, "net: not available\n");
@@ -453,8 +484,10 @@ fn udp_build(
         ip[1] = 0;
         ip[2] = (ip_len >> 8) as u8;
         ip[3] = ip_len as u8;
-        ip[4] = 0; ip[5] = 0; // id
-        ip[6] = 0; ip[7] = 0; // flags + frag
+        ip[4] = 0;
+        ip[5] = 0; // id
+        ip[6] = 0;
+        ip[7] = 0; // flags + frag
         ip[8] = 64;
         ip[9] = 17; // UDP
         ip[10] = 0; // checksum field MUST be zero before computing inet_csum;
@@ -503,19 +536,34 @@ fn dhcp_build(
     bootp[236..240].copy_from_slice(&DHCP_MAGIC);
 
     let mut p = 240;
-    bootp[p] = OPT_MSGTYPE; bootp[p + 1] = 1; bootp[p + 2] = msg_type; p += 3;
-    bootp[p] = OPT_PARAM_REQ; bootp[p + 1] = 4; p += 2;
-    bootp[p] = OPT_SUBNET; bootp[p + 1] = OPT_ROUTER; bootp[p + 2] = OPT_LEASE; bootp[p + 3] = OPT_SERVER_ID;
+    bootp[p] = OPT_MSGTYPE;
+    bootp[p + 1] = 1;
+    bootp[p + 2] = msg_type;
+    p += 3;
+    bootp[p] = OPT_PARAM_REQ;
+    bootp[p + 1] = 4;
+    p += 2;
+    bootp[p] = OPT_SUBNET;
+    bootp[p + 1] = OPT_ROUTER;
+    bootp[p + 2] = OPT_LEASE;
+    bootp[p + 3] = OPT_SERVER_ID;
     p += 4;
     if let Some(ip) = requested_ip {
-        bootp[p] = OPT_REQ_IP; bootp[p + 1] = 4; p += 2;
-        bootp[p..p + 4].copy_from_slice(ip); p += 4;
+        bootp[p] = OPT_REQ_IP;
+        bootp[p + 1] = 4;
+        p += 2;
+        bootp[p..p + 4].copy_from_slice(ip);
+        p += 4;
     }
     if let Some(sid) = server_id {
-        bootp[p] = OPT_SERVER_ID; bootp[p + 1] = 4; p += 2;
-        bootp[p..p + 4].copy_from_slice(sid); p += 4;
+        bootp[p] = OPT_SERVER_ID;
+        bootp[p + 1] = 4;
+        p += 2;
+        bootp[p..p + 4].copy_from_slice(sid);
+        p += 4;
     }
-    bootp[p] = OPT_END; p += 1;
+    bootp[p] = OPT_END;
+    p += 1;
     p
 }
 
@@ -621,7 +669,10 @@ fn dhcp_parse(frame: &[u8], expect_xid: u32, expect_msg: u8) -> Option<DhcpReply
     }
     if let Some(ls) = dhcp_find_option(opts, OPT_LEASE) {
         if ls.len() == 4 {
-            r.lease = ((ls[0] as u32) << 24) | ((ls[1] as u32) << 16) | ((ls[2] as u32) << 8) | ls[3] as u32;
+            r.lease = ((ls[0] as u32) << 24)
+                | ((ls[1] as u32) << 16)
+                | ((ls[2] as u32) << 8)
+                | ls[3] as u32;
         }
     }
     Some(r)
@@ -645,7 +696,16 @@ fn dhcp_acquire_locked(dev: &mut NetDevice) -> bool {
 
     // DISCOVER.
     let blen = dhcp_build(&mut bootp, DHCP_DISCOVER, &dev.mac, xid, None, None);
-    let flen = udp_build(dev, &mut frame, &bcast_mac, &any_ip, &bcast_ip, 68, 67, &bootp[..blen]);
+    let flen = udp_build(
+        dev,
+        &mut frame,
+        &bcast_mac,
+        &any_ip,
+        &bcast_ip,
+        68,
+        67,
+        &bootp[..blen],
+    );
     if tx_locked(dev, &frame[..flen]) <= 0 {
         Uart.errorln("[DHCP] DISCOVER TX failed");
         return false;
@@ -674,14 +734,36 @@ fn dhcp_acquire_locked(dev: &mut NetDevice) -> bool {
     };
     kprintln!(
         "[DHCP] OFFER: {}.{}.{}.{} (server={}.{}.{}.{}, lease={}s)",
-        offer.yiaddr[0], offer.yiaddr[1], offer.yiaddr[2], offer.yiaddr[3],
-        offer.server[0], offer.server[1], offer.server[2], offer.server[3],
+        offer.yiaddr[0],
+        offer.yiaddr[1],
+        offer.yiaddr[2],
+        offer.yiaddr[3],
+        offer.server[0],
+        offer.server[1],
+        offer.server[2],
+        offer.server[3],
         offer.lease
     );
 
     // REQUEST.
-    let blen = dhcp_build(&mut bootp, DHCP_REQUEST, &dev.mac, xid, Some(&offer.yiaddr), Some(&offer.server));
-    let flen = udp_build(dev, &mut frame, &bcast_mac, &any_ip, &bcast_ip, 68, 67, &bootp[..blen]);
+    let blen = dhcp_build(
+        &mut bootp,
+        DHCP_REQUEST,
+        &dev.mac,
+        xid,
+        Some(&offer.yiaddr),
+        Some(&offer.server),
+    );
+    let flen = udp_build(
+        dev,
+        &mut frame,
+        &bcast_mac,
+        &any_ip,
+        &bcast_ip,
+        68,
+        67,
+        &bootp[..blen],
+    );
     if tx_locked(dev, &frame[..flen]) <= 0 {
         Uart.errorln("[DHCP] REQUEST TX failed");
         return false;
@@ -718,7 +800,11 @@ fn dhcp_acquire_locked(dev: &mut NetDevice) -> bool {
     let ip = dev.my_ip;
     kprintln!(
         "[DHCP] Lease ACK ip={}.{}.{}.{} lease={}s",
-        ip[0], ip[1], ip[2], ip[3], dev.lease_secs
+        ip[0],
+        ip[1],
+        ip[2],
+        ip[3],
+        dev.lease_secs
     );
     true
 }
@@ -759,7 +845,10 @@ pub fn init() {
     dsb_sy();
     while mmio::read8(base + VIRTIO_COMMON_STATUS) != VIRTIO_STATUS_RESET {}
     let mut status = mmio::read8(base + VIRTIO_COMMON_STATUS);
-    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_ACKNOWLEDGE);
+    mmio::write8(
+        base + VIRTIO_COMMON_STATUS,
+        status | VIRTIO_STATUS_ACKNOWLEDGE,
+    );
     dsb_sy();
     status = mmio::read8(base + VIRTIO_COMMON_STATUS);
     mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_DRIVER);
@@ -786,10 +875,17 @@ pub fn init() {
     dsb_sy();
     mmio::write32(base + VIRTIO_COMMON_GF, guest_hi);
     dsb_sy();
-    kprintln!("[NET] accepted features: lo={:#x} hi={:#x}", guest_lo, guest_hi);
+    kprintln!(
+        "[NET] accepted features: lo={:#x} hi={:#x}",
+        guest_lo,
+        guest_hi
+    );
 
     status = mmio::read8(base + VIRTIO_COMMON_STATUS);
-    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_FEATURES_OK);
+    mmio::write8(
+        base + VIRTIO_COMMON_STATUS,
+        status | VIRTIO_STATUS_FEATURES_OK,
+    );
     dsb_sy();
     status = mmio::read8(base + VIRTIO_COMMON_STATUS);
     if status & VIRTIO_STATUS_FEATURES_OK == 0 {
@@ -802,7 +898,10 @@ pub fn init() {
     // SAFETY: ring statics owned by this driver.
     let mut rx_vq = unsafe {
         Virtqueue {
-            size: 0, free_head: 0, last_used: 0, notify_addr: 0,
+            size: 0,
+            free_head: 0,
+            last_used: 0,
+            notify_addr: 0,
             desc: core::ptr::addr_of_mut!(RX_DESC.0) as *mut VirtqDesc,
             avail: core::ptr::addr_of_mut!(RX_AVAIL.0),
             used: core::ptr::addr_of_mut!(RX_USED.0),
@@ -814,7 +913,10 @@ pub fn init() {
     }
     let mut tx_vq = unsafe {
         Virtqueue {
-            size: 0, free_head: 0, last_used: 0, notify_addr: 0,
+            size: 0,
+            free_head: 0,
+            last_used: 0,
+            notify_addr: 0,
             desc: core::ptr::addr_of_mut!(TX_DESC.0) as *mut VirtqDesc,
             avail: core::ptr::addr_of_mut!(TX_AVAIL.0),
             used: core::ptr::addr_of_mut!(TX_USED.0),
@@ -862,7 +964,12 @@ pub fn init() {
         let m = dev.mac;
         kprintln!(
             "[NET] MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            m[0], m[1], m[2], m[3], m[4], m[5]
+            m[0],
+            m[1],
+            m[2],
+            m[3],
+            m[4],
+            m[5]
         );
     } else {
         kprintln!("[NET] Device did not advertise VIRTIO_NET_F_MAC");
@@ -871,7 +978,11 @@ pub fn init() {
         dev.link_status = mmio::read16(dcfg + CFG_STATUS);
         kprintln!(
             "[NET] Link: {} (status={:#x})",
-            if dev.link_status & S_LINK_UP != 0 { "UP" } else { "DOWN" },
+            if dev.link_status & S_LINK_UP != 0 {
+                "UP"
+            } else {
+                "DOWN"
+            },
             dev.link_status
         );
     }
@@ -903,7 +1014,11 @@ pub fn init() {
                 if ip[9] == 1 && icmp[0] == 0 {
                     kprintln!(
                         "[NET] PING reply from {}.{}.{}.{} ttl={} seq={} \\o/",
-                        ip[12], ip[13], ip[14], ip[15], ip[8],
+                        ip[12],
+                        ip[13],
+                        ip[14],
+                        ip[15],
+                        ip[8],
                         ((icmp[6] as u32) << 8) | icmp[7] as u32
                     );
                     break;

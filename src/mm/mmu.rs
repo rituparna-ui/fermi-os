@@ -376,7 +376,11 @@ pub fn free_user_tables(l0_phys: u64) {
 // --- Self-tests (run post-MMU, before any per-task TTBR0 takes over) ----------
 
 fn print_result(name: &str, pass: bool) {
-    kprintln!("[MMU TEST] {}: {}", name, if pass { "PASS" } else { "FAIL" });
+    kprintln!(
+        "[MMU TEST] {}: {}",
+        name,
+        if pass { "PASS" } else { "FAIL" }
+    );
 }
 
 fn test_mmu_enabled() -> bool {

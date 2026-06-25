@@ -234,12 +234,28 @@ pub fn render_info(out: &mut [u8]) -> usize {
          crc32        : {}\n\
          rndr         : {}\n\
          cycles       : {}\n",
-        implementer_name(implementer), implementer,
-        if implementer == 0x41 { arm_part_name(partnum) } else { "unknown" }, partnum,
-        arch, variant, revision, midr,
-        i_words * 4, d_words * 4, parange_bits(mmfr0),
-        yn(fp_field != 0xF), yn(simd_field != 0xF),
-        yn(has_aes), yn(has_sha1), yn(has_sha2), yn(has_crc32), yn(has_rndr),
+        implementer_name(implementer),
+        implementer,
+        if implementer == 0x41 {
+            arm_part_name(partnum)
+        } else {
+            "unknown"
+        },
+        partnum,
+        arch,
+        variant,
+        revision,
+        midr,
+        i_words * 4,
+        d_words * 4,
+        parange_bits(mmfr0),
+        yn(fp_field != 0xF),
+        yn(simd_field != 0xF),
+        yn(has_aes),
+        yn(has_sha1),
+        yn(has_sha2),
+        yn(has_crc32),
+        yn(has_rndr),
         cycles
     );
     w.len()

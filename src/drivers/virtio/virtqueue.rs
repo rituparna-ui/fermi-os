@@ -179,7 +179,11 @@ impl Virtqueue {
                 (*d).addr = seg.pa;
                 (*d).len = seg.len;
                 (*d).flags = flags;
-                (*d).next = if i < n - 1 { (head + i + 1) % self.size } else { 0 };
+                (*d).next = if i < n - 1 {
+                    (head + i + 1) % self.size
+                } else {
+                    0
+                };
             }
 
             self.free_head = (head + n) % self.size;

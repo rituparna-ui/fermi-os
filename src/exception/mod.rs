@@ -201,9 +201,21 @@ fn dump_user_abort(what: &str, t: *mut crate::sched::Task, frame: &TrapFrame) {
         "  cause: {} (DFSC={:#x}){}{}{}",
         dfsc_str(dfsc),
         dfsc,
-        if esr_iss_wnr(frame.esr) { "  write" } else { "  read" },
-        if esr_iss_cm(frame.esr) { "  cache-maint" } else { "" },
-        if esr_iss_ea(frame.esr) { "  external-abort" } else { "" }
+        if esr_iss_wnr(frame.esr) {
+            "  write"
+        } else {
+            "  read"
+        },
+        if esr_iss_cm(frame.esr) {
+            "  cache-maint"
+        } else {
+            ""
+        },
+        if esr_iss_ea(frame.esr) {
+            "  external-abort"
+        } else {
+            ""
+        }
     );
     kprintln!("  FAR region: {}", va_classify_user(frame.far));
     kprintln!("  -> killing task");

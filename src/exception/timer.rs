@@ -39,11 +39,7 @@ pub fn init() {
     kprintln!("[TIMER] Initializing hardware timer");
     let freq = mrs!("cntfrq_el0");
     TIMER.lock().freq = freq;
-    kprintln!(
-        "[TIMER] Frequency: {} Hz ({} MHz)",
-        freq,
-        freq / 1_000_000
-    );
+    kprintln!("[TIMER] Frequency: {} Hz ({} MHz)", freq, freq / 1_000_000);
 
     gic::enable_irq(TIMER_PPI_INTID);
     kprintln!("[TIMER] Initialized!");

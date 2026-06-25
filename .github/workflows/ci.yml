@@ -20,7 +20,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add aarch64-unknown-none
-          rustup component add clippy llvm-tools-preview
+          rustup component add clippy rustfmt llvm-tools-preview
 
       - name: Install QEMU + FAT tooling
         run: |
@@ -35,6 +35,9 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Format check
+        run: cargo fmt --check
 
       - name: Clippy (deny warnings)
         run: cargo clippy --target aarch64-unknown-none -- -D warnings

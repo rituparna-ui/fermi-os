@@ -233,7 +233,10 @@ fn fmt_83(raw: &[u8; 11], out: &mut [u8]) -> usize {
         }
     }
     // extension
-    let ext_len = (0..3).rev().find(|&i| raw[8 + i] != b' ').map_or(0, |i| i + 1);
+    let ext_len = (0..3)
+        .rev()
+        .find(|&i| raw[8 + i] != b' ')
+        .map_or(0, |i| i + 1);
     if ext_len > 0 && p < out.len() {
         out[p] = b'.';
         p += 1;
@@ -349,8 +352,12 @@ pub fn count_free_clusters() -> u64 {
         if !blk::read(sector as u64, &mut buf) {
             break;
         }
-        let val = u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
-            & 0x0FFF_FFFF;
+        let val = u32::from_le_bytes([
+            buf[offset],
+            buf[offset + 1],
+            buf[offset + 2],
+            buf[offset + 3],
+        ]) & 0x0FFF_FFFF;
         if val == 0 {
             free += 1;
         }
@@ -414,7 +421,9 @@ fn dir_mark_deleted(v: &Volume, dir_cluster: u32, target: &[u8; 11]) -> bool {
                 if e[0] == 0x00 {
                     return false; // end of directory; not found
                 }
-                if e[0] != 0xE5 && e[11] != ATTR_LFN && (e[11] & ATTR_VOLUME_ID) == 0
+                if e[0] != 0xE5
+                    && e[11] != ATTR_LFN
+                    && (e[11] & ATTR_VOLUME_ID) == 0
                     && e[0..11] == target[..]
                 {
                     buf[off] = 0xE5; // mark free
@@ -537,7 +546,12 @@ fn resolve_parent(v: &Volume, path: &[u8]) -> Option<(u32, [u8; 11])> {
 
 /// Build a directory entry into `de`. `attr` is ATTR_ARCHIVE for files /
 /// ATTR_DIRECTORY for dirs.
-fn build_dir_entry(name83: &[u8; 11], attr: u8, first_cluster: u32, size: u32) -> [u8; DIR_ENTRY_SIZE] {
+fn build_dir_entry(
+    name83: &[u8; 11],
+    attr: u8,
+    first_cluster: u32,
+    size: u32,
+) -> [u8; DIR_ENTRY_SIZE] {
     let mut de = [0u8; DIR_ENTRY_SIZE];
     de[..11].copy_from_slice(name83);
     de[11] = attr;
@@ -630,7 +644,11 @@ pub fn mkdir(path: &[u8]) -> bool {
     // entries into the first sector.
     let mut sec = [0u8; SECTOR];
     let dot = build_dir_entry(b".          ", ATTR_DIRECTORY, dir_cluster, 0);
-    let parent_link = if parent_cluster == v.root_cluster { 0 } else { parent_cluster };
+    let parent_link = if parent_cluster == v.root_cluster {
+        0
+    } else {
+        parent_cluster
+    };
     let dotdot = build_dir_entry(b"..         ", ATTR_DIRECTORY, parent_link, 0);
     sec[0..DIR_ENTRY_SIZE].copy_from_slice(&dot);
     sec[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&dotdot);
@@ -746,7 +764,11 @@ fn fat32_lookup(dir: *mut Vnode, name: *const u8, namelen: usize) -> *mut Vnode 
         (*cpd).size = size;
 
         let name_str = core::str::from_utf8(name_slice).unwrap_or("?");
-        let vtype = if is_dir { VnodeType::Dir } else { VnodeType::Reg };
+        let vtype = if is_dir {
+            VnodeType::Dir
+        } else {
+            VnodeType::Reg
+        };
         let child = vfs::create_node(dir, name_str, vtype);
         if child.is_null() {
             heap::kfree(cpd as *mut u8);
@@ -827,7 +849,11 @@ pub fn vfs_mount(path: &str) -> bool {
         (*pd).size = 0;
         (*mp).private_data = pd as *mut ();
         (*mp).v_ops = &DIR_OPS;
-        kprintln!("[FAT32] Mounted at {} (root cluster {})", path, (*pd).first_cluster);
+        kprintln!(
+            "[FAT32] Mounted at {} (root cluster {})",
+            path,
+            (*pd).first_cluster
+        );
     }
     true
 }

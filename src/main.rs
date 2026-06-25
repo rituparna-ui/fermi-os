@@ -148,7 +148,10 @@ pub extern "C" fn kmain() -> ! {
         let wrote = drivers::virtio::blk::write(1, &wbuf);
         let read = drivers::virtio::blk::read(1, &mut rbuf);
         let ok = wrote && read && wbuf == rbuf;
-        kprintln!("[BLK TEST] write+read sector 1 round-trip: {}", if ok { "PASS" } else { "FAIL" });
+        kprintln!(
+            "[BLK TEST] write+read sector 1 round-trip: {}",
+            if ok { "PASS" } else { "FAIL" }
+        );
     }
 
     drivers::virtio::net::init();
@@ -228,7 +231,12 @@ pub extern "C" fn kmain() -> ! {
         let fd = fs::vfs::fd_open(t, "/dev/rng");
         let mut buf = [0u8; 8];
         let n = fs::vfs::fd_read(t, fd, buf.as_mut_ptr(), buf.len());
-        kprintln!("[VFS TEST] /dev/rng fd={} read {} bytes: {:02x?}", fd, n, &buf[..]);
+        kprintln!(
+            "[VFS TEST] /dev/rng fd={} read {} bytes: {:02x?}",
+            fd,
+            n,
+            &buf[..]
+        );
         fs::vfs::fd_close(t, fd);
         fs::vfs::fd_table_destroy(t);
     }
@@ -295,7 +303,10 @@ extern "C" fn churn_test() {
     let final_free = mm::pmm::free_pages_count();
     let leaked = baseline as i64 - final_free as i64;
     if leaked == 0 {
-        kprintln!("[CHURN TEST] PASS: no page leak across {} task creations", ROUNDS * BATCH);
+        kprintln!(
+            "[CHURN TEST] PASS: no page leak across {} task creations",
+            ROUNDS * BATCH
+        );
     } else {
         kprintln!("[CHURN TEST] FAIL: leaked {} pages across churn", leaked);
     }
@@ -373,7 +384,10 @@ fn fat32_stress() {
     for i in 0..N {
         // 8.3 name: STRESSNN  (NN = 00..29), unique per file.
         let name = [
-            b'S', b'T', b'R', b'S',
+            b'S',
+            b'T',
+            b'R',
+            b'S',
             b'0' + (i / 10) as u8,
             b'0' + (i % 10) as u8,
         ];
@@ -494,7 +508,9 @@ fn fat32_stress() {
     } else {
         kprintln!(
             "[FAT32 CYCLE] FAIL: ok={} free {} -> {}",
-            cyc_ok, blk_free_before, blk_free_after
+            cyc_ok,
+            blk_free_before,
+            blk_free_after
         );
     }
 }
@@ -535,11 +551,18 @@ fn fd_stress() {
 
     let ok = opened == vfs::MAX_FDS && overflow < 0 && reused == 0 && double == 0 && badfd < 0;
     if ok {
-        kprintln!("[FD STRESS] PASS: {} fds, overflow rejected, close/reuse + bad-fd handled", opened);
+        kprintln!(
+            "[FD STRESS] PASS: {} fds, overflow rejected, close/reuse + bad-fd handled",
+            opened
+        );
     } else {
         kprintln!(
             "[FD STRESS] FAIL: opened={} overflow={} reused={} double={} badfd={}",
-            opened, overflow, reused, double, badfd
+            opened,
+            overflow,
+            reused,
+            double,
+            badfd
         );
     }
 }
@@ -573,7 +596,10 @@ fn heap_stress() {
 
     let after = mm::heap::used_bytes();
     if after == baseline {
-        kprintln!("[HEAP STRESS] PASS: heap used-bytes back to baseline ({} B)", baseline);
+        kprintln!(
+            "[HEAP STRESS] PASS: heap used-bytes back to baseline ({} B)",
+            baseline
+        );
     } else {
         kprintln!(
             "[HEAP STRESS] FAIL: heap leaked {} bytes (baseline {} -> {})",
@@ -606,7 +632,12 @@ extern "C" fn netd() {
         let ttl = drivers::virtio::net::send_ping(seq);
         if ttl >= 0 {
             let t1 = exception::timer::get_ticks();
-            kprintln!("[netd] ping seq={} reply ttl={} in {} ticks", seq, ttl, t1 - t0);
+            kprintln!(
+                "[netd] ping seq={} reply ttl={} in {} ticks",
+                seq,
+                ttl,
+                t1 - t0
+            );
         } else {
             kprintln!("[netd] ping seq={} — no reply", seq);
         }

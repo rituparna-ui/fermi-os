@@ -252,7 +252,11 @@ pub fn assign_bars(dev: &mut PciDevice) {
                 i += 2;
                 continue;
             }
-            kprintln!("[PCI][64 Bit Memory Space] BAR{} has size: {:#x}", i, size64);
+            kprintln!(
+                "[PCI][64 Bit Memory Space] BAR{} has size: {:#x}",
+                i,
+                size64
+            );
             let addr = alloc_mmio64(&mut pci, size64);
             config_write32(b, d, f, bar_offset, (addr & 0xFFFF_FFFF) as u32);
             config_write32(b, d, f, bar_offset + 4, (addr >> 32) as u32);

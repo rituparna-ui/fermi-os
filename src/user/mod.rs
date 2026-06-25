@@ -297,7 +297,11 @@ pub extern "C" fn task_shell() {
         } else if starts_with(cmd, b"ls ") || streq(cmd, b"ls") {
             // `ls` with no arg lists the FAT32 mount; `ls <path>` lists <path>.
             let mut path = [0u8; 120];
-            let arg: &[u8] = if cmd.len() > 3 { &cmd[3..] } else { b"/mnt/fat32" };
+            let arg: &[u8] = if cmd.len() > 3 {
+                &cmd[3..]
+            } else {
+                b"/mnt/fat32"
+            };
             let plen = copy_cstr(&mut path, arg);
             ls(&path[..plen]);
         } else if starts_with(cmd, b"mkdir ") {
@@ -361,7 +365,11 @@ pub extern "C" fn task_shell() {
                 print_uint(b"fork: child pid=", r as u64, b"\n");
             }
         } else if streq(cmd, b"balloon") || starts_with(cmd, b"balloon ") {
-            let arg = if cmd.len() > 8 { &cmd[8..] } else { b"" as &[u8] };
+            let arg = if cmd.len() > 8 {
+                &cmd[8..]
+            } else {
+                b"" as &[u8]
+            };
             if arg.is_empty() || streq(arg, b"status") {
                 let a = sys_balloon(2, 0);
                 let t = sys_balloon(3, 0);
@@ -369,10 +377,18 @@ pub extern "C" fn task_shell() {
                 print_uint(b" target=", t as u64, b" pages\n");
             } else if starts_with(arg, b"inflate ") {
                 let got = sys_balloon(0, atou(&arg[8..]));
-                print_uint(b"balloon: inflated ", if got < 0 { 0 } else { got as u64 }, b" pages\n");
+                print_uint(
+                    b"balloon: inflated ",
+                    if got < 0 { 0 } else { got as u64 },
+                    b" pages\n",
+                );
             } else if starts_with(arg, b"deflate ") {
                 let got = sys_balloon(1, atou(&arg[8..]));
-                print_uint(b"balloon: deflated ", if got < 0 { 0 } else { got as u64 }, b" pages\n");
+                print_uint(
+                    b"balloon: deflated ",
+                    if got < 0 { 0 } else { got as u64 },
+                    b" pages\n",
+                );
             } else {
                 print(b"balloon: usage: balloon [status|inflate N|deflate N]\n");
             }

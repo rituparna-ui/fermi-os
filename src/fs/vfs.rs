@@ -43,8 +43,7 @@ pub struct VnodeOperations {
     pub lookup: Option<fn(dir: *mut Vnode, name: *const u8, namelen: usize) -> *mut Vnode>,
     /// Copy the `index`-th entry's name into `name_out` (capacity `cap`).
     /// Returns the name length on success, or -1 when there is no such entry.
-    pub readdir:
-        Option<fn(dir: *mut Vnode, index: usize, name_out: *mut u8, cap: usize) -> i64>,
+    pub readdir: Option<fn(dir: *mut Vnode, index: usize, name_out: *mut u8, cap: usize) -> i64>,
 }
 
 #[repr(C)]
@@ -302,9 +301,12 @@ pub fn fd_table_create() -> *mut FdTable {
     let t = heap::kmalloc(core::mem::size_of::<FdTable>()) as *mut FdTable;
     if !t.is_null() {
         unsafe {
-            ptr::write(t, FdTable {
-                fds: [ptr::null_mut(); MAX_FDS],
-            });
+            ptr::write(
+                t,
+                FdTable {
+                    fds: [ptr::null_mut(); MAX_FDS],
+                },
+            );
         }
     }
     t

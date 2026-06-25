@@ -87,7 +87,11 @@ fn submit_pfn_batch(vq: &mut Virtqueue, count: u32) {
     }
     // SAFETY: PFN_BUF is this driver's DMA scratch, serialized by the lock.
     let pa = unsafe { virt_to_phys(core::ptr::addr_of!(PFN_BUF.0) as u64) };
-    vq.submit(pa, count * core::mem::size_of::<u32>() as u32, VIRTQ_DESC_F_NONE);
+    vq.submit(
+        pa,
+        count * core::mem::size_of::<u32>() as u32,
+        VIRTQ_DESC_F_NONE,
+    );
     vq.notify();
     vq.poll();
 }
@@ -274,7 +278,10 @@ pub fn init() {
     } else {
         0
     };
-    kprintln!("[BALLOON] DRIVER_OK; host target={} pages, actual=0", target);
+    kprintln!(
+        "[BALLOON] DRIVER_OK; host target={} pages, actual=0",
+        target
+    );
     device.ready = true;
     *BALLOON.lock() = Some(device);
 }

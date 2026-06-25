@@ -114,11 +114,7 @@ fn populate_capability(dev: &PciDevice, caps: &mut VirtioPciCaps, cap_ptr: u8) {
 /// (VIRTIO_F_VERSION_1 = bit 0 of the high word is always added). `tag` is a
 /// short driver name used for logging. Returns the negotiated high features on
 /// success, or None on failure.
-pub fn device_init_handshake(
-    base: usize,
-    tag: &str,
-    extra_features_hi: u32,
-) -> Option<u32> {
+pub fn device_init_handshake(base: usize, tag: &str, extra_features_hi: u32) -> Option<u32> {
     use crate::arch::cpu::dsb_sy;
     use crate::klib::mmio;
 
@@ -129,7 +125,10 @@ pub fn device_init_handshake(
 
     // ACK + DRIVER.
     let mut status = mmio::read8(base + VIRTIO_COMMON_STATUS);
-    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_ACKNOWLEDGE);
+    mmio::write8(
+        base + VIRTIO_COMMON_STATUS,
+        status | VIRTIO_STATUS_ACKNOWLEDGE,
+    );
     dsb_sy();
     status = mmio::read8(base + VIRTIO_COMMON_STATUS);
     mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_DRIVER);
@@ -142,7 +141,12 @@ pub fn device_init_handshake(
     mmio::write32(base + VIRTIO_COMMON_DFSELECT, 1);
     dsb_sy();
     let feat_hi = mmio::read32(base + VIRTIO_COMMON_DF);
-    kprintln!("[{}] device features: lo={:#x} hi={:#x}", tag, feat_lo, feat_hi);
+    kprintln!(
+        "[{}] device features: lo={:#x} hi={:#x}",
+        tag,
+        feat_lo,
+        feat_hi
+    );
 
     // Accept VIRTIO_F_VERSION_1 (high bit 0) plus any requested extra high bits
     // the device actually offers.
@@ -156,11 +160,19 @@ pub fn device_init_handshake(
     dsb_sy();
     mmio::write32(base + VIRTIO_COMMON_GF, guest_hi);
     dsb_sy();
-    kprintln!("[{}] accepted features: lo={:#x} hi={:#x}", tag, guest_lo, guest_hi);
+    kprintln!(
+        "[{}] accepted features: lo={:#x} hi={:#x}",
+        tag,
+        guest_lo,
+        guest_hi
+    );
 
     // FEATURES_OK + verify it stuck.
     status = mmio::read8(base + VIRTIO_COMMON_STATUS);
-    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_FEATURES_OK);
+    mmio::write8(
+        base + VIRTIO_COMMON_STATUS,
+        status | VIRTIO_STATUS_FEATURES_OK,
+    );
     dsb_sy();
     status = mmio::read8(base + VIRTIO_COMMON_STATUS);
     if status & VIRTIO_STATUS_FEATURES_OK == 0 {
@@ -176,7 +188,10 @@ pub fn set_driver_ok(base: usize) {
     use crate::arch::cpu::dsb_sy;
     use crate::klib::mmio;
     let status = mmio::read8(base + VIRTIO_COMMON_STATUS);
-    mmio::write8(base + VIRTIO_COMMON_STATUS, status | VIRTIO_STATUS_DRIVER_OK);
+    mmio::write8(
+        base + VIRTIO_COMMON_STATUS,
+        status | VIRTIO_STATUS_DRIVER_OK,
+    );
     dsb_sy();
 }
 

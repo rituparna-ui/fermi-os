@@ -16,9 +16,9 @@ pub mod elf;
 
 use crate::exception::{self, TrapFrame};
 use crate::fs::vfs::{self, FdTable};
+use crate::kprintln;
 use crate::mm::consts::*;
 use crate::mm::{heap, mmu, pmm};
-use crate::kprintln;
 use crate::sched::elf::ElfImage;
 use core::arch::global_asm;
 use core::ptr;
@@ -56,15 +56,15 @@ pub type TaskEntry = extern "C" fn();
 /// offset 40 — switch.S reads them as TASK_SP / TASK_TTBR0.
 #[repr(C)]
 pub struct Task {
-    pub sp: u64,           // 0  : kernel SP (context_switch saves/restores)
-    pub pid: u64,          // 8
-    pub state: TaskState,  // 16 (+4 pad)
-    pub sleep_until: u64,  // 24
-    pub stack_phys: u64,   // 32
-    pub ttbr0: u64,        // 40 : user page-table base + ASID (0 for EL1 tasks)
-    pub user_sp: u64,      // 48
-    pub kstack_top: u64,   // 56
-    pub ustack_phys: u64,  // 64
+    pub sp: u64,          // 0  : kernel SP (context_switch saves/restores)
+    pub pid: u64,         // 8
+    pub state: TaskState, // 16 (+4 pad)
+    pub sleep_until: u64, // 24
+    pub stack_phys: u64,  // 32
+    pub ttbr0: u64,       // 40 : user page-table base + ASID (0 for EL1 tasks)
+    pub user_sp: u64,     // 48
+    pub kstack_top: u64,  // 56
+    pub ustack_phys: u64, // 64
     pub exec_image: ElfImage,
     pub name: [u8; 16],
     pub fds: *mut FdTable,
@@ -317,7 +317,13 @@ pub fn create_task(name: &str, entry: TaskEntry) -> i64 {
     let text_pages = (user_text_end_pa - text_start_pa) / PAGE_SIZE;
     let entry_offset = entry_pa - text_start_pa;
     let text_flags = pte_attridx(1) | PTE_AP_RO_EL0 | PTE_PXN;
-    mmu::map_user_range(user_l0, USER_TEXT_BASE, text_start_pa, text_pages, text_flags);
+    mmu::map_user_range(
+        user_l0,
+        USER_TEXT_BASE,
+        text_start_pa,
+        text_pages,
+        text_flags,
+    );
     let user_entry = USER_TEXT_BASE + entry_offset;
 
     // User stack.
@@ -338,7 +344,13 @@ pub fn create_task(name: &str, entry: TaskEntry) -> i64 {
     }
     let ustack_user_base = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
     let stack_flags = pte_attridx(1) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN;
-    mmu::map_user_range(user_l0, ustack_user_base, ustack_phys, USER_STACK_PAGES, stack_flags);
+    mmu::map_user_range(
+        user_l0,
+        ustack_user_base,
+        ustack_phys,
+        USER_STACK_PAGES,
+        stack_flags,
+    );
 
     unsafe {
         // Context-switch frame: x19 = user entry, x20 = user SP, x30 = trampoline.
@@ -465,7 +477,11 @@ pub extern "C" fn task_exit() {
     // SAFETY (single-core): cur is the running task.
     unsafe {
         if !quiet_task(name_str(&(*cur).name)) {
-            kprintln!("[SCHED] Task {} '{}' exiting", (*cur).pid, name_str(&(*cur).name));
+            kprintln!(
+                "[SCHED] Task {} '{}' exiting",
+                (*cur).pid,
+                name_str(&(*cur).name)
+            );
         }
         (*cur).state = TaskState::Dead;
     }
@@ -614,7 +630,11 @@ pub fn reap() {
             irq_restore(daif);
 
             if !quiet_task(name_str(&(*dead).name)) {
-                kprintln!("[SCHED] Reaping task {} '{}'", (*dead).pid, name_str(&(*dead).name));
+                kprintln!(
+                    "[SCHED] Reaping task {} '{}'",
+                    (*dead).pid,
+                    name_str(&(*dead).name)
+                );
             }
 
             if (*dead).stack_phys != 0 {
@@ -740,7 +760,13 @@ pub fn fork(parent: *mut Task, frame: *mut TrapFrame) -> i64 {
     let user_text_end_pa = virt_to_phys(core::ptr::addr_of!(__user_text_end) as u64);
     let text_pages = (user_text_end_pa - text_start_pa) / PAGE_SIZE;
     let text_flags = pte_attridx(1) | PTE_AP_RO_EL0 | PTE_PXN;
-    mmu::map_user_range(user_l0, USER_TEXT_BASE, text_start_pa, text_pages, text_flags);
+    mmu::map_user_range(
+        user_l0,
+        USER_TEXT_BASE,
+        text_start_pa,
+        text_pages,
+        text_flags,
+    );
 
     // Fresh user stack, copied from the parent.
     let ustack_phys = pmm::allocate_pages(USER_STACK_PAGES);
@@ -760,7 +786,13 @@ pub fn fork(parent: *mut Task, frame: *mut TrapFrame) -> i64 {
     }
     let ustack_user_base = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
     let stack_flags = pte_attridx(1) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN;
-    mmu::map_user_range(user_l0, ustack_user_base, ustack_phys, USER_STACK_PAGES, stack_flags);
+    mmu::map_user_range(
+        user_l0,
+        ustack_user_base,
+        ustack_phys,
+        USER_STACK_PAGES,
+        stack_flags,
+    );
 
     unsafe {
         // Copy the parent's 688-byte trap frame to the top of the child kstack;

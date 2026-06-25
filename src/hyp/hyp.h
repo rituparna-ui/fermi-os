@@ -32,8 +32,21 @@
 
 /* HCR_EL2 bits */
 #define HCR_VM (1ULL << 0)   /* Enable stage-2 translation for EL1&0          */
+#define HCR_IMO (1ULL << 4)  /* Route physical IRQ to EL2 + enable vIRQ        */
 #define HCR_TID3 (1ULL << 18) /* Trap ID group 3 (ID_AA64*) reads to EL2      */
 #define HCR_RW (1ULL << 31)  /* EL1 execution state is AArch64                */
+
+/* GICv3 EL2 control bits (System Register interface / virtual CPU interface) */
+#define ICC_SRE_SRE (1ULL << 0)    /* System Register interface enable        */
+#define ICC_SRE_ENABLE (1ULL << 3) /* allow lower-EL ICC_SRE access (no trap) */
+#define ICC_CTLR_EOIMODE (1ULL << 1) /* EOIR1 = priority drop only (no deact) */
+#define ICH_HCR_EN (1ULL << 0)       /* enable the virtual CPU interface       */
+/* ICH_LR<n>_EL2 list-register fields */
+#define ICH_LR_GROUP1 (1ULL << 60)
+#define ICH_LR_HW (1ULL << 61)
+#define ICH_LR_STATE_PENDING (1ULL << 62) /* State[63:62] = 0b01 */
+#define ICH_LR_PINTID_SHIFT 32
+#define ICH_LR_PRIO_SHIFT 48
 
 /* CNTHCTL_EL2 bits (non-VHE): let EL1/EL0 reach the physical counter/timer */
 #define CNTHCTL_EL1PCTEN (1ULL << 0)
@@ -56,6 +69,7 @@ typedef struct {
   uint64_t hvc_count;    /* hypercalls serviced                              */
   uint64_t sysreg_traps; /* emulated MSR/MRS accesses                        */
   uint64_t abort_count;  /* stage-2 / lower-EL aborts seen                   */
+  uint64_t virq_injected; /* virtual interrupts injected into the guest      */
   /* Reserved for M5 world-switch context (guest EL1 sysregs). */
   uint64_t sp_el1, elr_el1, spsr_el1;
   uint64_t sctlr_el1, ttbr0_el1, ttbr1_el1, tcr_el1, mair_el1, vbar_el1;

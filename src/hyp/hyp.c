@@ -172,6 +172,7 @@ void hyp_init(void) {
   g_vcpu.hvc_count = 0;
   g_vcpu.sysreg_traps = 0;
   g_vcpu.abort_count = 0;
+  g_vcpu.virq_injected = 0;
 
   /* Sanity: confirm we really are at EL2. */
   uint64_t el = (MRS(CurrentEL) >> 2) & 0x3;
@@ -217,9 +218,28 @@ void hyp_init(void) {
 
   __asm__ __volatile__("isb");
 
-  /* Enable stage-2, pin EL1 to AArch64, and trap guest ID-register reads
-   * (HCR_EL2.TID3) so we can emulate the CPU feature view. */
-  MSR(hcr_el2, HCR_RW | HCR_VM | HCR_TID3);
+  /* --- GICv3 virtualization bring-up ---
+   * Own the physical CPU interface at EL2 so physical IRQs (routed here by
+   * HCR_EL2.IMO below) can be acked, and enable the virtual CPU interface so
+   * we can inject virtual interrupts the guest consumes on ICV_*.
+   *
+   * EOImode=1 makes our physical EOIR1 a priority-drop only; the actual
+   * deactivation is deferred to the guest via hardware-linked list regs. */
+  MSR(icc_sre_el2, ICC_SRE_SRE | ICC_SRE_ENABLE);
+  __asm__ __volatile__("isb");
+  MSR(icc_pmr_el1, 0xFFULL);                 /* accept all priorities (phys) */
+  {
+    uint64_t ctlr = MRS(icc_ctlr_el1);
+    ctlr |= ICC_CTLR_EOIMODE;
+    MSR(icc_ctlr_el1, ctlr);
+  }
+  MSR(icc_igrpen1_el1, 1ULL);                /* enable phys Group 1 at EL2   */
+  MSR(ich_hcr_el2, ICH_HCR_EN);              /* enable virtual CPU interface */
+  __asm__ __volatile__("isb");
+
+  /* Enable stage-2, pin EL1 to AArch64, trap guest ID-register reads
+   * (TID3), and route physical IRQs to EL2 (IMO) so we can inject vIRQs. */
+  MSR(hcr_el2, HCR_RW | HCR_VM | HCR_TID3 | HCR_IMO);
   __asm__ __volatile__("isb");
 
   hyp_puts("[HYP] stage-2 enabled (HCR_EL2.VM=1), dropping to EL1 guest...\n");
@@ -380,7 +400,78 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
     __asm__ __volatile__("wfi");
 }
 
+/* ------------------------------- vGIC -------------------------------------- */
+
+/* Inject a hardware-linked virtual interrupt into the guest via a free list
+ * register. HW=1 ties the virtual INTID to the physical one so the guest's
+ * own EOI/deactivation on the virtual interface deactivates the physical
+ * interrupt — no maintenance interrupt needed. Only the timer PPI is in play
+ * for this guest, so a single in-flight LR is the normal case; we scan LR0/LR1
+ * for robustness. */
+static void hyp_vgic_inject_hw(uint32_t intid) {
+  uint64_t lr = ((uint64_t)intid) |                       /* vINTID [31:0]   */
+                (((uint64_t)intid) << ICH_LR_PINTID_SHIFT) | /* pINTID       */
+                (0ULL << ICH_LR_PRIO_SHIFT) |             /* priority 0      */
+                ICH_LR_GROUP1 | ICH_LR_HW | ICH_LR_STATE_PENDING;
+
+  uint64_t lr0, lr1;
+  __asm__ __volatile__("mrs %0, ich_lr0_el2" : "=r"(lr0));
+  if ((lr0 >> 62) == 0) { /* State == Invalid => free */
+    __asm__ __volatile__("msr ich_lr0_el2, %0" ::"r"(lr));
+    return;
+  }
+  __asm__ __volatile__("mrs %0, ich_lr1_el2" : "=r"(lr1));
+  if ((lr1 >> 62) == 0) {
+    __asm__ __volatile__("msr ich_lr1_el2, %0" ::"r"(lr));
+    return;
+  }
+  /* No free LR (shouldn't happen with a single timer source): overwrite LR0
+   * as a best-effort fallback. */
+  __asm__ __volatile__("msr ich_lr0_el2, %0" ::"r"(lr));
+}
+
+/* Physical IRQ taken at EL2 (HCR_EL2.IMO). Ack on the physical CPU interface,
+ * inject a hardware-linked virtual copy into the guest, then priority-drop
+ * (EOImode=1 means this does not deactivate — the guest will, via the HW
+ * link). The guest's existing IRQ handler runs unmodified on ICV_*. */
+static void hyp_handle_irq(void) {
+  uint64_t iar;
+  __asm__ __volatile__("mrs %0, icc_iar1_el1" : "=r"(iar));
+  uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
+
+  if (intid >= 1020) /* 1020-1023 are special / spurious: no EOI needed */
+    return;
+
+  g_vcpu.virq_injected++;
+  hyp_vgic_inject_hw(intid);
+  __asm__ __volatile__("msr icc_eoir1_el1, %0" ::"r"(iar)); /* priority drop */
+
+  if (g_vcpu.virq_injected <= 3) {
+    hyp_puts("[HYP] injected hw vIRQ intid=");
+    hyp_puthex(intid);
+    hyp_puts(" (count=");
+    hyp_puthex(g_vcpu.virq_injected);
+    hyp_puts(")\n");
+  }
+}
+
 void el2_dispatch(uint64_t index, el2_frame_t *frame) {
+  /* Vector slot kind: 0=sync, 1=IRQ, 2=FIQ, 3=SError (within each group). */
+  uint64_t kind = index & 3;
+
+  if (kind == 1) {
+    hyp_handle_irq();
+    return;
+  }
+  if (kind != 0) {
+    hyp_puts("\n[HYP] unexpected EL2 exception kind=");
+    hyp_puthex(kind);
+    hyp_puts(" vector=");
+    hyp_puthex(index);
+    hyp_puts("\n");
+    return;
+  }
+
   uint64_t ec = (MRS(esr_el2) >> ESR_EC_SHIFT) & ESR_EC_MASK;
 
   switch (ec) {

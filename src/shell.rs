@@ -272,6 +272,7 @@ fn dispatch(line: &str) {
         "hexdump" => {
             if arg1.is_empty() { kprintln!("usage: hexdump <path>"); } else { cmd_hexdump(arg1); }
         }
+        "traps" => kprint!("{}", crate::exception::render_stats()),
         "ls" => {
             let path = if arg1.is_empty() { "/" } else { arg1 };
             kprint!("{}", vfs::list(path));

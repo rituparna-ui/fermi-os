@@ -19,6 +19,39 @@ extern "C" {
     static vector_table: u8;
 }
 
+use crate::sync::Racy;
+
+#[derive(Default)]
+struct TrapStats {
+    sync: u64,
+    irq: u64,
+    fiq: u64,
+    serror: u64,
+    svc: u64,
+    data_abort: u64,
+    inst_abort: u64,
+    brk: u64,
+}
+static TRAPS: Racy<TrapStats> = Racy::new(TrapStats {
+    sync: 0, irq: 0, fiq: 0, serror: 0, svc: 0, data_abort: 0, inst_abort: 0, brk: 0,
+});
+
+/// Render a /proc-style trap-count summary.
+pub fn render_stats() -> alloc::string::String {
+    use core::fmt::Write;
+    let t = unsafe { TRAPS.get() };
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "sync        : {}", t.sync);
+    let _ = writeln!(s, "  svc       : {}", t.svc);
+    let _ = writeln!(s, "  data_abort: {}", t.data_abort);
+    let _ = writeln!(s, "  inst_abort: {}", t.inst_abort);
+    let _ = writeln!(s, "  brk       : {}", t.brk);
+    let _ = writeln!(s, "irq         : {}", t.irq);
+    let _ = writeln!(s, "fiq         : {}", t.fiq);
+    let _ = writeln!(s, "serror      : {}", t.serror);
+    s
+}
+
 /// Trap frame — must match the layout written by `vector.S`.
 #[repr(C)]
 pub struct TrapFrame {
@@ -164,6 +197,25 @@ fn dump_trap_frame(type_: u64, frame: &TrapFrame) {
 pub extern "C" fn exception_dispatch(type_: u64, frame: *mut TrapFrame) {
     let frame = unsafe { &mut *frame };
     let ec = esr_ec(frame.esr);
+    {
+        let t = unsafe { TRAPS.get() };
+        match type_ {
+            EXCEPTION_SYNC => {
+                t.sync += 1;
+                match ec {
+                    EC_SVC_AARCH64 => t.svc += 1,
+                    EC_DATA_ABORT_LO | EC_DATA_ABORT_CUR => t.data_abort += 1,
+                    EC_INST_ABORT_LO | EC_INST_ABORT_CUR => t.inst_abort += 1,
+                    EC_BRK => t.brk += 1,
+                    _ => {}
+                }
+            }
+            EXCEPTION_IRQ => t.irq += 1,
+            EXCEPTION_FIQ => t.fiq += 1,
+            EXCEPTION_SERROR => t.serror += 1,
+            _ => {}
+        }
+    }
 
     match type_ {
         EXCEPTION_SYNC => match ec {

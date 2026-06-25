@@ -206,6 +206,11 @@ struct Vcpu {
     ich_lr: [u64; 2], // list registers 0..1 (pending/active vIRQs)
     ich_vmcr: u64,    // virtual machine control (group enables, vPMR)
     ich_ap1r0: u64,   // group-1 active priorities
+
+    // FP/SIMD state: q0..q31 (16 bytes each = 64 u64) plus status/control.
+    vregs: [u64; 64],
+    fpsr: u64,
+    fpcr: u64,
 }
 
 impl Vcpu {
@@ -242,6 +247,9 @@ impl Vcpu {
             ich_lr: [0; 2],
             ich_vmcr: 0,
             ich_ap1r0: 0,
+            vregs: [0; 64],
+            fpsr: 0,
+            fpcr: 0,
         }
     }
 }
@@ -469,9 +477,9 @@ fn hyp_build_stage2() {
 /// `boot.S` while still at EL2, MMU off. `boot.S` performs the `eret` to EL1.
 #[no_mangle]
 pub extern "C" fn hyp_init() {
-    // Permit FP/SIMD at EL2 (clear CPTR_EL2.TFP) so any auto-vectorized codegen
-    // in this module can't take an FP trap. We keep the hot paths scalar, so
-    // this is purely defensive and does not disturb guest FP state.
+    // Permit FP/SIMD at EL2 (clear CPTR_EL2.TFP): the world-switch executes
+    // stp/ldp q-registers to context-switch guest FP state (M7), so EL2 must be
+    // allowed to touch SIMD without trapping.
     // SAFETY: configures the current (EL2) CPU; no memory effects.
     unsafe {
         let mut cptr = mrs!("cptr_el2");
@@ -669,6 +677,69 @@ unsafe fn hyp_restore_el1(v: *mut Vcpu) {
     }
 }
 
+/// Save the live FP/SIMD register file (q0..q31 + FPSR/FPCR) into `v`.
+/// # Safety
+/// Writes 64 u64 (1 KiB) at `v.vregs`; `v` must be a valid `Vcpu`. EL2 must
+/// have FP enabled (CPTR_EL2.TFP=0), as set in `hyp_init`.
+unsafe fn hyp_save_fp(v: *mut Vcpu) {
+    unsafe {
+        let p = (*v).vregs.as_mut_ptr();
+        core::arch::asm!(
+            "stp q0, q1, [{0}, #0]",
+            "stp q2, q3, [{0}, #32]",
+            "stp q4, q5, [{0}, #64]",
+            "stp q6, q7, [{0}, #96]",
+            "stp q8, q9, [{0}, #128]",
+            "stp q10, q11, [{0}, #160]",
+            "stp q12, q13, [{0}, #192]",
+            "stp q14, q15, [{0}, #224]",
+            "stp q16, q17, [{0}, #256]",
+            "stp q18, q19, [{0}, #288]",
+            "stp q20, q21, [{0}, #320]",
+            "stp q22, q23, [{0}, #352]",
+            "stp q24, q25, [{0}, #384]",
+            "stp q26, q27, [{0}, #416]",
+            "stp q28, q29, [{0}, #448]",
+            "stp q30, q31, [{0}, #480]",
+            in(reg) p,
+            options(nostack),
+        );
+        (*v).fpsr = mrs!("fpsr");
+        (*v).fpcr = mrs!("fpcr");
+    }
+}
+
+/// Restore `v`'s FP/SIMD register file onto the live CPU.
+/// # Safety
+/// As `hyp_save_fp`.
+unsafe fn hyp_restore_fp(v: *mut Vcpu) {
+    unsafe {
+        msr!("fpsr", (*v).fpsr);
+        msr!("fpcr", (*v).fpcr);
+        let p = (*v).vregs.as_ptr();
+        core::arch::asm!(
+            "ldp q0, q1, [{0}, #0]",
+            "ldp q2, q3, [{0}, #32]",
+            "ldp q4, q5, [{0}, #64]",
+            "ldp q6, q7, [{0}, #96]",
+            "ldp q8, q9, [{0}, #128]",
+            "ldp q10, q11, [{0}, #160]",
+            "ldp q12, q13, [{0}, #192]",
+            "ldp q14, q15, [{0}, #224]",
+            "ldp q16, q17, [{0}, #256]",
+            "ldp q18, q19, [{0}, #288]",
+            "ldp q20, q21, [{0}, #320]",
+            "ldp q22, q23, [{0}, #352]",
+            "ldp q24, q25, [{0}, #384]",
+            "ldp q26, q27, [{0}, #416]",
+            "ldp q28, q29, [{0}, #448]",
+            "ldp q30, q31, [{0}, #480]",
+            in(reg) p,
+            options(nostack, readonly),
+        );
+    }
+}
+
 /// Save the live per-guest vGIC state into `v`.
 /// # Safety
 /// Reads EL2 vGIC registers; `v` must be a valid `Vcpu`.
@@ -719,6 +790,7 @@ fn hyp_world_switch(frame: *mut El2Frame) {
         let from = *CURRENT_VCPU.get();
         let cur = &mut (*VCPUS.get())[from] as *mut Vcpu;
 
+        hyp_save_fp(cur); // first: guest FP is still live, Rust path hasn't used SIMD
         for i in 0..31 {
             (*cur).regs[i] = (*frame).x[i];
         }
@@ -750,6 +822,7 @@ fn hyp_world_switch(frame: *mut El2Frame) {
         core::arch::asm!("isb");
         hyp_restore_el1(nv);
         hyp_restore_vgic(nv);
+        hyp_restore_fp(nv); // last: nothing in the Rust path touches SIMD after this
     }
 }
 
@@ -807,7 +880,8 @@ fn hyp_create_guest1() {
         v.pstate = 0x3c5; // EL1h, DAIF masked
         v.sp_el1 = base + GUEST1_RAM_SIZE as u64;
         v.vttbr = phys_of(G1_L0.get()) | (1 << 48); // VMID 1
-                                                    // EL1 sysregs left 0 => guest 1 runs with its stage-1 MMU off.
+        v.cpacr_el1 = 3 << 20; // CPACR_EL1.FPEN=11 => guest 1 may use FP
+                               // Other EL1 sysregs left 0 => guest 1 runs with its stage-1 MMU off.
     }
 }
 

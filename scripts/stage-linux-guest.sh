@@ -77,7 +77,13 @@ echo "==================================================="
 /bin/busybox uname -a
 echo "guest0 = Fermi OS, guest1 = this Linux, both on Fermi-HV"
 echo ""
-exec /bin/busybox sh
+# Respawn the shell so exiting it (e.g. EOF on the serial console) does not
+# kill PID 1 and panic the kernel.
+while true; do
+	/bin/busybox sh
+	echo "[init] shell exited; respawning..."
+	/bin/busybox sleep 1
+done
 INIT
 chmod +x "$IR/init"
 ( cd "$IR" && find . | cpio -o -H newc 2>/dev/null | gzip -9 > "$GUEST/initramfs.cpio.gz" )

@@ -928,6 +928,65 @@ fn set_frame_x(frame: *mut El2Frame, i: usize, v: u64) {
     unsafe { (*frame).x[i] = v };
 }
 
+// PSCI function IDs (SMC Calling Convention, 32-bit space).
+const PSCI_VERSION_FN: u64 = 0x8400_0000;
+const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+
+/// Reap the running vCPU and switch to the next runnable one WITHOUT saving the
+/// dying vCPU's state. If none remain, halt.
+fn hyp_vcpu_exit(frame: *mut El2Frame) {
+    // SAFETY (single-core): EL2 trap context has exclusive access.
+    unsafe {
+        let from = *CURRENT_VCPU.get();
+        let cur = &mut (*VCPUS.get())[from] as *mut Vcpu;
+        hyp_puts("[HYP] vCPU ");
+        hyp_puthex((*cur).id);
+        hyp_puts(" powered off (PSCI)\n");
+        (*cur).state = VCPU_UNUSED;
+
+        let next = hyp_pick_next(from);
+        if next == from {
+            hyp_puts("[HYP] no runnable vCPUs left; halting\n");
+            loop {
+                core::arch::asm!("wfi");
+            }
+        }
+
+        let nv = &mut (*VCPUS.get())[next] as *mut Vcpu;
+        *CURRENT_VCPU.get() = next;
+        (*nv).state = VCPU_RUNNING;
+        *G_SWITCH_COUNT.get() += 1;
+
+        for i in 0..31 {
+            (*frame).x[i] = (*nv).regs[i];
+        }
+        msr!("elr_el2", (*nv).pc);
+        msr!("spsr_el2", (*nv).pstate);
+        msr!("vttbr_el2", (*nv).vttbr);
+        core::arch::asm!("isb");
+        hyp_restore_el1(nv);
+        hyp_restore_vgic(nv);
+        hyp_restore_fp(nv);
+    }
+}
+
+/// Minimal PSCI: report a version, and treat SYSTEM_OFF / SYSTEM_RESET from a
+/// guest as "this VM is done" — reap it. Returns true if handled.
+fn hyp_handle_psci(frame: *mut El2Frame, fn_id: u64) -> bool {
+    match fn_id {
+        PSCI_VERSION_FN => {
+            set_frame_x(frame, 0, 0x0001_0001); // PSCI v1.1
+            true
+        }
+        PSCI_SYSTEM_OFF | PSCI_SYSTEM_RESET => {
+            hyp_vcpu_exit(frame); // does not return to the caller's vCPU
+            true
+        }
+        _ => false,
+    }
+}
+
 /// HVC hypercall: function ID in x0, args in x1..x3, result back in x0. ELR_EL2
 /// already points past the HVC, so no PC adjustment is needed.
 fn hyp_handle_hvc(frame: *mut El2Frame) {
@@ -940,6 +999,16 @@ fn hyp_handle_hvc(frame: *mut El2Frame) {
     // only from EL2 trap context, which cannot reenter on a single core.
     let vcpu = cur_vcpu();
     unsafe { (*vcpu).hvc_count += 1 };
+
+    // PSCI calls use the 0x8400_00xx / 0xC400_00xx function-ID space, distinct
+    // from our small-integer hypercall ABI. Dispatch them first.
+    if (fn_id & 0xFFFF_FF00) == 0x8400_0000 || (fn_id & 0xFFFF_FF00) == 0xC400_0000 {
+        if hyp_handle_psci(frame, fn_id) {
+            return;
+        }
+        set_frame_x(frame, 0, u64::MAX); // PSCI NOT_SUPPORTED
+        return;
+    }
 
     let ret = match fn_id {
         HVC_VERSION => HYP_ABI_VERSION,

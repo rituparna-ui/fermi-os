@@ -98,6 +98,7 @@ require "[HYP] created guest1 (vCPU 1) with its own stage-2"
 require "[HYP] preemptive scheduler armed (CNTHP tick)"
 require "[g1]"
 require "Fermi hypervisor (EL2): 2 vCPUs"
+require "[HYP] vCPU 0x0000000000000001 powered off (PSCI)"
 require "[MMU TEST] TTBR1 Upper Half: PASS"
 require "[BLK TEST] write+read sector 1 round-trip: PASS"
 require "[FAT32 TEST] create+read RUSTW.TXT round-trip: PASS"
@@ -114,6 +115,15 @@ if grep -qiE 'KERNEL PANIC|RUST PANIC|\[HYP\] \*\*\* EL2 trap| FAIL' "$LOG"; the
 	fail=1
 else
 	echo "  ok: no EL2 traps / panics / FAILs"
+fi
+
+# guest1's FP-sentinel self-test prints a lone "X" line if its d5 was corrupted
+# across a preemption — i.e. the hypervisor failed to context-switch FP state.
+if grep -qxF 'X' "$LOG"; then
+	echo "  FP CORRUPTION: guest1 emitted 'X' (per-guest FP not preserved across switch)"
+	fail=1
+else
+	echo "  ok: guest1 FP sentinel survived all preemptions (no 'X')"
 fi
 
 if [ "$fail" -ne 0 ]; then

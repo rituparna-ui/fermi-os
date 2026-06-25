@@ -133,6 +133,7 @@ fn dispatch(line: &str) {
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
         "ps" => kprint!("{}", sched::render_tasks()),
         "free" | "meminfo" => cmd_free(),
+        "heapstat" => kprint!("{}", heap::render_stats()),
         "ifconfig" => kprint!("{}", net::render_info()),
         "irqs" => kprint!("{}", gic::render_interrupts()),
         "ls" => {

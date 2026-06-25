@@ -54,6 +54,9 @@ struct Heap {
     head: usize, // *mut BlockHeader, 0 = null
     regions: [Region; HEAP_MAX_REGIONS],
     region_count: u32,
+    alloc_count: u64,
+    free_count: u64,
+    peak_used: u64,
 }
 
 static HEAP: SpinLock<Heap> = SpinLock::new(Heap {
@@ -63,6 +66,9 @@ static HEAP: SpinLock<Heap> = SpinLock::new(Heap {
         size_bytes: 0,
     }; HEAP_MAX_REGIONS],
     region_count: 0,
+    alloc_count: 0,
+    free_count: 0,
+    peak_used: 0,
 });
 
 impl Heap {
@@ -204,6 +210,17 @@ pub fn kmalloc(size: usize) -> usize {
                     c.is_free = 0;
                     c.magic = BLOCK_MAGIC_ALLOC;
                 }
+                h.alloc_count += 1;
+                let mut used = 0u64;
+                let mut c = h.head;
+                while c != 0 {
+                    unsafe {
+                        let b = hdr(c);
+                        if b.is_free == 0 { used += b.size as u64; }
+                        c = b.next;
+                    }
+                }
+                if used > h.peak_used { h.peak_used = used; }
                 return current + BLOCK_HEADER_SIZE;
             }
             current = unsafe { hdr(current).next };
@@ -221,7 +238,7 @@ pub fn kfree(ptr: usize) {
         return;
     }
     let block = ptr - BLOCK_HEADER_SIZE;
-    let h = HEAP.lock();
+    let mut h = HEAP.lock();
 
     if !h.addr_in_any_region(block) {
         uart::errorln("[HEAP] kfree: pointer outside heap regions!");
@@ -244,6 +261,7 @@ pub fn kfree(ptr: usize) {
         b.is_free = 1;
         b.magic = BLOCK_MAGIC_FREE;
     }
+    h.free_count += 1;
 
     // Coalesce physically-adjacent free blocks.
     let mut current = h.head;
@@ -423,3 +441,24 @@ unsafe impl GlobalAlloc for KernelAlloc {
 
 #[global_allocator]
 static GLOBAL: KernelAlloc = KernelAlloc;
+
+/// (alloc_count, free_count, peak_used_bytes).
+pub fn stats() -> (u64, u64, u64) {
+    let h = HEAP.lock();
+    (h.alloc_count, h.free_count, h.peak_used)
+}
+
+/// Render a heap statistics summary.
+pub fn render_stats() -> alloc::string::String {
+    use core::fmt::Write;
+    let (a, f, peak) = stats();
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "allocations : {}", a);
+    let _ = writeln!(s, "frees       : {}", f);
+    let _ = writeln!(s, "live blocks : {}", a - f);
+    let _ = writeln!(s, "used now    : {} bytes", used_bytes());
+    let _ = writeln!(s, "peak used   : {} bytes", peak);
+    let _ = writeln!(s, "free now    : {} bytes", free_bytes());
+    let _ = writeln!(s, "total       : {} bytes", total_bytes());
+    s
+}

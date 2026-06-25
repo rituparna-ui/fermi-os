@@ -439,6 +439,13 @@ fn dispatch(line: &str) {
                       if c0 + c1 == enq && s0 + s1 == expect { "OK (no loss/dup)" } else { "MISMATCH" });
         }
         "sysinfo" => cmd_sysinfo(),
+        "uname" => {
+            if arg1 == "-a" {
+                kprintln!("Fermi 0.1.0 fermi-os aarch64 ARMv8-A QEMU-virt Rust+asm");
+            } else {
+                kprintln!("Fermi");
+            }
+        }
         "ps" => kprint!("{}", sched::render_tasks()),
         "top" => cmd_top(),
         "free" | "meminfo" => cmd_free(),

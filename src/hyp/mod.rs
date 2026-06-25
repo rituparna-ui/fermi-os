@@ -201,6 +201,11 @@ struct Vcpu {
     esr_el1: u64,
     far_el1: u64,
     par_el1: u64,
+
+    // Per-guest vGIC (virtual CPU interface) state.
+    ich_lr: [u64; 2], // list registers 0..1 (pending/active vIRQs)
+    ich_vmcr: u64,    // virtual machine control (group enables, vPMR)
+    ich_ap1r0: u64,   // group-1 active priorities
 }
 
 impl Vcpu {
@@ -234,6 +239,9 @@ impl Vcpu {
             esr_el1: 0,
             far_el1: 0,
             par_el1: 0,
+            ich_lr: [0; 2],
+            ich_vmcr: 0,
+            ich_ap1r0: 0,
         }
     }
 }
@@ -661,6 +669,31 @@ unsafe fn hyp_restore_el1(v: *mut Vcpu) {
     }
 }
 
+/// Save the live per-guest vGIC state into `v`.
+/// # Safety
+/// Reads EL2 vGIC registers; `v` must be a valid `Vcpu`.
+unsafe fn hyp_save_vgic(v: *mut Vcpu) {
+    unsafe {
+        (*v).ich_lr[0] = mrs!("ich_lr0_el2");
+        (*v).ich_lr[1] = mrs!("ich_lr1_el2");
+        (*v).ich_vmcr = mrs!("ich_vmcr_el2");
+        (*v).ich_ap1r0 = mrs!("ich_ap1r0_el2");
+    }
+}
+
+/// Restore `v`'s per-guest vGIC state onto the live virtual CPU interface.
+/// # Safety
+/// Writes EL2 vGIC registers; `v` must be a valid `Vcpu`.
+unsafe fn hyp_restore_vgic(v: *mut Vcpu) {
+    unsafe {
+        msr!("ich_lr0_el2", (*v).ich_lr[0]);
+        msr!("ich_lr1_el2", (*v).ich_lr[1]);
+        msr!("ich_vmcr_el2", (*v).ich_vmcr);
+        msr!("ich_ap1r0_el2", (*v).ich_ap1r0);
+        core::arch::asm!("isb");
+    }
+}
+
 /// Round-robin to the next non-unused vCPU after `from`.
 fn hyp_pick_next(from: usize) -> usize {
     // SAFETY (single-core): EL2 trap context.
@@ -693,6 +726,7 @@ fn hyp_world_switch(frame: *mut El2Frame) {
         (*cur).pstate = mrs!("spsr_el2");
         (*cur).vttbr = mrs!("vttbr_el2");
         hyp_save_el1(cur);
+        hyp_save_vgic(cur);
         if (*cur).state == VCPU_RUNNING {
             (*cur).state = VCPU_READY;
         }
@@ -715,6 +749,7 @@ fn hyp_world_switch(frame: *mut El2Frame) {
         msr!("vttbr_el2", (*nv).vttbr);
         core::arch::asm!("isb");
         hyp_restore_el1(nv);
+        hyp_restore_vgic(nv);
     }
 }
 
@@ -969,43 +1004,59 @@ fn hyp_handle_abort(index: u64, frame: *mut El2Frame) {
 
 // --- vGIC --------------------------------------------------------------------
 
-/// Inject a hardware-linked virtual interrupt into the guest via a free list
-/// register. HW=1 ties the virtual INTID to the physical one so the guest's own
-/// EOI/deactivation on the virtual interface deactivates the physical interrupt
-/// — no maintenance interrupt needed. Only the timer PPI is in play for this
-/// guest, so a single in-flight LR is the normal case; we scan LR0/LR1 for
-/// robustness.
-fn hyp_vgic_inject_hw(intid: u32) {
-    let lr = (intid as u64)                              // vINTID [31:0]
-        | ((intid as u64) << ICH_LR_PINTID_SHIFT)        // pINTID
-        | (0u64 << ICH_LR_PRIO_SHIFT)                    // priority 0
+/// Which vCPU owns a given physical INTID. The primary guest (vCPU 0) owns the
+/// device/timer interrupts it programmed; extend this map as guests gain their
+/// own interrupt sources.
+fn hyp_intid_owner(_intid: u32) -> usize {
+    0
+}
+
+/// Inject a hardware-linked virtual interrupt into `target`'s vGIC. If the
+/// target is the running vCPU we write a live list register; otherwise we stash
+/// it in the target's saved LR state, to be loaded when it is resumed. HW=1 ties
+/// the vINTID to the physical one so the guest's own EOI deactivates the
+/// physical interrupt.
+fn hyp_vgic_inject(target: usize, intid: u32) {
+    let lr = (intid as u64)
+        | ((intid as u64) << ICH_LR_PINTID_SHIFT)
+        | (0u64 << ICH_LR_PRIO_SHIFT)
         | ICH_LR_GROUP1
         | ICH_LR_HW
         | ICH_LR_STATE_PENDING;
 
-    // SAFETY: ICH_LR<n>_EL2 are EL2 vGIC list registers; reads/writes here have
-    // no memory side effects. State[63:62]==0 (Invalid) means the LR is free.
+    // SAFETY (single-core): EL2 trap context. State[63:62]==0 (Invalid) = free.
     unsafe {
-        let lr0 = mrs!("ich_lr0_el2");
-        if (lr0 >> 62) == 0 {
-            msr!("ich_lr0_el2", lr);
-            return;
+        if target == *CURRENT_VCPU.get() {
+            let lr0 = mrs!("ich_lr0_el2");
+            if (lr0 >> 62) == 0 {
+                msr!("ich_lr0_el2", lr);
+                return;
+            }
+            let lr1 = mrs!("ich_lr1_el2");
+            if (lr1 >> 62) == 0 {
+                msr!("ich_lr1_el2", lr);
+                return;
+            }
+            msr!("ich_lr0_el2", lr); // fallback
+        } else {
+            let v = &mut (*VCPUS.get())[target];
+            if (v.ich_lr[0] >> 62) == 0 {
+                v.ich_lr[0] = lr;
+                return;
+            }
+            if (v.ich_lr[1] >> 62) == 0 {
+                v.ich_lr[1] = lr;
+                return;
+            }
+            v.ich_lr[0] = lr; // fallback
         }
-        let lr1 = mrs!("ich_lr1_el2");
-        if (lr1 >> 62) == 0 {
-            msr!("ich_lr1_el2", lr);
-            return;
-        }
-        // No free LR (shouldn't happen with a single timer source): overwrite
-        // LR0 as a best-effort fallback.
-        msr!("ich_lr0_el2", lr);
     }
 }
 
 /// Physical IRQ taken at EL2 (HCR_EL2.IMO). Ack on the physical CPU interface,
-/// inject a hardware-linked virtual copy into the guest, then priority-drop
-/// (EOImode=1 means this does not deactivate — the guest will, via the HW link).
-/// The guest's existing IRQ handler runs unmodified on ICV_*.
+/// inject a hardware-linked virtual copy into the owning guest, then priority-
+/// drop (EOImode=1 means this does not deactivate — the guest will, via the HW
+/// link). The guest's existing IRQ handler runs unmodified on ICV_*.
 fn hyp_handle_irq(frame: *mut El2Frame) {
     let iar = mrs!("icc_iar1_el1");
     let intid = (iar & 0xFF_FFFF) as u32;
@@ -1030,13 +1081,15 @@ fn hyp_handle_irq(frame: *mut El2Frame) {
         return;
     }
 
-    // SAFETY (single-core): see hyp_handle_hvc.
+    // Route to the owning vCPU (which may not be the one currently running).
+    let owner = hyp_intid_owner(intid);
+    // SAFETY (single-core): EL2 trap context.
     let n = unsafe {
-        let v = cur_vcpu();
-        (*v).virq_injected += 1;
-        (*v).virq_injected
+        let v = &mut (*VCPUS.get())[owner];
+        v.virq_injected += 1;
+        v.virq_injected
     };
-    hyp_vgic_inject_hw(intid);
+    hyp_vgic_inject(owner, intid);
     // Priority drop on the physical interface (does not deactivate).
     // SAFETY: EOIR1 write on the physical CPU interface.
     unsafe { msr!("icc_eoir1_el1", iar) };
@@ -1044,6 +1097,8 @@ fn hyp_handle_irq(frame: *mut El2Frame) {
     if n <= 3 {
         hyp_puts("[HYP] injected hw vIRQ intid=");
         hyp_puthex(intid as u64);
+        hyp_puts(" -> vCPU ");
+        hyp_puthex(owner as u64);
         hyp_puts(" (count=");
         hyp_puthex(n);
         hyp_puts(")\n");

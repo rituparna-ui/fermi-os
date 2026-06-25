@@ -20,8 +20,6 @@
 
 #define S2_L1_ENTRIES 1024
 
-static uint64_t *s2_l1_root; /* host PA of the concatenated L1 (== VA, MMU off) */
-
 static uint64_t s2_leaf_flags(int device) {
   uint64_t f = PTE_VALID | PTE_AF | S2_S2AP_RW;
   if (device) {
@@ -32,15 +30,19 @@ static uint64_t s2_leaf_flags(int device) {
   return f;
 }
 
-/* Return the L2 table for the 1 GiB region containing `ipa`, allocating it if
- * the L1 entry is not yet a table. Splits are never needed because we build
- * the map once from scratch. */
-static uint64_t *s2_get_l2(uint64_t ipa) {
+/* Allocate a fresh concatenated 1024-entry L1 root (8 KiB, 8 KiB aligned). */
+static uint64_t *s2_alloc_l1(void) {
+  return (uint64_t *)hyp_alloc_aligned(2, 0x2000);
+}
+
+/* Return the L2 table for the 1 GiB region containing `ipa` in table `l1`,
+ * allocating it if absent. */
+static uint64_t *s2_get_l2(uint64_t *l1, uint64_t ipa) {
   uint64_t i = S2_L1_INDEX(ipa);
-  uint64_t e = s2_l1_root[i];
+  uint64_t e = l1[i];
   if (!(e & PTE_VALID)) {
     uint64_t *l2 = (uint64_t *)hyp_alloc_pages(1);
-    s2_l1_root[i] = ((uint64_t)(uintptr_t)l2 & PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE;
+    l1[i] = ((uint64_t)(uintptr_t)l2 & PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE;
     return l2;
   }
   if (!(e & PTE_TABLE)) {
@@ -49,8 +51,8 @@ static uint64_t *s2_get_l2(uint64_t ipa) {
   return (uint64_t *)(uintptr_t)(e & PTE_ADDR_MASK);
 }
 
-static uint64_t *s2_get_l3(uint64_t ipa) {
-  uint64_t *l2 = s2_get_l2(ipa);
+static uint64_t *s2_get_l3(uint64_t *l1, uint64_t ipa) {
+  uint64_t *l2 = s2_get_l2(l1, ipa);
   uint64_t i = S2_L2_INDEX(ipa);
   uint64_t e = l2[i];
   if (!(e & PTE_VALID)) {
@@ -64,33 +66,28 @@ static uint64_t *s2_get_l3(uint64_t ipa) {
   return (uint64_t *)(uintptr_t)(e & PTE_ADDR_MASK);
 }
 
-void s2_map_range(uint64_t ipa, uint64_t pa, uint64_t size, int device) {
+void s2_map_range_in(uint64_t *l1, uint64_t ipa, uint64_t pa, uint64_t size,
+                     int device) {
   uint64_t leaf = s2_leaf_flags(device);
   uint64_t end = ipa + size;
 
   while (ipa < end) {
     uint64_t remain = end - ipa;
 
-    /* 1 GiB L1 block: IPA+PA 1 GiB-aligned and >=1 GiB remaining. */
     if ((ipa % S2_1GB) == 0 && (pa % S2_1GB) == 0 && remain >= S2_1GB) {
-      s2_l1_root[S2_L1_INDEX(ipa)] =
-          (pa & PTE_ADDR_MASK) | leaf | PTE_BLOCK;
+      l1[S2_L1_INDEX(ipa)] = (pa & PTE_ADDR_MASK) | leaf | PTE_BLOCK;
       ipa += S2_1GB;
       pa += S2_1GB;
       continue;
     }
-
-    /* 2 MiB L2 block. */
     if ((ipa % S2_2MB) == 0 && (pa % S2_2MB) == 0 && remain >= S2_2MB) {
-      uint64_t *l2 = s2_get_l2(ipa);
+      uint64_t *l2 = s2_get_l2(l1, ipa);
       l2[S2_L2_INDEX(ipa)] = (pa & PTE_ADDR_MASK) | leaf | PTE_BLOCK;
       ipa += S2_2MB;
       pa += S2_2MB;
       continue;
     }
-
-    /* 4 KiB L3 page. L3 leaf uses PTE_TABLE (bit[1]=1) like stage-1 pages. */
-    uint64_t *l3 = s2_get_l3(ipa);
+    uint64_t *l3 = s2_get_l3(l1, ipa);
     l3[S2_L3_INDEX(ipa)] = (pa & PTE_ADDR_MASK) | leaf | PTE_TABLE;
     ipa += S2_PAGE;
     pa += S2_PAGE;
@@ -106,64 +103,67 @@ void s2_tlb_flush_all(void) {
                        "isb" ::: "memory");
 }
 
-uint64_t s2_init(void) {
-  hyp_puts("[S2] building stage-2 identity tables (IPA==PA)\n");
-
-  /* Concatenated 1024-entry L1 = two contiguous 4 KiB pages, 8 KiB aligned
-   * so VTTBR_EL2.BADDR alignment is satisfied. */
-  s2_l1_root = (uint64_t *)hyp_alloc_aligned(2, 0x2000);
-
-  /* Guest RAM: 0x40000000 .. 0x240000000 (8 GiB) — eight 1 GiB Normal-WB
-   * blocks. This is the bulk of the map and costs zero L2/L3 pages. */
-  s2_map_range(0x40000000ULL, 0x40000000ULL, 0x200000000ULL, /*device=*/0);
-
-  /* --- Device windows (Phase A: map straight-through so the guest boots
-   * exactly as M1; M5 will remove the GIC/ECAM mappings to trap them). --- */
-
-  /* PL011 UART (single 4 KiB page; the surrounding 2 MiB has RTC/fw_cfg/GPIO
-   * we deliberately leave invalid). */
-  s2_map_range(0x09000000ULL, 0x09000000ULL, S2_PAGE, /*device=*/1);
-
-  /* GICv3 distributor (0x08000000) + redistributor (0x080A0000) are LEFT
-   * STAGE-2 INVALID so guest MMIO faults to EL2 (EC=0x24) and is serviced by
-   * the vGIC software model (vgic_mmio_emulate). The ITS at 0x08080000 is also
-   * left invalid — the guest does not use it. */
-
-  /* PCI MMIO32 window 0x10000000..0x3EFEFFFF. Round the size down/up safely:
-   * map [0x10000000, 0x3F000000) = 0x2F000000 (752 MiB). 0x10000000 is 2 MiB
-   * aligned and 0x2F000000 is a 2 MiB multiple, so this is whole 2 MiB blocks
-   * and never spills into the 0x3F000000 PIO/low-ECAM region. */
-  s2_map_range(0x10000000ULL, 0x10000000ULL, 0x2F000000ULL, /*device=*/1);
-
-  /* PCI ECAM (high) 0x4010000000, 256 MiB. (Phase A straight-through; the
-   * guest enumerates real devices. M5 may trap this for a vPCI model.) */
-  s2_map_range(0x4010000000ULL, 0x4010000000ULL, 0x10000000ULL, /*device=*/1);
-
-  /* PCI MMIO64 window 0x8000000000, 512 GiB — 512 one-GiB Device blocks. */
-  s2_map_range(0x8000000000ULL, 0x8000000000ULL, 0x8000000000ULL, /*device=*/1);
-
-  /* Clean every table page to PoC so the WB-cacheable stage-2 walker sees the
-   * descriptors we wrote with the EL2 caches off. Range = the whole hyp pool
-   * from the L1 root upward (bump allocator is contiguous). */
-  hyp_dcache_clean_range((uint64_t)(uintptr_t)s2_l1_root,
-                         HYP_RAM_TOP - (uint64_t)(uintptr_t)s2_l1_root);
-
-  /* Program VTCR_EL2 then VTTBR_EL2 (VMID in [55:48]). */
+void s2_init_vtcr(void) {
+  /* One-time: program VTCR_EL2 (shared IPA geometry for every VM). */
   uint64_t vtcr = 0x80023558ULL; /* T0SZ=24,SL0=1,WBWA,IS,4K,PS=40b,VS=8b,RES1 */
   __asm__ __volatile__("msr vtcr_el2, %0\n\tisb" ::"r"(vtcr));
-
-  uint64_t vttbr =
-      ((uint64_t)(uintptr_t)s2_l1_root & ~0x1FFFULL) | (HYP_VMID << 48);
-  __asm__ __volatile__("msr vttbr_el2, %0\n\tdsb ish\n\tisb" ::"r"(vttbr));
-
-  /* Flush stale stage-1+2 TLB for this VMID before the guest runs. */
-  s2_tlb_flush_all();
-
   hyp_puts("[S2] VTCR_EL2=");
   hyp_puthex(vtcr);
-  hyp_puts(" VTTBR_EL2=");
-  hyp_puthex(vttbr);
   hyp_putc('\n');
+}
 
-  return (uint64_t)(uintptr_t)s2_l1_root;
+uint64_t s2_make_vttbr(uint64_t l1_root, uint32_t vmid) {
+  return (l1_root & ~0x1FFFULL) | ((uint64_t)vmid << 48);
+}
+
+/* Clean all hyp pool memory to PoC so the WB-cacheable stage-2 walker observes
+ * the descriptors written with EL2 caches off. Called once after building both
+ * VMs' tables (the bump allocator is contiguous). */
+static void s2_clean_tables(void) {
+  /* Use a fixed low base (the first stage-2 table allocated). The hyp pool is
+   * contiguous from just above __hyp_end; cleaning from HYP_PHYS_BASE upward
+   * covers every table page. */
+  extern uint8_t __hyp_end[];
+  uint64_t base = (uint64_t)(uintptr_t)__hyp_end;
+  hyp_dcache_clean_range(base, HYP_RAM_TOP - base);
+}
+
+uint64_t s2_build_vm1(void) {
+  hyp_puts("[S2] building VM1 (FermiOS) stage-2 identity map (IPA==PA)\n");
+  uint64_t *l1 = s2_alloc_l1();
+
+  /* Guest RAM 0x40000000..0x240000000 (8 GiB) — eight 1 GiB Normal-WB blocks. */
+  s2_map_range_in(l1, 0x40000000ULL, 0x40000000ULL, 0x200000000ULL, 0);
+
+  /* PL011 UART (single 4 KiB Device page). */
+  s2_map_range_in(l1, 0x09000000ULL, 0x09000000ULL, S2_PAGE, 1);
+
+  /* GICD/GICR LEFT INVALID -> guest MMIO traps to the vGIC model. */
+
+  /* PCI MMIO32 [0x10000000, 0x3F000000) Device. */
+  s2_map_range_in(l1, 0x10000000ULL, 0x10000000ULL, 0x2F000000ULL, 1);
+  /* PCI ECAM (high) 256 MiB Device. */
+  s2_map_range_in(l1, 0x4010000000ULL, 0x4010000000ULL, 0x10000000ULL, 1);
+  /* PCI MMIO64 512 GiB Device. */
+  s2_map_range_in(l1, 0x8000000000ULL, 0x8000000000ULL, 0x8000000000ULL, 1);
+
+  s2_clean_tables();
+  return (uint64_t)(uintptr_t)l1;
+}
+
+uint64_t s2_build_vm2(uint64_t host_ram_base, uint64_t ram_size) {
+  hyp_puts("[S2] building VM2 stage-2: IPA 0x40000000 -> host PA ");
+  hyp_puthex(host_ram_base);
+  hyp_putc('\n');
+  uint64_t *l1 = s2_alloc_l1();
+
+  /* VM2 sees RAM at the SAME IPA 0x40000000 as VM1, but it maps to a DIFFERENT
+   * host PA — the isolation demonstration. ram_size rounded to 2 MiB. */
+  s2_map_range_in(l1, 0x40000000ULL, host_ram_base, ram_size, 0);
+
+  /* VM2 prints to the same UART (Device, straight-through IPA==PA). */
+  s2_map_range_in(l1, 0x09000000ULL, 0x09000000ULL, S2_PAGE, 1);
+
+  s2_clean_tables();
+  return (uint64_t)(uintptr_t)l1;
 }

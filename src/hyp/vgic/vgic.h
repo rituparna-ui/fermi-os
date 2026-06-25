@@ -24,8 +24,22 @@
  * live in hardware between exits).
  * ------------------------------------------------------------------------- */
 
-/* Initialise the EL2 + virtual GIC interface. Reads VPL from ICH_VTR_EL2. */
+/* Per-vCPU vGIC state lives in vcpu.h; forward-declare so vgic.h does not have
+ * to include it (avoids a circular include — vcpu.h pulls in this header's
+ * sibling declarations indirectly). */
+struct vcpu_vgic;
+
+/* Initialise the EL2 + virtual GIC interface (one-time global setup: ICC_SRE_EL2
+ * enable, read VPL). Per-vCPU state is set up by vgic_vcpu_reset. */
 void vgic_init(void);
+
+/* Number of implemented List Registers (VPL), read from ICH_VTR_EL2. */
+uint32_t vgic_num_lr(void);
+
+/* Per-vCPU vGIC lifecycle for the multi-VM world switch. */
+void vgic_vcpu_reset(struct vcpu_vgic *g);
+void vgic_save(struct vcpu_vgic *g);      /* live HW interface -> g  (exit)  */
+void vgic_restore(const struct vcpu_vgic *g); /* g -> live HW interface (entry) */
 
 /* Inject a virtual PPI/SPI (e.g. timer INTID 30) into the guest as a pending
  * Group1 interrupt. Picks a free List Register; if none is free (a previous

@@ -39,8 +39,10 @@ void hyp_gic_init(void) {
   /* Mark all SGIs/PPIs Group1-NS. */
   gicr_w32(HYP_GICR_SGI_BASE, GICR_SGI_IGROUPR0, 0xFFFFFFFFU);
 
-  /* Enable PPI 26 (EL2 physical-timer / CNTHP) in the redistributor. */
-  gicr_w32(HYP_GICR_SGI_BASE, GICR_SGI_ISENABLER0, (1U << 26));
+  /* Enable PPI 26 (EL2 physical-timer / CNTHP — per-guest vtimer) and PPI 28
+   * (EL2 virtual-timer / CNTHV — the hypervisor's own scheduler tick) in the
+   * redistributor. */
+  gicr_w32(HYP_GICR_SGI_BASE, GICR_SGI_ISENABLER0, (1U << 26) | (1U << 28));
 
   /* EL2 host CPU interface: accept all priorities, enable Group1. */
   __asm__ __volatile__("msr icc_pmr_el1, %0" ::"r"(0xFFULL));

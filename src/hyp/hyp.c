@@ -4,6 +4,7 @@
 #include "hyp_sysregs.h"
 #include "stage2.h"
 #include "timer/vtimer.h"
+#include "vcpu.h"
 #include "vgic/vgic.h"
 #include <stdint.h>
 
@@ -118,55 +119,82 @@ static void hyp_load_guest(void) {
   hyp_puts(" bytes)\n");
 }
 
-/* Called from hyp_boot.S after the EL2 register context is established and
- * just before the eret into the guest. Places the guest image, builds stage-2,
- * enables HCR_EL2.VM, and returns; hyp_boot.S then erets into the guest. */
+/* VM2's flat image, embedded in the hyp (guest2_blob.S). */
+extern const uint8_t __guest2_blob_start[];
+extern const uint8_t __guest2_blob_end[];
+
+/* VM2's RAM lives above the hypervisor image, in the top reserved GiB. The hyp
+ * is at 0x250000000; place VM2's RAM at 0x260000000 (well clear of the hyp's
+ * own pool which grows up from ~0x250100000). 64 MiB is ample for the tiny
+ * guest and keeps the stage-2 map to whole 2 MiB blocks. */
+#define VM2_HOST_RAM_BASE 0x260000000ULL
+#define VM2_RAM_SIZE      0x04000000ULL /* 64 MiB */
+
+/* Copy a flat blob to a host physical destination (EL2 MMU off). */
+static void copy_blob(uint64_t dst_pa, const uint8_t *src, uint64_t size) {
+  volatile uint64_t *d = (volatile uint64_t *)(uintptr_t)dst_pa;
+  const uint64_t *s = (const uint64_t *)src;
+  uint64_t words = size / 8;
+  for (uint64_t i = 0; i < words; i++) d[i] = s[i];
+  volatile uint8_t *db = (volatile uint8_t *)(uintptr_t)dst_pa;
+  for (uint64_t i = words * 8; i < size; i++) db[i] = src[i];
+  hyp_dcache_clean_range(dst_pa, size);
+  __asm__ __volatile__("ic ialluis\n\tdsb ish\n\tisb" ::: "memory");
+}
+
+/* Called from hyp_boot.S after the EL2 register context is established. Sets up
+ * stage-2 for both VMs, the GIC/timer virtualization, both vCPUs, the EL2
+ * scheduler, and enters VM1. Does NOT return (vcpu_run_first erets). */
 void hyp_main(void) {
-  uint64_t current_el, hcr, cptr;
+  uint64_t current_el, cptr;
   __asm__ __volatile__("mrs %0, CurrentEL" : "=r"(current_el));
-  __asm__ __volatile__("mrs %0, hcr_el2" : "=r"(hcr));
   __asm__ __volatile__("mrs %0, cptr_el2" : "=r"(cptr));
 
-  hyp_puts("\n");
-  hyp_puts("==================================================\n");
-  hyp_puts("  Fermi Hypervisor (EL2) - Milestone 1\n");
+  hyp_puts("\n==================================================\n");
+  hyp_puts("  Fermi Hypervisor (EL2) - multi-VM\n");
   hyp_puts("==================================================\n");
   hyp_puts("[HYP] CurrentEL = ");
   hyp_puthex(current_el);
-  hyp_puts("  (expect 0x8 = EL2)\n");
-  hyp_puts("[HYP] HCR_EL2   = ");
-  hyp_puthex(hcr);
-  hyp_puts("  (RW=1, VM=0 passthrough)\n");
-  hyp_puts("[HYP] CPTR_EL2  = ");
+  hyp_puts("  CPTR_EL2 = ");
   hyp_puthex(cptr);
-  hyp_puts("  (FP/SVE not trapped)\n");
+  hyp_putc('\n');
 
-  /* Place the embedded guest image at its physical load base. */
-  hyp_load_guest();
+  /* Place both guest images at their host PAs.
+   *   VM1 (FermiOS) -> host PA 0x40000000 (== its IPA 0x40000000)
+   *   VM2 (tiny)    -> host PA VM2_HOST_RAM_BASE (its IPA 0x40000000 maps here) */
+  hyp_load_guest(); /* VM1 -> 0x40000000 */
+  copy_blob(VM2_HOST_RAM_BASE, __guest2_blob_start,
+            (uint64_t)(__guest2_blob_end - __guest2_blob_start));
+  hyp_puts("[HYP] VM2 image copied to ");
+  hyp_puthex(VM2_HOST_RAM_BASE);
+  hyp_putc('\n');
 
-  /* Stage-2: build the identity IPA->PA tables and program VTCR/VTTBR. */
-  s2_init();
+  /* Stage-2: one VTCR (shared geometry), two L1 roots (isolated spaces). */
+  s2_init_vtcr();
+  uint64_t vm1_l1 = s2_build_vm1();
+  uint64_t vm2_l1 = s2_build_vm2(VM2_HOST_RAM_BASE, VM2_RAM_SIZE);
 
-  /* Interrupt + timer virtualization (M3/M4):
-   *   - host GIC: EL2 physical CPU interface + CNTHP PPI 26 enabled
-   *   - vGIC:     virtual CPU interface enabled, ready to inject via LRs
-   *   - vtimer:   trap guest CNTP_*, drive the EL2 timer, inject vINTID 30
-   * Order matters: enable HCR_EL2.IMO (route IRQ to EL2) only AFTER the host
-   * GIC + vGIC are ready, or a stray physical IRQ would hit an unprepared
-   * dispatcher. */
+  /* GIC + timer virtualization. */
   hyp_gic_init();
   vgic_init();
   vtimer_init();
 
-  uint64_t hcr3 = HCR_EL2_M3;
+  /* Route physical IRQ/FIQ/SError to EL2, trap WFI/SMC, stage-2 on. */
+  uint64_t hcr3 = HCR_EL2_M3, hcr;
   __asm__ __volatile__("msr hcr_el2, %0\n\tisb" ::"r"(hcr3));
   __asm__ __volatile__("mrs %0, hcr_el2" : "=r"(hcr));
-  hyp_puts("[HYP] HCR_EL2   = ");
+  hyp_puts("[HYP] HCR_EL2 = ");
   hyp_puthex(hcr);
-  hyp_puts("  (VM=1 stage-2, IMO/FMO/AMO route IRQ->EL2, TWI/TSC)\n");
+  hyp_puts(" (VM=1, IRQ->EL2, TWI/TSC)\n");
 
-  hyp_puts("[HYP] guest @ IPA ");
-  hyp_puthex(GUEST_ENTRY_IPA);
-  hyp_puts(" -> eret to EL1 (virtualized timer+GIC)...\n");
+  /* Create the two vCPUs. Both enter at IPA 0x40000000 with their own stage-2.
+   * VM1 uses FermiOS's own boot.S stack math (SP set by guest); VM2 sets its
+   * own SP in _g2_start, so sp_el1_override is 0 for both. */
+  vcpu_alloc("FermiOS", GUEST_ENTRY_IPA, s2_make_vttbr(vm1_l1, 1), 0);
+  vcpu_alloc("guest2",  GUEST_ENTRY_IPA, s2_make_vttbr(vm2_l1, 2), 0);
+  hyp_puts("[HYP] 2 vCPUs created. Starting EL2 scheduler.\n");
   hyp_puts("--------------------------------------------------\n\n");
+
+  vcpu_sched_init();  /* arm CNTHV scheduler tick */
+  vcpu_run_first();   /* enter VM1 — does not return */
 }

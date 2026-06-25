@@ -3,6 +3,7 @@
 #include "hyp_gic.h"
 #include "timer/vtimer.h"
 #include "vgic/vgic.h"
+#include "vcpu.h"
 #include <stdint.h>
 
 /* ---------------------------------------------------------------------------
@@ -122,7 +123,13 @@ static void handle_sync(uint64_t type, hyp_trap_frame_t *f) {
   switch (ec) {
   case EC_HVC_AARCH64:
     /* HVC: ELR already past the instruction — do NOT advance. */
-    handle_psci(f);
+    if (f->regs[0] == 0xFE110000ULL) {
+      /* Fermi hypercall: cooperative yield to the other VM. */
+      f->regs[0] = 0;
+      vcpu_sched_tick(f);
+    } else {
+      handle_psci(f);
+    }
     break;
 
   case EC_SMC_AARCH64:
@@ -139,9 +146,11 @@ static void handle_sync(uint64_t type, hyp_trap_frame_t *f) {
     break;
 
   case EC_WF_TRAPPED:
-    /* Guest WFI/WFE. Nothing to do — a pending vINTID (if any) is already in a
-     * List Register and will be presented on eret. Just skip the instruction
-     * so the guest re-checks rather than spinning on the same WFI. */
+    /* Guest WFI/WFE — the guest is idle. Skip the instruction so it re-checks
+     * for a pending vIRQ rather than re-trapping in a tight loop. We do NOT
+     * world-switch here: the preemptive CNTHP scheduler tick already shares the
+     * CPU fairly, and switching on every idle WFI starves a guest (like
+     * FermiOS) that idles between every timer tick. */
     advance_elr(f);
     break;
 
@@ -154,16 +163,37 @@ static void handle_sync(uint64_t type, hyp_trap_frame_t *f) {
   }
 }
 
-static void handle_irq(void) {
+static void handle_irq(hyp_trap_frame_t *f) {
   /* A physical IRQ was routed to EL2 (HCR_EL2.IMO=1). Ack it on the host
-   * interface, dispatch, and EOI. The only physical IRQ we enable at EL2 is
-   * the EL2 physical-timer PPI (26). */
+   * interface, dispatch, and EOI. Two PPIs are enabled at EL2:
+   *   26 (CNTHP) — the running guest's virtualized EL1 physical timer
+   *   28 (CNTHV) — the hypervisor's own round-robin scheduler tick */
   uint32_t intid = hyp_gic_ack();
   if (intid == 1023) {
     return; /* spurious */
   }
   if (intid == HYP_CNTHP_PPI) {
-    vtimer_handle_host_irq();
+    /* CNTHP is shared between the running guest's vtimer and the scheduler
+     * slice (we arm it to the sooner of the two). Service whichever
+     * deadline(s) have elapsed. */
+    uint64_t now;
+    __asm__ __volatile__("mrs %0, cntpct_el0" : "=r"(now));
+
+    /* Guest vtimer deadline reached -> inject vINTID 30. */
+    if ((cur_vcpu->vtimer.ctl & 1ULL) && now >= cur_vcpu->vtimer.cval) {
+      vtimer_handle_host_irq();
+    }
+    /* Scheduler slice elapsed -> round-robin (this also re-arms CNTHP). */
+    if (now >= hyp_sched_deadline()) {
+      vcpu_sched_tick(f);
+    } else {
+      /* Only the vtimer fired; re-arm CNTHP to the next (folded) deadline. */
+      hyp_cnthp_arm();
+    }
+  } else {
+    hyp_puts("[HYP] EL2 IRQ intid=");
+    hyp_puthex(intid);
+    hyp_putc('\n');
   }
   hyp_gic_eoi(intid);
 }
@@ -174,7 +204,7 @@ void hyp_dispatch(uint64_t type, hyp_trap_frame_t *f) {
     handle_sync(type, f);
     break;
   case HYP_EXC_IRQ:
-    handle_irq();
+    handle_irq(f);
     break;
   case HYP_EXC_FIQ:
   case HYP_EXC_SERROR:

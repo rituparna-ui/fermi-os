@@ -1,4 +1,5 @@
 #include "vgic.h"
+#include "vcpu.h"
 #include "hyp.h"
 #include <stdint.h>
 
@@ -90,22 +91,59 @@ void vgic_init(void) {
   __asm__ __volatile__("mrs %0, ich_vtr_el2" : "=r"(vtr));
   vgic_nr_lr = (uint32_t)((vtr & 0x1F) + 1);
 
-  /* Clear all implemented List Registers + active-priority regs. */
+  /* Clear the live hardware interface; per-vCPU state is seeded by
+   * vgic_vcpu_reset and loaded by vgic_restore on each world entry. */
   for (uint32_t i = 0; i < vgic_nr_lr; i++) {
     lr_write(i, 0);
   }
   __asm__ __volatile__("msr ich_ap0r0_el2, %0" ::"r"(0ULL));
   __asm__ __volatile__("msr ich_ap1r0_el2, %0" ::"r"(0ULL));
 
-  /* Seed the virtual control regs and enable the virtual CPU interface. */
-  __asm__ __volatile__("msr ich_vmcr_el2, %0" ::"r"(ICH_VMCR_SEED));
-  __asm__ __volatile__("msr ich_hcr_el2, %0\n\tisb" ::"r"(ICH_HCR_EN));
-
   hyp_puts("[VGIC] ICC_SRE_EL2=");
   hyp_puthex(sre);
   hyp_puts(" VPL=");
   hyp_puthex(vgic_nr_lr);
-  hyp_puts(" (virtual CPU interface enabled)\n");
+  hyp_puts(" (virtual CPU interface ready)\n");
+}
+
+uint32_t vgic_num_lr(void) { return vgic_nr_lr; }
+
+/* Seed a fresh per-vCPU vGIC state: virtual interface enabled, Group1 + PMR
+ * seeded, LRs empty, MMIO model zeroed. */
+void vgic_vcpu_reset(vcpu_vgic_t *g) {
+  g->hcr = ICH_HCR_EN;
+  g->vmcr = ICH_VMCR_SEED;
+  g->ap0r0 = 0;
+  g->ap1r0 = 0;
+  for (int i = 0; i < 16; i++) g->lr[i] = 0;
+  g->gicd_ctlr = 0;
+  g->gicd_isenabler0 = 0;
+  g->gicr_igroupr0 = 0;
+  g->gicr_igrpmodr0 = 0;
+  g->gicr_isenabler0 = 0;
+}
+
+/* Save the live hardware virtual interface into `g` (world exit). */
+void vgic_save(vcpu_vgic_t *g) {
+  __asm__ __volatile__("mrs %0, ich_vmcr_el2" : "=r"(g->vmcr));
+  __asm__ __volatile__("mrs %0, ich_ap0r0_el2" : "=r"(g->ap0r0));
+  __asm__ __volatile__("mrs %0, ich_ap1r0_el2" : "=r"(g->ap1r0));
+  for (uint32_t i = 0; i < vgic_nr_lr; i++) {
+    g->lr[i] = lr_read(i);
+  }
+  /* Quiesce the interface while another guest / EL2 runs. */
+  __asm__ __volatile__("msr ich_hcr_el2, %0\n\tisb" ::"r"(0ULL));
+}
+
+/* Restore `g` into the live hardware virtual interface (world entry). En last. */
+void vgic_restore(const vcpu_vgic_t *g) {
+  __asm__ __volatile__("msr ich_vmcr_el2, %0" ::"r"(g->vmcr));
+  __asm__ __volatile__("msr ich_ap0r0_el2, %0" ::"r"(g->ap0r0));
+  __asm__ __volatile__("msr ich_ap1r0_el2, %0" ::"r"(g->ap1r0));
+  for (uint32_t i = 0; i < vgic_nr_lr; i++) {
+    lr_write(i, g->lr[i]);
+  }
+  __asm__ __volatile__("msr ich_hcr_el2, %0\n\tisb" ::"r"(g->hcr));
 }
 
 /* ---------------------------------------------------------------------------
@@ -133,14 +171,6 @@ void vgic_init(void) {
 #define GICD_CTLR_ARE_NS  (1U << 4)
 #define GICD_CTLR_EN_G1NS (1U << 1)
 
-static struct {
-  uint32_t gicd_ctlr;
-  uint32_t gicd_isenabler0; /* SPIs 0..31 (guest only enables PPIs though) */
-  uint32_t gicr_igroupr0;
-  uint32_t gicr_igrpmodr0;
-  uint32_t gicr_isenabler0; /* SGIs/PPIs 0..31 — guest enables INTID 30 here */
-} vd;
-
 int vgic_mmio_is_target(uint64_t ipa) {
   return (ipa >= GICD_IPA_BASE && ipa < GICD_IPA_END) ||
          (ipa >= GICR_IPA_BASE && ipa < GICR_IPA_END);
@@ -149,6 +179,7 @@ int vgic_mmio_is_target(uint64_t ipa) {
 void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
                        int size_bytes) {
   (void)size_bytes;
+  vcpu_vgic_t *vd = &cur_vcpu->vgic; /* per-VM distributor/redistributor model */
   uint64_t off;
   if (ipa >= GICR_IPA_BASE) {
     off = ipa - GICR_IPA_BASE;
@@ -159,12 +190,12 @@ void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
   if (is_write) {
     uint32_t w = (uint32_t)*val;
     switch (off) {
-    case R_GICD_CTLR:        vd.gicd_ctlr = w & (GICD_CTLR_ARE_NS | GICD_CTLR_EN_G1NS); break;
-    case R_GICD_ISENABLER0:  vd.gicd_isenabler0 |= w; break;
+    case R_GICD_CTLR:        vd->gicd_ctlr = w & (GICD_CTLR_ARE_NS | GICD_CTLR_EN_G1NS); break;
+    case R_GICD_ISENABLER0:  vd->gicd_isenabler0 |= w; break;
     case R_GICR_WAKER:       /* ProcessorSleep handled on read; ignore write */ break;
-    case R_GICR_SGI_IGROUPR0:   vd.gicr_igroupr0 = w; break;
-    case R_GICR_SGI_IGRPMODR0:  vd.gicr_igrpmodr0 = w; break;
-    case R_GICR_SGI_ISENABLER0: vd.gicr_isenabler0 |= w; break;
+    case R_GICR_SGI_IGROUPR0:   vd->gicr_igroupr0 = w; break;
+    case R_GICR_SGI_IGRPMODR0:  vd->gicr_igrpmodr0 = w; break;
+    case R_GICR_SGI_ISENABLER0: vd->gicr_isenabler0 |= w; break;
     default: /* unmodelled write — drop silently */ break;
     }
     return;
@@ -173,13 +204,13 @@ void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
   /* Read. */
   uint32_t r = 0;
   switch (off) {
-  case R_GICD_CTLR:        r = vd.gicd_ctlr; break;
-  case R_GICD_ISENABLER0:  r = vd.gicd_isenabler0; break;
+  case R_GICD_CTLR:        r = vd->gicd_ctlr; break;
+  case R_GICD_ISENABLER0:  r = vd->gicd_isenabler0; break;
   case R_GICR_WAKER:       r = 0; /* ProcessorSleep=0, ChildrenAsleep=0 — the
                                    * guest's poll loop (gic.c:30) exits */ break;
-  case R_GICR_SGI_IGROUPR0:   r = vd.gicr_igroupr0; break;
-  case R_GICR_SGI_IGRPMODR0:  r = vd.gicr_igrpmodr0; break;
-  case R_GICR_SGI_ISENABLER0: r = vd.gicr_isenabler0; break;
+  case R_GICR_SGI_IGROUPR0:   r = vd->gicr_igroupr0; break;
+  case R_GICR_SGI_IGRPMODR0:  r = vd->gicr_igrpmodr0; break;
+  case R_GICR_SGI_ISENABLER0: r = vd->gicr_isenabler0; break;
   default: r = 0; break;
   }
   *val = r;

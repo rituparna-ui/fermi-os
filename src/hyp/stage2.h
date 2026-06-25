@@ -60,16 +60,26 @@
 /* Single guest => fixed VMID 1 (VMID 0 reserved by convention). */
 #define HYP_VMID 1ULL
 
-/* Build the stage-2 identity tables and program VTCR_EL2 + VTTBR_EL2. Does NOT
- * set HCR_EL2.VM — the caller (hyp_boot) flips VM=1 just before eret so stage-2
- * turns on atomically with the world switch. Returns the L1 root host PA. */
-uint64_t s2_init(void);
+/* Program VTCR_EL2 (one-time, shared by all VMs — same IPA geometry). */
+void s2_init_vtcr(void);
 
-/* Map [ipa, ipa+size) -> [pa, pa+size) at stage-2.
- *   device != 0 : Device-nGnRE + execute-never; else Normal-WB + executable.
- * size/ipa/pa must be 4 KiB aligned. Chooses 1 GiB / 2 MiB blocks or 4 KiB
- * pages automatically based on alignment. */
-void s2_map_range(uint64_t ipa, uint64_t pa, uint64_t size, int device);
+/* Build VM1's (FermiOS) stage-2 identity map (IPA==PA) and return its L1 root
+ * host PA. Maps 8 GiB RAM + device windows; GICD/GICR left invalid to trap. */
+uint64_t s2_build_vm1(void);
+
+/* Build VM2's stage-2: guest RAM IPA [0x40000000, 0x40000000+ram_size) -> host
+ * PA [host_ram_base, ...), plus the UART (Device, straight-through IPA==PA).
+ * Demonstrates isolation — VM2's IPA 0x40000000 maps to host_ram_base, not
+ * 0x40000000. Returns the L1 root host PA. */
+uint64_t s2_build_vm2(uint64_t host_ram_base, uint64_t ram_size);
+
+/* Map [ipa, ipa+size) -> [pa, pa+size) into the stage-2 table rooted at l1.
+ *   device != 0 : Device-nGnRE + execute-never; else Normal-WB + executable. */
+void s2_map_range_in(uint64_t *l1, uint64_t ipa, uint64_t pa, uint64_t size,
+                     int device);
+
+/* Compose VTTBR_EL2 from an L1 root + VMID. */
+uint64_t s2_make_vttbr(uint64_t l1_root, uint32_t vmid);
 
 /* Full stage-2 + stage-1 TLB flush for the current VMID (inner-shareable).
  * Call after building or editing the tables (VTTBR_EL2.VMID must be set). */

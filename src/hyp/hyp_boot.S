@@ -97,21 +97,10 @@ _hyp_start:
 	dsb	sy
 	isb
 
-	// --- 9. C entry at EL2. hyp_main returns here. ---
+	// --- 9. C entry at EL2. hyp_main sets up both VMs + the scheduler and
+	// enters the first guest via vcpu_run_first(); it does NOT return. ---
 	bl	hyp_main
 
-	// --- 10. eret into the guest at EL1. ---
-	ldr	x0, =GUEST_ENTRY_IPA
-	msr	elr_el2, x0
-	ldr	x0, =SPSR_EL2_GUEST_ENTRY
-	msr	spsr_el2, x0
-	// Guest (FermiOS boot.S) ignores x0-x3; clear them for a clean reset image.
-	mov	x0, xzr
-	mov	x1, xzr
-	mov	x2, xzr
-	mov	x3, xzr
-	eret
-
-	// eret should never return; if it somehow does, spin.
+	// hyp_main should never return; if it does, spin.
 2:	wfe
 	b	2b

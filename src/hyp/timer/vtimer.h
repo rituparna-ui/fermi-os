@@ -37,6 +37,10 @@ void vtimer_init(void);
  * sysreg was a timer register and was handled (caller advances ELR_EL2). */
 int vtimer_emulate_sysreg(hyp_trap_frame_t *f);
 
+/* Re-arm/disarm the EL2 physical timer (CNTHP) from the CURRENT vCPU's shadow
+ * state. Called on each guest re-arm and on every world switch. */
+void vtimer_reprogram_current(void);
+
 /* Called from the EL2 IRQ handler when the host CNTHP PPI (26) fires. Injects
  * vINTID 30 into the guest and disarms the EL2 timer until the guest re-arms. */
 void vtimer_handle_host_irq(void);

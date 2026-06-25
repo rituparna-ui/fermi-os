@@ -18,9 +18,10 @@ HYP_TARGET := $(BUILD_DIR)/hyp.elf       # the HYPERVISOR (runs at EL2)
 S_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.S" -print)
 C_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.c" -print)
 
-# The HYPERVISOR image sources (EL2).
-HYP_S_SOURCES := $(shell find $(HYP_DIR) -name "*.S")
-HYP_C_SOURCES := $(shell find $(HYP_DIR) -name "*.c")
+# The HYPERVISOR image sources (EL2). Exclude the guest2/ subdir — VM2 is a
+# standalone guest built separately to a flat blob, not linked into the hyp.
+HYP_S_SOURCES := $(shell find $(HYP_DIR) -path "$(HYP_DIR)/guest2" -prune -o -name "*.S" -print)
+HYP_C_SOURCES := $(shell find $(HYP_DIR) -path "$(HYP_DIR)/guest2" -prune -o -name "*.c" -print)
 
 # Object File Mapping
 # src/boot.S      -> build/boot.o
@@ -117,6 +118,21 @@ $(GUEST_BIN): $(TARGET)
 
 # The guest blob object incbin's $(GUEST_BIN); make it an explicit prerequisite.
 $(BUILD_DIR)/hyp/guest_blob.o: $(GUEST_BIN)
+
+# VM2: a tiny standalone EL1 guest (heartbeat printer) used to demonstrate the
+# multi-VM world switch + per-VM stage-2 isolation. Built directly to a flat
+# binary; linked at IPA 0x40000000 (same as VM1 — the hyp maps it to a
+# different host PA). Embedded via guest2_blob.S.
+GUEST2_BIN := $(BUILD_DIR)/guest2.bin
+$(GUEST2_BIN): $(HYP_DIR)/guest2/guest2.S $(HYP_DIR)/guest2/linker_g2.ld
+	@echo "GUEST2 $@"
+	@mkdir -p $(dir $@)
+	@$(CC) -ffreestanding -nostdlib -nostartfiles -fno-pic \
+		-Wl,-T,$(HYP_DIR)/guest2/linker_g2.ld -Wl,--build-id=none \
+		-o $(BUILD_DIR)/guest2.elf $(HYP_DIR)/guest2/guest2.S
+	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/guest2.elf $@
+
+$(BUILD_DIR)/hyp/guest2_blob.o: $(GUEST2_BIN)
 
 # Hypervisor (EL2) — separate image, its own linker script.
 $(HYP_TARGET): $(HYP_OBJECTS)

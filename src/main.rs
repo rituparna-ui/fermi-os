@@ -48,41 +48,42 @@ extern "C" fn task_b() {
     }
 }
 
-/// Kernel entry point, called from `boot.S` after low-level setup.
+/// Pre-MMU init, called from `boot.S` while running at the physical address.
+/// Sets up UART + PMM and enables the MMU, then returns so boot.S can jump to
+/// the upper half. Rust static accesses here resolve to physical addresses
+/// (PC-relative) because PC is physical.
 #[no_mangle]
-pub extern "C" fn rust_main() -> ! {
+pub extern "C" fn early_init() {
     uart::init();
     uart::putc(b'\n');
     uart::println("================================");
     uart::println("  Fermi OS (Rust) is booting");
     uart::println("================================");
-    cpu::print_current_el();
 
-    // Physical memory manager.
+    // Physical memory manager (bitmap placed at physical __kernel_end).
     mm::pmm::init(mm::pmm::MEM_START, mm::pmm::MEM_SIZE);
     mm::pmm::print_info();
 
-    // PMM smoke test: allocate a few pages, free one, re-allocate.
-    let a = mm::pmm::allocate_page();
-    let b = mm::pmm::allocate_page();
-    uart::log_hex("[TEST] alloc a=", a);
-    uart::log_hex("[TEST] alloc b=", b);
-    mm::pmm::free_page(a);
-    let c = mm::pmm::allocate_page();
-    uart::log_hex("[TEST] freed a, re-alloc c= (expect==a) ", c);
-    mm::pmm::free_page(b);
-    mm::pmm::free_page(c);
+    // Build page tables and enable the MMU (identity-low + upper-half).
+    let _l1_lo = mm::mmu::init();
+    uart::println("[boot] early_init done; jumping to higher half");
+}
 
-    let big = mm::pmm::allocate_pages(8);
-    uart::log_hex("[TEST] alloc 8 contiguous pages at ", big);
-    mm::pmm::free_pages(big, 8);
+/// Higher-half kernel entry, branched to from `boot.S` at the upper-half VA.
+#[no_mangle]
+pub extern "C" fn kernel_main() -> ! {
+    // Route MMIO through the upper half and relocate the PMM bitmap before any
+    // allocation, so everything stays mapped once TTBR0 is swapped per task.
+    mmio::switch_to_upper(mm::mmu::KERNEL_VA_OFFSET as usize);
+    mm::pmm::relocate_upper();
 
-    // Enable the MMU. After this, RAM is Normal cacheable memory and
-    // core::fmt (kprintln!) + SpinLock are safe to use.
-    let l1_lo = mm::mmu::init();
+    uart::println("[boot] running in higher half (TTBR1)");
+    cpu::print_current_el();
+    kprintln!("[boot] kernel VA base in use; EL={}", cpu::current_el());
+
+    // Exception vectors (VBAR now resolves to the upper-half VA).
     exception::init();
-    mm::mmu::run_tests(l1_lo);
-    kprintln!("[boot] MMU on; kprintln! now safe. EL={}", cpu::current_el());
+    mm::mmu::run_tests(0);
 
     // Kernel heap (backs the global allocator: Vec/Box/String).
     mm::heap::init();
@@ -90,7 +91,9 @@ pub extern "C" fn rust_main() -> ! {
     {
         use alloc::vec::Vec;
         let mut v: Vec<u64> = Vec::new();
-        for i in 0..8 { v.push(i * i); }
+        for i in 0..8 {
+            v.push(i * i);
+        }
         kprintln!("[boot] alloc::Vec works: {:?}", v.as_slice());
     }
 
@@ -104,9 +107,6 @@ pub extern "C" fn rust_main() -> ! {
     sched::create_task("task_b", task_b);
     exception::timer::start(exception::timer::TIMER_INTERVAL_MS);
     kprintln!("[boot] scheduler running; idle loop reaping dead tasks");
-    uart::puts("UART base: ");
-    uart::puthex(uart::UART_BASE as u64);
-    uart::putc(b'\n');
 
     loop {
         sched::reap();

@@ -126,6 +126,15 @@ pub fn init(mem_start: u64, mem_size: u64) {
     uart::println("[PMM] Initialized!");
 }
 
+/// After the higher-half jump, relocate the bitmap pointer from its physical
+/// address to the TTBR1 upper-half alias so it stays mapped when TTBR0 is
+/// swapped for a user task.
+pub fn relocate_upper() {
+    let p = unsafe { PMM.get() };
+    p.bitmap = crate::mm::mmu::phys_to_virt(p.bitmap as u64) as usize;
+    uart::log_hex("[PMM] Bitmap relocated to upper half: ", p.bitmap as u64);
+}
+
 pub fn print_info() {
     let p = unsafe { PMM.get() };
     let mem_size = p.region_end - p.region_start;

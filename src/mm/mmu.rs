@@ -274,6 +274,30 @@ pub fn init() -> u64 {
     l1_lo
 }
 
+/// Enable the MMU on a secondary core, reusing the page tables built by the
+/// primary (no table construction). Runs with the MMU off (physical PC), so
+/// static reads resolve to physical via PC-relative addressing.
+pub fn enable_on_this_core() {
+    let st = unsafe { MMU.get() };
+    let mair: u64 = (0x00 << 0) | (0xFF << 8);
+    crate::msr!(mair_el1, mair);
+    let tcr: u64 = (16 << 0)
+        | (0b01 << 8) | (0b01 << 10) | (0b11 << 12) | (0b00 << 14)
+        | (16 << 16) | (0b01 << 24) | (0b01 << 26) | (0b11 << 28) | (0b10 << 30)
+        | (0b010 << 32) | (1 << 36);
+    crate::msr!(tcr_el1, tcr);
+    unsafe { core::arch::asm!("dsb ish") };
+    crate::msr!(ttbr0_el1, st.l0_lo);
+    crate::msr!(ttbr1_el1, st.l0_hi);
+    unsafe {
+        core::arch::asm!("dsb ish", "isb", "tlbi vmalle1", "dsb ish", "isb");
+    }
+    let mut sctlr: u64 = mrs!(sctlr_el1);
+    sctlr |= (1 << 0) | (1 << 2) | (1 << 12);
+    crate::msr!(sctlr_el1, sctlr);
+    unsafe { core::arch::asm!("isb") };
+}
+
 /// Create an empty L0 table for a user address space (TTBR0). Tables for
 /// L1/L2/L3 are allocated on demand by [`map_user_range`].
 pub fn create_user_tables() -> u64 {

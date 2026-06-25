@@ -246,6 +246,13 @@ pub extern "C" fn exception_dispatch(type_: u64, frame: *mut TrapFrame) {
     }
 }
 
+/// Set VBAR_EL1 to the vector table on the current core (no logging).
+pub fn set_vbar_current() {
+    let vbar = unsafe { &vector_table as *const u8 as u64 };
+    crate::msr!(vbar_el1, vbar);
+    unsafe { core::arch::asm!("isb") };
+}
+
 /// Install the vector table into VBAR_EL1.
 pub fn init() {
     uart::println("[EXCEPTION] Installing vector table");

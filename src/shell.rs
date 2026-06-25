@@ -130,6 +130,17 @@ fn dispatch(line: &str) {
             kprintln!("          ls [path] run <elf-path> cpuinfo reboot");
         }
         "uptime" => kprintln!("up {} ms ({} s)", timer::uptime_ms(), timer::uptime_seconds()),
+        "smp" => {
+            if crate::smp::secondary_online() {
+                let h1 = crate::smp::heartbeat();
+                sched::sleep_ms(300);
+                let h2 = crate::smp::heartbeat();
+                kprintln!("core1 (higher half) MPIDR={:#x} heartbeat {} -> {} (+{})",
+                          crate::smp::secondary_mpidr(), h1, h2, h2 - h1);
+            } else {
+                kprintln!("secondary not online (-smp 2)");
+            }
+        }
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
         "ps" => kprint!("{}", sched::render_tasks()),
         "free" | "meminfo" => cmd_free(),

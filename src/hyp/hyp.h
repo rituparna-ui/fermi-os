@@ -90,4 +90,10 @@ void hyp_run_psci_test(void);
  * return (owns the console). No-op at EL1. */
 void hyp_run_interactive_guest(void);
 
+/* Milestone 14: run TWO full FermiOS guests preemptively (round-robin on the
+ * EL2 timer) AND interactively — host console input is routed to the FOCUSED
+ * guest, and Ctrl-X cycles which guest's shell has focus. Does not return.
+ * No-op at EL1. */
+void hyp_run_multi_interactive(void);
+
 #endif /* HYP_HYP_H */

@@ -1083,3 +1083,161 @@ void hyp_run_interactive_guest(void) {
   }
   pmm_free_pages(ram_phys, FERMI_GUEST_RAM / 0x1000);
 }
+
+/* ---- Milestone 14: two FermiOS guests, preemptive AND interactive ---- */
+
+#define MI_COUNT      2
+#define MI_RAM_SIZE   (128ULL * 1024 * 1024)
+#define MI_FOCUS_KEY  0x18  /* Ctrl-X cycles console focus between guests */
+
+void hyp_run_multi_interactive(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M14: two preemptive + interactive FermiOS guests");
+  uart_println("[HYP] (Ctrl-X switches which guest's shell receives your input)");
+
+  static stage2_t s2[MI_COUNT];
+  static vcpu_t vc[MI_COUNT];
+  uintptr_t ram[MI_COUNT];
+  uint64_t blob_len = (uint64_t)(__guest_blob_end - __guest_blob_start);
+
+  vgic_init();
+
+  for (int i = 0; i < MI_COUNT; i++) {
+    ram[i] = pmm_allocate_pages(MI_RAM_SIZE / 0x1000);
+    if (!ram[i] || !stage2_create(&s2[i], (uint32_t)(i + 1))) {
+      uart_errorln("[HYP] M14: setup failed");
+      return;
+    }
+    stage2_map(&s2[i], GUEST_ENTRY_IPA, (uint64_t)ram[i], MI_RAM_SIZE, 0);
+    /* ECAM backed with 0xFF RAM for trap-free PCI scan; this loop never
+     * returns, so the backing is intentionally kept for the VM's lifetime. */
+    stage2_back_ecam(&s2[i]);
+
+    uint64_t kva = PHYS_TO_VIRT((uint64_t)ram[i]);
+    for (uint64_t b = 0; b < blob_len; b++) {
+      ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)__guest_blob_start)[b];
+    }
+    guest_sync_icache(kva, (blob_len + 0xFFF) & ~0xFFFULL);
+
+    for (int r = 0; r < 31; r++) vc[i].x[r] = 0;
+    vc[i].pc = GUEST_ENTRY_IPA;
+    vc[i].pstate = 0x3C5;
+    vc[i].sp_el1 = 0;
+    vc[i].vttbr = stage2_vttbr(&s2[i]);
+    /* IMO routes physical IRQs to EL2 so the hypervisor's own scheduler tick
+     * (CNTHP, PPI 26) preempts the guest even while it is in WFI. We do NOT
+     * enable the physical guest timer (PPI 30); the hypervisor is the guest's
+     * timer source, soft-injecting vINTID 30 per slice — so the two guests
+     * never contend for the one physical timer or its Active state. */
+    vc[i].hcr_extra = HCR_IMO;
+    vc[i].vmid = (uint32_t)(i + 1);
+    vc[i].id = (uint32_t)i;
+    vc[i].name = (i == 0) ? "vm0" : "vm1";
+    vgic_vcpu_reset(&vc[i].vgic);
+    vuart_init(&vc[i].vuart, vc[i].name);
+  }
+
+  /* Enable the EL2 physical-timer PPI (26) at the redistributor so the
+   * scheduler quantum (CNTHP), with IMO routing it to EL2, actually preempts a
+   * running/WFI guest and ends its slice. */
+  gic_enable_irq(HYP_CNTHP_PPI);
+
+  uint64_t freq;
+  __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
+  uint64_t slice = freq / 60; /* ~16 ms scheduler quantum per guest */
+
+  uint64_t host_daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(host_daif));
+  __asm__ __volatile__("msr daifset, #3");
+
+  int started[MI_COUNT] = {0, 0};
+  int cur = 0, focus = 0;
+
+  for (;;) {
+    vcpu_t *v = &vc[cur];
+    if (started[cur]) {
+      vcpu_restore_el1(&v->el1);
+      vcpu_restore_fp(&v->fp);
+      vgic_restore(&v->vgic);
+    }
+    vgic_set_current(&v->vgic);
+
+    /* Hypervisor IS the guest timer: present one virtual tick (INTID 30) per
+     * slice so the guest's scheduler advances. Soft (HW=0) LR — the guest
+     * virtually EOIs it, nothing physical to storm. Only inject once the guest
+     * has enabled the timer PPI (past gic_init/sched_init), else we'd deliver a
+     * tick before its run-queue exists and it would fault in sched_wake_sleepers. */
+    if (vgic_intid_enabled(30)) {
+      vgic_inject_ppi(30);
+    }
+
+    cnthp_arm(slice);
+    int slice_done = 0;
+    int fresh = 0; /* set if reset this slice -> don't save over fresh state */
+    long guard = 2000000;
+    while (!slice_done && guard-- > 0) {
+      vcpu_enter(v);
+
+      /* Pump host input to the FOCUSED guest; Ctrl-X cycles focus. */
+      int c;
+      while ((c = host_uart_rx_poll()) >= 0) {
+        if (c == MI_FOCUS_KEY) {
+          focus = (focus + 1) % MI_COUNT;
+          uart_printf("\n[HYP] console focus -> %s\n", vc[focus].name);
+        } else {
+          vuart_rx_push(&vc[focus].vuart, (uint8_t)c);
+        }
+      }
+
+      if (v->exit_reason == HYP_EXC_IRQ) {
+        uint64_t intid = gic_ack_irq();
+        if (intid == HYP_CNTHP_PPI) {
+          cnthp_disarm();
+          gic_end_irq(intid);
+          slice_done = 1; /* quantum expired -> round-robin */
+        } else if (intid != GIC_INTID_NO_PENDING) {
+          gic_end_irq(intid);
+        }
+      } else if (v->exit_reason == HYP_EXC_SYNC && ESR_EC_OF(v->esr) == 0x16) {
+        psci_action_t act = psci_handle(v);
+        if (act == PSCI_ACT_RESET) {
+          vuart_flush(&v->vuart);
+          uart_printf("\n[HYP] %s reboot -> warm reset\n", v->name);
+          df_reset_guest(v, ram[cur], MI_RAM_SIZE);
+          started[cur] = 0;
+          fresh = 1;
+          slice_done = 1;
+        } else if (act == PSCI_ACT_OFF) {
+          uart_printf("\n[HYP] %s powered off\n", v->name);
+          slice_done = 1;
+        }
+      } else if (!df_service_exit(v)) {
+        uint64_t ipa = ((v->hpfar >> 4) << 12) | (v->far & 0xFFF);
+        uart_printf("\n[HYP] %s fatal exit reason=%u EC=%x pc=%x IPA=%x\n",
+                    v->name, v->exit_reason, ESR_EC_OF(v->esr), v->pc, ipa);
+        slice_done = 1;
+      }
+    }
+    cnthp_disarm();
+
+    vuart_flush(&v->vuart);
+    if (!fresh) {
+      /* Save the live guest context out before switching away. */
+      vcpu_save_el1(&v->el1);
+      vcpu_save_fp(&v->fp);
+      vgic_save(&v->vgic);
+      started[cur] = 1;
+    } else {
+      /* Just reset: keep the fresh in-struct state, only quiesce the shared
+       * virtual-GIC HW interface for the next guest. */
+      __asm__ __volatile__("msr ich_hcr_el2, %0\n\tisb" ::"r"(0ULL));
+    }
+
+    cur = (cur + 1) % MI_COUNT;
+  }
+
+  /* not reached */
+}

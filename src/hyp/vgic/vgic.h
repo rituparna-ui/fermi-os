@@ -47,6 +47,12 @@ void vgic_inject_ppi(uint32_t intid);
  * caller must NOT physically EOI it. Returns 1 if injected. */
 int vgic_inject_hw(uint32_t intid);
 
+/* True if the CURRENT guest has enabled `intid` (PPI/SGI 0..31) in its emulated
+ * redistributor — i.e. it is past gic_init and ready to take that interrupt.
+ * Used to gate soft timer-tick injection so we don't deliver before the guest's
+ * scheduler/timer are initialised. */
+int vgic_intid_enabled(uint32_t intid);
+
 /* --- Per-vCPU vGIC state (multi-guest, M9) ------------------------------ */
 struct vcpu_vgic; /* defined in vcpu.h */
 

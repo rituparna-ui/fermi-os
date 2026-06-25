@@ -847,9 +847,10 @@ void kernel_main() {
   hyp_run_dual_fermios();     /* M9c */
 #endif
 
-  /* Hand the console to ONE interactive FermiOS guest. Does not return — the
-   * guest's EL0 shell owns the terminal from here. */
-  hyp_run_interactive_guest();
+  /* Hand the console to TWO preemptive, interactive FermiOS guests. Does not
+   * return — Ctrl-X switches which guest's shell receives input.
+   * (hyp_run_interactive_guest() runs a single interactive guest if preferred.) */
+  hyp_run_multi_interactive();
 #endif
 
   timer_init();

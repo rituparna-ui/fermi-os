@@ -161,6 +161,13 @@ void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
 
 void vgic_set_current(vcpu_vgic_t *g) { cur = g; }
 
+int vgic_intid_enabled(uint32_t intid) {
+  if (!cur || intid >= 32) {
+    return 0;
+  }
+  return (cur->gicr_isenabler0 >> intid) & 1;
+}
+
 void vgic_vcpu_reset(vcpu_vgic_t *g) {
   g->hcr = ICH_HCR_EN;
   g->vmcr = ICH_VMCR_SEED;

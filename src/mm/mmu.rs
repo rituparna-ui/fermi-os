@@ -260,6 +260,11 @@ fn walk_levels(l0_table: u64, va: u64, target_level: u8, alloc: bool) -> Option<
         pte_write(l0_table, l0i, l1_phys | PTE_VALID | PTE_TABLE);
         l1_phys
     } else {
+        // A valid non-table descriptor here is a block, not a next-level table;
+        // following pte_next_table would misread its OA as a table base.
+        if l0e & PTE_TABLE == 0 {
+            return None;
+        }
         pte_next_table(l0e)
     };
 
@@ -276,6 +281,9 @@ fn walk_levels(l0_table: u64, va: u64, target_level: u8, alloc: bool) -> Option<
         pte_write(l1, l1i, l2_phys | PTE_VALID | PTE_TABLE);
         l2_phys
     } else {
+        if l1e & PTE_TABLE == 0 {
+            return None; // 1 GiB block, not a table
+        }
         pte_next_table(l1e)
     };
 
@@ -296,6 +304,9 @@ fn walk_levels(l0_table: u64, va: u64, target_level: u8, alloc: bool) -> Option<
         pte_write(l2, l2i, l3_phys | PTE_VALID | PTE_TABLE);
         l3_phys
     } else {
+        if l2e & PTE_TABLE == 0 {
+            return None; // 2 MiB block, not a table
+        }
         pte_next_table(l2e)
     };
 

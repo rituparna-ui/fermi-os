@@ -5,6 +5,7 @@
 //! register CPU interface (ICC_*). Provides IRQ enable, ack (IAR1), EOI (EOIR1),
 //! and per-INTID counters for `/proc/interrupts`.
 
+use crate::arch::cpu::dsb_sy;
 use crate::klib::mmio;
 use crate::klib::sync::SpinLockIrqSafe;
 use crate::kprintln;
@@ -44,6 +45,10 @@ fn enable_distributor_affinity_routing() {
     kprintln!("[GIC] Enabling Distributor affinity routing");
     mmio::write32(GICD_CTLR, GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_G1NS);
     kprintln!("[GIC] GICD_CTLR = {:#x}", mmio::read32(GICD_CTLR));
+    // Ensure the affinity-routing config write is globally visible to the GIC
+    // before the redistributor is touched — on weakly-ordered ARMv8 the store
+    // could otherwise sit buffered while GICR_WAKER is polled.
+    dsb_sy();
 }
 
 fn redistributor_wakeup() {

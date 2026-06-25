@@ -60,6 +60,8 @@ SECTIONS
 		__bss_start = .;
 		*(.bss*)
 		*(COMMON)
+		. = ALIGN(8);		/* boot.S zeroes BSS with 8-byte stores; keep
+							 * __bss_end 8-aligned so no tail bytes are missed */
 		__bss_end = .;
 	} :data
 

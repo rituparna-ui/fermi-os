@@ -136,6 +136,9 @@ pub extern "C" fn kmain() -> ! {
         kprintln!("[BLK TEST] write+read sector 1 round-trip: {}", if ok { "PASS" } else { "FAIL" });
     }
 
+    drivers::virtio::console::init();
+    drivers::virtio::balloon::init();
+
     // Scheduler + a couple of demo kernel tasks (mirrors the original boot).
     sched::init();
     sched::create_task("task_a", task_a);

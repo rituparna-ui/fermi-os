@@ -23,6 +23,7 @@ mod panic;
 mod pci;
 mod print;
 mod sched;
+mod shell;
 mod strings;
 mod syscall;
 mod sync;
@@ -201,9 +202,9 @@ pub extern "C" fn kernel_main() -> ! {
 
     // Scheduler + a couple of preemptive EL1 demo tasks.
     sched::init();
-    sched::create_task("task_a", task_a);
     sched::create_task("netd", netd);
     sched::create_user_task("user1");
+    sched::create_task("shell", shell::shell_task);
     exception::timer::start(exception::timer::TIMER_INTERVAL_MS);
     kprintln!("[boot] scheduler running; idle loop reaping dead tasks");
 

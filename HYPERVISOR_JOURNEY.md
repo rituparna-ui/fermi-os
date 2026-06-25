@@ -324,10 +324,16 @@ qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on -m 8G \
   0x40-byte ARP reply from the slirp gateway (10.0.2.2), a full guest-driven
   round-trip.
 
-## 12. What's next (not yet built)
+- **M21 — dynamic VM lifecycle (done):** `stage2_destroy()` walks and frees
+  every L2/L3 table page + the L1 root (and TLBIs the VMID); `hyp_run_vm_lifecycle`
+  creates/runs/destroys a VM repeatedly and asserts the PMM free-page count
+  returns to baseline. Verified leak-free over 4 cycles (each re-uses the same
+  recycled physical addresses).
 
-- A non-FermiOS guest (needs a DTB + broader device emulation) and dynamic VM
-  lifecycle (create/destroy at runtime).
+## 13. What's next (not yet built)
+
+- A non-FermiOS guest (needs a DTB + broader device-tree-driven emulation) —
+  the largest remaining unknown.
 
 ---
 

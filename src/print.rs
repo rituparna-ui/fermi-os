@@ -6,6 +6,11 @@
 //! machinery. This is brought in early because every subsystem logs through it.
 
 use core::fmt::{self, Write};
+use crate::sync::SpinLock;
+
+// Serializes formatted output across cores. IRQs are masked while held to
+// avoid same-core re-entrant deadlock (e.g. a fault printing mid-print).
+static PRINT_LOCK: SpinLock<()> = SpinLock::new(());
 
 pub struct Uart;
 
@@ -18,8 +23,19 @@ impl Write for Uart {
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    // Single-core; UART FIFO writes are inherently serialized by the busy-wait.
-    let _ = Uart.write_fmt(args);
+    // Save + mask IRQs so an interrupt on this core can't re-enter and
+    // deadlock on the lock; then serialize across cores.
+    let daif: u64;
+    unsafe { core::arch::asm!("mrs {}, daif", out(reg) daif) };
+    unsafe { core::arch::asm!("msr daifset, #2") };
+    {
+        let _g = PRINT_LOCK.lock();
+        let _ = Uart.write_fmt(args);
+    }
+    // Restore IRQ mask state (DAIF.I is bit 7).
+    if daif & (1 << 7) == 0 {
+        unsafe { core::arch::asm!("msr daifclr, #2") };
+    }
 }
 
 #[macro_export]
@@ -29,9 +45,10 @@ macro_rules! kprint {
 
 #[macro_export]
 macro_rules! kprintln {
-    () => ($crate::uart::putc(b'\n'));
+    () => ($crate::print::_print(format_args!("\n")));
     ($($arg:tt)*) => ({
-        $crate::print::_print(format_args!($($arg)*));
-        $crate::uart::putc(b'\n');
+        // Fold the newline into a single locked _print so a full line is
+        // emitted atomically (important once multiple cores print).
+        $crate::print::_print(format_args!("{}\n", format_args!($($arg)*)));
     });
 }

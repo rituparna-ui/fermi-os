@@ -66,6 +66,15 @@ void early_init() {
   uart_printf("[BOOT]   HVC_VM_INFO  -> %u hypercalls served\n",
               hvc_call(HVC_VM_INFO, 0, 0, 0));
 
+  /* Isolation probe: ask the hypervisor where its private memory lives, then
+   * deliberately try to read it. Stage-2 must block this — the read should
+   * trap to EL2 and come back poisoned (0) rather than leaking hyp state. */
+  uint64_t hyp_base = hvc_call(HVC_HYP_BASE, 0, 0, 0);
+  uart_printf("[BOOT] poking hypervisor memory at %x (must be blocked)...\n",
+              hyp_base);
+  volatile uint64_t leaked = *(volatile uint64_t *)hyp_base;
+  uart_printf("[BOOT]   read back %x (0 => stage-2 isolation held)\n", leaked);
+
   exceptions_init();
 
   pmm_init(MEM_START, MEM_SIZE);

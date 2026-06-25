@@ -19,6 +19,7 @@
 #define HVC_PING 2    /* (val in x1) -> val + 1 ; liveness / echo            */
 #define HVC_VM_INFO 3 /* () -> number of hypercalls serviced for this vCPU    */
 #define HVC_YIELD 4   /* () -> 0 ; cooperative yield (stub until M5)          */
+#define HVC_HYP_BASE 5 /* () -> base IPA of the hypervisor-private region     */
 
 #define HYP_ABI_VERSION 0x00010000ULL      /* 1.0 */
 #define HVC_ERR_BADCALL ((uint64_t)-1)     /* unknown function ID */

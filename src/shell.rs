@@ -157,6 +157,65 @@ fn cmd_cat(path: &str) {
     vfs::fd_table_destroy(t);
 }
 
+fn line_has(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > hay.len() {
+        return false;
+    }
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+fn cmd_grep(pattern: &str, path: &str) {
+    if vfs::resolve(path).is_null() {
+        kprintln!("grep: {}: not found", path);
+        return;
+    }
+    let t = vfs::fd_table_create();
+    let fd = vfs::fd_open(t, path);
+    let needle = pattern.as_bytes();
+    let mut matches = 0u32;
+    if fd >= 0 {
+        let mut b = [0u8; 256];
+        let mut line = [0u8; 1024];
+        let mut ll = 0usize;
+        let mut emit = |line: &[u8]| {
+            if line_has(line, needle) {
+                for &c in line {
+                    uart::putc(c);
+                }
+                uart::putc(b'\n');
+                return true;
+            }
+            false
+        };
+        loop {
+            let n = vfs::fd_read(t, fd, &mut b);
+            if n <= 0 {
+                break;
+            }
+            for &c in &b[..n as usize] {
+                if c == b'\n' {
+                    if emit(&line[..ll]) {
+                        matches += 1;
+                    }
+                    ll = 0;
+                } else if ll < line.len() {
+                    line[ll] = c;
+                    ll += 1;
+                }
+            }
+        }
+        if ll > 0 && emit(&line[..ll]) {
+            matches += 1;
+        }
+        vfs::fd_close(t, fd);
+    }
+    vfs::fd_table_destroy(t);
+    kprintln!("grep: {} matching line(s)", matches);
+}
+
 fn cmd_free() {
     let total = pmm::total_pages();
     let used = pmm::used_pages();
@@ -397,6 +456,7 @@ fn dispatch(line: &str) {
         None => return,
     };
     let arg1 = parts.next().unwrap_or("");
+    let arg2 = parts.next().unwrap_or("");
     match cmd {
         "help" => {
             kprintln!("builtins: help uptime version ps top free meminfo ifconfig irqs");
@@ -539,6 +599,19 @@ fn dispatch(line: &str) {
                 kprintln!("usage: mv <oldpath> <newpath>");
             } else if vfs::rename(rest[1], rest[2]) {
                 kprintln!("renamed {} -> {}", rest[1], rest[2]);
+}
+}
+        "grep" => {
+            if arg1.is_empty() || arg2.is_empty() {
+                kprintln!("usage: grep <pattern> <path>");
+            } else {
+                cmd_grep(arg1, arg2);
+            }
+        }
+        "ping" => {
+            let ttl = net::ping(1);
+            if ttl >= 0 {
+                kprintln!("reply from gateway ttl={}", ttl);
             } else {
                 kprintln!("mv: failed (missing source, dest exists, or not a FAT32 file)");
             }

@@ -31,6 +31,7 @@ mod pci;
 mod print;
 mod sched;
 mod shell;
+mod smp;
 mod strings;
 mod syscall;
 mod sync;
@@ -126,6 +127,7 @@ pub extern "C" fn kernel_main() -> ! {
     // path's wfi-deadline waits make progress (timer ticks + net IRQs).
     sched::init();
     exception::timer::start(exception::timer::TIMER_INTERVAL_MS);
+    smp::bringup();
 
     // PCI enumeration + VirtIO RNG.
     pci::enumerate_bus();

@@ -7,4 +7,4 @@ rustflags = [
     "-C", "link-arg=--no-rosegment",
     "-C", "force-frame-pointers=yes",
 ]
-runner = "qemu-system-aarch64 -machine virt,gic-version=3 -cpu cortex-a72 -m 8G -nographic -device virtio-rng-pci,disable-legacy=on -drive file=build/disk.img,if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0,disable-legacy=on -netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on -chardev file,id=vc,path=build/vcons.txt -device virtio-serial-pci,disable-legacy=on -device virtconsole,chardev=vc -device virtio-balloon-pci,disable-legacy=on -kernel"
+runner = "qemu-system-aarch64 -machine virt,gic-version=3 -cpu cortex-a72 -smp 2 -m 8G -nographic -device virtio-rng-pci,disable-legacy=on -drive file=build/disk.img,if=none,id=hd0,format=raw -device virtio-blk-pci,drive=hd0,disable-legacy=on -netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on -chardev file,id=vc,path=build/vcons.txt -device virtio-serial-pci,disable-legacy=on -device virtconsole,chardev=vc -device virtio-balloon-pci,disable-legacy=on -kernel"

@@ -123,6 +123,9 @@ release, and runs the smoke-test against both on every push/PR.
   format), the concurrency model, and the test matrix.
 - [`docs/PORT-NOTES.md`](docs/PORT-NOTES.md) — the C→Rust port plan, build order,
   and risk register.
+- [`docs/PROJECT-JOURNAL.md`](docs/PROJECT-JOURNAL.md) — the full record of the
+  C→Rust port: strategy, every phase, decisions and rationale, bugs found, and
+  the hardening/feature work that followed.
 
 ## Debugging
 

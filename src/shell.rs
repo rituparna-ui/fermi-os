@@ -133,6 +133,15 @@ fn dispatch(line: &str) {
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
         "ps" => kprint!("{}", sched::render_tasks()),
         "free" | "meminfo" => cmd_free(),
+        "df" => {
+            let cap = crate::virtio::blk::capacity_sectors();
+            kprintln!("/dev/blk : {} sectors ({} MiB)", cap, cap / 2048);
+            let (tot, free, bpc) = crate::fs::fat32::usage();
+            let used = tot - free;
+            kprintln!("/mnt/fat32: {} KiB total, {} KiB used, {} KiB free (clusters {}/{}, {}B each)",
+                      tot as u64 * bpc as u64 / 1024, used as u64 * bpc as u64 / 1024,
+                      free as u64 * bpc as u64 / 1024, used, tot, bpc);
+        }
         "ifconfig" => kprint!("{}", net::render_info()),
         "irqs" => kprint!("{}", gic::render_interrupts()),
         "ls" => {

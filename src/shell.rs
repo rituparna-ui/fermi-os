@@ -183,6 +183,13 @@ fn dispatch(line: &str) {
                 kprintln!("ping: no reply");
             }
         }
+        "ntp" => {
+            let host = if arg1.is_empty() { "time.google.com" } else { arg1 };
+            match net::ntp_query(host) {
+                Some(t) => kprintln!("{}: network time = {} (unix epoch seconds)", host, t),
+                None => kprintln!("ntp: no response from {}", host),
+            }
+        }
         "resolve" => {
             if arg1.is_empty() {
                 kprintln!("usage: resolve <hostname>");

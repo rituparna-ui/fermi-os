@@ -614,6 +614,47 @@ pub fn resolve(host: &str) -> Option<[u8; 4]> {
     None
 }
 
+/// Minimal SNTP client: query `host` (UDP 123) and return the Unix epoch
+/// seconds from the server's transmit timestamp, or None.
+pub fn ntp_query(host: &str) -> Option<u64> {
+    let ip = resolve(host)?;
+    if !ensure_gateway_mac() {
+        return None;
+    }
+    let gw = state().gateway_mac;
+    let src_ip = state().my_ip;
+    // 48-byte NTP request: LI=0, VN=4, Mode=3 (client) -> 0x23.
+    let mut pkt = [0u8; 48];
+    pkt[0] = 0x23;
+    let mut frame = [0u8; 200];
+    let flen = udp_build(&mut frame, &gw, &src_ip, &ip, 0x4e54, 123, &pkt);
+    net::tx(&frame[..flen]);
+
+    let mut rx = [0u8; 600];
+    let dl = timer::get_ticks() + 700;
+    while timer::get_ticks() < dl {
+        let n = net::rx_poll(&mut rx) as usize;
+        if n >= 14 + 20 + 8 + 48 && rx[12] == 0x08 && rx[13] == 0x00 {
+            let ip4 = &rx[14..];
+            if ip4[9] == 17 {
+                let ihl = (ip4[0] & 0xF) as usize * 4;
+                let udp = &ip4[ihl..];
+                let sport = ((udp[0] as u16) << 8) | udp[1] as u16;
+                if sport == 123 {
+                    let ntp = &udp[8..];
+                    if ntp.len() >= 44 {
+                        // Transmit timestamp seconds at offset 40 (NTP epoch 1900).
+                        let secs = u32::from_be_bytes([ntp[40], ntp[41], ntp[42], ntp[43]]) as u64;
+                        return Some(secs.wrapping_sub(2_208_988_800));
+                    }
+                }
+            }
+        }
+        idle_wait();
+    }
+    None
+}
+
 /// SYS_NET_PING backend: ensure gateway MAC (ARP), send one ping, wait for the
 /// echo reply, and return its TTL (or -1).
 pub fn ping(seq: u16) -> i64 {

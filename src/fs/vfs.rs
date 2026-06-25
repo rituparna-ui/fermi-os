@@ -34,6 +34,7 @@ pub enum ProcKind {
     Netinfo,
     Cmdline,
     Version,
+    Cpuinfo,
 }
 
 #[derive(Clone, Copy, PartialEq)]

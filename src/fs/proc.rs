@@ -45,6 +45,9 @@ pub fn generate(kind: ProcKind) -> String {
             let _ = writeln!(s, "Fermi OS (Rust) — bare-metal aarch64 kernel");
             let _ = writeln!(s, "rustc {}, target aarch64-unknown-none", "1.85.0");
         }
+        ProcKind::Cpuinfo => {
+            s = crate::cpu::render_info();
+        }
     }
     s
 }
@@ -61,6 +64,7 @@ pub fn mount() {
         ("netinfo", ProcKind::Netinfo),
         ("cmdline", ProcKind::Cmdline),
         ("version", ProcKind::Version),
+        ("cpuinfo", ProcKind::Cpuinfo),
     ];
     for (name, kind) in files {
         let n = vfs::create_node(proc, name, VnodeType::Reg);

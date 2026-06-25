@@ -20,9 +20,11 @@ use crate::{kprintln, mrs, msr};
 #[allow(unused_imports)]
 pub use crate::mm::consts::{USER_STACK_PAGES, USER_STACK_TOP, USER_TEXT_BASE};
 
-/// Boot-time identity tables. Set once by `init`, read by the self-tests.
-static mut L0_TABLE_LO: u64 = 0;
-static mut L0_TABLE_HI: u64 = 0;
+/// Boot-time identity table physical bases. Set once by `init` (kept for
+/// diagnostics / future TTBR switches). SyncUnsafeCell over `static mut`.
+use crate::klib::sync::SyncUnsafeCell;
+static L0_TABLE_LO: SyncUnsafeCell<u64> = SyncUnsafeCell::new(0);
+static L0_TABLE_HI: SyncUnsafeCell<u64> = SyncUnsafeCell::new(0);
 
 /// Allocate a zeroed 4 KiB page-table page from the PMM. Returns its physical
 /// address (0 on failure).
@@ -175,8 +177,9 @@ pub fn init() -> u64 {
         uart.errorln("[MMU] Failed to build TTBR0 tables");
         return 0;
     }
+    // SAFETY (single-core): boot-time init, written once.
     unsafe {
-        L0_TABLE_LO = l0_lo;
+        *L0_TABLE_LO.get() = l0_lo;
     }
     uart.println("[MMU] TTBR0 lower half tables build");
 
@@ -187,8 +190,9 @@ pub fn init() -> u64 {
         uart.errorln("[MMU] Failed to build TTBR1 tables");
         return 0;
     }
+    // SAFETY (single-core): boot-time init, written once.
     unsafe {
-        L0_TABLE_HI = l0_hi;
+        *L0_TABLE_HI.get() = l0_hi;
     }
     uart.println("[MMU] TTBR1 upper half tables build");
 

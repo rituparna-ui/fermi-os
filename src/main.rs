@@ -14,6 +14,7 @@ use core::panic::PanicInfo;
 global_asm!(include_str!("boot.S"));
 
 mod cpu;
+mod elf;
 mod exception;
 mod fs;
 mod mm;
@@ -205,6 +206,26 @@ pub extern "C" fn kernel_main() -> ! {
     sched::create_task("netd", netd);
     sched::create_user_task("user1");
     sched::create_task("shell", shell::shell_task);
+    // Load an ELF binary from FAT32 and run it at EL0 (milestone 17).
+    {
+        use alloc::vec::Vec;
+        let t = fs::vfs::fd_table_create();
+        let fd = fs::vfs::fd_open(t, "/mnt/fat32/HELLO.ELF");
+        if fd >= 0 {
+            let mut data: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 512];
+            loop {
+                let n = fs::vfs::fd_read(t, fd, &mut chunk);
+                if n <= 0 { break; }
+                data.extend_from_slice(&chunk[..n as usize]);
+            }
+            fs::vfs::fd_close(t, fd);
+            kprintln!("[boot] loaded /mnt/fat32/HELLO.ELF ({} bytes)", data.len());
+            sched::spawn_elf("hello", &data);
+        }
+        fs::vfs::fd_table_destroy(t);
+    }
+
     exception::timer::start(exception::timer::TIMER_INTERVAL_MS);
     kprintln!("[boot] scheduler running; idle loop reaping dead tasks");
 

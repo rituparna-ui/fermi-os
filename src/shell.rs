@@ -92,6 +92,29 @@ fn cmd_free() {
     );
 }
 
+fn cmd_run(path: &str) {
+    let node = vfs::resolve(path);
+    if node.is_null() {
+        kprintln!("run: {}: not found", path);
+        return;
+    }
+    let t = vfs::fd_table_create();
+    let fd = vfs::fd_open(t, path);
+    if fd >= 0 {
+        let mut data: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = vfs::fd_read(t, fd, &mut chunk);
+            if n <= 0 { break; }
+            data.extend_from_slice(&chunk[..n as usize]);
+        }
+        vfs::fd_close(t, fd);
+        let pid = sched::spawn_elf("user", &data);
+        kprintln!("run: spawned pid {}", pid);
+    }
+    vfs::fd_table_destroy(t);
+}
+
 fn dispatch(line: &str) {
     let mut parts = line.split_whitespace();
     let cmd = match parts.next() {
@@ -104,7 +127,7 @@ fn dispatch(line: &str) {
             kprintln!("builtins: help uptime version ps free meminfo ifconfig irqs");
             kprintln!("          cat <path> ping sleep <ms> kill <pid> echo <text>");
             kprintln!("          balloon <inflate|deflate|status> [n] vlog <text> clear");
-            kprintln!("          cpuinfo reboot");
+            kprintln!("          run <elf-path> cpuinfo reboot");
         }
         "uptime" => kprintln!("up {} ms ({} s)", timer::uptime_ms(), timer::uptime_seconds()),
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
@@ -167,6 +190,13 @@ fn dispatch(line: &str) {
                 virtio::console::send(rest[1].as_bytes());
                 virtio::console::send(b"\n");
                 kprintln!("logged to /dev/vcons");
+            }
+        }
+        "run" => {
+            if arg1.is_empty() {
+                kprintln!("usage: run <elf-path>");
+            } else {
+                cmd_run(arg1);
             }
         }
         "cpuinfo" => {

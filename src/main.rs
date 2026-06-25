@@ -183,6 +183,26 @@ pub extern "C" fn kmain() -> ! {
         } else {
             kprintln!("[FAT32 TEST] HELLO.TXT not found (disk not formatted?)");
         }
+
+        // Write round-trip: create a file, then read it back through the VFS.
+        let payload = b"written by the Rust kernel\n";
+        if fs::fat32::create(b"RUSTW.TXT", payload) {
+            let fd = fs::vfs::fd_open(t, "/mnt/fat32/RUSTW.TXT");
+            if fd >= 0 {
+                let mut buf = [0u8; 64];
+                let n = fs::vfs::fd_read(t, fd, buf.as_mut_ptr(), buf.len());
+                let ok = n as usize == payload.len() && &buf[..n as usize] == payload;
+                kprintln!(
+                    "[FAT32 TEST] create+read RUSTW.TXT round-trip: {}",
+                    if ok { "PASS" } else { "FAIL" }
+                );
+                fs::vfs::fd_close(t, fd);
+            } else {
+                kprintln!("[FAT32 TEST] create+read RUSTW.TXT round-trip: FAIL (reopen)");
+            }
+        } else {
+            kprintln!("[FAT32 TEST] create RUSTW.TXT FAILED");
+        }
         fs::vfs::fd_table_destroy(t);
     }
 

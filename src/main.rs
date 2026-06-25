@@ -17,6 +17,7 @@ mod cpu;
 mod exception;
 mod mm;
 mod mmio;
+mod panic;
 mod print;
 mod sync;
 mod uart;
@@ -77,10 +78,11 @@ pub extern "C" fn rust_main() -> ! {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
     uart::putc(b'\n');
-    uart::errorln("KERNEL PANIC");
-    loop {
-        unsafe { core::arch::asm!("wfe") };
+    if let Some(loc) = info.location() {
+        kprintln!("[panic] at {}:{}", loc.file(), loc.line());
     }
+    kprintln!("[panic] {}", info.message());
+    panic::kernel_panic("Rust panic");
 }

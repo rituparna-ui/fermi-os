@@ -197,6 +197,7 @@ fn dispatch(line: &str) {
                 kprintln!("secondary not online (-smp 2)");
             }
         }
+        "date" => kprintln!("{}", crate::rtc::format_now()),
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
         "smptest" => {
             let (c0, c1, s0, s1, enq, rem) = crate::smp::wq_stats();

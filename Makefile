@@ -20,7 +20,7 @@ C_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.c" -p
 
 # The HYPERVISOR image sources (EL2). Exclude the standalone guest subdirs —
 # those are built separately to flat blobs, not linked into the hyp.
-HYP_GUEST_DIRS := $(HYP_DIR)/guest2 $(HYP_DIR)/ipc $(HYP_DIR)/dom0 $(HYP_DIR)/vmtgt $(HYP_DIR)/crasher
+HYP_GUEST_DIRS := $(HYP_DIR)/guest2 $(HYP_DIR)/ipc $(HYP_DIR)/dom0 $(HYP_DIR)/vmtgt $(HYP_DIR)/crasher $(HYP_DIR)/hangguest
 HYP_PRUNE := $(foreach d,$(HYP_GUEST_DIRS),-path "$(d)" -o)
 HYP_S_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.S" -print)
 HYP_C_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.c" -print)
@@ -185,6 +185,18 @@ $(CRASHER_BIN): $(HYP_DIR)/crasher/crasher.S $(HYP_DIR)/crasher/linker_crasher.l
 	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/crasher.elf $@
 
 $(BUILD_DIR)/hyp/crasher_blob.o: $(CRASHER_BIN)
+
+# hangguest: livelocks (no fault) to demonstrate the liveness watchdog.
+HANG_BIN := $(BUILD_DIR)/hangguest.bin
+$(HANG_BIN): $(HYP_DIR)/hangguest/hangguest.S $(HYP_DIR)/hangguest/linker_hang.ld
+	@echo "HANGGUEST $@"
+	@mkdir -p $(dir $@)
+	@$(CC) -ffreestanding -nostdlib -nostartfiles -fno-pic \
+		-Wl,-T,$(HYP_DIR)/hangguest/linker_hang.ld -Wl,--build-id=none \
+		-o $(BUILD_DIR)/hangguest.elf $(HYP_DIR)/hangguest/hangguest.S
+	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/hangguest.elf $@
+
+$(BUILD_DIR)/hyp/hangguest_blob.o: $(HANG_BIN)
 
 # Hypervisor (EL2) — separate image, its own linker script.
 $(HYP_TARGET): $(HYP_OBJECTS)

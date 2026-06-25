@@ -17,7 +17,7 @@
  * so the same guest IPA maps to different host PAs — true memory isolation.
  * ------------------------------------------------------------------------- */
 
-#define MAX_VCPUS 7
+#define MAX_VCPUS 8
 
 static vcpu_t vcpus[MAX_VCPUS];
 static int    nr_vcpus;
@@ -28,6 +28,7 @@ extern void vcpu_first_entry(vcpu_gp_t *gp) __attribute__((noreturn));
 
 /* Forward decls (definitions appear later in this file). */
 static vcpu_t *pick_next(vcpu_t *cur);
+static uint64_t read_cntpct(void);
 static void switch_to(vcpu_t *next, hyp_trap_frame_t *f);
 static void vcpu_load(vcpu_t *v);
 
@@ -108,6 +109,39 @@ void vcpu_fault_isolate(hyp_trap_frame_t *f) {
   hyp_puthex(VCPU_FAULT_MAX);
   hyp_puts(")\n");
   vcpu_reset(v, f);
+}
+
+void vcpu_wdog_arm(uint64_t period) {
+  cur_vcpu->wdog_period = period;
+  if (period == 0) {
+    cur_vcpu->wdog_deadline = 0; /* disarmed */
+  } else {
+    cur_vcpu->wdog_deadline = read_cntpct() + period;
+  }
+}
+
+void vcpu_check_watchdogs(hyp_trap_frame_t *f) {
+  uint64_t now = read_cntpct();
+  for (int i = 0; i < nr_vcpus; i++) {
+    vcpu_t *v = &vcpus[i];
+    /* Only armed, live, non-paused VMs are watched. A paused VM legitimately
+     * isn't petting; a dead one is gone. */
+    if (v->wdog_period == 0 || v->dead || v->paused) {
+      continue;
+    }
+    if (now < v->wdog_deadline) {
+      continue; /* pet in time */
+    }
+    /* Watchdog expired: the guest hung without petting. Reboot it (and disarm
+     * the watchdog — the fresh guest re-arms if it wants). */
+    v->wdog_expiries++;
+    v->wdog_period = 0;
+    v->wdog_deadline = 0;
+    hyp_puts("[WDOG] VM '");
+    hyp_puts(v->name);
+    hyp_puts("' watchdog expired (hung) — rebooting\n");
+    vcpu_reset(v, (v == cur_vcpu) ? f : (hyp_trap_frame_t *)0);
+  }
 }
 
 vcpu_t *vcpu_by_id(int id) {
@@ -442,6 +476,11 @@ int vcpu_wake_expired(void) {
 /* Periodic scheduler tick (CNTHP slice elapsed): round-robin to the next
  * runnable guest and size the new slice by THAT guest's weight. */
 void vcpu_sched_tick(hyp_trap_frame_t *f) {
+  /* Liveness check first: reboot any VM whose watchdog expired (hung). For a
+   * non-current expired VM this just resets its struct (takes effect when it is
+   * next loaded); for the current one it reloads HW + rewrites f in place. */
+  vcpu_check_watchdogs(f);
+
   vcpu_t *next = pick_next(cur_vcpu);
   sched_arm_slice_for(next); /* weighted slice for whoever runs next */
   switch_to(next, f);

@@ -82,6 +82,10 @@ typedef struct hyp_trap_frame {
 #define HVC_FERMI_LOG      0xFE110003ULL /* PV console: x1 = buf IPA, x2 = len.
                                           * Hyp prints it tagged with VM name.
                                           * Any VM may call (non-privileged). */
+#define HVC_FERMI_WDOG     0xFE110004ULL /* liveness watchdog: x1 = timeout in
+                                          * CNTPCT ticks (0 disarms). Arm/pet;
+                                          * if not re-called before the deadline
+                                          * the hyp reboots this VM. */
 
 /* VMCTL operations (in x1). Results return in registers — no shared buffer, so
  * no IPA translation is needed. */

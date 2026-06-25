@@ -252,6 +252,20 @@ dom0, and the IPC pair run on undisturbed.
 > otherwise it falls through and keeps emulating against the *rebooted* VM's
 > freshly-restored trap frame, corrupting it.
 
+### Liveness watchdog
+
+Fault isolation catches a guest that *crashes*; the watchdog catches one that
+*hangs* (livelocks without faulting). A guest arms a watchdog with
+`HVC_FERMI_WDOG` (x1 = timeout ticks) and must "pet" it (call again) before the
+deadline. On every scheduler tick the hypervisor checks all VMs
+(`vcpu_check_watchdogs`); any whose deadline has passed is **rebooted** (and its
+watchdog disarmed — the fresh guest re-arms if it wants). The `hangguest/` VM
+demonstrates it: it pets 3×, then spins forever in a tight loop with no pets or
+traps, and the hypervisor reboots it on the missed deadline — repeatedly — while
+every other VM (including the crasher's fault-isolation cycle) runs on. Together
+with fault isolation this gives the EL2 analog of OS process supervision:
+recovery from both crashes and hangs, per VM, without panicking the machine.
+
 ### VM snapshot / restore (checkpoint + rollback)
 
 dom0 can checkpoint a guest's *complete* state and roll it back later

@@ -140,6 +140,13 @@ typedef struct vcpu {
   uint32_t       fault_count; /* unhandled EL2 traps this VM has caused; after
                                * VCPU_FAULT_MAX the hypervisor stops rebooting
                                * it and powers it off (avoids a reset loop). */
+  /* Liveness watchdog: a guest arms it (HVC_FERMI_WDOG, x1=timeout ticks) and
+   * must "pet" it before the deadline; if it stops (hangs/livelocks without
+   * faulting), the scheduler reboots it. Catches hangs the way fault isolation
+   * catches crashes. wdog_period 0 = disarmed. */
+  uint64_t       wdog_period;   /* CNTPCT ticks between required pets (0 = off) */
+  uint64_t       wdog_deadline; /* absolute CNTPCT by which the next pet is due */
+  uint32_t       wdog_expiries; /* count of watchdog-triggered reboots */
 } vcpu_t;
 
 /* Reboot-on-fault budget: after this many unhandled traps, kill instead of
@@ -182,6 +189,16 @@ void vcpu_poweroff_current(hyp_trap_frame_t *f);
  * running. `f` is the faulting VM's live trap frame. Does not return to the
  * faulting instruction. */
 void vcpu_fault_isolate(hyp_trap_frame_t *f);
+
+/* Arm or pet the CURRENT VM's liveness watchdog (HVC_FERMI_WDOG). period == 0
+ * disarms it; otherwise (re)sets the deadline to now + period ticks. The guest
+ * must call this again before the deadline or the scheduler reboots it. */
+void vcpu_wdog_arm(uint64_t period);
+
+/* Called on each scheduler tick: reboot any VM whose armed watchdog deadline has
+ * passed (it hung without petting). If the CURRENT vCPU is the one that expired,
+ * `f` is rewritten so the vector exit erets into the rebooted guest. */
+void vcpu_check_watchdogs(hyp_trap_frame_t *f);
 
 /* Ring the doorbell from `from` to its configured peer: inject DOORBELL_INTID
  * into the peer (live List Register if it is current, saved state otherwise)

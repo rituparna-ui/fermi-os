@@ -159,6 +159,10 @@ static void handle_sync(uint64_t type, hyp_trap_frame_t *f) {
     } else if (f->regs[0] == HVC_FERMI_LOG) {
       /* PV console: print the guest's buffer tagged with its VM name. */
       f->regs[0] = (uint64_t)vcpu_pv_log(f->regs[1], f->regs[2]);
+    } else if (f->regs[0] == HVC_FERMI_WDOG) {
+      /* Arm/pet the liveness watchdog (x1 = timeout ticks, 0 = disarm). */
+      vcpu_wdog_arm(f->regs[1]);
+      f->regs[0] = 0;
     } else {
       handle_psci(f);
     }

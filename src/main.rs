@@ -150,6 +150,30 @@ pub extern "C" fn kmain() -> ! {
     fs::devices::register();
     fs::proc::init();
 
+    // Mount FAT32 from virtio-blk at /mnt/fat32.
+    if fs::fat32::mount() {
+        let mnt = fs::vfs::create_node(fs::vfs::root(), "mnt", fs::vfs::VnodeType::Dir);
+        fs::vfs::create_node(mnt, "fat32", fs::vfs::VnodeType::Dir);
+        fs::fat32::vfs_mount("/mnt/fat32");
+
+        // Smoke test: read /mnt/fat32/HELLO.TXT if present.
+        let t = fs::vfs::fd_table_create();
+        let fd = fs::vfs::fd_open(t, "/mnt/fat32/HELLO.TXT");
+        if fd >= 0 {
+            let mut buf = [0u8; 128];
+            let n = fs::vfs::fd_read(t, fd, buf.as_mut_ptr(), buf.len());
+            if n > 0 {
+                if let Ok(s) = core::str::from_utf8(&buf[..n as usize]) {
+                    kprintln!("[FAT32 TEST] /mnt/fat32/HELLO.TXT ({} bytes): {:?}", n, s);
+                }
+            }
+            fs::vfs::fd_close(t, fd);
+        } else {
+            kprintln!("[FAT32 TEST] HELLO.TXT not found (disk not formatted?)");
+        }
+        fs::vfs::fd_table_destroy(t);
+    }
+
     // /proc smoke test: read /proc/cpuinfo through the fd path.
     {
         let t = fs::vfs::fd_table_create();

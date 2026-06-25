@@ -11,9 +11,15 @@ KERNEL="${1:?usage: run.sh <kernel.elf>}"
 BUILD_DIR="$(dirname "$KERNEL")"
 DISK_IMG="${BUILD_DIR}/disk.img"
 
-# Create a small raw disk for virtio-blk if one doesn't exist.
+# Create a FAT32 disk for virtio-blk if one doesn't exist. The kernel mounts it
+# at /mnt/fat32 and reads HELLO.TXT.
 if [ ! -f "$DISK_IMG" ]; then
 	truncate -s 64M "$DISK_IMG"
+	if command -v mkfs.fat >/dev/null 2>&1 && command -v mcopy >/dev/null 2>&1; then
+		mkfs.fat -F 32 -n FERMI "$DISK_IMG" >/dev/null 2>&1
+		printf 'Hello from Fermi OS FAT32!\nThis is HELLO.TXT.\n' \
+			| MTOOLS_SKIP_CHECK=1 mcopy -i "$DISK_IMG" - ::/HELLO.TXT 2>/dev/null || true
+	fi
 fi
 
 QEMU_CPU=cortex-a72

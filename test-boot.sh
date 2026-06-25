@@ -8,7 +8,20 @@ KERNEL="target/aarch64-unknown-none/debug/kernel"
 DISK="/tmp/fermi_disk.img"
 VCONS="/tmp/fermi_vcons.txt"
 
-[ -f "$DISK" ] || truncate -s 64M "$DISK"
+# Build a FAT32 disk with a couple of test files if one doesn't exist (or if
+# REFORMAT=1). The FAT32 mount + file-read test in kmain expects HELLO.TXT.
+if [ ! -f "$DISK" ] || [ "${REFORMAT:-0}" = "1" ]; then
+	rm -f "$DISK"
+	truncate -s 64M "$DISK"
+	if command -v mkfs.fat >/dev/null 2>&1 && command -v mcopy >/dev/null 2>&1; then
+		mkfs.fat -F 32 -n FERMI "$DISK" >/dev/null 2>&1
+		printf 'Hello from Fermi OS FAT32!\nThis is HELLO.TXT.\n' \
+			| MTOOLS_SKIP_CHECK=1 mcopy -i "$DISK" - ::/HELLO.TXT
+		MTOOLS_SKIP_CHECK=1 mmd -i "$DISK" ::/SUBDIR 2>/dev/null || true
+		printf 'Inside a subdirectory.\n' \
+			| MTOOLS_SKIP_CHECK=1 mcopy -i "$DISK" - ::/SUBDIR/INFO.TXT 2>/dev/null || true
+	fi
+fi
 rm -f "$VCONS"
 
 timeout "$TIMEOUT" qemu-system-aarch64 \

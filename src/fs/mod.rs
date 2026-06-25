@@ -4,5 +4,6 @@
 #![allow(dead_code)]
 
 pub mod devices;
+pub mod fat32;
 pub mod proc;
 pub mod vfs;

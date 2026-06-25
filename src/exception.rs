@@ -12,6 +12,9 @@ use core::arch::global_asm;
 
 global_asm!(include_str!("exception/vector.S"));
 
+pub mod gic;
+pub mod timer;
+
 extern "C" {
     static vector_table: u8;
 }
@@ -197,9 +200,19 @@ pub extern "C" fn exception_dispatch(type_: u64, frame: *mut TrapFrame) {
             }
         },
         EXCEPTION_IRQ => {
-            // GIC/timer/scheduler routing wired at the GIC milestone.
-            dump_trap_frame(type_, frame);
-            kernel_panic("Unexpected IRQ (GIC not yet initialised)");
+            let intid = gic::ack_irq();
+            if intid == gic::GIC_INTID_NO_PENDING {
+                return;
+            }
+            gic::count_irq(intid as u32);
+            if intid as u32 == timer::TIMER_PPI_INTID {
+                timer::handle_irq();
+            } else {
+                kprintln!("[IRQ] INTID {} (not implemented)", intid);
+            }
+            gic::end_irq(intid);
+            // schedule() after EOI is wired at the scheduler milestone.
+            crate::schedule_hook();
         }
         EXCEPTION_FIQ => {
             dump_trap_frame(type_, frame);

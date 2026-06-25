@@ -22,6 +22,12 @@ mod print;
 mod sync;
 mod uart;
 
+/// Timer-tick hook to wake sleeping tasks. No-op until the scheduler lands.
+pub fn sched_wake_sleepers_hook() {}
+
+/// Post-IRQ scheduling hook. No-op until the scheduler lands.
+pub fn schedule_hook() {}
+
 /// Kernel entry point, called from `boot.S` after low-level setup.
 #[no_mangle]
 pub extern "C" fn rust_main() -> ! {
@@ -67,6 +73,12 @@ pub extern "C" fn rust_main() -> ! {
         for i in 0..8 { v.push(i * i); }
         kprintln!("[boot] alloc::Vec works: {:?}", v.as_slice());
     }
+
+    // GICv3 + generic timer (10ms tick). Enables IRQs.
+    exception::gic::init();
+    exception::timer::init();
+    exception::timer::start(exception::timer::TIMER_INTERVAL_MS);
+    kprintln!("[boot] timer running; waiting for ticks (1 line/sec)...");
     uart::puts("UART base: ");
     uart::puthex(uart::UART_BASE as u64);
     uart::putc(b'\n');

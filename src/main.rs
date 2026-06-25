@@ -40,6 +40,7 @@ mod uart;
 
 /// Timer-tick hook to wake sleeping tasks.
 pub fn sched_wake_sleepers_hook() {
+    sched::account_tick();
     sched::wake_sleepers();
 }
 

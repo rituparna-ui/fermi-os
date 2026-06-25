@@ -47,6 +47,7 @@ pub struct Task {
     pub exec_count: u32,
     pub stack_grown: [u64; 16],  // demand-paged stack pages (for reap)
     pub stack_grown_count: u32,
+    pub ticks: u64,              // timer ticks accumulated while RUNNING
 }
 
 extern "C" {
@@ -86,6 +87,7 @@ static SCHED: Racy<Sched> = Racy::new(Sched {
         exec_count: 0,
         stack_grown: [0; 16],
         stack_grown_count: 0,
+        ticks: 0,
     },
     current: core::ptr::null_mut(),
     next_pid: 0,
@@ -649,6 +651,14 @@ pub fn sleep_ms(ms: u64) {
     schedule();
 }
 
+/// Charge one timer tick to the currently-running task (CPU-time accounting).
+pub fn account_tick() {
+    let s = unsafe { SCHED.get() };
+    if !s.current.is_null() {
+        unsafe { (*s.current).ticks += 1 };
+    }
+}
+
 pub fn wake_sleepers() {
     let s = unsafe { SCHED.get() };
     if s.current.is_null() {
@@ -713,7 +723,7 @@ pub fn render_tasks() -> alloc::string::String {
     use core::fmt::Write;
     let s = unsafe { SCHED.get() };
     let mut out = alloc::string::String::new();
-    let _ = writeln!(out, "PID  STATE     NAME");
+    let _ = writeln!(out, "PID  STATE     TICKS    NAME");
     unsafe {
         let idle = &mut s.idle as *mut Task;
         let mut t = idle;
@@ -724,7 +734,7 @@ pub fn render_tasks() -> alloc::string::String {
                 TASK_SLEEPING => "SLEEPING",
                 _ => "DEAD",
             };
-            let _ = writeln!(out, "{:<4} {:<9} {}", (*t).pid, state, name_str(&*t));
+            let _ = writeln!(out, "{:<4} {:<9} {:<8} {}", (*t).pid, state, (*t).ticks, name_str(&*t));
             t = (*t).next as *mut Task;
             if t == idle {
                 break;

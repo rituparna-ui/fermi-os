@@ -59,3 +59,19 @@ void hyp_dcache_clean_range(uint64_t start, uint64_t len) {
   }
   __asm__ __volatile__("dsb ish" ::: "memory");
 }
+
+void hyp_dcache_inval_range(uint64_t start, uint64_t len) {
+  /* Clean+invalidate by VA to PoC ('dc civac') over the range. Used before EL2
+   * (MMU off => Normal Non-cacheable) READS memory the guest wrote as Normal-WB
+   * cacheable — without this, EL2 would not snoop the guest's dirty cache lines
+   * and could read stale data (e.g. a virtio avail ring / descriptor table).
+   * civac (not plain ivac) so a line EL2 itself dirtied is flushed first, never
+   * discarded. Same 64-byte stride as the clean helper. */
+  uint64_t line = 64;
+  uint64_t addr = start & ~(line - 1);
+  uint64_t end = start + len;
+  for (; addr < end; addr += line) {
+    __asm__ __volatile__("dc civac, %0" ::"r"(addr) : "memory");
+  }
+  __asm__ __volatile__("dsb ish" ::: "memory");
+}

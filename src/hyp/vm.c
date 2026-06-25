@@ -3,6 +3,7 @@
 #include "hyp_gic.h"
 #include "timer/vtimer.h"
 #include "vgic/vgic.h"
+#include "virtio/virtio_rng.h"
 #include "vcpu.h"
 #include <stdint.h>
 
@@ -97,7 +98,10 @@ static uint64_t fault_ipa(hyp_trap_frame_t *f) {
 static void handle_data_abort(uint64_t type, hyp_trap_frame_t *f) {
   uint64_t ipa = fault_ipa(f);
 
-  if (!vgic_mmio_is_target(ipa)) {
+  /* Route to whichever emulated MMIO device owns this IPA window. */
+  int is_vgic = vgic_mmio_is_target(ipa);
+  int is_virtio = virtio_mmio_is_target(ipa);
+  if (!is_vgic && !is_virtio) {
     hyp_puts("\n[HYP] stage-2 data abort outside emulated MMIO, IPA=");
     hyp_puthex(ipa);
     hyp_putc('\n');
@@ -109,9 +113,9 @@ static void handle_data_abort(uint64_t type, hyp_trap_frame_t *f) {
   uint64_t esr = f->esr;
   if (!ISS_ISV(esr)) {
     /* No decoded syndrome — would require software instruction decode at
-     * ELR_EL2. The guest's gic.c uses plain 32-bit str/ldr which QEMU decodes,
-     * so we expect ISV=1; surface loudly if not. */
-    hyp_puts("\n[HYP] GIC MMIO abort with ISV=0 (need insn decode), IPA=");
+     * ELR_EL2. The guests use plain 32-bit str/ldr which QEMU decodes, so we
+     * expect ISV=1; surface loudly if not. */
+    hyp_puts("\n[HYP] MMIO abort with ISV=0 (need insn decode), IPA=");
     hyp_puthex(ipa);
     hyp_putc('\n');
     hyp_fatal_trap(type, f);
@@ -127,9 +131,11 @@ static void handle_data_abort(uint64_t type, hyp_trap_frame_t *f) {
   if (is_write) {
     /* xzr (reg 31) reads as 0. */
     val = (srt == 31) ? 0 : f->regs[srt];
-    vgic_mmio_emulate(ipa, 1, &val, size_bytes);
+    if (is_virtio) virtio_mmio_emulate(ipa, 1, &val, size_bytes);
+    else           vgic_mmio_emulate(ipa, 1, &val, size_bytes);
   } else {
-    vgic_mmio_emulate(ipa, 0, &val, size_bytes);
+    if (is_virtio) virtio_mmio_emulate(ipa, 0, &val, size_bytes);
+    else           vgic_mmio_emulate(ipa, 0, &val, size_bytes);
     if (srt != 31) {
       /* SF=0 (32-bit) zero-extends into the 64-bit reg, which writing the
        * masked value already achieves. */

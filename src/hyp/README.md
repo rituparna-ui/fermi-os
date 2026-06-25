@@ -223,6 +223,33 @@ all HVC (management calls), and the event-driven IPC consumer is WFx-heavy with
 *zero* IRQ exits — its doorbells are hardware-delivered via List Registers and
 never trap to EL2, which is exactly what an exit counter should (not) record.
 
+### virtio-mmio device (standard paravirtual transport)
+
+Beyond the ad-hoc Fermi hypercalls, the hypervisor emulates a **standard
+virtio-mmio entropy (RNG) device** (modern transport, virtio 1.x, Version=2) at a
+fixed guest IPA window (`0x0A000000`, left stage-2-invalid so accesses trap, like
+the GIC). A guest discovers it via the real virtio register block
+(MagicValue/Version/DeviceID), runs the spec handshake
+(ACKNOWLEDGE→DRIVER→FEATURES_OK→DRIVER_OK), sets up a **split virtqueue**
+(descriptor table + avail ring + used ring) in its own RAM, and kicks via
+QueueNotify. The hyp (`virtio/virtio_rng.c`) walks the avail ring, fills each
+WRITE descriptor with PRNG bytes, posts a used-ring element, advances `used.idx`,
+and injects the device SPI (41). The `rngclient/` guest demonstrates it,
+receiving fresh random bytes each request. *Any* virtio-aware guest would drive
+this same interface — it is not Fermi-specific.
+
+Design-verified hazards that are load-bearing here:
+- **Every guest-supplied IPA** (the three ring bases + each `desc.addr`) is
+  bounds-checked via `vcpu_ipa_to_pa` before EL2 dereferences it — this is the
+  first interface where a guest hands EL2 bulk pointers, so it's the prime
+  VM-escape surface.
+- **Cache coherence across the EL2-MMU-off / cacheable-guest boundary**: a new
+  `hyp_dcache_inval_range` (`dc civac`) is issued before reading guest-written
+  rings; buffers and the used ring are cleaned (`dc cvac`) after writing, with
+  `used.idx` published strictly *after* the element + buffer stores (`dsb ish`).
+- **16-bit free-running `avail.idx`/`used.idx`** handled with wrapping
+  subtraction; ring indexed `% N`; descriptor chains bounded to `N` (DoS guard).
+
 ### Paravirtualized console (PV log)
 
 A guest can emit a log line through the hypervisor instead of poking the raw

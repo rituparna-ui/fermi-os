@@ -102,6 +102,8 @@ extern const uint8_t __crasher_blob_start[];
 extern const uint8_t __crasher_blob_end[];
 extern const uint8_t __hang_blob_start[];
 extern const uint8_t __hang_blob_end[];
+extern const uint8_t __rng_blob_start[];
+extern const uint8_t __rng_blob_end[];
 
 /* Guest RAM regions in the top reserved GiB (hyp is at 0x250000000, its pool
  * grows up from ~0x250100000). Each region is 2 MiB-aligned and well clear of
@@ -120,6 +122,8 @@ extern const uint8_t __hang_blob_end[];
 #define CRASH_RAM_SIZE      0x01000000ULL
 #define HANG_HOST_RAM_BASE  0x271000000ULL /* watchdog hangguest   16 MiB */
 #define HANG_RAM_SIZE       0x01000000ULL
+#define RNG_HOST_RAM_BASE   0x272000000ULL /* virtio-mmio rngclient 16 MiB */
+#define RNG_RAM_SIZE        0x01000000ULL
 
 /* Copy a flat blob to a host physical destination (EL2 MMU off) and make it
  * coherent for guest instruction fetch. Used at boot and on warm reset. */
@@ -168,6 +172,8 @@ void hyp_main(void) {
   hyp_copy_image(CRASH_HOST_RAM_BASE, __crasher_blob_start, crash_size);
   uint64_t hang_size = (uint64_t)(__hang_blob_end - __hang_blob_start);
   hyp_copy_image(HANG_HOST_RAM_BASE, __hang_blob_start, hang_size);
+  uint64_t rng_size = (uint64_t)(__rng_blob_end - __rng_blob_start);
+  hyp_copy_image(RNG_HOST_RAM_BASE, __rng_blob_start, rng_size);
   /* Zero the shared IPC page (its seqno starts at 0). */
   for (volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)IPC_SHARED_PA;
        p < (volatile uint64_t *)(uintptr_t)(IPC_SHARED_PA + 0x1000); p++) {
@@ -189,6 +195,7 @@ void hyp_main(void) {
   uint64_t vmtgt_l1 = s2_build_vm2(VMTGT_HOST_RAM_BASE, VMTGT_RAM_SIZE);
   uint64_t crash_l1 = s2_build_vm2(CRASH_HOST_RAM_BASE, CRASH_RAM_SIZE);
   uint64_t hang_l1 = s2_build_vm2(HANG_HOST_RAM_BASE, HANG_RAM_SIZE);
+  uint64_t rng_l1 = s2_build_vm2(RNG_HOST_RAM_BASE, RNG_RAM_SIZE);
 
   /* GIC + timer virtualization. */
   hyp_gic_init();
@@ -265,7 +272,13 @@ void hyp_main(void) {
                             __hang_blob_start, HANG_HOST_RAM_BASE, hang_size);
   hang->ram_size = HANG_RAM_SIZE;
 
-  hyp_puts("[HYP] 8 vCPUs created (incl. dom0, migration target, crasher, hangguest). Starting scheduler.\n");
+  /* rngclient (id 8, VMID 9): drives the emulated virtio-mmio entropy device.
+   * Its stage-2 leaves the virtio window 0x0A000000 invalid -> MMIO traps. */
+  vcpu_t *rngc = vcpu_alloc("rngclient", GUEST_ENTRY_IPA, s2_make_vttbr(rng_l1, 9), 0,
+                            __rng_blob_start, RNG_HOST_RAM_BASE, rng_size);
+  rngc->ram_size = RNG_RAM_SIZE;
+
+  hyp_puts("[HYP] 9 vCPUs created (incl. dom0, vmtgt, crasher, hangguest, rngclient). Starting scheduler.\n");
   hyp_puts("--------------------------------------------------\n\n");
 
   snapshot_init();    /* reserve the VM snapshot slot */

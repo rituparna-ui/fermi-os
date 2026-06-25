@@ -20,7 +20,7 @@ C_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.c" -p
 
 # The HYPERVISOR image sources (EL2). Exclude the standalone guest subdirs —
 # those are built separately to flat blobs, not linked into the hyp.
-HYP_GUEST_DIRS := $(HYP_DIR)/guest2 $(HYP_DIR)/ipc $(HYP_DIR)/dom0 $(HYP_DIR)/vmtgt $(HYP_DIR)/crasher $(HYP_DIR)/hangguest
+HYP_GUEST_DIRS := $(HYP_DIR)/guest2 $(HYP_DIR)/ipc $(HYP_DIR)/dom0 $(HYP_DIR)/vmtgt $(HYP_DIR)/crasher $(HYP_DIR)/hangguest $(HYP_DIR)/rngclient
 HYP_PRUNE := $(foreach d,$(HYP_GUEST_DIRS),-path "$(d)" -o)
 HYP_S_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.S" -print)
 HYP_C_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.c" -print)
@@ -197,6 +197,18 @@ $(HANG_BIN): $(HYP_DIR)/hangguest/hangguest.S $(HYP_DIR)/hangguest/linker_hang.l
 	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/hangguest.elf $@
 
 $(BUILD_DIR)/hyp/hangguest_blob.o: $(HANG_BIN)
+
+# rngclient: drives the emulated virtio-mmio entropy device.
+RNG_BIN := $(BUILD_DIR)/rngclient.bin
+$(RNG_BIN): $(HYP_DIR)/rngclient/rngclient.S $(HYP_DIR)/rngclient/linker_rng.ld
+	@echo "RNGCLIENT $@"
+	@mkdir -p $(dir $@)
+	@$(CC) -ffreestanding -nostdlib -nostartfiles -fno-pic \
+		-Wl,-T,$(HYP_DIR)/rngclient/linker_rng.ld -Wl,--build-id=none \
+		-o $(BUILD_DIR)/rngclient.elf $(HYP_DIR)/rngclient/rngclient.S
+	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/rngclient.elf $@
+
+$(BUILD_DIR)/hyp/rngclient_blob.o: $(RNG_BIN)
 
 # Hypervisor (EL2) — separate image, its own linker script.
 $(HYP_TARGET): $(HYP_OBJECTS)

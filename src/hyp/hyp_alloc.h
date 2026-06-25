@@ -44,4 +44,9 @@ void *hyp_alloc_aligned(uint64_t pages, uint64_t align);
  * QEMU (no cache model) but architecturally required on real hardware. */
 void hyp_dcache_clean_range(uint64_t start, uint64_t len);
 
+/* Clean+invalidate the data cache to PoC over [start, start+len). Use before
+ * EL2 (MMU off) READS memory a cacheable guest wrote, so stale lines aren't
+ * read. */
+void hyp_dcache_inval_range(uint64_t start, uint64_t len);
+
 #endif /* HYP_ALLOC_H */

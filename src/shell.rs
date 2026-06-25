@@ -258,12 +258,26 @@ fn dispatch(line: &str) {
             }
         }
         "ping" => {
-            let ttl = net::ping(1);
-            if ttl >= 0 {
-                kprintln!("reply from gateway ttl={}", ttl);
-            } else {
-                kprintln!("ping: no reply");
+            let count = parse_u64(arg1).unwrap_or(4).max(1);
+            let freq = timer::get_frequency().max(1);
+            let mut received = 0u64;
+            for seq in 1..=count {
+                let t0 = timer::get_count();
+                let ttl = net::ping(seq as u16);
+                let t1 = timer::get_count();
+                if ttl >= 0 {
+                    received += 1;
+                    let us = (t1.wrapping_sub(t0)) * 1_000_000 / freq;
+                    kprintln!("reply seq={} ttl={} time={} us", seq, ttl, us);
+                } else {
+                    kprintln!("seq={} timeout", seq);
+                }
+                if seq < count {
+                    sched::sleep_ms(200);
+                }
             }
+            let loss = (count - received) * 100 / count;
+            kprintln!("--- {} sent, {} received, {}% loss", count, received, loss);
         }
         "ntp" => {
             let host = if arg1.is_empty() { "time.google.com" } else { arg1 };

@@ -18,6 +18,7 @@ pub struct NetState {
     pub dhcp_acquired: bool,
     pub gateway_mac: [u8; 6],
     pub have_gateway_mac: bool,
+    pub arp_cache: [([u8; 4], [u8; 6], bool); 8],
 }
 
 static NET: Racy<NetState> = Racy::new(NetState {
@@ -29,6 +30,7 @@ static NET: Racy<NetState> = Racy::new(NetState {
     dhcp_acquired: false,
     gateway_mac: [0; 6],
     have_gateway_mac: false,
+    arp_cache: [([0;4],[0;6],false); 8],
 });
 
 fn state() -> &'static mut NetState {
@@ -65,9 +67,15 @@ fn inet_csum(data: &[u8]) -> u16 {
 
 /// Broadcast an ARP request for the gateway IP.
 pub fn send_arp_probe() -> i32 {
+    let target = state().gateway_ip;
+    send_arp_for(&target)
+}
+
+/// Broadcast an ARP request for an arbitrary target IPv4 address.
+pub fn send_arp_for(target_ip: &[u8; 4]) -> i32 {
     let nd = net::dev();
     if !nd.have_mac {
-        uart::errorln("[NET] arp_probe: no MAC");
+        uart::errorln("[NET] arp: no MAC");
         return -1;
     }
     let st = state();
@@ -91,9 +99,8 @@ pub fn send_arp_probe() -> i32 {
         a[14 + i] = st.my_ip[i];
     }
     for i in 0..4 {
-        a[24 + i] = st.gateway_ip[i];
+        a[24 + i] = target_ip[i];
     }
-    uart::println("[NET] Sending ARP probe for gateway");
     net::tx(&f)
 }
 
@@ -110,10 +117,23 @@ pub fn parse_arp_reply(frame: &[u8]) {
         return; // not a reply
     }
     let st = state();
-    for i in 0..6 {
-        st.gateway_mac[i] = a[8 + i];
+    // Sender protocol address (SPA) at a[14..18], sender HW (SHA) at a[8..14].
+    let mut sip = [0u8; 4];
+    sip.copy_from_slice(&a[14..18]);
+    let mut smac = [0u8; 6];
+    smac.copy_from_slice(&a[8..14]);
+    // Insert/update the ARP cache.
+    let mut slot = None;
+    for (i, e) in st.arp_cache.iter().enumerate() {
+        if e.2 && e.0 == sip { slot = Some(i); break; }
     }
-    st.have_gateway_mac = true;
+    let slot = slot.or_else(|| st.arp_cache.iter().position(|e| !e.2)).unwrap_or(0);
+    st.arp_cache[slot] = (sip, smac, true);
+    // Track gateway MAC specifically.
+    if sip == st.gateway_ip {
+        st.gateway_mac = smac;
+        st.have_gateway_mac = true;
+    }
     kprintln!(
         "[NET] Learned gateway MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         st.gateway_mac[0], st.gateway_mac[1], st.gateway_mac[2],
@@ -460,6 +480,53 @@ fn poll_dhcp(rx: &mut [u8], xid: u32, msg: u8, tick_budget: u64) -> Option<DhcpR
         if n > 0 {
             if let Some(r) = dhcp_parse(&rx[..n as usize], xid, msg) {
                 return Some(r);
+            }
+        }
+        idle_wait();
+    }
+    None
+}
+
+/// Look up a cached MAC for an IPv4 address.
+pub fn arp_lookup(ip: &[u8; 4]) -> Option<[u8; 6]> {
+    for e in state().arp_cache.iter() {
+        if e.2 && &e.0 == ip {
+            return Some(e.1);
+        }
+    }
+    None
+}
+
+/// Render the ARP cache.
+pub fn render_arp() -> alloc::string::String {
+    use core::fmt::Write;
+    let st = state();
+    let mut s = alloc::string::String::new();
+    let _ = writeln!(s, "IP               MAC");
+    for e in st.arp_cache.iter() {
+        if e.2 {
+            let _ = writeln!(s, "{}.{}.{}.{}   {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                e.0[0], e.0[1], e.0[2], e.0[3],
+                e.1[0], e.1[1], e.1[2], e.1[3], e.1[4], e.1[5]);
+        }
+    }
+    s
+}
+
+/// Send an ARP request for `ip` and wait briefly for the reply; returns MAC.
+pub fn arp_resolve(ip: &[u8; 4]) -> Option<[u8; 6]> {
+    if let Some(m) = arp_lookup(ip) {
+        return Some(m);
+    }
+    send_arp_for(ip);
+    let mut rx = [0u8; 256];
+    let dl = timer::get_ticks() + 100;
+    while timer::get_ticks() < dl {
+        let n = net::rx_poll(&mut rx);
+        if n > 0 {
+            parse_arp_reply(&rx[..n as usize]);
+            if let Some(m) = arp_lookup(ip) {
+                return Some(m);
             }
         }
         idle_wait();

@@ -41,6 +41,7 @@ pub struct Task {
     pub utext_phys: u64,  // 72 — user text page phys (for freeing)
     pub name: [u8; 16],   // 80
     pub next: u64,        // 96 — *mut Task, 0 = null
+    pub fds: u64,         // 104 — *mut FdTable, 0 = none
 }
 
 extern "C" {
@@ -73,6 +74,7 @@ static SCHED: Racy<Sched> = Racy::new(Sched {
         utext_phys: 0,
         name: [0; 16],
         next: 0,
+        fds: 0,
     },
     current: core::ptr::null_mut(),
     next_pid: 0,
@@ -141,6 +143,7 @@ pub fn create_task(name: &str, entry: TaskEntry) -> i64 {
         (*t).pid = s.next_pid;
         (*t).state = TASK_READY;
         (*t).stack_phys = stack_phys;
+        (*t).fds = crate::fs::vfs::fd_table_create() as u64;
         copy_name(&mut (*t).name, name);
 
         // Tail-insert into the circular queue.
@@ -242,6 +245,7 @@ pub fn create_user_task(name: &str) -> i64 {
         (*t).ustack_phys = ustack_phys;
         (*t).user_l0 = l0;
         (*t).utext_phys = utext_phys;
+        (*t).fds = crate::fs::vfs::fd_table_create() as u64;
         copy_name(&mut (*t).name, name);
 
         let cur = s.current;
@@ -348,6 +352,37 @@ pub fn wake_sleepers() {
     }
 }
 
+/// Kill a task by pid. Returns 0 on success, -1 if not found / not killable.
+pub fn kill(pid: u64) -> i64 {
+    let s = unsafe { SCHED.get() };
+    unsafe {
+        let idle = &mut s.idle as *mut Task;
+        if pid == (*idle).pid {
+            return -1; // never kill idle
+        }
+        if pid == (*s.current).pid {
+            (*s.current).state = TASK_DEAD;
+            schedule();
+            return 0;
+        }
+        // Find and unlink the target from the circular queue.
+        let mut prev = s.current;
+        let mut t = (*prev).next as *mut Task;
+        while t != s.current {
+            if (*t).pid == pid {
+                (*prev).next = (*t).next;
+                (*t).state = TASK_DEAD;
+                (*t).next = s.dead_list as u64;
+                s.dead_list = t;
+                return 0;
+            }
+            prev = t;
+            t = (*t).next as *mut Task;
+        }
+    }
+    -1
+}
+
 pub fn reap() {
     let s = unsafe { SCHED.get() };
     unsafe {
@@ -366,6 +401,9 @@ pub fn reap() {
             }
             if (*dead).user_l0 != 0 {
                 mmu::free_user_tables((*dead).user_l0);
+            }
+            if (*dead).fds != 0 {
+                crate::fs::vfs::fd_table_destroy((*dead).fds as *mut crate::fs::vfs::FdTable);
             }
             kfree(dead as usize);
         }

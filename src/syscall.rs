@@ -1,15 +1,15 @@
 //! System-call interface (SVC #0 dispatch).
 //!
-//! Port of `src/syscall/syscall.c` (core subset). AAPCS64 convention: x8 holds
-//! the syscall number, x0..x5 the arguments, and the return value is written
-//! back into the trap frame's x0. User pointers are range-checked against
-//! `[0, USER_STACK_TOP)` to prevent kernel-pointer injection.
+//! Port of `src/syscall/syscall.c` (core subset). x8 = syscall number,
+//! x0..x5 = args, return value in x0. I/O routes through the current task's
+//! fd table. User pointers are range-checked against `[0, USER_STACK_TOP)`.
 
 use crate::exception::{timer, TrapFrame};
+use crate::fs::vfs::{self, FdTable};
 use crate::kprintln;
 use crate::mm::mmu::USER_STACK_TOP;
 use crate::sched;
-use crate::uart;
+use crate::strings;
 
 pub const SYS_READ: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
@@ -22,28 +22,14 @@ pub const SYS_GETPID: u64 = 7;
 pub const SYS_LSEEK: u64 = 8;
 pub const SYS_UPTIME: u64 = 9;
 pub const SYS_NET_PING: u64 = 10;
+pub const SYS_KILL: u64 = 11;
 
-/// Validate that a user buffer lies wholly within the EL0 address window.
 fn user_ptr_ok(ptr: u64, len: u64) -> bool {
     ptr != 0 && ptr.checked_add(len).map_or(false, |end| end <= USER_STACK_TOP)
 }
 
-/// Write `len` bytes from user VA `buf` to the console (fd 1/2).
-fn sys_write(fd: u64, buf: u64, len: u64) -> i64 {
-    if fd != 1 && fd != 2 {
-        return -1;
-    }
-    if !user_ptr_ok(buf, len) {
-        kprintln!("[SYS] write: bad user ptr {:#x}+{}", buf, len);
-        return -1;
-    }
-    // TTBR0 still points at the calling task's user table, so the kernel can
-    // read the EL0 buffer directly.
-    for i in 0..len {
-        let b = unsafe { *((buf + i) as *const u8) };
-        uart::putc(b);
-    }
-    len as i64
+fn current_fds() -> *mut FdTable {
+    unsafe { (*sched::current()).fds as *mut FdTable }
 }
 
 pub fn syscall_dispatch(frame: &mut TrapFrame) {
@@ -51,9 +37,39 @@ pub fn syscall_dispatch(frame: &mut TrapFrame) {
     let a0 = frame.regs[0];
     let a1 = frame.regs[1];
     let a2 = frame.regs[2];
+    let a3 = frame.regs[3];
 
     let ret: i64 = match num {
-        SYS_WRITE => sys_write(a0, a1, a2),
+        SYS_WRITE => {
+            // a0 = fd, a1 = buf, a2 = len
+            if !user_ptr_ok(a1, a2) {
+                -1
+            } else {
+                let buf = unsafe { core::slice::from_raw_parts(a1 as *const u8, a2 as usize) };
+                vfs::fd_write(current_fds(), a0 as i32, buf) as i64
+            }
+        }
+        SYS_READ => {
+            if !user_ptr_ok(a1, a2) {
+                -1
+            } else {
+                let buf = unsafe { core::slice::from_raw_parts_mut(a1 as *mut u8, a2 as usize) };
+                vfs::fd_read(current_fds(), a0 as i32, buf) as i64
+            }
+        }
+        SYS_OPEN => {
+            // a0 = path (user C-string)
+            if !user_ptr_ok(a0, 1) {
+                -1
+            } else {
+                match unsafe { strings::cstr_as_str(a0 as *const u8) } {
+                    Some(path) => vfs::fd_open(current_fds(), path) as i64,
+                    None => -1,
+                }
+            }
+        }
+        SYS_CLOSE => vfs::fd_close(current_fds(), a0 as i32) as i64,
+        SYS_LSEEK => vfs::fd_seek(current_fds(), a0 as i32, a1 as i64, a2 as i64),
         SYS_GETPID => unsafe { (*sched::current()).pid as i64 },
         SYS_YIELD => {
             sched::schedule();
@@ -65,6 +81,7 @@ pub fn syscall_dispatch(frame: &mut TrapFrame) {
         }
         SYS_UPTIME => timer::uptime_ms() as i64,
         SYS_NET_PING => crate::net::ping(a0 as u16),
+        SYS_KILL => sched::kill(a0 as u64),
         SYS_EXIT => {
             kprintln!("[SYS] exit({})", a0 as i64);
             sched::task_exit(); // does not return
@@ -72,6 +89,7 @@ pub fn syscall_dispatch(frame: &mut TrapFrame) {
         }
         _ => {
             kprintln!("[SYS] unknown syscall {} (ENOSYS)", num);
+            let _ = a3;
             -1
         }
     };

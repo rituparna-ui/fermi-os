@@ -89,17 +89,37 @@ timer `CNTHP` (PPI 26) instead.
 | M10 | Per-guest virtual PL011 (attributed `[vm0]`/`[vm1]` consoles). |
 | M11 | PSCI provider (guest warm reboot / power-off). |
 | M12 | Interactive guest console (host input routed to a guest, bidirectional). |
+| M13 | A real unmodified FermiOS runs as a **fully interactive** EL1 guest — its EL0 shell responds to typed `help`/`uptime`/`ps`. |
 
-The default hypervisor build runs an interactive guest; build with
+The default hypervisor build runs the interactive FermiOS guest; build with
 `-DHYP_RUN_DEMOS` to run the M3/M4/M9a/M11/M9c self-tests first.
+
+### The guest-timer interrupt: HW-mapped List Registers
+
+The guest's EL1 physical timer (PPI 30) is **level-triggered**. If the
+hypervisor EOIs it at EL2 before the guest re-arms `CNTP_CVAL`, it re-fires
+immediately and the guest never finishes its handler (whose own MMIO traps back
+to EL2) — an interrupt storm. The fix (standard KVM technique) is to inject the
+timer through a **hardware-mapped List Register** (`ICH_LR<n>_EL2.HW=1`,
+`pINTID=vINTID=30`) and **never physically EOI it**: the physical interrupt
+stays *Active* (parked) throughout the guest's handler, and the guest's own
+virtual EOI deactivates the physical interrupt automatically once it re-arms the
+timer. See `vgic_inject_hw()`.
+
+### Fast guest boot (PCI)
+
+A full FermiOS guest scans PCI config space. The guest build limits the scan to
+bus 0 (`MAX_PCI_BUS=1` under `GUEST_BUILD`; QEMU `virt` has one bus), and the
+hypervisor backs the bus-0 ECAM window with all-`0xFF` RAM (`stage2_back_ecam`)
+so config reads return "no device" without trapping.
 
 ## Known limitations / future work
 
 - Guest virtio is not passed through (PCI config space is emulated as "no
-  device"); a full FermiOS guest's 256-bus PCI scan is slow because each ECAM
-  read traps.
-- The interactive demo uses a small echo guest to exercise input directly; a
-  fully interactive *FermiOS* shell needs faster PCI handling and input-aware
-  scheduling.
+  device"), so a guest has no block/net/console virtio — its drivers detect the
+  absence and no-op.
+- The interactive path runs one guest; the multi-guest scheduler (M9c) uses
+  separate VMs. A unified "interactive + preemptive multi-guest" console
+  (switch focus between live guest shells) is future work.
 - The world switch shares one EL2 stack frame, so the serial scheduler is not
   reentrant across nested guest exits (fine as used).

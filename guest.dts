@@ -1,0 +1,81 @@
+/dts-v1/;
+
+/*
+ * guest.dts — device tree for the Linux guest running under the Fermi
+ * hypervisor. The guest sees 1 GiB of RAM at IPA 0x40000000, a PL011 UART at
+ * 0x09000000 (mapped through stage-2 to the physical board UART), a GICv3, and
+ * the architected timer. PSCI is routed over HVC to the hypervisor.
+ *
+ * Compiled to build/guest.dtb by the Makefile and loaded into guest RAM by
+ * QEMU's generic loader.
+ */
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	compatible = "linux,dummy-virt";
+	model = "Fermi hypervisor guest";
+	interrupt-parent = <&gic>;
+
+	chosen {
+		bootargs = "earlycon=pl011,mmio32,0x9000000 console=ttyAMA0 nokaslr";
+		stdout-path = "/pl011@9000000";
+	};
+
+	psci {
+		compatible = "arm,psci-1.0", "arm,psci-0.2";
+		method = "hvc";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,cortex-a72";
+			reg = <0x0>;
+			enable-method = "psci";
+		};
+	};
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x0 0x40000000 0x0 0x40000000>; /* 1 GiB */
+	};
+
+	apb_pclk: apb-pclk {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "clk24mhz";
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <1 13 0xf08>,
+			     <1 14 0xf08>,
+			     <1 11 0xf08>,
+			     <1 10 0xf08>;
+		always-on;
+	};
+
+	pl011@9000000 {
+		compatible = "arm,pl011", "arm,primecell";
+		reg = <0x0 0x09000000 0x0 0x1000>;
+		interrupts = <0 1 4>;
+		clocks = <&apb_pclk>, <&apb_pclk>;
+		clock-names = "uartclk", "apb_pclk";
+	};
+
+	gic: interrupt-controller@8000000 {
+		compatible = "arm,gic-v3";
+		#interrupt-cells = <3>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		interrupt-controller;
+		reg = <0x0 0x08000000 0x0 0x10000>,   /* GICD */
+		      <0x0 0x080a0000 0x0 0x20000>;    /* GICR */
+	};
+};

@@ -69,7 +69,7 @@ extern uint8_t __hyp_end[];
  * window there, plus the PL011 UART so the guest can drive earlycon. */
 #define LINUX_PHYS_BASE 0x240000000ULL /* 9 GiB: past Fermi's 8 GiB view      */
 #define LINUX_IPA_BASE 0x40000000ULL   /* arm64 RAM base the guest sees       */
-#define LINUX_RAM_SIZE (256ULL * 1024 * 1024)
+#define LINUX_RAM_SIZE (1024ULL * 1024 * 1024)
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l0[512];
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l1[512];
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_ram[512]; /* IPA 1-2 GiB (RAM)     */
@@ -282,7 +282,7 @@ void hyp_init(void) {
   vcpus[0].vttbr = (uint64_t)s2_l0; /* VMID 0 */
   current_vcpu = 0;
   hyp_create_linux_guest();
-  hyp_puts("[HYP] created Linux-slot guest (vCPU 1): 256 MiB @ IPA 0x40000000\n");
+  hyp_puts("[HYP] created Linux-slot guest (vCPU 1): 1 GiB @ IPA 0x40000000\n");
 
   /* Start the preemptive scheduling tick (CNTHP / PPI 26). */
   hyp_tick_init();
@@ -468,20 +468,19 @@ static void hyp_build_linux_stage2(void) {
 static void hyp_create_linux_guest(void) {
   hyp_build_linux_stage2();
 
-  /* Copy the bring-up stub into the guest's high RAM (physical, MMU off). */
-  uint64_t len = (uint64_t)(linux_stub_end - linux_stub);
-  memcpy((void *)LINUX_PHYS_BASE, linux_stub, len);
-
+  /* The Linux Image and DTB are staged into the guest's high RAM by QEMU's
+   * generic loader (see Makefile), at IPAs 0x40200000 and 0x48000000. We just
+   * enter per the arm64 boot protocol: PC = Image base, x0 = DTB, EL1h, MMU
+   * off, x1..x3 = 0. */
   vcpu_t *v = &vcpus[1];
   memset(v, 0, sizeof(*v));
   v->id = 1;
   v->state = VCPU_READY;
-  v->pc = LINUX_IPA_BASE;                       /* entry (IPA) -> high RAM   */
+  v->pc = LINUX_IPA_BASE + 0x200000;            /* Image entry (IPA)         */
+  v->regs[0] = LINUX_IPA_BASE + 0x8000000;      /* x0 = DTB (IPA 0x48000000) */
   v->pstate = 0x3c5;                            /* EL1h, DAIF masked         */
-  v->sp_el1 = LINUX_IPA_BASE + LINUX_RAM_SIZE;
   v->vttbr = ((uint64_t)lx_l0) | (1ULL << 48);  /* VMID 1                    */
-  /* sctlr_el1 = 0 => stage-1 MMU off, as the stub and Linux's early entry
-   * both expect. */
+  /* sctlr_el1 = 0 => stage-1 MMU off, as Linux's early entry expects. */
 }
 
 /* Bring up just enough of the physical GIC for the hypervisor's own timer

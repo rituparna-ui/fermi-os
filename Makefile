@@ -68,6 +68,16 @@ QEMU_BASE := qemu-system-aarch64 -machine $(QEMU_MACHINE) -nographic -cpu $(QEMU
 QEMU_FLAGS_RUN   := -kernel $(TARGET)
 QEMU_FLAGS_DEBUG := -kernel $(TARGET) -s -S
 
+# Linux guest assets staged into the Fermi-invisible high RAM via QEMU's
+# generic loader. Physical addresses correspond to guest IPAs through the
+# Linux-slot stage-2 (IPA 0x40000000 -> phys 0x240000000):
+#   Image @ IPA 0x40200000  (phys 0x240200000)
+#   DTB   @ IPA 0x48000000  (phys 0x248000000)
+GUEST_IMAGE := guest/Image
+GUEST_DTB   := $(BUILD_DIR)/guest.dtb
+GUEST_LOAD  := -device loader,file=$(GUEST_IMAGE),addr=0x240200000,force-raw=on \
+               -device loader,file=$(GUEST_DTB),addr=0x248000000,force-raw=on
+
 .PHONY: all run debug clean gdb tmux disk dump_dts compile_commands.json
 
 
@@ -125,11 +135,17 @@ user_bins: $(USER_BINS)
 
 
 # Run QEMU
-run: all disk
-	@$(QEMU_BASE) $(QEMU_FLAGS_RUN)
+run: all disk $(GUEST_DTB)
+	@$(QEMU_BASE) $(QEMU_FLAGS_RUN) $(GUEST_LOAD)
 
-debug: all disk
-	@$(QEMU_BASE) $(QEMU_FLAGS_DEBUG)
+debug: all disk $(GUEST_DTB)
+	@$(QEMU_BASE) $(QEMU_FLAGS_DEBUG) $(GUEST_LOAD)
+
+# Compile the Linux guest device tree.
+$(GUEST_DTB): guest.dts
+	@mkdir -p $(BUILD_DIR)
+	@dtc -I dts -O dtb -o $@ $< 2>/dev/null
+	@echo "DTC $@"
 
 disk: $(DISK_IMG)
 

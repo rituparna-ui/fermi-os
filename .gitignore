@@ -9,3 +9,6 @@ user/*.elf
 user/*.bin
 wasabi-toolbag/
 
+
+# Linux guest assets (large binaries, not tracked)
+guest/

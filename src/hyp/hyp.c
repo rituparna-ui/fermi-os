@@ -241,6 +241,15 @@ void hyp_init(void) {
 
   __asm__ __volatile__("isb");
 
+  /* Allow EL2 itself to use FP/SIMD — we execute stp/ldp q-regs to context-
+   * switch guest FP state. (CPTR_EL2.TFP=0 => FP not trapped to EL2.) */
+  {
+    uint64_t cptr = MRS(cptr_el2);
+    cptr &= ~(1ULL << 10); /* TFP */
+    MSR(cptr_el2, cptr);
+    __asm__ __volatile__("isb");
+  }
+
   /* --- GICv3 virtualization bring-up ---
    * Own the physical CPU interface at EL2 so physical IRQs (routed here by
    * HCR_EL2.IMO below) can be acked, and enable the virtual CPU interface so
@@ -327,6 +336,38 @@ static void hyp_restore_el1(vcpu_t *v) {
   __asm__ __volatile__("isb");
 }
 
+static void hyp_save_fp(vcpu_t *v) {
+  uint64_t *p = v->vregs;
+  __asm__ __volatile__(
+      "stp q0, q1, [%0, #0]\n\t stp q2, q3, [%0, #32]\n\t"
+      "stp q4, q5, [%0, #64]\n\t stp q6, q7, [%0, #96]\n\t"
+      "stp q8, q9, [%0, #128]\n\t stp q10, q11, [%0, #160]\n\t"
+      "stp q12, q13, [%0, #192]\n\t stp q14, q15, [%0, #224]\n\t"
+      "stp q16, q17, [%0, #256]\n\t stp q18, q19, [%0, #288]\n\t"
+      "stp q20, q21, [%0, #320]\n\t stp q22, q23, [%0, #352]\n\t"
+      "stp q24, q25, [%0, #384]\n\t stp q26, q27, [%0, #416]\n\t"
+      "stp q28, q29, [%0, #448]\n\t stp q30, q31, [%0, #480]\n\t" ::"r"(p)
+      : "memory");
+  v->fpsr = MRS(fpsr);
+  v->fpcr = MRS(fpcr);
+}
+
+static void hyp_restore_fp(vcpu_t *v) {
+  uint64_t *p = v->vregs;
+  MSR(fpsr, v->fpsr);
+  MSR(fpcr, v->fpcr);
+  __asm__ __volatile__(
+      "ldp q0, q1, [%0, #0]\n\t ldp q2, q3, [%0, #32]\n\t"
+      "ldp q4, q5, [%0, #64]\n\t ldp q6, q7, [%0, #96]\n\t"
+      "ldp q8, q9, [%0, #128]\n\t ldp q10, q11, [%0, #160]\n\t"
+      "ldp q12, q13, [%0, #192]\n\t ldp q14, q15, [%0, #224]\n\t"
+      "ldp q16, q17, [%0, #256]\n\t ldp q18, q19, [%0, #288]\n\t"
+      "ldp q20, q21, [%0, #320]\n\t ldp q22, q23, [%0, #352]\n\t"
+      "ldp q24, q25, [%0, #384]\n\t ldp q26, q27, [%0, #416]\n\t"
+      "ldp q28, q29, [%0, #448]\n\t ldp q30, q31, [%0, #480]\n\t" ::"r"(p)
+      : "memory");
+}
+
 /* Per-guest vGIC state save/restore. */
 static void hyp_save_vgic(vcpu_t *v) {
   __asm__ __volatile__("mrs %0, ich_lr0_el2" : "=r"(v->ich_lr[0]));
@@ -360,6 +401,7 @@ static int hyp_pick_next(int from) {
 static void hyp_world_switch(el2_frame_t *f) {
   vcpu_t *cur = &vcpus[current_vcpu];
 
+  hyp_save_fp(cur); /* first: guest FP is still live, C path hasn't used SIMD */
   for (int i = 0; i < 31; i++)
     cur->regs[i] = f->x[i];
   cur->pc = MRS(elr_el2);
@@ -388,6 +430,7 @@ static void hyp_world_switch(el2_frame_t *f) {
   __asm__ __volatile__("isb");
   hyp_restore_el1(nv);
   hyp_restore_vgic(nv);
+  hyp_restore_fp(nv); /* last: nothing in the C path touches SIMD after this */
 }
 
 /* Build guest 1's stage-2: identity-map ONLY its RAM slice (IPA == PA over
@@ -431,6 +474,7 @@ static void hyp_create_guest1(void) {
   v->pstate = 0x3c5;                           /* EL1h, DAIF masked         */
   v->sp_el1 = (uint64_t)guest1_ram + GUEST1_RAM_SIZE;
   v->vttbr = ((uint64_t)g1_l0) | (1ULL << 48); /* VMID 1                    */
+  v->cpacr_el1 = (3ULL << 20); /* CPACR_EL1.FPEN=11 => guest 1 may use FP    */
   /* EL1 sysregs left 0 => guest 1 runs with its stage-1 MMU off. */
 }
 

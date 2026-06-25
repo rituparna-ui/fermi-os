@@ -102,6 +102,10 @@ typedef struct {
   uint64_t ich_lr[2];   /* list registers 0..1 (pending/active vIRQs)        */
   uint64_t ich_vmcr;    /* virtual machine control (group enables, vPMR)     */
   uint64_t ich_ap1r0;   /* group-1 active priorities                          */
+
+  /* FP/SIMD state: q0..q31 (16 bytes each = 64 u64) plus status/control. */
+  uint64_t vregs[64];
+  uint64_t fpsr, fpcr;
 } vcpu_t;
 
 /* Configure EL2 and stage-2, install the EL2 vector table. Called once from

@@ -422,6 +422,8 @@ void hyp_boot_fermios_guest(void) {
   v.vmid = 1;
   v.id = 0;
   v.name = "fermios";
+  vgic_vcpu_reset(&v.vgic);
+  vgic_set_current(&v.vgic);
 
   uart_printf("[HYP] entering FermiOS guest: entry=%x VTTBR_EL2=%x\n",
               v.pc, v.vttbr);

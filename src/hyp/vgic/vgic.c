@@ -1,4 +1,5 @@
 #include "vgic.h"
+#include "../vcpu.h" /* vcpu_vgic_t */
 #include "uart/uart.h"
 
 /* GICv3 virtualization: the binutils in osdev:dev accepts the symbolic ich_*
@@ -26,14 +27,10 @@
 
 static uint32_t vgic_nr_lr;
 
-/* GICD/GICR software model for the single guest. */
-static struct {
-  uint32_t gicd_ctlr;
-  uint32_t gicd_isenabler0;
-  uint32_t gicr_igroupr0;
-  uint32_t gicr_igrpmodr0;
-  uint32_t gicr_isenabler0;
-} vd;
+/* The per-vCPU GICD/GICR software model the MMIO emulator currently acts on.
+ * Set by vgic_set_current() at each world entry. For a single guest this is
+ * just the one vcpu's model; for multi-guest each vcpu has its own. */
+static vcpu_vgic_t *cur;
 
 static uint64_t lr_read(uint32_t n) {
   uint64_t v = 0;
@@ -135,13 +132,13 @@ void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
     uint32_t w = (uint32_t)*val & size_mask;
     switch (off) {
     case R_GICD_CTLR:
-      vd.gicd_ctlr = w & (GICD_CTLR_ARE_NS | GICD_CTLR_EN_G1NS);
+      cur->gicd_ctlr = w & (GICD_CTLR_ARE_NS | GICD_CTLR_EN_G1NS);
       break;
-    case R_GICD_ISENABLER0:     vd.gicd_isenabler0 |= w; break;
+    case R_GICD_ISENABLER0:     cur->gicd_isenabler0 |= w; break;
     case R_GICR_WAKER:          /* ProcessorSleep handled on read */ break;
-    case R_GICR_SGI_IGROUPR0:   vd.gicr_igroupr0 = w; break;
-    case R_GICR_SGI_IGRPMODR0:  vd.gicr_igrpmodr0 = w; break;
-    case R_GICR_SGI_ISENABLER0: vd.gicr_isenabler0 |= w; break;
+    case R_GICR_SGI_IGROUPR0:   cur->gicr_igroupr0 = w; break;
+    case R_GICR_SGI_IGRPMODR0:  cur->gicr_igrpmodr0 = w; break;
+    case R_GICR_SGI_ISENABLER0: cur->gicr_isenabler0 |= w; break;
     default: break;
     }
     return;
@@ -149,15 +146,55 @@ void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
 
   uint32_t r = 0;
   switch (off) {
-  case R_GICD_CTLR:           r = vd.gicd_ctlr; break;
-  case R_GICD_ISENABLER0:     r = vd.gicd_isenabler0; break;
+  case R_GICD_CTLR:           r = cur->gicd_ctlr; break;
+  case R_GICD_ISENABLER0:     r = cur->gicd_isenabler0; break;
   case R_GICR_WAKER:          r = 0; /* ChildrenAsleep clear -> poll exits */ break;
-  case R_GICR_SGI_IGROUPR0:   r = vd.gicr_igroupr0; break;
-  case R_GICR_SGI_IGRPMODR0:  r = vd.gicr_igrpmodr0; break;
-  case R_GICR_SGI_ISENABLER0: r = vd.gicr_isenabler0; break;
+  case R_GICR_SGI_IGROUPR0:   r = cur->gicr_igroupr0; break;
+  case R_GICR_SGI_IGRPMODR0:  r = cur->gicr_igrpmodr0; break;
+  case R_GICR_SGI_ISENABLER0: r = cur->gicr_isenabler0; break;
   default: r = 0; break;
   }
   *val = r & size_mask;
+}
+
+/* --- Per-vCPU vGIC state (multi-guest) --- */
+
+void vgic_set_current(vcpu_vgic_t *g) { cur = g; }
+
+void vgic_vcpu_reset(vcpu_vgic_t *g) {
+  g->hcr = ICH_HCR_EN;
+  g->vmcr = ICH_VMCR_SEED;
+  g->ap0r0 = 0;
+  g->ap1r0 = 0;
+  for (int i = 0; i < 16; i++) {
+    g->lr[i] = 0;
+  }
+  g->gicd_ctlr = 0;
+  g->gicd_isenabler0 = 0;
+  g->gicr_igroupr0 = 0;
+  g->gicr_igrpmodr0 = 0;
+  g->gicr_isenabler0 = 0;
+}
+
+void vgic_save(vcpu_vgic_t *g) {
+  __asm__ __volatile__("mrs %0, ich_vmcr_el2" : "=r"(g->vmcr));
+  __asm__ __volatile__("mrs %0, ich_ap0r0_el2" : "=r"(g->ap0r0));
+  __asm__ __volatile__("mrs %0, ich_ap1r0_el2" : "=r"(g->ap1r0));
+  for (uint32_t i = 0; i < vgic_nr_lr; i++) {
+    g->lr[i] = lr_read(i);
+  }
+  /* Quiesce the interface while another guest / EL2 runs. */
+  __asm__ __volatile__("msr ich_hcr_el2, %0\n\tisb" ::"r"(0ULL));
+}
+
+void vgic_restore(const vcpu_vgic_t *g) {
+  __asm__ __volatile__("msr ich_vmcr_el2, %0" ::"r"(g->vmcr));
+  __asm__ __volatile__("msr ich_ap0r0_el2, %0" ::"r"(g->ap0r0));
+  __asm__ __volatile__("msr ich_ap1r0_el2, %0" ::"r"(g->ap1r0));
+  for (uint32_t i = 0; i < vgic_nr_lr; i++) {
+    lr_write(i, g->lr[i]);
+  }
+  __asm__ __volatile__("msr ich_hcr_el2, %0\n\tisb" ::"r"(g->hcr));
 }
 
 static uint64_t lr_pending(uint32_t intid) {

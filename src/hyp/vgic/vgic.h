@@ -41,4 +41,19 @@ void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val, int size_bytes
  * live virtual interface via a free List Register. */
 void vgic_inject_ppi(uint32_t intid);
 
+/* --- Per-vCPU vGIC state (multi-guest, M9) ------------------------------ */
+struct vcpu_vgic; /* defined in vcpu.h */
+
+/* Seed a fresh per-vCPU vGIC state (virtual interface enabled, VMCR seeded,
+ * LRs empty, MMIO model zeroed). */
+void vgic_vcpu_reset(struct vcpu_vgic *g);
+
+/* Save the live hardware virtual interface (ICH_VMCR/AP0R0/AP1R0/LRs) into g
+ * and quiesce it (world exit); restore g into the hardware (world entry). */
+void vgic_save(struct vcpu_vgic *g);
+void vgic_restore(const struct vcpu_vgic *g);
+
+/* Select which per-vCPU GICD/GICR software model vgic_mmio_emulate() acts on. */
+void vgic_set_current(struct vcpu_vgic *g);
+
 #endif /* HYP_VGIC_H */

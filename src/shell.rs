@@ -444,6 +444,15 @@ fn dispatch(line: &str) {
         "free" | "meminfo" => cmd_free(),
         "memtest" => cmd_memtest(parse_u64(arg1).unwrap_or(64).clamp(1, 512)),
         "heapstat" => kprint!("{}", heap::render_stats()),
+        "df" => {
+            let cap = crate::virtio::blk::capacity_sectors();
+            kprintln!("/dev/blk : {} sectors ({} MiB)", cap, cap / 2048);
+            let (tot, free, bpc) = crate::fs::fat32::usage();
+            let used = tot - free;
+            kprintln!("/mnt/fat32: {} KiB total, {} KiB used, {} KiB free (clusters {}/{}, {}B each)",
+                      tot as u64 * bpc as u64 / 1024, used as u64 * bpc as u64 / 1024,
+                      free as u64 * bpc as u64 / 1024, used, tot, bpc);
+        }
         "ifconfig" => kprint!("{}", net::render_info()),
         "arp" => {
             if arg1.is_empty() {

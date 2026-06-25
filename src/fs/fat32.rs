@@ -23,6 +23,7 @@ struct Vol {
     data_start_sector: u32,
     sectors_per_cluster: u32,
     root_cluster: u32,
+    total_sectors: u32,
     mounted: bool,
 }
 static VOL: Racy<Vol> = Racy::new(Vol {
@@ -30,6 +31,7 @@ static VOL: Racy<Vol> = Racy::new(Vol {
     data_start_sector: 0,
     sectors_per_cluster: 0,
     root_cluster: 0,
+    total_sectors: 0,
     mounted: false,
 });
 
@@ -100,6 +102,9 @@ pub fn mount() {
     let fat_size_16 = u16::from_le_bytes([b[22], b[23]]);
     let fat_size_32 = u32::from_le_bytes([b[36], b[37], b[38], b[39]]);
     let root_cluster = u32::from_le_bytes([b[44], b[45], b[46], b[47]]);
+    let total_sectors_16 = u16::from_le_bytes([b[19], b[20]]) as u32;
+    let total_sectors_32 = u32::from_le_bytes([b[32], b[33], b[34], b[35]]);
+    let total_sectors = if total_sectors_16 != 0 { total_sectors_16 } else { total_sectors_32 };
 
     if bytes_per_sector as usize != SECTOR {
         uart::errorln("[FS][FAT32] Unsupported sector size");
@@ -113,6 +118,7 @@ pub fn mount() {
     v.fat_start_sector = reserved_sectors as u32;
     v.data_start_sector = reserved_sectors as u32 + num_fats as u32 * fat_size_32;
     v.root_cluster = root_cluster;
+    v.total_sectors = total_sectors;
     v.mounted = true;
     kprintln!(
         "[FS][FAT32] Mounted: sec/clus={} FAT@{} data@{} root={}",
@@ -536,4 +542,34 @@ pub fn vfs_mount(path: &str) {
         (*mp).private0 = v.root_cluster as u64;
     }
     kprintln!("[FAT32] Mounted at {} (root cluster {})", path, v.root_cluster);
+}
+
+/// (total_clusters, free_clusters, bytes_per_cluster) by scanning the FAT.
+pub fn usage() -> (u32, u32, u32) {
+    let v = unsafe { VOL.get() };
+    if !v.mounted {
+        return (0, 0, 0);
+    }
+    let bpc = v.sectors_per_cluster * SECTOR as u32;
+    let data_sectors = v.total_sectors.saturating_sub(v.data_start_sector);
+    let total_clusters = data_sectors / v.sectors_per_cluster;
+    let mut free = 0u32;
+    // FAT entries for clusters 2..(2+total_clusters).
+    for c in 2..(2 + total_clusters) {
+        let fat_offset = c * 4;
+        let sector = v.fat_start_sector + fat_offset / SECTOR as u32;
+        if sector >= v.data_start_sector {
+            break;
+        }
+        let off = (fat_offset % SECTOR as u32) as usize;
+        if !blk::read(sector as u64, sec()) {
+            break;
+        }
+        let b = sec();
+        let val = u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]) & 0x0FFF_FFFF;
+        if val == 0 {
+            free += 1;
+        }
+    }
+    (total_clusters, free, bpc)
 }

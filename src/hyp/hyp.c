@@ -2,6 +2,7 @@
 #include "hyp/hypercall.h" /* HVC_* ABI */
 #include "mm/mmu/mmu.h" /* _1GB, _512GB */
 #include "mm/pmm/pmm.h" /* MEM_START, MEM_SIZE */
+#include "strings/strings.h" /* memset, memcpy */
 #include "uart/uart.h"  /* UART_BASE / UART_DR / UART_FR */
 
 /* ---------------------------------------------------------------------------
@@ -61,10 +62,26 @@ __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t s2_l3_spl
 extern uint8_t __hyp_start[];
 extern uint8_t __hyp_end[];
 
-/* The single guest's vCPU control block. In .hyp_tables (NOLOAD), so it is
- * neither zeroed by the guest's zero_bss nor reused by the guest PMM; we
- * initialise its fields explicitly in hyp_init(). */
-__attribute__((section(".hyp_tables"))) static vcpu_t g_vcpu;
+/* Guest 1's stage-2 tables and RAM slice (hypervisor-private; the hole-punch
+ * in hyp_build_stage2 keeps this region invisible to guest 0). Guest 1 runs
+ * with its stage-1 MMU off, so it sees IPA == PA over just this slice; every
+ * other IPA is unmapped, isolating it. */
+#define GUEST1_RAM_SIZE (16 * 1024)
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g1_l0[512];
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g1_l1[512];
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g1_l2[512];
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g1_l3[512];
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint8_t guest1_ram[GUEST1_RAM_SIZE];
+
+extern uint8_t guest1_payload[];
+extern uint8_t guest1_payload_end[];
+
+/* The vCPUs and the index of the one currently running. In .hyp_tables
+ * (NOLOAD); initialised explicitly in hyp_init(). */
+__attribute__((section(".hyp_tables"))) static vcpu_t vcpus[NUM_VCPUS];
+__attribute__((section(".hyp_tables"))) static int current_vcpu;
+
+static void hyp_create_guest1(void);
 
 /* --- self-contained PL011 output (no driver state, safe pre-uart_init) --- */
 static void hyp_putc(char c) {
@@ -167,12 +184,10 @@ static void hyp_build_stage2(void) {
 void hyp_init(void) {
   hyp_puts("\n[HYP] Fermi hypervisor online at EL2\n");
 
-  /* Initialise the guest vCPU control block (NOLOAD memory => not zeroed). */
-  g_vcpu.id = 0;
-  g_vcpu.hvc_count = 0;
-  g_vcpu.sysreg_traps = 0;
-  g_vcpu.abort_count = 0;
-  g_vcpu.virq_injected = 0;
+  /* vCPU table starts empty; populated near the end of hyp_init once the
+   * stage-2 tables and guest 1 payload are in place. */
+  memset(vcpus, 0, sizeof(vcpus));
+  current_vcpu = 0;
 
   /* Sanity: confirm we really are at EL2. */
   uint64_t el = (MRS(CurrentEL) >> 2) & 0x3;
@@ -242,7 +257,150 @@ void hyp_init(void) {
   MSR(hcr_el2, HCR_RW | HCR_VM | HCR_TID3 | HCR_IMO);
   __asm__ __volatile__("isb");
 
+  /* Register the primary guest (Fermi) as vCPU 0 — its full context is
+   * captured lazily on its first yield — and create the tiny guest 1. */
+  vcpus[0].id = 0;
+  vcpus[0].state = VCPU_RUNNING;
+  vcpus[0].vttbr = (uint64_t)s2_l0; /* VMID 0 */
+  current_vcpu = 0;
+  hyp_create_guest1();
+  hyp_puts("[HYP] created guest1 (vCPU 1) with its own stage-2\n");
+
   hyp_puts("[HYP] stage-2 enabled (HCR_EL2.VM=1), dropping to EL1 guest...\n");
+}
+
+/* ------------------------ world switch / vCPUs ----------------------------- */
+
+static void hyp_save_el1(vcpu_t *v) {
+  v->sp_el1 = MRS(sp_el1);
+  v->elr_el1 = MRS(elr_el1);
+  v->spsr_el1 = MRS(spsr_el1);
+  v->sctlr_el1 = MRS(sctlr_el1);
+  v->cpacr_el1 = MRS(cpacr_el1);
+  v->ttbr0_el1 = MRS(ttbr0_el1);
+  v->ttbr1_el1 = MRS(ttbr1_el1);
+  v->tcr_el1 = MRS(tcr_el1);
+  v->mair_el1 = MRS(mair_el1);
+  v->amair_el1 = MRS(amair_el1);
+  v->vbar_el1 = MRS(vbar_el1);
+  v->contextidr_el1 = MRS(contextidr_el1);
+  v->tpidr_el1 = MRS(tpidr_el1);
+  v->tpidrro_el0 = MRS(tpidrro_el0);
+  v->tpidr_el0 = MRS(tpidr_el0);
+  v->esr_el1 = MRS(esr_el1);
+  v->far_el1 = MRS(far_el1);
+  v->par_el1 = MRS(par_el1);
+}
+
+static void hyp_restore_el1(vcpu_t *v) {
+  MSR(sp_el1, v->sp_el1);
+  MSR(elr_el1, v->elr_el1);
+  MSR(spsr_el1, v->spsr_el1);
+  MSR(sctlr_el1, v->sctlr_el1);
+  MSR(cpacr_el1, v->cpacr_el1);
+  MSR(ttbr0_el1, v->ttbr0_el1);
+  MSR(ttbr1_el1, v->ttbr1_el1);
+  MSR(tcr_el1, v->tcr_el1);
+  MSR(mair_el1, v->mair_el1);
+  MSR(amair_el1, v->amair_el1);
+  MSR(vbar_el1, v->vbar_el1);
+  MSR(contextidr_el1, v->contextidr_el1);
+  MSR(tpidr_el1, v->tpidr_el1);
+  MSR(tpidrro_el0, v->tpidrro_el0);
+  MSR(tpidr_el0, v->tpidr_el0);
+  MSR(esr_el1, v->esr_el1);
+  MSR(far_el1, v->far_el1);
+  MSR(par_el1, v->par_el1);
+  __asm__ __volatile__("isb");
+}
+
+/* Round-robin to the next non-unused vCPU after `from`. */
+static int hyp_pick_next(int from) {
+  for (int i = 1; i <= NUM_VCPUS; i++) {
+    int idx = (from + i) % NUM_VCPUS;
+    if (vcpus[idx].state != VCPU_UNUSED)
+      return idx;
+  }
+  return from;
+}
+
+/* Cooperative world switch: suspend the running vCPU and resume the next.
+ * The outgoing GP regs come from / incoming GP regs go to the EL2 trap frame
+ * (which el2_common restores on eret). Each vCPU has a distinct VMID, so no
+ * stage-2 TLB flush is needed when swapping VTTBR_EL2. */
+static void hyp_world_switch(el2_frame_t *f) {
+  vcpu_t *cur = &vcpus[current_vcpu];
+
+  for (int i = 0; i < 31; i++)
+    cur->regs[i] = f->x[i];
+  cur->pc = MRS(elr_el2);
+  cur->pstate = MRS(spsr_el2);
+  cur->vttbr = MRS(vttbr_el2);
+  hyp_save_el1(cur);
+  if (cur->state == VCPU_RUNNING)
+    cur->state = VCPU_READY;
+
+  int next = hyp_pick_next(current_vcpu);
+  if (next == current_vcpu) {
+    cur->state = VCPU_RUNNING; /* nobody else runnable: keep going */
+    return;
+  }
+
+  vcpu_t *nv = &vcpus[next];
+  current_vcpu = next;
+  nv->state = VCPU_RUNNING;
+
+  for (int i = 0; i < 31; i++)
+    f->x[i] = nv->regs[i];
+  MSR(elr_el2, nv->pc);
+  MSR(spsr_el2, nv->pstate);
+  MSR(vttbr_el2, nv->vttbr);
+  __asm__ __volatile__("isb");
+  hyp_restore_el1(nv);
+}
+
+/* Build guest 1's stage-2: identity-map ONLY its RAM slice (IPA == PA over
+ * the slice), leaving every other IPA unmapped so the guest is sandboxed. */
+static void hyp_build_guest1_stage2(void) {
+  const uint64_t PG = 4096ULL;
+  uint64_t base = (uint64_t)guest1_ram; /* physical == guest IPA */
+  uint64_t pages = GUEST1_RAM_SIZE / PG;
+  uint64_t gb = base / _1GB;
+  uint64_t mb = (base % _1GB) / _2MB;
+  uint64_t first_page = (base % _2MB) / PG;
+
+  for (int i = 0; i < 512; i++) {
+    g1_l0[i] = 0;
+    g1_l1[i] = 0;
+    g1_l2[i] = 0;
+    g1_l3[i] = 0;
+  }
+  g1_l0[0] = ((uint64_t)g1_l1) | S2_TABLE | S2_VALID;
+  g1_l1[gb] = ((uint64_t)g1_l2) | S2_TABLE | S2_VALID;
+  g1_l2[mb] = ((uint64_t)g1_l3) | S2_TABLE | S2_VALID;
+  for (uint64_t p = 0; p < pages; p++) {
+    uint64_t pa = base + p * PG;
+    g1_l3[first_page + p] =
+        pa | S2_TABLE | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
+  }
+  __asm__ __volatile__("dsb ish");
+}
+
+static void hyp_create_guest1(void) {
+  hyp_build_guest1_stage2();
+
+  uint64_t len = (uint64_t)(guest1_payload_end - guest1_payload);
+  memcpy(guest1_ram, guest1_payload, len);
+
+  vcpu_t *v = &vcpus[1];
+  memset(v, 0, sizeof(*v));
+  v->id = 1;
+  v->state = VCPU_READY;
+  v->pc = (uint64_t)guest1_ram;                /* entry (IPA == PA)         */
+  v->pstate = 0x3c5;                           /* EL1h, DAIF masked         */
+  v->sp_el1 = (uint64_t)guest1_ram + GUEST1_RAM_SIZE;
+  v->vttbr = ((uint64_t)g1_l0) | (1ULL << 48); /* VMID 1                    */
+  /* EL1 sysregs left 0 => guest 1 runs with its stage-1 MMU off. */
 }
 
 /* ------------------------------- traps ------------------------------------ */
@@ -264,12 +422,15 @@ static const char *ec_name(uint64_t ec) {
 
 /* HVC hypercall: function ID in x0, args in x1..x3, result back in x0.
  * ELR_EL2 already points past the HVC, so no PC adjustment is needed. */
+static void hyp_world_switch(el2_frame_t *f);
+
 static void hyp_handle_hvc(el2_frame_t *f) {
   uint64_t fn = f->x[0];
   uint64_t a1 = f->x[1];
   uint64_t ret;
+  vcpu_t *cur = &vcpus[current_vcpu];
 
-  g_vcpu.hvc_count++;
+  cur->hvc_count++;
 
   switch (fn) {
   case HVC_VERSION:
@@ -283,12 +444,14 @@ static void hyp_handle_hvc(el2_frame_t *f) {
     ret = a1 + 1;
     break;
   case HVC_VM_INFO:
-    ret = g_vcpu.hvc_count;
+    ret = cur->hvc_count;
     break;
   case HVC_YIELD:
-    /* Cooperative yield is a no-op until the M5 world-switch scheduler. */
-    ret = 0;
-    break;
+    /* Cooperative world switch: save this vCPU, resume the next ready one.
+     * The frame's GP regs are rewritten in place, so we must NOT touch
+     * f->x[0] afterwards — return immediately. */
+    hyp_world_switch(f);
+    return;
   case HVC_HYP_BASE:
     /* Introspection probe (test build): expose the hyp region base so the
      * guest can attempt — and be denied — an access to hypervisor memory. */
@@ -324,7 +487,7 @@ static void hyp_handle_sysreg(el2_frame_t *f) {
   uint64_t is_read = iss & 0x1;
   uint64_t val = 0;
 
-  g_vcpu.sysreg_traps++;
+  vcpus[current_vcpu].sysreg_traps++;
 
   /* Decode by (op0,op1,crn,crm,op2). Pass real values through for the ID
    * registers Fermi actually consumes; any other ID register under TID3 is
@@ -354,7 +517,7 @@ static void hyp_handle_sysreg(el2_frame_t *f) {
  * destination register on a read, and step over the access so the guest keeps
  * running. Any other abort is an unexpected (real) fault — dump and park. */
 static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
-  g_vcpu.abort_count++;
+  vcpus[current_vcpu].abort_count++;
 
   uint64_t esr = MRS(esr_el2);
   uint64_t far = MRS(far_el2);
@@ -442,15 +605,16 @@ static void hyp_handle_irq(void) {
   if (intid >= 1020) /* 1020-1023 are special / spurious: no EOI needed */
     return;
 
-  g_vcpu.virq_injected++;
+  vcpu_t *cur = &vcpus[current_vcpu];
+  cur->virq_injected++;
   hyp_vgic_inject_hw(intid);
   __asm__ __volatile__("msr icc_eoir1_el1, %0" ::"r"(iar)); /* priority drop */
 
-  if (g_vcpu.virq_injected <= 3) {
+  if (cur->virq_injected <= 3) {
     hyp_puts("[HYP] injected hw vIRQ intid=");
     hyp_puthex(intid);
     hyp_puts(" (count=");
-    hyp_puthex(g_vcpu.virq_injected);
+    hyp_puthex(cur->virq_injected);
     hyp_puts(")\n");
   }
 }

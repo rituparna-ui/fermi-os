@@ -1,7 +1,9 @@
 #ifndef HYP_HYPERCALL_H
 #define HYP_HYPERCALL_H
 
+#ifndef __ASSEMBLER__
 #include <stdint.h>
+#endif
 
 /* ---------------------------------------------------------------------------
  * hypercall.h — Fermi hypervisor call ABI (shared by guest and hypervisor)

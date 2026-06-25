@@ -119,6 +119,14 @@ generalizes to N vCPUs; the picker simply skips `UNUSED` ones.
 A guest can also yield cooperatively via `HVC_YIELD`, and can remove itself via
 PSCI `SYSTEM_OFF` (§7), after which it is never scheduled again.
 
+**Idle yielding (WFI trap).** `HCR_EL2.TWI=1` traps guest `WFI` to EL2 (EC
+`0x01`). An idle guest — notably Linux's idle loop — therefore doesn't halt the
+physical CPU until the next tick; instead the trap steps past the `WFI` and
+immediately world-switches to the next runnable vCPU, donating the rest of the
+idle slice to the other guests. The idle-yield count is exposed as
+`idle-yields` in `cat /proc/vms`. (`WFE` is intentionally *not* trapped — `TWE`
+is left off — to avoid thrashing on guest spinlocks.)
+
 ---
 
 ## 5. Boot flow summary

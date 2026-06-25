@@ -166,13 +166,15 @@ static int gen_cpuinfo(char *buf, size_t buflen) {
 static int gen_vms(char *buf, size_t buflen) {
   uint64_t count = hvc_call(HVC_VM_COUNT, 0, 0, 0);
   uint64_t switches = hvc_call(HVC_VM_STAT, 0, VMSTAT_SWITCHES, 0);
+  uint64_t wfi = hvc_call(HVC_VM_STAT, 0, VMSTAT_WFI, 0);
 
   size_t pos = 0;
   int n = ksnprintf(buf, buflen,
-                    "Fermi hypervisor (EL2): %u vCPUs, %u world-switches\n"
+                    "Fermi hypervisor (EL2): %u vCPUs, %u world-switches, "
+                    "%u idle-yields\n"
                     "VCPU NAME   STATE    HVC    SYSREG ABORT VIRQ   MMIO\n"
                     "---- ------ -------- ------ ------ ----- ------ ------\n",
-                    count, switches);
+                    count, switches, wfi);
   pos += (n < 0) ? 0 : (size_t)n;
 
   for (uint64_t i = 0; i < count && pos < buflen; i++) {

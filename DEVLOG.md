@@ -267,6 +267,18 @@ the shell runs the full command and prints the `/dev/vda` signature
 `VBLKOK_FERMI_HV`. Lesson: trace before theorizing — the bug was a console-
 emulation gap, not byte loss.
 
+### WFI idle-yield trapping
+*Why:* with three guests round-robin on a 100 ms quantum, an idle guest's `WFI`
+halts the physical CPU until the next interrupt — wasting the rest of its slice
+while the others wait. Set `HCR_EL2.TWI=1` so guest `WFI` traps to EL2 (EC
+`0x01`); the handler steps past the instruction and immediately world-switches
+to the next runnable vCPU, donating the idle time. `WFE` is deliberately left
+untrapped (no `TWE`) to avoid thrashing on guest spinlocks. The idle-yield count
+is exposed via a new `VMSTAT_WFI` and shown as `idle-yields` in `/proc/vms`.
+*Verified:* a normal run shows hundreds of idle-yields (e.g. `1161
+world-switches, 362 idle-yields`) while Linux still boots and reads `/dev/vda`,
+with no anomalies.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)

@@ -34,6 +34,7 @@
 #define HCR_VM (1ULL << 0)   /* Enable stage-2 translation for EL1&0          */
 #define HCR_IMO (1ULL << 4)  /* Route physical IRQ to EL2 + enable vIRQ        */
 #define HCR_TID3 (1ULL << 18) /* Trap ID group 3 (ID_AA64*) reads to EL2      */
+#define HCR_TWI (1ULL << 13)  /* Trap EL0/EL1 WFI to EL2 (idle guest -> yield)  */
 #define HCR_RW (1ULL << 31)  /* EL1 execution state is AArch64                */
 
 /* GICv3 EL2 control bits (System Register interface / virtual CPU interface) */
@@ -55,6 +56,7 @@
 /* Exception-class values we care about in ESR_EL2[31:26]. */
 #define ESR_EC_SHIFT 26
 #define ESR_EC_MASK 0x3FULL
+#define EC_WFx 0x01       /* Trapped WFI/WFE                                  */
 #define EC_SYSREG 0x18    /* Trapped MSR/MRS/system instruction (AArch64)     */
 #define EC_HVC64 0x16     /* HVC instruction execution in AArch64 state       */
 #define EC_DABT_LOWER 0x24 /* Data abort from a lower EL (stage-2 fault, etc.) */

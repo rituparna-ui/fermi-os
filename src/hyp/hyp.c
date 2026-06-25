@@ -93,6 +93,7 @@ extern uint8_t guest2_payload_end[];
 __attribute__((section(".hyp_tables"))) static vcpu_t vcpus[NUM_VCPUS];
 __attribute__((section(".hyp_tables"))) static int current_vcpu;
 __attribute__((section(".hyp_tables"))) static uint64_t g_switch_count;
+__attribute__((section(".hyp_tables"))) static uint64_t g_wfi_count;
 
 /* Captured Linux-guest console. The Linux PL011 is left unmapped in its
  * stage-2, so its UART MMIO traps to EL2 and is emulated (hyp_emulate_pl011);
@@ -344,10 +345,12 @@ void hyp_init(void) {
   MSR(ich_hcr_el2, ICH_HCR_EN);              /* enable virtual CPU interface */
   __asm__ __volatile__("isb");
 
-  /* Enable stage-2, pin EL1 to AArch64, and route physical IRQs to EL2 (IMO)
-   * so we can inject vIRQs. (TID3 ID-register trapping from the M2 demo is
-   * left off here — guests, including Linux, read ID registers natively.) */
-  MSR(hcr_el2, HCR_RW | HCR_VM | HCR_IMO);
+  /* Enable stage-2, pin EL1 to AArch64, route physical IRQs to EL2 (IMO) so we
+   * can inject vIRQs, and trap guest WFI (TWI) so an idle guest yields its slice
+   * to the others instead of halting the physical CPU until the next tick.
+   * (TID3 ID-register trapping from the M2 demo is left off here — guests,
+   * including Linux, read ID registers natively.) */
+  MSR(hcr_el2, HCR_RW | HCR_VM | HCR_IMO | HCR_TWI);
   __asm__ __volatile__("isb");
 
   /* Register the primary guest (Fermi) as vCPU 0 — its full context is
@@ -1069,6 +1072,7 @@ static void hyp_handle_hvc(el2_frame_t *f) {
     case VMSTAT_VIRQ:     ret = t->virq_injected; break;
     case VMSTAT_MMIO:     ret = t->mmio_emulated; break;
     case VMSTAT_SWITCHES: ret = g_switch_count; break;
+    case VMSTAT_WFI:      ret = g_wfi_count; break;
     default:              ret = (uint64_t)-1; break;
     }
     break;
@@ -1510,6 +1514,13 @@ void el2_dispatch(uint64_t index, el2_frame_t *frame) {
   uint64_t ec = (MRS(esr_el2) >> ESR_EC_SHIFT) & ESR_EC_MASK;
 
   switch (ec) {
+  case EC_WFx:
+    /* Idle guest hint: step past the WFI (ELR points *at* it) and yield to the
+     * next runnable vCPU, so the idle slice isn't wasted halting the CPU. */
+    MSR(elr_el2, MRS(elr_el2) + 4);
+    g_wfi_count++;
+    hyp_world_switch(frame);
+    return;
   case EC_HVC64:
     hyp_handle_hvc(frame);
     return;

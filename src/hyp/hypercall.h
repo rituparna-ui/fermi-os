@@ -37,6 +37,7 @@
 #define VMSTAT_VIRQ 5
 #define VMSTAT_SWITCHES 6  /* global world-switch count (same for all ids) */
 #define VMSTAT_MMIO 7      /* emulated guest MMIO accesses */
+#define VMSTAT_WFI 8       /* global WFI idle-yield count (same for all ids) */
 
 #define HYP_ABI_VERSION 0x00010000ULL      /* 1.0 */
 #define HVC_ERR_BADCALL ((uint64_t)-1)     /* unknown function ID */

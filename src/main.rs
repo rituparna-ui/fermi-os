@@ -298,7 +298,49 @@ extern "C" fn churn_test() {
     } else {
         kprintln!("[CHURN TEST] FAIL: leaked {} pages across churn", leaked);
     }
+
+    heap_stress();
     sched::task_exit();
+}
+
+/// Heap stress: churn many varied-size allocations (incl. one large enough to
+/// force a heap expand) and assert the heap's used-byte count returns exactly
+/// to baseline — catching leaks, double-frees, and coalescing bugs across the
+/// first-fit free list and any expanded regions.
+fn heap_stress() {
+    use alloc::vec::Vec;
+
+    let baseline = mm::heap::used_bytes();
+
+    for round in 0..8u64 {
+        // A spread of small/medium Vecs that grow (each push may realloc).
+        let mut keep: Vec<Vec<u8>> = Vec::new();
+        for i in 0..64u64 {
+            let n = ((i * 37 + round * 11) % 600 + 1) as usize;
+            let mut v = Vec::with_capacity(n);
+            v.resize(n, (i & 0xFF) as u8);
+            keep.push(v);
+        }
+        // One allocation larger than the 1 MiB initial heap, forcing expand().
+        let big: Vec<u8> = alloc::vec![round as u8; 1_200_000];
+        // Touch endpoints so the compiler can't elide the allocation.
+        core::hint::black_box(big.first().copied());
+        core::hint::black_box(big.last().copied());
+        core::hint::black_box(keep.len());
+        // `keep` and `big` drop here, returning everything to the heap.
+    }
+
+    let after = mm::heap::used_bytes();
+    if after == baseline {
+        kprintln!("[HEAP STRESS] PASS: heap used-bytes back to baseline ({} B)", baseline);
+    } else {
+        kprintln!(
+            "[HEAP STRESS] FAIL: heap leaked {} bytes (baseline {} -> {})",
+            after as i64 - baseline as i64,
+            baseline,
+            after
+        );
+    }
 }
 
 /// netd: an EL1 kernel daemon that periodically pings the slirp gateway and

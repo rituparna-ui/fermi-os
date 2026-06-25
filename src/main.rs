@@ -19,37 +19,60 @@ use core::arch::global_asm;
 // GNU-syntax `.S` file, so no external `as`/binutils is required.
 global_asm!(include_str!("arch/boot.S"));
 
-/// Rust entry point, called from `_start` (see `arch/boot.S`) with the stack
-/// already set up. Never returns.
+/// Early init — runs physically (PC == PA) with the MMU off, called from
+/// `_start`. Brings up the UART, physical memory manager, and the MMU. After it
+/// returns, `boot.S` switches to the upper-half stack and branches to `kmain`.
+///
+/// All logging here uses the UART's aligned helpers: RAM is Device memory until
+/// the MMU maps it Normal, so `core::fmt` would fault.
 #[no_mangle]
-pub extern "C" fn kmain() -> ! {
-    klib::uart::init();
+pub extern "C" fn early_init() {
+    // Rust uses SIMD (incl. in core::fmt); enable it before anything formats.
+    arch::cpu::enable_fp_simd();
 
-    // Pre-MMU: RAM is Device memory, so avoid core::fmt (it emits unaligned
-    // accesses that fault with no vectors installed). Plain string output via
-    // the UART is safe. Once the MMU maps RAM as Normal memory, kprintln! is
-    // usable everywhere.
+    // IMPORTANT: everything before `mmu::init` runs at the physical PC with the
+    // MMU off, so it must be position-independent. Code (PC-relative `adr`) and
+    // string literals are fine, but Rust constructs that materialize *absolute*
+    // VA pointers — `match`-on-enum returning `&str`, static reference arrays,
+    // trait-object vtables — load upper-half addresses that aren't mapped yet
+    // and fault. Keep the pre-MMU path to literal logging + computed pointers
+    // only. Once the MMU is on, both halves are mapped and such data resolves.
+    klib::uart::init();
     klib::uart::Uart.println("Fermi OS (Rust) - Booting Up...");
-    arch::cpu::print_current_el();
 
     // Physical memory manager (pre-MMU, identity mapped).
     mm::pmm::init(mm::pmm::MEM_START, mm::pmm::MEM_SIZE);
     mm::pmm::print_info();
 
-    // Quick sanity check: allocate, then free, a single page.
-    let p = mm::pmm::allocate_page();
-    let uart = klib::uart::Uart;
-    uart.puts("[PMM][TEST] allocated page at ");
-    uart.puthex(p);
-    uart.putc(b'\n');
-    mm::pmm::free_page(p);
-    uart.puts("[PMM][TEST] freed; free pages now ");
-    uart.putdec(mm::pmm::free_pages_count());
-    uart.putc(b'\n');
+    // Build page tables and enable the MMU; keep the L1 handle for the tests.
+    let l1_phys = mm::mmu::init();
 
-    // Echo received bytes, mirroring the original early kernel loop.
+    // MMU is on now — absolute-VA data resolves via TTBR1 even at physical PC.
+    arch::cpu::print_current_el();
+    // Self-tests run while TTBR0 is still the boot identity table.
+    mm::mmu::run_tests(l1_phys);
+
+    klib::uart::Uart.println("[BOOT] MMU Enabled. Jumping to Upper Half");
+}
+
+/// Upper-half kernel entry, branched to from `boot.S` after the MMU is enabled
+/// and SP has been switched to the upper-half stack. Never returns.
+#[no_mangle]
+pub extern "C" fn kmain() -> ! {
+    // Route all device MMIO through the TTBR1 upper half from here on.
+    klib::mmio::switch_to_upper(mm::consts::KERNEL_VA_OFFSET as usize);
+
+    // Relocate the PMM bitmap pointer to its upper-half virtual address.
+    mm::pmm::relocate_upper();
+
+    // Now in the upper half with RAM mapped Normal: core::fmt is safe.
+    kprintln!("[KERNEL] kmain address: {:#x}", kmain as usize as u64);
+    let sp: u64;
+    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp) };
+    kprintln!("[KERNEL] Stack Pointer: {:#x}", sp);
+
+    kprintln!("[KERNEL] Ready! Entering idle loop.");
     loop {
-        let c = uart.getc();
-        uart.putc(c);
+        unsafe { core::arch::asm!("wfi") };
     }
 }

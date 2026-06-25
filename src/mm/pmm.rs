@@ -18,15 +18,10 @@
 use crate::klib::sync::SpinLock;
 use crate::klib::uart::Uart;
 use crate::kprintln;
+use crate::mm::consts::{phys_to_virt, PAGE_SHIFT, PAGE_SIZE};
 
 pub const MEM_START: u64 = 0x4000_0000;
 pub const MEM_SIZE: u64 = 8 * 1024 * 1024 * 1024;
-pub const PAGE_SIZE: u64 = 4096;
-pub const PAGE_SHIFT: u32 = 12;
-
-/// Higher-half offset applied to physical addresses to reach the kernel's
-/// virtual mapping (TTBR1). Matches `KERNEL_VA_OFFSET` in the C MMU code.
-pub const KERNEL_VA_OFFSET: u64 = 0xFFFF_0000_0000_0000;
 
 #[inline]
 pub const fn pfn_to_phys(pfn: u64) -> u64 {
@@ -46,16 +41,6 @@ pub const fn page_align_up(addr: u64) -> u64 {
 #[inline]
 pub const fn page_align_down(addr: u64) -> u64 {
     addr & !(PAGE_SIZE - 1)
-}
-
-#[inline]
-pub const fn phys_to_virt(pa: u64) -> u64 {
-    pa + KERNEL_VA_OFFSET
-}
-
-#[inline]
-pub const fn virt_to_phys(va: u64) -> u64 {
-    va - KERNEL_VA_OFFSET
 }
 
 extern "C" {

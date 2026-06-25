@@ -5,7 +5,21 @@
 //! later, following the original commit progression.
 
 use crate::klib::uart::Uart;
-use crate::mrs;
+use crate::{mrs, msr};
+
+/// Enable FP/SIMD at EL1 (CPACR_EL1.FPEN = 0b11).
+///
+/// The Rust compiler — like GCC for varargs — uses SIMD registers, including in
+/// `core::fmt`. Without this, the first FP/SIMD instruction traps (ESR
+/// `0x1FE0_0000`). Must run early in boot, before any formatting.
+pub fn enable_fp_simd() {
+    let mut cpacr = mrs!("cpacr_el1");
+    cpacr |= 3 << 20;
+    unsafe {
+        msr!("cpacr_el1", cpacr);
+        core::arch::asm!("isb");
+    }
+}
 
 /// The current exception level, read from `CurrentEL[3:2]`.
 pub fn current_el() -> u8 {

@@ -10,7 +10,11 @@
 macro_rules! mrs {
     ($reg:literal) => {{
         let value: u64;
-        // SAFETY: reading a system register has no memory side effects.
+        // SAFETY: reading a system register has no memory side effects. This is
+        // wrapped in its own unsafe block so the macro is usable from safe code;
+        // `#[allow(unused_unsafe)]` keeps it quiet when expanded inside an
+        // existing unsafe block.
+        #[allow(unused_unsafe)]
         unsafe {
             core::arch::asm!(
                 concat!("mrs {0}, ", $reg),

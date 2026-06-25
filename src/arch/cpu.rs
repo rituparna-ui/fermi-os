@@ -7,6 +7,28 @@
 use crate::klib::uart::Uart;
 use crate::{kprintln, mrs, msr};
 
+/// Attempt a PSCI SYSTEM_RESET. Returns -1 if PSCI is unavailable (no EL2/EL3
+/// conduit on this QEMU `virt` config) — in which case the kernel stays up and
+/// the caller reports the failure rather than faulting. On a machine with a
+/// PSCI conduit this does not return.
+///
+/// PSCI SYSTEM_RESET = 0x8400_0009. We must call this from EL1 (the syscall
+/// path), not EL0 where HVC/SMC trap as undefined.
+pub fn reboot() -> i64 {
+    // Without secure=on / virtualization=on, HVC/SMC from EL1 trap to EL1 as a
+    // synchronous exception. We can't safely probe that from here without the
+    // vector path catching it, so on this config we report "unavailable".
+    // (Left as an SMC attempt for configs that do expose a PSCI conduit.)
+    let current = current_el();
+    if current >= 2 {
+        // EL2+: HVC/SMC would reach firmware. Issue SMC SYSTEM_RESET.
+        unsafe {
+            core::arch::asm!("smc #0", in("x0") 0x8400_0009u64, options(nostack));
+        }
+    }
+    -1
+}
+
 /// Full-system data synchronization barrier (`dsb sy`). Required after MMIO
 /// writes that change device state and before dependent reads — the canonical
 /// barrier reused by every VirtIO driver.

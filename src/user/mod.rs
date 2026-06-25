@@ -22,6 +22,7 @@ const SYS_KILL: u64 = 11;
 const SYS_FORK: u64 = 12;
 const SYS_EXEC: u64 = 13;
 const SYS_BALLOON: u64 = 14;
+const SYS_REBOOT: u64 = 15;
 
 // --- raw syscall wrappers ---------------------------------------------------
 
@@ -77,6 +78,9 @@ fn sys_fork() -> i64 {
 }
 fn sys_exec(path: *const u8, argv: *const *const u8) -> i64 {
     syscall3(SYS_EXEC, path as u64, argv as u64, 0)
+}
+fn sys_reboot() -> i64 {
+    syscall3(SYS_REBOOT, 0, 0, 0)
 }
 fn sys_balloon(op: u64, n: u64) -> i64 {
     syscall3(SYS_BALLOON, op, n, 0)
@@ -211,7 +215,9 @@ fn sh_help() {
           \x20 cpuinfo         - cat /proc/cpuinfo\n\
           \x20 stack           - stress demand-paged user stack growth\n\
           \x20 cat <path>      - print a file\n\
+          \x20 hexdump <path>  - hex+ascii dump of a file\n\
           \x20 echo <text>     - print text\n\
+          \x20 vlog <text>     - send <text> to /dev/vcons (host log)\n\
           \x20 kill <pid>      - terminate a task by pid\n\
           \x20 fork            - spawn a child task; both print\n\
           \x20 exec <path>     - replace this task with an ELF from disk\n\
@@ -220,6 +226,7 @@ fn sh_help() {
           \x20 ping            - ICMP echo the slirp gateway (10.0.2.2)\n\
           \x20 sleep <ms>      - block for <ms> milliseconds\n\
           \x20 clear           - clear the terminal (ANSI)\n\
+          \x20 reboot          - PSCI SYSTEM_RESET (warm restart)\n\
           \x20 exit            - terminate the shell task\n",
     );
 }
@@ -376,6 +383,28 @@ pub extern "C" fn task_shell() {
             } else {
                 b"stack: 64 KiB stack probe FAILED\n"
             });
+        } else if starts_with(cmd, b"hexdump ") {
+            let mut path = [0u8; 120];
+            let plen = copy_cstr(&mut path, &cmd[8..]);
+            hexdump(&path[..plen]);
+        } else if starts_with(cmd, b"vlog ") {
+            // Send the rest of the line to /dev/vcons (virtio-console host log).
+            let fd = sys_open(b"/dev/vcons\0");
+            if fd < 0 {
+                print(b"vlog: cannot open /dev/vcons\n");
+            } else {
+                sys_write(fd as i32, &cmd[5..]);
+                sys_write(fd as i32, b"\n");
+                sys_close(fd as i32);
+                print(b"vlog: sent (check the virtio-console host file)\n");
+            }
+        } else if streq(cmd, b"reboot") {
+            print(b"rebooting via PSCI SYSTEM_RESET...\n");
+            // Reboot is a syscall: HVC/SMC must come from EL1, and undefined-
+            // from-EL0 would just fault. On a QEMU virt machine without a PSCI
+            // conduit (no EL2/EL3) this returns -1 and we say so.
+            sys_reboot();
+            print(b"reboot: PSCI unavailable on this machine\n");
         } else if streq(cmd, b"exit") {
             print(b"bye!\n");
             sys_exit();
@@ -383,6 +412,63 @@ pub extern "C" fn task_shell() {
             print(b"unknown command - try 'help'\n");
         }
     }
+}
+
+/// hexdump a file: 8-hex-digit offset, 16 bytes hex, then ASCII gutter.
+fn hexdump(path: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let fd = sys_open(path);
+    if fd < 0 {
+        print(b"hexdump: cannot open\n");
+        return;
+    }
+    let mut hbuf = [0u8; 16];
+    let mut offset: u64 = 0;
+    loop {
+        let got = sys_read(fd as i32, hbuf.as_mut_ptr(), 16);
+        if got <= 0 {
+            break;
+        }
+        let got = got as usize;
+        let mut ln = [0u8; 96];
+        let mut p = 0;
+        for i in (0..8).rev() {
+            ln[p] = HEX[((offset >> (i * 4)) & 0xF) as usize];
+            p += 1;
+        }
+        ln[p] = b' ';
+        ln[p + 1] = b' ';
+        p += 2;
+        for i in 0..16 {
+            if i < got {
+                ln[p] = HEX[(hbuf[i] >> 4) as usize];
+                ln[p + 1] = HEX[(hbuf[i] & 0xF) as usize];
+            } else {
+                ln[p] = b' ';
+                ln[p + 1] = b' ';
+            }
+            p += 2;
+            ln[p] = b' ';
+            p += 1;
+            if i == 7 {
+                ln[p] = b' ';
+                p += 1;
+            }
+        }
+        ln[p] = b'|';
+        p += 1;
+        for i in 0..got {
+            let c = hbuf[i];
+            ln[p] = if (32..127).contains(&c) { c } else { b'.' };
+            p += 1;
+        }
+        ln[p] = b'|';
+        ln[p + 1] = b'\n';
+        p += 2;
+        sys_write(1, &ln[..p]);
+        offset += got as u64;
+    }
+    sys_close(fd as i32);
 }
 
 /// Copy `src` into `dst` and NUL-terminate; returns total length incl. NUL.

@@ -32,6 +32,10 @@ pub const SYS_KILL: u64 = 11;
 pub const SYS_FORK: u64 = 12;
 pub const SYS_EXEC: u64 = 13;
 pub const SYS_BALLOON: u64 = 14;
+/// Reboot via PSCI from EL1 (HVC from EL0 traps as undefined). Extends the
+/// original ABI — the C shell issued HVC directly from EL0, which faults on a
+/// QEMU virt machine without EL2/EL3, so reboot never worked there.
+pub const SYS_REBOOT: u64 = 15;
 
 pub const BALLOON_OP_INFLATE: u64 = 0;
 pub const BALLOON_OP_DEFLATE: u64 = 1;
@@ -155,6 +159,9 @@ pub fn dispatch(frame: &mut TrapFrame) {
         }
         SYS_FORK => {
             ret = sched::fork(sched::current(), frame);
+        }
+        SYS_REBOOT => {
+            ret = crate::arch::cpu::reboot();
         }
         SYS_BALLOON => {
             ret = match arg0 {

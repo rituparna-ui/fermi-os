@@ -69,7 +69,9 @@ timer `CNTHP` (PPI 26) instead.
 | `vgic/vgic.{c,h}` | Virtual GICv3: enable `ICC_SRE_EL2` + the virtual CPU interface, inject via `ICH_LR<n>_EL2`, and a GICD/GICR MMIO software model (the windows are left stage-2-unmapped so they trap). Per-vCPU save/restore. |
 | `vuart/vuart.{c,h}` | Per-guest virtual PL011 console: trap-and-emulate `DR`/`FR`/init regs, line-buffered TX with a `[name]` prefix and an RX FIFO fed from the host console. |
 | `psci/psci.{c,h}` | Minimal PSCI 1.1 provider (VERSION/FEATURES/SYSTEM_RESET/SYSTEM_OFF/CPU_OFF); SYSTEM_RESET warm-resets the calling guest. |
-| `hvc/hvc.{c,h}` | Unified HVC hypercall ABI: PSCI + vendor services (VERSION/PUTC/VM_INFO/YIELD/DOORBELL) folded into one dispatcher returning an action enum. |
+| `hvc/hvc.{c,h}` | Unified HVC hypercall ABI: PSCI + vendor services (VERSION/PUTC/VM_INFO/YIELD/DOORBELL/BLK/NET) folded into one dispatcher returning an action enum. |
+| `fdt.{c,h}` | Minimal flattened-device-tree (DTB) builder for foreign guests (M22). |
+| `miniguest/` | A standalone, non-FermiOS AArch64 EL1 guest (own start.S/main.c/linker.ld) that boots via `x0=DTB` and parses the device tree. |
 | `guest_stub.S` | Small hand-written EL1 guests used by the demos/self-tests (marker write + HVC, spin, heartbeat, PSCI, interactive echo). |
 | `guest_blob.S` | `.incbin` of the reduced-RAM FermiOS guest image (`build/guest.bin`) into the hypervisor. |
 
@@ -99,6 +101,7 @@ timer `CNTHP` (PPI 26) instead.
 | M19 | **Paravirt block device:** a guest reads the real host disk via block hypercalls, with its buffer IPA safely stage-2-translated (DMA-equivalent). |
 | M20 | **Paravirt network device:** a guest does a real NIC round-trip (MAC query + ARP to the gateway + RX of the reply) via net hypercalls. |
 | M21 | **Dynamic VM lifecycle:** create/run/destroy a VM at runtime with leak-free stage-2 teardown (free-page count returns to baseline across cycles). |
+| M22 | **Foreign (non-FermiOS) guest:** boot a standalone AArch64 guest via the standard `x0=DTB` boot protocol; it parses the hypervisor-built device tree to discover its UART + RAM. |
 
 The default hypervisor build runs **two** interactive FermiOS guests (M14);
 `Ctrl-X` cycles console focus. Build with `-DHYP_RUN_DEMOS` to run the

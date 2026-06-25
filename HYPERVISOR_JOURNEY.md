@@ -330,10 +330,22 @@ qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on -m 8G \
   returns to baseline. Verified leak-free over 4 cycles (each re-uses the same
   recycled physical addresses).
 
-## 13. What's next (not yet built)
+- **M22 — foreign (non-FermiOS) guest (done):** a standalone AArch64 EL1
+  program (`src/hyp/miniguest/`, sharing no code with FermiOS) booted via the
+  standard `x0 = DTB` protocol. `src/hyp/fdt.c` builds a spec-valid device tree
+  into guest RAM; the guest parses it to discover its UART + RAM and prints
+  `miniguest: discovered via DTB -> uart=0x9000000 mem_base=0x40000000
+  mem_size=0x200000`. Proves the hypervisor is generic, not FermiOS-specific.
 
-- A non-FermiOS guest (needs a DTB + broader device-tree-driven emulation) —
-  the largest remaining unknown.
+## 14. Status
+
+The hypervisor is feature-complete for a small multi-tenant Type-1 design:
+VHE EL2 host; multiple stage-2-isolated guests; preemptive scheduling;
+interactive per-guest consoles; PSCI; inter-VM shared memory + interrupt
+doorbells; a unified hypercall ABI; an audited guest→host boundary; paravirt
+disk + network with safe IPA translation; leak-free dynamic VM lifecycle; and a
+generic DTB-booted foreign guest. Further work would be breadth (a full foreign
+OS, SMP/multi-vCPU-per-VM, more devices) rather than missing fundamentals.
 
 ---
 

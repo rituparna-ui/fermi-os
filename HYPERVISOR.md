@@ -197,6 +197,16 @@ own registers and needs no context switch.
   RX interrupt the hypervisor injects the **UART SPI** (INTID 33) as a software
   virtual interrupt (see §6) so the guest's IRQ handler drains the FIFO. The
   output side is captured to `/proc/linux_console` (§10).
+- **Emulated virtio-rng (virtio-mmio)**: a full virtio device at IPA
+  `0x0a000000` (unmapped → trapped). The hypervisor emulates the virtio-mmio v2
+  register set (Magic/Version/DeviceID=4/Status/queue programming) and, on
+  `QueueNotify`, walks the guest's split virtqueue *in guest memory* (descriptor
+  / avail / used rings, reached via the Linux IPA→PA linear map), fills each
+  buffer with pseudo-random bytes, publishes the used ring, and injects the
+  device's SPI (INTID 34, software). Linux's stock `virtio_mmio` (built-in) +
+  `virtio-rng` (a module loaded from the initramfs) driver drives it, feeding
+  the guest's entropy pool / `/dev/hwrng`. This exercises the complete virtio
+  path and is the template for further virtio devices (e.g. virtio-blk).
 
 ---
 

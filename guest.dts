@@ -80,4 +80,12 @@
 		reg = <0x0 0x08000000 0x0 0x10000>,   /* GICD */
 		      <0x0 0x080a0000 0x0 0x20000>;    /* GICR */
 	};
+
+	/* Emulated virtio-rng (virtio-mmio, device id 4). The hypervisor traps
+	 * this MMIO region and the device interrupt is SPI 2 (INTID 34). */
+	virtio_rng@a000000 {
+		compatible = "virtio,mmio";
+		reg = <0x0 0x0a000000 0x0 0x200>;
+		interrupts = <0 2 4>;
+	};
 };

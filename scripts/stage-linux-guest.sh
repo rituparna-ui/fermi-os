@@ -62,14 +62,28 @@ deb_extract "$WORK/bb.deb" "$WORK/bb"
 BB="$(find "$WORK/bb" -name busybox -type f | head -1)"
 [ -n "$BB" ] || { echo "[stage] ERROR: busybox binary not found" >&2; exit 1; }
 
+echo "[stage] fetching virtio-rng kernel module..."
+KDIR="http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/"
+MODDEB="linux-modules-5.4.0-99-generic_5.4.0-99.112_arm64.deb"
+curl -fsSL -o "$WORK/mod.deb" "${KDIR}${MODDEB}"
+deb_extract "$WORK/mod.deb" "$WORK/mod"
+VRNG_KO="$(find "$WORK/mod" -name 'virtio-rng.ko' | head -1)"
+[ -n "$VRNG_KO" ] || { echo "[stage] ERROR: virtio-rng.ko not found" >&2; exit 1; }
+
 echo "[stage] building initramfs..."
 IR="$WORK/ir"
 mkdir -p "$IR/bin" "$IR/proc" "$IR/sys" "$IR/dev"
 cp "$BB" "$IR/bin/busybox"; chmod +x "$IR/bin/busybox"
+cp "$VRNG_KO" "$IR/virtio-rng.ko"
 cat > "$IR/init" <<'INIT'
 #!/bin/busybox sh
 /bin/busybox mount -t proc proc /proc 2>/dev/null
 /bin/busybox mount -t sysfs sys /sys 2>/dev/null
+/bin/busybox mount -t devtmpfs dev /dev 2>/dev/null
+# Load the virtio-rng driver (CONFIG_HW_RANDOM_VIRTIO=m); virtio_mmio and the
+# rng core are built into the kernel, so a plain insmod is enough. It binds to
+# the hypervisor's emulated virtio-mmio RNG device.
+/bin/busybox insmod /virtio-rng.ko 2>/dev/null && echo "[init] loaded virtio-rng driver"
 echo ""
 echo "==================================================="
 echo "  Linux userspace is ALIVE on the Fermi hypervisor!"

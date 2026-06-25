@@ -80,7 +80,7 @@ void early_init() {
    * opens the tty, after which it is delivered via an injected UART SPI,
    * executed, and its output appears in `cat /proc/linux_console`. */
   {
-    const char *cmd = "echo HVTEST_OK\n";
+    const char *cmd = "echo HVTEST_OK; od -An -N8 -tx1 /dev/hwrng\n";
     for (const char *p = cmd; *p; p++)
       hvc_call(HVC_LCON_PUT, (uint64_t)(uint8_t)*p, 0, 0);
     uart_println("[BOOT] queued 'echo HVTEST_OK' to Linux guest console");

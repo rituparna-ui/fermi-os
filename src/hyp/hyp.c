@@ -124,6 +124,7 @@ __attribute__((section(".hyp_tables"))) static uint64_t g_quantum_ticks;
 static void hyp_create_linux_guest(void);
 static void hyp_create_guest2(void);
 static void hyp_tick_init(void);
+static void hyp_vgic_inject_ex(int target, uint32_t intid, int hw);
 static void hyp_tick_start(void);
 
 /* --- self-contained PL011 output (no driver state, safe pre-uart_init) --- */
@@ -599,6 +600,142 @@ static void hyp_tick_start(void) {
   MSR(cnthp_ctl_el2, 1ULL); /* enable, unmasked */
 }
 
+/* ------------------------- emulated virtio-rng ----------------------------- */
+/* A minimal virtio-mmio (version 2) virtio-rng device for the Linux guest. Its
+ * MMIO window is unmapped in the guest's stage-2 so accesses trap to EL2. The
+ * device has one virtqueue; on QueueNotify the hypervisor walks the guest's
+ * split ring, fills each available buffer with pseudo-random bytes, publishes
+ * the used ring, and injects the device's SPI. */
+#define VIRTIO_LO 0x0a000000ULL
+#define VIRTIO_HI 0x0a000200ULL
+#define VIRTIO_RNG_INTID 34 /* DT: virtio interrupts = <0 2 4> => SPI 2 => 34 */
+
+__attribute__((section(".hyp_tables"))) static struct {
+  uint32_t status;
+  uint32_t dev_feat_sel, drv_feat_sel;
+  uint32_t q_num;
+  uint32_t q_ready;
+  uint64_t q_desc, q_avail, q_used;
+  uint16_t last_avail;
+  uint32_t int_status;
+  uint64_t prng;
+  uint32_t served;
+} g_vrng;
+
+/* Translate a Linux-guest IPA to a hypervisor-usable physical pointer (the
+ * Linux RAM window is mapped linearly IPA 0x40000000 -> phys LINUX_PHYS_BASE).
+ * Returns NULL for IPAs outside that window. */
+static void *lx_gpa(uint64_t ipa) {
+  if (ipa < LINUX_IPA_BASE || ipa >= LINUX_IPA_BASE + LINUX_RAM_SIZE)
+    return 0;
+  return (void *)(ipa - LINUX_IPA_BASE + LINUX_PHYS_BASE);
+}
+
+static uint8_t vrng_byte(void) {
+  uint64_t x = g_vrng.prng ? g_vrng.prng : 0x9e3779b97f4a7c15ULL;
+  x ^= x << 13;
+  x ^= x >> 7;
+  x ^= x << 17;
+  g_vrng.prng = x;
+  return (uint8_t)(x >> 24);
+}
+
+/* Split-virtqueue descriptor (matches the Linux/virtio layout). */
+struct vq_desc {
+  uint64_t addr;
+  uint32_t len;
+  uint16_t flags;
+  uint16_t next;
+};
+
+static void hyp_virtio_process(void) {
+  if (!g_vrng.q_ready || !g_vrng.q_desc || !g_vrng.q_avail || !g_vrng.q_used)
+    return;
+  struct vq_desc *desc = lx_gpa(g_vrng.q_desc);
+  volatile uint16_t *avail = lx_gpa(g_vrng.q_avail); /* [0]=flags [1]=idx ring[2..] */
+  volatile uint16_t *used16 = lx_gpa(g_vrng.q_used); /* [0]=flags [1]=idx */
+  if (!desc || !avail || !used16 || g_vrng.q_num == 0)
+    return;
+
+  uint16_t avail_idx = avail[1];
+  int worked = 0;
+  while (g_vrng.last_avail != avail_idx) {
+    uint16_t slot = g_vrng.last_avail % g_vrng.q_num;
+    uint16_t didx = avail[2 + slot];
+    if (didx >= g_vrng.q_num)
+      break;
+    struct vq_desc *d = &desc[didx];
+    uint8_t *buf = lx_gpa(d->addr);
+    uint32_t len = d->len;
+    if (buf)
+      for (uint32_t i = 0; i < len; i++)
+        buf[i] = vrng_byte();
+
+    /* used ring entry at offset 4: struct { u32 id; u32 len; } ring[] */
+    volatile uint32_t *used_ring = (volatile uint32_t *)(used16 + 2);
+    uint16_t uidx = used16[1];
+    uint16_t uslot = uidx % g_vrng.q_num;
+    used_ring[uslot * 2 + 0] = didx;
+    used_ring[uslot * 2 + 1] = len;
+    __asm__ __volatile__("dsb ish");
+    used16[1] = uidx + 1; /* publish */
+
+    g_vrng.last_avail++;
+    worked = 1;
+  }
+  if (worked) {
+    __asm__ __volatile__("dsb ish");
+    g_vrng.int_status |= 1; /* used-buffer notification */
+    hyp_vgic_inject_ex(1 /* Linux */, VIRTIO_RNG_INTID, 0 /* SW */);
+    if (g_vrng.served < 3) {
+      g_vrng.served++;
+      hyp_puts("[HYP] virtio-rng: served guest queue (");
+      hyp_puthex(g_vrng.served);
+      hyp_puts(")\n");
+    }
+  }
+}
+
+static int hyp_emulate_virtio(uint64_t ipa, int is_write, uint64_t *val) {
+  uint64_t off = ipa - VIRTIO_LO;
+  if (is_write) {
+    switch (off) {
+    case 0x014: g_vrng.dev_feat_sel = (uint32_t)*val; break;
+    case 0x024: g_vrng.drv_feat_sel = (uint32_t)*val; break;
+    case 0x030: /* QueueSel — only queue 0 exists */ break;
+    case 0x038: g_vrng.q_num = (uint32_t)*val; break;
+    case 0x044: g_vrng.q_ready = (uint32_t)*val; break;
+    case 0x050: hyp_virtio_process(); break; /* QueueNotify */
+    case 0x064: g_vrng.int_status &= ~(uint32_t)*val; break; /* InterruptACK */
+    case 0x070: g_vrng.status = (uint32_t)*val; break;
+    case 0x080: g_vrng.q_desc = (g_vrng.q_desc & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x084: g_vrng.q_desc = (g_vrng.q_desc & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    case 0x090: g_vrng.q_avail = (g_vrng.q_avail & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x094: g_vrng.q_avail = (g_vrng.q_avail & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    case 0x0a0: g_vrng.q_used = (g_vrng.q_used & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x0a4: g_vrng.q_used = (g_vrng.q_used & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    default: break;
+    }
+    return 1;
+  }
+  switch (off) {
+  case 0x000: *val = 0x74726976; break;       /* Magic "virt"               */
+  case 0x004: *val = 2; break;                /* Version 2 (modern)         */
+  case 0x008: *val = 4; break;                /* DeviceID 4 = entropy/rng   */
+  case 0x00c: *val = 0x554d4551; break;       /* VendorID "QEMU"            */
+  case 0x010: /* DeviceFeatures: only VIRTIO_F_VERSION_1 (bit 32) */
+    *val = (g_vrng.dev_feat_sel == 1) ? (1u << 0) : 0;
+    break;
+  case 0x034: *val = 8; break;                /* QueueNumMax                */
+  case 0x044: *val = g_vrng.q_ready; break;   /* QueueReady                 */
+  case 0x060: *val = g_vrng.int_status; break;/* InterruptStatus            */
+  case 0x070: *val = g_vrng.status; break;    /* Status                     */
+  case 0x0fc: *val = 0; break;                /* ConfigGeneration           */
+  default: *val = 0; break;
+  }
+  return 1;
+}
+
 /* ------------------------------- traps ------------------------------------ */
 
 static const char *ec_name(uint64_t ec) {
@@ -963,11 +1100,13 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
     return;
   }
 
-  /* Linux guest: emulate trapped GIC distributor/redistributor or PL011 MMIO. */
+  /* Linux guest: emulate trapped GIC / PL011 / virtio-mmio accesses. */
   if (current_vcpu == 1 &&
       ((ipa >= GICD_LO && ipa < GICD_HI) || (ipa >= GICR_LO && ipa < GICR_HI) ||
-       (ipa >= PL011_LO && ipa < PL011_HI))) {
+       (ipa >= PL011_LO && ipa < PL011_HI) ||
+       (ipa >= VIRTIO_LO && ipa < VIRTIO_HI))) {
     int is_uart = (ipa >= PL011_LO && ipa < PL011_HI);
+    int is_virtio = (ipa >= VIRTIO_LO && ipa < VIRTIO_HI);
     vcpus[current_vcpu].mmio_emulated++;
     uint64_t isv = (esr >> 24) & 1;
     uint64_t sas = (esr >> 22) & 3;
@@ -979,11 +1118,15 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
         v = (srt == 31) ? 0 : frame->x[srt];
         if (is_uart)
           hyp_emulate_pl011(ipa, 1, &v);
+        else if (is_virtio)
+          hyp_emulate_virtio(ipa, 1, &v);
         else
           hyp_emulate_gic(ipa, 1, &v);
       } else {
         if (is_uart)
           hyp_emulate_pl011(ipa, 0, &v);
+        else if (is_virtio)
+          hyp_emulate_virtio(ipa, 0, &v);
         else
           hyp_emulate_gic(ipa, 0, &v);
         if (sas == 0)

@@ -329,6 +329,21 @@ receives SGIs, runs the work, and acks) with `/dev/vda` read and `ping` working
 concurrently. The primary guest (Fermi) is unaffected by the new `TC` trapping.
 No anomalies.
 
+### A real ext4 disk on virtio-blk
+*Why:* the natural step up from the 256 KiB signature disk toward a root disk —
+back virtio-blk with a genuine, larger filesystem the guest can mount. The
+256 KiB in-`.hyp` RAM disk is replaced by an **8 MiB ext4 image** staged by
+QEMU's loader into Fermi-invisible high RAM at phys `0x280000000` (just past the
+Linux window). `g_vdisk` becomes a pointer to that physical region (EL2 is
+MMU-off), capacity 16384 sectors; the seeded MBR/signature is gone — the image
+*is* the content. The image is built reproducibly with `mke2fs -d` (populate
+from a directory, no loop mount) in the build container via a Makefile rule
+(`CONFIG_EXT4_FS=y`, so no kernel module is needed). *Verified:* `EXT4-fs
+(vda): mounted filesystem with ordered data mode`, and the guest reads back
+`hello.txt` ("Hello from a real ext4 filesystem served by Fermi-HV
+virtio-blk!") — all while SMP (`nproc` 2) and `ping` work concurrently. No
+anomalies.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)
@@ -361,8 +376,9 @@ under preemptive scheduling**:
 - **vCPU 1:** an unmodified aarch64 **Linux 5.4** kernel — to a BusyBox userspace
   shell — with an emulated **GICv3**, **virtual timer**, a **captured+interactive
   console** (`/proc/linux_console`), an emulated **virtio-rng**, an emulated
-  **virtio-blk `/dev/vda`** (partition `vda1` detected), and an emulated
-  **virtio-net `eth0`** (can `ping` the hypervisor host `10.0.0.1`).
+  **virtio-blk `/dev/vda`** (an 8 MiB ext4 image the guest mounts and reads),
+  and an emulated **virtio-net `eth0`** (can `ping` the hypervisor host
+  `10.0.0.1`).
 - **vCPU 2:** Linux's **second core** (SMP secondary), brought online by the boot
   CPU via PSCI `CPU_ON`; `nproc` reports 2.
 
@@ -407,11 +423,10 @@ Pushed to `git@github.com:rituparna-ui/fermi-os.git`:
   identity distributor reads + software SPI injection for emulated devices); full
   SPI routing/priority for arbitrary devices isn't modelled.
 - Requires an **SCS-free** guest kernel (the staging script fetches one).
-- **virtio-blk is not yet a root disk** — it's a verified read/write `/dev/vda`
-  (reads confirmed via the partition scan detecting `vda1`; writes confirmed by a
-  shell round-trip: writing `FERMIWR` to sector 2 and reading it back). A real
-  root-fs (`root=/dev/vda` with an ext2/ext4 image) is the natural next step, but
-  needs a larger disk backing than the current 256 KiB hyp-private RAM disk.
+- **virtio-blk is mountable but not yet the root device** — `/dev/vda` is an
+  8 MiB ext4 image the guest mounts and reads files from (reads/writes both
+  exercised). Making it the actual root (`root=/dev/vda` via an initramfs
+  `switch_root`, since `virtio_blk` is a module) is the remaining step.
 - Building a custom kernel here is blocked by host disk space.
 
 ---

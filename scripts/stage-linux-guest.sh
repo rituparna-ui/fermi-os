@@ -118,5 +118,6 @@ INIT
 chmod +x "$IR/init"
 ( cd "$IR" && find . | cpio -o -H newc 2>/dev/null | gzip -9 > "$GUEST/initramfs.cpio.gz" )
 echo "[stage] guest/initramfs.cpio.gz ready ($(stat -c %s "$GUEST/initramfs.cpio.gz") bytes)"
+echo "[stage] (the ext4 virtio-blk image guest/rootdisk.img is built by 'make' in the container)"
 
 echo "[stage] done. Now: make run  (inside the build container)"

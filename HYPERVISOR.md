@@ -231,14 +231,14 @@ own registers and needs no context switch.
   the guest's entropy pool / `/dev/hwrng`. This exercises the complete virtio
   path and is the template for further virtio devices (e.g. virtio-blk).
 - **Emulated virtio-blk (virtio-mmio)**: a block device at IPA `0x0a000200`
-  (IRQ SPI 3 / INTID 35) backed by a 256 KiB in-hypervisor RAM disk, exposing
-  `/dev/vda`. The config space reports the capacity; on `QueueNotify` the
-  hypervisor walks each request's descriptor chain (16-byte out-header → data
-  buffer(s) → 1-byte status) and reads/writes the RAM disk, then completes the
-  request and injects the device SPI. The disk is seeded with a signature and a
-  minimal MBR, so Linux's `virtio_blk` driver (a module from the initramfs)
-  registers `/dev/vda` with the right size and its partition scan detects
-  `vda1` — confirming correct block reads.
+  (IRQ SPI 3 / INTID 35) => `/dev/vda`. It is backed by an **8 MiB ext4 image**
+  staged by QEMU's loader into Fermi-invisible high RAM (phys `0x280000000`,
+  just past the Linux window); the hypervisor reaches it physically (MMU-off)
+  and neither guest can see the backing directly. On `QueueNotify` the
+  hypervisor walks each request's descriptor chain (16-byte out-header → data →
+  status) and reads/writes the image. Verified: Linux's `virtio_blk` driver (a
+  module from the initramfs) registers `/dev/vda`, and the guest **mounts it as
+  ext4 and reads real files** (`EXT4-fs (vda): mounted filesystem`).
 - **Emulated virtio-net (virtio-mmio)**: a network device (DeviceID 1) at IPA
   `0x0a000400` (IRQ SPI 4 / INTID 36) exposing `eth0`, with two virtqueues
   (0 = RX guest←host, 1 = TX guest→host) and a `VIRTIO_NET_F_MAC` address. The

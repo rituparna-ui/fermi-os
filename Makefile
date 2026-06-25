@@ -76,9 +76,11 @@ QEMU_FLAGS_DEBUG := -kernel $(TARGET) -s -S
 GUEST_IMAGE := guest/Image
 GUEST_DTB   := $(BUILD_DIR)/guest.dtb
 GUEST_INITRD := guest/initramfs.cpio.gz
+GUEST_DISK  := guest/rootdisk.img
 GUEST_LOAD  := -device loader,file=$(GUEST_IMAGE),addr=0x240200000,force-raw=on \
                -device loader,file=$(GUEST_DTB),addr=0x248000000,force-raw=on \
-               -device loader,file=$(GUEST_INITRD),addr=0x24a000000,force-raw=on
+               -device loader,file=$(GUEST_INITRD),addr=0x24a000000,force-raw=on \
+               -device loader,file=$(GUEST_DISK),addr=0x280000000,force-raw=on
 
 .PHONY: all run debug clean gdb tmux disk dump_dts compile_commands.json
 
@@ -137,7 +139,7 @@ user_bins: $(USER_BINS)
 
 
 # Run QEMU
-run: all disk $(GUEST_DTB)
+run: all disk $(GUEST_DTB) $(GUEST_DISK)
 	@$(QEMU_BASE) $(QEMU_FLAGS_RUN) $(GUEST_LOAD)
 
 debug: all disk $(GUEST_DTB)
@@ -147,6 +149,17 @@ debug: all disk $(GUEST_DTB)
 $(GUEST_DTB): guest.dts
 	@mkdir -p $(BUILD_DIR)
 	@dtc -I dts -O dtb -o $@ $< 2>/dev/null
+
+# Build the 8 MiB ext4 image that backs the guest's virtio-blk (/dev/vda).
+# Uses mke2fs -d to populate from a directory (no loop mount); runs in the
+# build container where e2fsprogs supports -d.
+$(GUEST_DISK):
+	@echo "  GEN $(GUEST_DISK)"
+	@DR=$$(mktemp -d) && mkdir -p $$DR/dir1 && \
+	  echo "Hello from a real ext4 filesystem served by Fermi-HV virtio-blk!" > $$DR/hello.txt && \
+	  echo "Fermi-OS EL2 hypervisor - SMP Linux guest with virtio rng/blk/net." > $$DR/motd && \
+	  echo "nested file on the hypervisor disk" > $$DR/dir1/deep.txt && \
+	  mke2fs -F -q -t ext4 -d $$DR $@ 8M && rm -rf $$DR
 	@echo "DTC $@"
 
 disk: $(DISK_IMG)

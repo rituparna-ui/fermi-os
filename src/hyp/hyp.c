@@ -100,9 +100,14 @@ __attribute__((section(".hyp_tables"))) static uint32_t g_lcon_len;
 
 /* virtio-blk RAM disk (declared early so hyp_init can seed it; the device
  * model is defined further below). */
-#define VBLK_SECTORS 512               /* 256 KiB disk */
-#define VBLK_BYTES (VBLK_SECTORS * 512)
-__attribute__((aligned(4096), section(".hyp_tables"))) static uint8_t g_vdisk[VBLK_BYTES];
+/* virtio-blk is backed by an 8 MiB ext4 image staged by QEMU's loader into
+ * Fermi-invisible high RAM at phys 0x280000000 (just past the Linux window).
+ * EL2 runs MMU-off, so the hypervisor reaches it physically; neither guest can
+ * see it (outside Fermi's view and the Linux stage-2 window). */
+#define VBLK_PHYS_BASE 0x280000000ULL
+#define VBLK_BYTES (8ULL * 1024 * 1024) /* 8 MiB */
+#define VBLK_SECTORS (VBLK_BYTES / 512)
+#define g_vdisk ((uint8_t *)VBLK_PHYS_BASE)
 
 /* Emulated PL011 RX side (for interactive input to the Linux guest). Bytes
  * pushed via HVC_LCON_PUT land in this FIFO; when the guest has enabled the RX
@@ -249,24 +254,6 @@ void hyp_init(void) {
    * stage-2 tables and guest 1 payload are in place. */
   memset(vcpus, 0, sizeof(vcpus));
   current_vcpu = 0;
-
-  /* Seed the virtio-blk RAM disk: a recognizable signature at sector 0, plus a
-   * minimal MBR with one Linux partition. Linux's partition scan reads sector 0
-   * over the virtqueue and registers /dev/vda1 — proving block reads return the
-   * correct data, independent of the interactive shell. */
-  {
-    static const char sig[] = "VBLKOK_FERMI_HV\n";
-    memcpy(g_vdisk, sig, sizeof(sig));
-    uint8_t *p = &g_vdisk[446]; /* first MBR partition entry */
-    p[0] = 0x00;                /* not bootable                  */
-    p[1] = 0xFE; p[2] = 0xFF; p[3] = 0xFF; /* CHS first (dummy)   */
-    p[4] = 0x83;                /* type = Linux                  */
-    p[5] = 0xFE; p[6] = 0xFF; p[7] = 0xFF; /* CHS last (dummy)    */
-    p[8] = 1; p[9] = 0; p[10] = 0; p[11] = 0;        /* LBA start = 1   */
-    p[12] = 0xFE; p[13] = 1; p[14] = 0; p[15] = 0;   /* sectors = 510   */
-    g_vdisk[510] = 0x55;        /* MBR boot signature            */
-    g_vdisk[511] = 0xAA;
-  }
 
   /* Sanity: confirm we really are at EL2. */
   uint64_t el = (MRS(CurrentEL) >> 2) & 0x3;
@@ -1577,8 +1564,9 @@ static int hyp_emulate_pl011(uint64_t ipa, int is_write, uint64_t *val) {
              * virtio-blk signature, then bring up eth0 and ping the
              * hypervisor-emulated host (10.0.0.1) over virtio-net. */
             lrx_push_str(
-                "nproc; head -c 16 /dev/vda; ifconfig eth0 10.0.0.2 up; "
-                "ping -c 2 10.0.0.1; echo NETDONE\n");
+                "nproc; mkdir -p /mnt; mount -t ext4 /dev/vda /mnt && "
+                "cat /mnt/hello.txt; ifconfig eth0 10.0.0.2 up; "
+                "ping -c 1 10.0.0.1; echo ALLDONE\n");
           }
           hyp_uart_rx_kick();
         }

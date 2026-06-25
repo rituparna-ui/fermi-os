@@ -84,40 +84,9 @@ __attribute__((noreturn)) void hyp_panic(const char *msg) {
   }
 }
 
-/* Guest flat image embedded in the hyp (see guest_blob.S). */
+/* Guest flat images embedded in the hyp (see guest_blob.S / guest2_blob.S). */
 extern const uint8_t __guest_blob_start[];
 extern const uint8_t __guest_blob_end[];
-
-/* Copy the embedded guest image to its physical load base (0x40000000) so the
- * eret lands on real guest bytes. Done with the EL2 MMU off (physical stores).
- * The guest's first LOAD segment starts at PA 0x40000000 and the flat blob
- * preserves inter-segment gaps, so one linear copy places every PT_LOAD. */
-static void hyp_load_guest(void) {
-  const uint8_t *src = __guest_blob_start;
-  uint64_t size = (uint64_t)(__guest_blob_end - __guest_blob_start);
-  volatile uint8_t *dst = (volatile uint8_t *)(uintptr_t)GUEST_ENTRY_IPA;
-
-  /* Word copy for the aligned bulk, byte copy for the tail. */
-  uint64_t words = size / 8;
-  const uint64_t *s64 = (const uint64_t *)src;
-  volatile uint64_t *d64 = (volatile uint64_t *)dst;
-  for (uint64_t i = 0; i < words; i++) {
-    d64[i] = s64[i];
-  }
-  for (uint64_t i = words * 8; i < size; i++) {
-    dst[i] = src[i];
-  }
-  /* Ensure the stores are visible and instruction-coherent before the guest
-   * (at EL1) fetches them: clean D-cache then invalidate I-cache to PoU. */
-  hyp_dcache_clean_range(GUEST_ENTRY_IPA, size);
-  __asm__ __volatile__("ic ialluis\n\tdsb ish\n\tisb" ::: "memory");
-
-  hyp_puts("[HYP] guest image copied to ");
-  hyp_puthex(GUEST_ENTRY_IPA);
-  hyp_puts(" (");
-  hyp_puthex(size);
-  hyp_puts(" bytes)\n");
-}
 
 /* VM2's flat image, embedded in the hyp (guest2_blob.S). */
 extern const uint8_t __guest2_blob_start[];
@@ -130,8 +99,9 @@ extern const uint8_t __guest2_blob_end[];
 #define VM2_HOST_RAM_BASE 0x260000000ULL
 #define VM2_RAM_SIZE      0x04000000ULL /* 64 MiB */
 
-/* Copy a flat blob to a host physical destination (EL2 MMU off). */
-static void copy_blob(uint64_t dst_pa, const uint8_t *src, uint64_t size) {
+/* Copy a flat blob to a host physical destination (EL2 MMU off) and make it
+ * coherent for guest instruction fetch. Used at boot and on warm reset. */
+void hyp_copy_image(uint64_t dst_pa, const uint8_t *src, uint64_t size) {
   volatile uint64_t *d = (volatile uint64_t *)(uintptr_t)dst_pa;
   const uint64_t *s = (const uint64_t *)src;
   uint64_t words = size / 8;
@@ -162,12 +132,13 @@ void hyp_main(void) {
   /* Place both guest images at their host PAs.
    *   VM1 (FermiOS) -> host PA 0x40000000 (== its IPA 0x40000000)
    *   VM2 (tiny)    -> host PA VM2_HOST_RAM_BASE (its IPA 0x40000000 maps here) */
-  hyp_load_guest(); /* VM1 -> 0x40000000 */
-  copy_blob(VM2_HOST_RAM_BASE, __guest2_blob_start,
-            (uint64_t)(__guest2_blob_end - __guest2_blob_start));
-  hyp_puts("[HYP] VM2 image copied to ");
+  uint64_t vm1_size = (uint64_t)(__guest_blob_end - __guest_blob_start);
+  uint64_t vm2_size = (uint64_t)(__guest2_blob_end - __guest2_blob_start);
+  hyp_copy_image(GUEST_ENTRY_IPA, __guest_blob_start, vm1_size);
+  hyp_copy_image(VM2_HOST_RAM_BASE, __guest2_blob_start, vm2_size);
+  hyp_puts("[HYP] guest images placed (VM1 @ 0x40000000, VM2 @ ");
   hyp_puthex(VM2_HOST_RAM_BASE);
-  hyp_putc('\n');
+  hyp_puts(")\n");
 
   /* Stage-2: one VTCR (shared geometry), two L1 roots (isolated spaces). */
   s2_init_vtcr();
@@ -194,9 +165,12 @@ void hyp_main(void) {
 
   /* Create the two vCPUs. Both enter at IPA 0x40000000 with their own stage-2.
    * VM1 uses FermiOS's own boot.S stack math (SP set by guest); VM2 sets its
-   * own SP in _g2_start, so sp_el1_override is 0 for both. */
-  vcpu_alloc("FermiOS", GUEST_ENTRY_IPA, s2_make_vttbr(vm1_l1, 1), 0);
-  vcpu_alloc("guest2",  GUEST_ENTRY_IPA, s2_make_vttbr(vm2_l1, 2), 0);
+   * own SP in _g2_start, so sp_el1_override is 0 for both. The image triples
+   * let the hypervisor warm-reset a guest on PSCI SYSTEM_RESET. */
+  vcpu_alloc("FermiOS", GUEST_ENTRY_IPA, s2_make_vttbr(vm1_l1, 1), 0,
+             __guest_blob_start, GUEST_ENTRY_IPA, vm1_size);
+  vcpu_alloc("guest2", GUEST_ENTRY_IPA, s2_make_vttbr(vm2_l1, 2), 0,
+             __guest2_blob_start, VM2_HOST_RAM_BASE, vm2_size);
   hyp_puts("[HYP] 2 vCPUs created. Starting EL2 scheduler.\n");
   hyp_puts("--------------------------------------------------\n\n");
 

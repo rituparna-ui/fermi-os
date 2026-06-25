@@ -163,9 +163,25 @@ Notes captured the hard way: HVC and SMC are **symmetric** — neither advances
 The hyp is built `-mgeneral-regs-only` so its GPR-only trap frame can never
 clobber the guest's caller-saved q-registers.
 
+### VM lifecycle (PSCI)
+
+The hypervisor emulates a per-VM PSCI interface (the guest's `hvc`/`smc`):
+
+- **`PSCI_VERSION`** → reports v1.1.
+- **`SYSTEM_RESET`** → *warm-resets only the calling VM*: the hypervisor
+  re-copies that VM's pristine image to its host RAM, re-initialises its
+  register/FP/vGIC/vtimer state, flushes its stage-2 TLB, and restarts it at its
+  entry point. The other VM keeps running — it is a per-VM reset, not a machine
+  reset. (Each `vcpu_t` carries an `img_src/img_dst_pa/img_size` triple for the
+  reload.)
+- **`SYSTEM_OFF`** → powers off the calling VM (marked dead, scheduler skips it);
+  if it was the last VM the hypervisor halts.
+
+VM2 demonstrates this: it self-issues `SYSTEM_RESET` every 5 heartbeats and its
+banner re-prints each time, while VM1 (FermiOS) runs uninterrupted.
+
 ## Known limitations / future work
 
-- **PSCI SYSTEM_RESET** halts rather than warm-resetting.
 - **PCI ECAM** is mapped straight-through; no vPCI model.
 - Single physical CPU only; no SMP guests.
 - The scheduler is round-robin with block-on-WFI; there is no priority or

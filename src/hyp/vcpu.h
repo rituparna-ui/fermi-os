@@ -97,6 +97,17 @@ typedef struct vcpu {
   uint32_t id;        /* 0, 1, ... */
   const char *name;
   int runnable;       /* 0 = blocked on WFI awaiting its next interrupt */
+  int dead;           /* 1 = powered off (PSCI SYSTEM_OFF), never runs again */
+
+  /* Pristine image, for PSCI SYSTEM_RESET (warm restart). On reset the
+   * hypervisor re-copies [img_src, img_src+img_size) to img_dst_pa (the host
+   * PA backing the guest's load IPA), then re-initialises register state and
+   * re-enters at entry_ipa. */
+  const uint8_t *img_src;
+  uint64_t       img_dst_pa;
+  uint64_t       img_size;
+  uint64_t       entry_ipa;
+  uint64_t       sp_el1_init;
 } vcpu_t;
 
 /* The currently-running vCPU (set by the scheduler before each guest entry).
@@ -112,9 +123,24 @@ void vcpu_restore_fp(const vcpu_fp_t *f);
 
 /* Allocate a vCPU: enters `name` at `entry_ipa` (EL1h) with stage-2 base
  * `vttbr`; sp_el1_override (0 = leave at reset baseline) sets the initial
- * guest SP_EL1. */
+ * guest SP_EL1. img_src/img_dst_pa/img_size describe the pristine guest image
+ * (re-copied on PSCI SYSTEM_RESET); pass img_src=0 to disable warm-reset. */
 vcpu_t *vcpu_alloc(const char *name, uint64_t entry_ipa, uint64_t vttbr,
-                   uint64_t sp_el1_override);
+                   uint64_t sp_el1_override, const uint8_t *img_src,
+                   uint64_t img_dst_pa, uint64_t img_size);
+
+/* Warm-reset a vCPU: re-copy its pristine image, re-init register/timer/vGIC
+ * state, mark runnable. If `v` is the CURRENT vCPU, `f` (its live trap frame)
+ * is rewritten so the vector exit erets into the fresh guest; pass f=0 when
+ * resetting a non-current vCPU. */
+void vcpu_reset(vcpu_t *v, hyp_trap_frame_t *f);
+
+/* Power off the current VM (PSCI SYSTEM_OFF): mark it permanently dead and
+ * switch to another runnable VM. If it is the last one, the hypervisor halts. */
+void vcpu_poweroff_current(hyp_trap_frame_t *f);
+
+/* True once a vCPU has been powered off (never runs again). */
+int vcpu_is_dead(const vcpu_t *v);
 
 /* Arm the EL2 scheduler tick (CNTHV) and enter the first vCPU (no return). */
 void vcpu_sched_init(void);

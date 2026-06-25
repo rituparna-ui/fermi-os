@@ -57,9 +57,20 @@ static void handle_psci(hyp_trap_frame_t *f) {
     f->regs[0] = 0x00010001; /* PSCI v1.1 */
     break;
   case PSCI_SYSTEM_OFF_FN:
-    hyp_panic("guest requested PSCI SYSTEM_OFF — halting");
+    /* Power off this VM: mark it dead and switch away. If it was the last
+     * runnable VM, the scheduler keeps it (nothing else to run) — for a
+     * 2-VM demo SYSTEM_OFF from one VM lets the other keep running. */
+    hyp_puts("[HYP] VM '");
+    hyp_puts(cur_vcpu->name);
+    hyp_puts("' requested PSCI SYSTEM_OFF\n");
+    vcpu_poweroff_current(f);
+    break;
   case PSCI_SYSTEM_RESET_FN:
-    hyp_panic("guest requested PSCI SYSTEM_RESET — halting (warm reset TODO)");
+    /* Warm-reset THIS VM: reload its pristine image and restart it from its
+     * entry point. The other VM is unaffected — a per-VM reset, not a machine
+     * reset. */
+    vcpu_reset(cur_vcpu, f);
+    break;
   case PSCI_FEATURES_FN:
   case PSCI_CPU_ON_FN64:
   case PSCI_AFFINITY_INFO_FN64:

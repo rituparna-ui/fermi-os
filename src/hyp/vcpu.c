@@ -1,6 +1,7 @@
 #include "vcpu.h"
 #include "hyp.h"
 #include "hyp_sysregs.h"
+#include "stage2.h"
 #include "vgic/vgic.h"
 #include "timer/vtimer.h"
 #include <stdint.h>
@@ -24,45 +25,103 @@ vcpu_t       *cur_vcpu;
 /* Implemented in vcpu_switch.S — load gp->x[]/elr/spsr and eret (no return). */
 extern void vcpu_first_entry(vcpu_gp_t *gp) __attribute__((noreturn));
 
+/* Forward decls (definitions appear later in this file). */
+static vcpu_t *pick_next(vcpu_t *cur);
+static void switch_to(vcpu_t *next, hyp_trap_frame_t *f);
+static void vcpu_load(vcpu_t *v);
+
 /* Capture the current (QEMU reset) EL1 sysregs as a valid baseline both VMs
  * start from. Called once at boot before any guest runs. */
 static void capture_reset_baseline(vcpu_sysregs_t *s) { vcpu_save_sysregs(s); }
 
-vcpu_t *vcpu_alloc(const char *name, uint64_t entry_ipa, uint64_t vttbr,
-                   uint64_t sp_el1_override) {
-  vcpu_t *v = &vcpus[nr_vcpus];
-  v->id = (uint32_t)nr_vcpus;
-  v->vmid = (uint32_t)(nr_vcpus + 1); /* VMID 1, 2 (0 reserved) */
-  v->name = name;
-  v->vttbr_el2 = vttbr;
-  v->runnable = 1;
-
+/* (Re)initialise the resettable execution state of a vCPU to its pristine
+ * boot values: GP/PC/PSTATE, EL1 sysregs (from the captured QEMU-reset
+ * baseline), FP, vGIC, vtimer. Shared by vcpu_alloc and vcpu_reset. */
+static void vcpu_init_state(vcpu_t *v) {
   /* GP: enter the guest at its IPA in EL1h with DAIF masked (guest unmasks). */
   for (int i = 0; i < 31; i++) v->gp.x[i] = 0;
-  v->gp.elr_el2 = entry_ipa;
+  v->gp.elr_el2 = v->entry_ipa;
   v->gp.spsr_el2 = SPSR_EL2_GUEST_ENTRY;
 
   /* Start from the captured reset sysreg baseline. */
   capture_reset_baseline(&v->sys);
-  if (sp_el1_override) {
-    v->sys.sp_el1 = sp_el1_override;
+  if (v->sp_el1_init) {
+    v->sys.sp_el1 = v->sp_el1_init;
   }
 
-  /* FP reset state = all zero (fpsr/fpcr 0). */
+  /* FP reset state = all zero. */
   for (unsigned i = 0; i < sizeof(v->fp.q); i++) v->fp.q[i] = 0;
   v->fp.fpsr = 0;
   v->fp.fpcr = 0;
 
-  /* vGIC reset: virtual interface enabled, group1 + PMR seeded. The MMIO
-   * model fields start at 0 (guest programs them). */
+  /* vGIC reset: virtual interface enabled, group1 + PMR seeded. */
   vgic_vcpu_reset(&v->vgic);
 
   /* vtimer reset: disarmed. */
   v->vtimer.cval = 0;
   v->vtimer.ctl = 0;
+  v->vtimer.pending = 0;
+
+  v->runnable = 1;
+  v->dead = 0;
+}
+
+int vcpu_is_dead(const vcpu_t *v) { return v->dead; }
+
+void vcpu_poweroff_current(hyp_trap_frame_t *f) {
+  cur_vcpu->dead = 1;
+  cur_vcpu->runnable = 0;
+  vcpu_t *next = pick_next(cur_vcpu);
+  if (next == cur_vcpu) {
+    hyp_panic("last VM powered off — nothing left to run");
+  }
+  switch_to(next, f);
+}
+
+vcpu_t *vcpu_alloc(const char *name, uint64_t entry_ipa, uint64_t vttbr,
+                   uint64_t sp_el1_override, const uint8_t *img_src,
+                   uint64_t img_dst_pa, uint64_t img_size) {
+  vcpu_t *v = &vcpus[nr_vcpus];
+  v->id = (uint32_t)nr_vcpus;
+  v->vmid = (uint32_t)(nr_vcpus + 1); /* VMID 1, 2 (0 reserved) */
+  v->name = name;
+  v->vttbr_el2 = vttbr;
+  v->entry_ipa = entry_ipa;
+  v->sp_el1_init = sp_el1_override;
+  v->img_src = img_src;
+  v->img_dst_pa = img_dst_pa;
+  v->img_size = img_size;
+
+  vcpu_init_state(v);
 
   nr_vcpus++;
   return v;
+}
+
+void vcpu_reset(vcpu_t *v, hyp_trap_frame_t *f) {
+  hyp_puts("[SCHED] warm-reset VM '");
+  hyp_puts(v->name);
+  hyp_puts("'\n");
+
+  /* Re-copy the pristine image (the running guest mutated its own .data/.bss
+   * and possibly .text) and re-init all execution state. */
+  if (v->img_src && v->img_size) {
+    hyp_copy_image(v->img_dst_pa, v->img_src, v->img_size);
+  }
+  vcpu_init_state(v);
+
+  /* Drop any stale TLB entries for this VM's VMID so the fresh guest does not
+   * see cached translations from its previous life. */
+  s2_tlb_flush_all();
+
+  if (v == cur_vcpu) {
+    /* Reset-in-place: reload state into hardware and rewrite the live trap
+     * frame so the vector exit erets into the fresh guest. */
+    vcpu_load(v);
+    for (int i = 0; i < 31; i++) f->regs[i] = v->gp.x[i];
+    f->elr = v->gp.elr_el2;
+    f->spsr = v->gp.spsr_el2;
+  }
 }
 
 /* Restore the full guest context for `v` into the hardware. */
@@ -106,7 +165,8 @@ static int vtimer_armed(const vcpu_t *v) {
 void hyp_cnthp_arm(void) {
   uint64_t deadline = sched_deadline;
   for (int i = 0; i < nr_vcpus; i++) {
-    if (vtimer_armed(&vcpus[i]) && vcpus[i].vtimer.cval < deadline) {
+    if (!vcpus[i].dead && vtimer_armed(&vcpus[i]) &&
+        vcpus[i].vtimer.cval < deadline) {
       deadline = vcpus[i].vtimer.cval;
     }
   }
@@ -128,11 +188,12 @@ void vcpu_sched_init(void) {
   hyp_puts("[SCHED] EL2 scheduler armed (CNTHP PPI 26, ~50ms slice)\n");
 }
 
-/* Pick the next runnable vCPU round-robin after `cur`. */
+/* Pick the next runnable (non-dead) vCPU round-robin after `cur`. Returns `cur`
+ * if no other vCPU is runnable. */
 static vcpu_t *pick_next(vcpu_t *cur) {
   for (int i = 1; i <= nr_vcpus; i++) {
     vcpu_t *cand = &vcpus[(cur->id + i) % nr_vcpus];
-    if (cand->runnable) return cand;
+    if (cand->runnable && !cand->dead) return cand;
   }
   return cur;
 }
@@ -177,6 +238,7 @@ int vcpu_wake_expired(void) {
 
   for (int i = 0; i < nr_vcpus; i++) {
     vcpu_t *v = &vcpus[i];
+    if (v->dead) continue;
     if (vtimer_armed(v) && now >= v->vtimer.cval) {
       v->vtimer.pending = 1; /* latch ISTATUS; cleared on guest re-arm */
       if (v == cur_vcpu) {

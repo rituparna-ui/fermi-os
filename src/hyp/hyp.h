@@ -26,6 +26,11 @@
  * at IPA/PA 0x40000000 by QEMU '-device loader'). */
 void hyp_main(void);
 
+/* Copy a flat guest image to a host PA (EL2, MMU off) and make it coherent for
+ * guest instruction fetch (DC CVAC + IC IALLUIS). Used at boot and on warm
+ * reset. */
+void hyp_copy_image(uint64_t dst_pa, const uint8_t *src, uint64_t size);
+
 /* Minimal EL2 console (direct PL011 MMIO at physical 0x09000000). Safe to call
  * with the MMU off; does not depend on any guest state. */
 void hyp_putc(char c);

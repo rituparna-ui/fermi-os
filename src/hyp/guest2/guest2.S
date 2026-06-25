@@ -21,9 +21,33 @@ _g2_start:
 	adr	x19, g2_banner
 	bl	g2_puts
 
+	// Heartbeat counter in writable RAM (IPA 0x40210000). On a warm reset the
+	// hypervisor re-copies our pristine image and re-zeroes .bss-style state,
+	// but this scratch word lives in plain RAM, so we initialise it explicitly.
+	ldr	x21, =0x40210000
+	str	xzr, [x21]
+
 1:	// Heartbeat loop
 	adr	x19, g2_beat
 	bl	g2_puts
+
+	// After 5 heartbeats, request a PSCI SYSTEM_RESET. The hypervisor warm-
+	// resets THIS VM only: it reloads our image and restarts us from _g2_start,
+	// so the banner prints again and the counter restarts. (VM1 is unaffected.)
+	ldr	x21, =0x40210000
+	ldr	x22, [x21]
+	add	x22, x22, #1
+	str	x22, [x21]
+	cmp	x22, #5
+	b.lt	3f
+	adr	x19, g2_reset_msg
+	bl	g2_puts
+	mov	x0, #0
+	movk	x0, #0x8400, lsl #16	// x0 = 0x84000009 = PSCI SYSTEM_RESET
+	movk	x0, #0x0009
+	hvc	#0
+	// not reached — the hyp re-enters us at _g2_start
+3:
 	// crude delay
 	mov	x20, #0x4000000
 2:	subs	x20, x20, #1
@@ -52,3 +76,5 @@ g2_banner:
 	.asciz "\r\n[VM2] hello from guest 2 (EL1, isolated stage-2)\r\n"
 g2_beat:
 	.asciz "[VM2] heartbeat\r\n"
+g2_reset_msg:
+	.asciz "[VM2] 5 beats -> PSCI SYSTEM_RESET (warm restart)\r\n"

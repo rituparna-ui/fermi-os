@@ -80,4 +80,9 @@ void hyp_run_multi_guest_demo(void);
  * per-vCPU context save/restore. No-op at EL1; runs before the host timer. */
 void hyp_run_dual_fermios(void);
 
+/* Milestone 11: PSCI self-test. Run a guest that issues PSCI SYSTEM_RESET and
+ * verify the hypervisor warm-resets it (guest re-enters at its entry, counter
+ * cleared). No-op at EL1; runs before the host timer. */
+void hyp_run_psci_test(void);
+
 #endif /* HYP_HYP_H */

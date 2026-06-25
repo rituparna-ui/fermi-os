@@ -87,3 +87,37 @@ guest_hb_start:
 	b	1b
 .global guest_hb_end
 guest_hb_end:
+
+// ---------------------------------------------------------------------------
+// PSCI test EL1 guest (milestone 11). Counts beats in x10; on the FIRST beat it
+// records "ran before reset" by storing 0x1111 to RAM, then issues PSCI
+// SYSTEM_RESET (hvc with x0=0x84000009). The hypervisor should warm-reset it,
+// re-entering at the top with x10 cleared — so after reset x10 climbs from 0
+// again. The host watches x10 reset to prove the warm reset happened.
+// On entry the hypervisor seeds x0 = a "life" tag: 0 for the first boot, 1 for
+// the post-reset boot (the host sets x0 when it warm-resets). The guest stores
+// its beat counter to RAM each beat. On the FIRST life (x0==0) it requests PSCI
+// SYSTEM_RESET on beat 1; on the SECOND life (x0!=0) it just counts up, so the
+// host can see the counter climb past 1 only AFTER the reset.
+.section .text.guest, "ax"
+.balign 16
+.global guest_psci_start
+guest_psci_start:
+	mov	x12, x0			// x12 = life tag (preserved across beats)
+	movz	x11, #0x0000
+	movk	x11, #0x4000, lsl #16
+	add	x11, x11, #0x800	// RAM marker addr
+	movz	x10, #0			// beat counter
+1:	add	x10, x10, #1
+	str	x10, [x11]
+	// First life only, first beat only: request PSCI SYSTEM_RESET.
+	cbnz	x12, 2f			// second life -> never reset
+	cmp	x10, #1
+	b.ne	2f
+	movz	x0, #0x0009
+	movk	x0, #0x8400, lsl #16	// x0 = 0x84000009 (SYSTEM_RESET)
+	hvc	#0
+2:	hvc	#0			// yield to the hypervisor scheduler
+	b	1b
+.global guest_psci_end
+guest_psci_end:

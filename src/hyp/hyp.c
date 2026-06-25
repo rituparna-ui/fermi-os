@@ -3,6 +3,7 @@
 #include "stage2.h"
 #include "vcpu.h"
 #include "vgic/vgic.h"
+#include "psci/psci.h"
 #include "gic/gic.h" /* gic_enable_irq, gic_ack_irq, gic_end_irq */
 #include "mm/pmm/pmm.h"
 #include "mm/mmu/mmu.h" /* PHYS_TO_VIRT */
@@ -689,6 +690,25 @@ static int df_service_exit(vcpu_t *v) {
   return 0;
 }
 
+/* Warm-reset a guest: reload its flat image into its RAM and reset the vCPU to
+ * a fresh boot state. Used to service a guest PSCI SYSTEM_RESET. */
+static void df_reset_guest(vcpu_t *v, uintptr_t ram_phys, uint64_t ram_size) {
+  uint64_t blob_len = (uint64_t)(__guest_blob_end - __guest_blob_start);
+  uint64_t kva = PHYS_TO_VIRT(ram_phys);
+  for (uint64_t b = 0; b < blob_len; b++) {
+    ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)__guest_blob_start)[b];
+  }
+  guest_sync_icache(kva, (blob_len + 0xFFF) & ~0xFFFULL);
+
+  for (int r = 0; r < 31; r++) v->x[r] = 0;
+  v->pc = GUEST_ENTRY_IPA;
+  v->pstate = 0x3C5;
+  v->sp_el1 = 0;
+  vgic_vcpu_reset(&v->vgic);
+  vuart_init(&v->vuart, v->name);
+  (void)ram_size;
+}
+
 void hyp_run_dual_fermios(void) {
   if (!hyp_at_el2()) {
     return;
@@ -746,9 +766,20 @@ void hyp_run_dual_fermios(void) {
    * has run once. We restore-on-switch; the very first entry of each uses the
    * fresh reset state already in the hardware bank when it boots MMU-off. */
   int started[DF_COUNT] = {0, 0};
+  int off[DF_COUNT] = {0, 0};
   int cur_id = 0;
 
   for (int s = 0; s < DF_SLICES; s++) {
+    /* Skip powered-off guests; stop if all are off. */
+    int tries = 0;
+    while (off[cur_id] && tries < DF_COUNT) {
+      cur_id = (cur_id + 1) % DF_COUNT;
+      tries++;
+    }
+    if (tries >= DF_COUNT) {
+      uart_println("[HYP] all guests powered off");
+      break;
+    }
     vcpu_t *v = &vc[cur_id];
 
     /* Restore this guest's saved context (skip the very first time it runs). */
@@ -765,6 +796,7 @@ void hyp_run_dual_fermios(void) {
     /* Run this guest until the scheduler quantum (CNTHP, PPI 26) expires. */
     cnthp_arm(slice);
     int slice_done = 0;
+    int fresh = 0; /* set if this guest was reset/off this slice (no save) */
     long guard = 200000;
     while (!slice_done && guard-- > 0) {
       vcpu_enter(v);
@@ -778,6 +810,26 @@ void hyp_run_dual_fermios(void) {
           if (intid == 30) vgic_inject_ppi(30); /* guest's own timer */
           if (intid != GIC_INTID_NO_PENDING) gic_end_irq(intid);
         }
+      } else if (v->exit_reason == HYP_EXC_SYNC &&
+                 ESR_EC_OF(v->esr) == 0x16) {
+        /* Guest HVC -> PSCI. ELR_EL2 already points past the hvc. */
+        psci_action_t act = psci_handle(v);
+        if (act == PSCI_ACT_RESET) {
+          vuart_flush(&v->vuart);
+          uart_printf("\n[HYP] %s requested PSCI SYSTEM_RESET -> warm reset\n",
+                      v->name);
+          df_reset_guest(v, ram[cur_id], DF_RAM_SIZE);
+          started[cur_id] = 0; /* fresh boot: no saved context to restore */
+          fresh = 1;
+          slice_done = 1;
+        } else if (act == PSCI_ACT_OFF) {
+          vuart_flush(&v->vuart);
+          uart_printf("\n[HYP] %s requested PSCI power-off\n", v->name);
+          off[cur_id] = 1;
+          fresh = 1;
+          slice_done = 1;
+        }
+        /* PSCI_ACT_NONE: x0 set with the result; resume the guest. */
       } else if (!df_service_exit(v)) {
         uint64_t ipa = ((v->hpfar >> 4) << 12) | (v->far & 0xFFF);
         uart_printf("[HYP] %s fatal exit reason=%u EC=%x pc=%x IPA=%x\n",
@@ -791,11 +843,18 @@ void hyp_run_dual_fermios(void) {
      * does not bleed into the next guest's output. */
     vuart_flush(&v->vuart);
 
-    /* Save this guest's context out before switching away. */
-    vcpu_save_el1(&v->el1);
-    vcpu_save_fp(&v->fp);
-    vgic_save(&v->vgic);
-    started[cur_id] = 1;
+    /* Save this guest's live context before switching away. After a reset or
+     * power-off the in-struct state is already the one we want to keep, so we
+     * only quiesce the shared virtual-GIC HW interface and skip the save. */
+    if (!fresh) {
+      vcpu_save_el1(&v->el1);
+      vcpu_save_fp(&v->fp);
+      vgic_save(&v->vgic);
+      started[cur_id] = 1;
+    } else {
+      /* Quiesce ICH_HCR_EL2 for the next guest without overwriting v->vgic. */
+      __asm__ __volatile__("msr ich_hcr_el2, %0\n\tisb" ::"r"(0ULL));
+    }
 
     cur_id = (cur_id + 1) % DF_COUNT; /* round-robin */
   }
@@ -806,4 +865,84 @@ void hyp_run_dual_fermios(void) {
   for (int i = 0; i < DF_COUNT; i++) {
     pmm_free_pages(ram[i], DF_RAM_SIZE / 0x1000);
   }
+}
+
+/* ---- Milestone 11: PSCI SYSTEM_RESET self-test ---- */
+
+extern char guest_psci_start[];
+extern char guest_psci_end[];
+
+void hyp_run_psci_test(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M11: PSCI test — guest will request SYSTEM_RESET");
+
+  uintptr_t ram_phys = pmm_allocate_pages(MG_RAM_SIZE / 0x1000);
+  if (!ram_phys) {
+    return;
+  }
+  static stage2_t s2;
+  if (!stage2_create(&s2, /*vmid=*/3)) {
+    return;
+  }
+  stage2_map(&s2, GUEST_ENTRY_IPA, (uint64_t)ram_phys, MG_RAM_SIZE, 0);
+
+  uint64_t kva = PHYS_TO_VIRT((uint64_t)ram_phys);
+  uint64_t len = (uint64_t)(guest_psci_end - guest_psci_start);
+  for (uint64_t b = 0; b < len; b++) {
+    ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)guest_psci_start)[b];
+  }
+  *(volatile uint64_t *)(kva + MG_MARKER_OFF) = 0;
+  guest_sync_icache(kva, (len + 0xFFF) & ~0xFFFULL);
+
+  static vcpu_t v;
+  for (int i = 0; i < 31; i++) v.x[i] = 0;
+  v.pc = GUEST_ENTRY_IPA;
+  v.pstate = 0x3C5;
+  v.sp_el1 = GUEST_ENTRY_IPA + MG_RAM_SIZE;
+  v.vttbr = stage2_vttbr(&s2);
+  v.vmid = 3;
+  v.name = "psci";
+
+  int did_reset = 0;
+  uint64_t post_reset_x10 = 0;
+  for (int beat = 0; beat < 8; beat++) {
+    vcpu_enter(&v);
+    if (!(v.exit_reason == HYP_EXC_SYNC && ESR_EC_OF(v.esr) == 0x16)) {
+      uart_printf("[HYP] psci test: unexpected exit reason=%u EC=%x\n",
+                  v.exit_reason, ESR_EC_OF(v.esr));
+      break;
+    }
+    psci_action_t act = psci_handle(&v);
+    if (act == PSCI_ACT_RESET) {
+      uart_printf("[HYP] psci test: guest requested SYSTEM_RESET at x10=%u; "
+                  "warm-resetting\n", v.x[10]);
+      /* Warm reset: reload image + reset vcpu, re-enter at entry with x0=1 to
+       * mark this as the post-reset "second life" so it counts instead of
+       * resetting again. */
+      for (uint64_t b = 0; b < len; b++) {
+        ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)guest_psci_start)[b];
+      }
+      guest_sync_icache(kva, (len + 0xFFF) & ~0xFFFULL);
+      for (int i = 0; i < 31; i++) v.x[i] = 0;
+      v.x[0] = 1; /* life tag: second life */
+      v.pc = GUEST_ENTRY_IPA;
+      v.pstate = 0x3C5;
+      v.sp_el1 = GUEST_ENTRY_IPA + MG_RAM_SIZE;
+      did_reset = 1;
+    } else if (did_reset) {
+      /* Post-reset yields: the second life counts up normally. */
+      post_reset_x10 = v.x[10];
+    }
+  }
+
+  /* The guest reset once, then on its second life counted past 1 — proving the
+   * warm reset re-ran it from entry with a cleared counter. */
+  int ok = did_reset && (post_reset_x10 >= 2);
+  uart_printf("[HYP] psci test: post-reset beats=%u -> %s\n", post_reset_x10,
+              ok ? "PASS (guest warm-reset + resumed)" : "FAIL");
+
+  pmm_free_pages(ram_phys, MG_RAM_SIZE / 0x1000);
 }

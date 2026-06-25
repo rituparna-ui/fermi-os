@@ -64,19 +64,19 @@ __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t s2_l3_spl
 extern uint8_t __hyp_start[];
 extern uint8_t __hyp_end[];
 
-/* Guest 1's stage-2 tables and RAM slice (hypervisor-private; the hole-punch
- * in hyp_build_stage2 keeps this region invisible to guest 0). Guest 1 runs
- * with its stage-1 MMU off, so it sees IPA == PA over just this slice; every
- * other IPA is unmapped, isolating it. */
-#define GUEST1_RAM_SIZE (16 * 1024)
-__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g1_l0[512];
-__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g1_l1[512];
-__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g1_l2[512];
-__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g1_l3[512];
-__attribute__((aligned(4096), section(".hyp_tables"))) static uint8_t guest1_ram[GUEST1_RAM_SIZE];
+/* Linux-slot guest (vCPU 1). Its RAM lives in a Fermi-invisible high physical
+ * region (just past Fermi's 8 GiB PMM view); stage-2 maps the guest's IPA
+ * window there, plus the PL011 UART so the guest can drive earlycon. */
+#define LINUX_PHYS_BASE 0x240000000ULL /* 9 GiB: past Fermi's 8 GiB view      */
+#define LINUX_IPA_BASE 0x40000000ULL   /* arm64 RAM base the guest sees       */
+#define LINUX_RAM_SIZE (256ULL * 1024 * 1024)
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l0[512];
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l1[512];
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_ram[512]; /* IPA 1-2 GiB (RAM)     */
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_dev[512]; /* IPA 0-1 GiB (devices) */
 
-extern uint8_t guest1_payload[];
-extern uint8_t guest1_payload_end[];
+extern uint8_t linux_stub[];
+extern uint8_t linux_stub_end[];
 
 /* The vCPUs and the index of the one currently running. In .hyp_tables
  * (NOLOAD); initialised explicitly in hyp_init(). */
@@ -88,7 +88,7 @@ __attribute__((section(".hyp_tables"))) static uint64_t g_switch_count;
 #define HYP_QUANTUM_MS 100   /* preemption time-slice */
 __attribute__((section(".hyp_tables"))) static uint64_t g_quantum_ticks;
 
-static void hyp_create_guest1(void);
+static void hyp_create_linux_guest(void);
 static void hyp_tick_init(void);
 static void hyp_tick_start(void);
 
@@ -281,8 +281,8 @@ void hyp_init(void) {
   vcpus[0].state = VCPU_RUNNING;
   vcpus[0].vttbr = (uint64_t)s2_l0; /* VMID 0 */
   current_vcpu = 0;
-  hyp_create_guest1();
-  hyp_puts("[HYP] created guest1 (vCPU 1) with its own stage-2\n");
+  hyp_create_linux_guest();
+  hyp_puts("[HYP] created Linux-slot guest (vCPU 1): 256 MiB @ IPA 0x40000000\n");
 
   /* Start the preemptive scheduling tick (CNTHP / PPI 26). */
   hyp_tick_init();
@@ -435,49 +435,53 @@ static void hyp_world_switch(el2_frame_t *f) {
   hyp_restore_fp(nv); /* last: nothing in the C path touches SIMD after this */
 }
 
-/* Build guest 1's stage-2: identity-map ONLY its RAM slice (IPA == PA over
- * the slice), leaving every other IPA unmapped so the guest is sandboxed. */
-static void hyp_build_guest1_stage2(void) {
-  const uint64_t PG = 4096ULL;
-  uint64_t base = (uint64_t)guest1_ram; /* physical == guest IPA */
-  uint64_t pages = GUEST1_RAM_SIZE / PG;
-  uint64_t gb = base / _1GB;
-  uint64_t mb = (base % _1GB) / _2MB;
-  uint64_t first_page = (base % _2MB) / PG;
-
+/* Build the Linux-slot guest's stage-2: a 256 MiB RAM window at IPA
+ * 0x40000000 backed by Fermi-invisible physical RAM, plus the PL011 UART. */
+static void hyp_build_linux_stage2(void) {
   for (int i = 0; i < 512; i++) {
-    g1_l0[i] = 0;
-    g1_l1[i] = 0;
-    g1_l2[i] = 0;
-    g1_l3[i] = 0;
+    lx_l0[i] = 0;
+    lx_l1[i] = 0;
+    lx_l2_ram[i] = 0;
+    lx_l2_dev[i] = 0;
   }
-  g1_l0[0] = ((uint64_t)g1_l1) | S2_TABLE | S2_VALID;
-  g1_l1[gb] = ((uint64_t)g1_l2) | S2_TABLE | S2_VALID;
-  g1_l2[mb] = ((uint64_t)g1_l3) | S2_TABLE | S2_VALID;
-  for (uint64_t p = 0; p < pages; p++) {
-    uint64_t pa = base + p * PG;
-    g1_l3[first_page + p] =
-        pa | S2_TABLE | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
+  lx_l0[0] = ((uint64_t)lx_l1) | S2_TABLE | S2_VALID;
+  lx_l1[0] = ((uint64_t)lx_l2_dev) | S2_TABLE | S2_VALID; /* IPA 0..1 GiB    */
+  lx_l1[1] = ((uint64_t)lx_l2_ram) | S2_TABLE | S2_VALID; /* IPA 1..2 GiB    */
+
+  /* RAM: IPA [0x40000000, +256 MiB) -> phys [LINUX_PHYS_BASE, +256 MiB). */
+  uint64_t blocks = LINUX_RAM_SIZE / _2MB;
+  uint64_t base_idx = (LINUX_IPA_BASE % _1GB) / _2MB; /* = 0 */
+  for (uint64_t i = 0; i < blocks; i++) {
+    uint64_t pa = LINUX_PHYS_BASE + i * _2MB;
+    lx_l2_ram[base_idx + i] =
+        pa | S2_VALID | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
   }
+
+  /* PL011 UART: IPA 0x09000000 -> phys 0x09000000 (Device). */
+  uint64_t uart_idx = (0x09000000ULL % _1GB) / _2MB; /* = 72 */
+  lx_l2_dev[uart_idx] =
+      0x09000000ULL | S2_VALID | S2_AF | S2_AP_RW | S2_MEM_DEVICE;
+
   __asm__ __volatile__("dsb ish");
 }
 
-static void hyp_create_guest1(void) {
-  hyp_build_guest1_stage2();
+static void hyp_create_linux_guest(void) {
+  hyp_build_linux_stage2();
 
-  uint64_t len = (uint64_t)(guest1_payload_end - guest1_payload);
-  memcpy(guest1_ram, guest1_payload, len);
+  /* Copy the bring-up stub into the guest's high RAM (physical, MMU off). */
+  uint64_t len = (uint64_t)(linux_stub_end - linux_stub);
+  memcpy((void *)LINUX_PHYS_BASE, linux_stub, len);
 
   vcpu_t *v = &vcpus[1];
   memset(v, 0, sizeof(*v));
   v->id = 1;
   v->state = VCPU_READY;
-  v->pc = (uint64_t)guest1_ram;                /* entry (IPA == PA)         */
-  v->pstate = 0x3c5;                           /* EL1h, DAIF masked         */
-  v->sp_el1 = (uint64_t)guest1_ram + GUEST1_RAM_SIZE;
-  v->vttbr = ((uint64_t)g1_l0) | (1ULL << 48); /* VMID 1                    */
-  v->cpacr_el1 = (3ULL << 20); /* CPACR_EL1.FPEN=11 => guest 1 may use FP    */
-  /* EL1 sysregs left 0 => guest 1 runs with its stage-1 MMU off. */
+  v->pc = LINUX_IPA_BASE;                       /* entry (IPA) -> high RAM   */
+  v->pstate = 0x3c5;                            /* EL1h, DAIF masked         */
+  v->sp_el1 = LINUX_IPA_BASE + LINUX_RAM_SIZE;
+  v->vttbr = ((uint64_t)lx_l0) | (1ULL << 48);  /* VMID 1                    */
+  /* sctlr_el1 = 0 => stage-1 MMU off, as the stub and Linux's early entry
+   * both expect. */
 }
 
 /* Bring up just enough of the physical GIC for the hypervisor's own timer

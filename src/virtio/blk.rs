@@ -51,6 +51,8 @@ struct BlkDev {
     vq: Virtqueue,
     capacity_sectors: u64,
     ready: bool,
+    irq_intid: u32,
+    irqs: u64,
 }
 
 static BLK: Racy<BlkDev> = Racy::new(BlkDev {
@@ -58,6 +60,8 @@ static BLK: Racy<BlkDev> = Racy::new(BlkDev {
     vq: Virtqueue::empty(),
     capacity_sectors: 0,
     ready: false,
+    irq_intid: 0,
+    irqs: 0,
 });
 
 pub fn init() {
@@ -130,6 +134,11 @@ pub fn init() {
     let cap_hi = mmio::read32(dcfg + VIRTIO_BLK_CFG_CAPACITY + 4) as u64;
     blk.capacity_sectors = (cap_hi << 32) | cap_lo;
     blk.ready = true;
+    blk.irq_intid = pci::device_intid(&dev);
+    if blk.irq_intid != 0 {
+        crate::exception::gic::enable_irq(blk.irq_intid);
+        kprintln!("[BLK] INTx -> GIC INTID {}", blk.irq_intid);
+    }
     kprintln!(
         "[BLK] DRIVER_OK; capacity {} sectors ({} MiB)",
         blk.capacity_sectors,
@@ -186,4 +195,19 @@ pub fn read(sector: u64, buf: &mut [u8]) -> bool {
 pub fn write(sector: u64, buf: &[u8]) -> bool {
     let pa = virt_to_phys(buf.as_ptr() as u64);
     rw(sector, pa, true)
+}
+
+pub fn irq_intid() -> u32 {
+    unsafe { BLK.get() }.irq_intid
+}
+
+/// Block IRQ handler: read+clear the VirtIO ISR and count it. The request/
+/// response data path stays synchronous (poll), so this just acknowledges
+/// the device-level interrupt so the line deasserts.
+pub fn handle_irq() {
+    let blk = unsafe { BLK.get() };
+    if blk.caps.isr_cfg != 0 {
+        let _ = crate::mmio::read8(blk.caps.isr_cfg);
+    }
+    blk.irqs += 1;
 }

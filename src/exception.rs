@@ -224,6 +224,8 @@ pub extern "C" fn exception_dispatch(type_: u64, frame: *mut TrapFrame) {
                 timer::handle_irq();
             } else if intid as u32 == crate::virtio::net::irq_intid() {
                 crate::virtio::net::handle_irq();
+            } else if intid as u32 == crate::virtio::blk::irq_intid() {
+                crate::virtio::blk::handle_irq();
             } else {
                 kprintln!("[IRQ] INTID {} (not implemented)", intid);
             }

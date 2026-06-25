@@ -385,9 +385,16 @@ pub fn create_task(name: &str, entry: TaskEntry) -> i64 {
 }
 
 /// Pick the next READY task and switch to it.
+///
+/// The run queue, CURRENT, and DEAD_LIST are mutated here. Since this is reached
+/// BOTH from the timer IRQ (via the schedule hook, IRQs already masked) AND from
+/// syscalls (SYS_YIELD/SLEEP/EXIT, IRQs unmasked by `dispatch`), the critical
+/// section masks IRQs itself — otherwise a tick landing mid-walk would re-enter
+/// schedule() through the hook and corrupt the list (audit bug #5).
 pub fn schedule() {
     reap();
-    // SAFETY (single-core): callers mask IRQs or are in IRQ context.
+    let daif = irq_save();
+    // SAFETY (single-core): IRQs masked above, so no re-entrant schedule().
     unsafe {
         let prev = *CURRENT.get();
         let idle = *IDLE_TASK.get();
@@ -410,6 +417,7 @@ pub fn schedule() {
 
         if next == prev {
             if fallback.is_null() || (*prev).state == TaskState::Running {
+                irq_restore(daif);
                 return; // prev still runnable; keep its timeslice
             }
             next = fallback; // prev dead/blocked — fall back to idle
@@ -435,6 +443,11 @@ pub fn schedule() {
         *CURRENT.get() = next;
         context_switch(prev as *mut u8, next as *mut u8);
     }
+    // Reached when THIS task is later switched back in (execution resumes right
+    // after context_switch above): restore the IRQ state it had on entry. A
+    // freshly-created task instead enters via its trampoline, which unmasks
+    // IRQs and never returns here; a dead task never resumes.
+    irq_restore(daif);
 }
 
 extern "C" fn schedule_hook() {
@@ -587,11 +600,18 @@ pub fn try_grow_stack(t: *mut Task, far: u64) -> bool {
 pub fn reap() {
     unsafe {
         loop {
+            // Pop one node atomically w.r.t. IRQs: a timer tick re-entering
+            // schedule()->reap() between the read and the unlink would otherwise
+            // hand the same node to two reapers (double-free). Freeing the
+            // node's resources afterwards happens with IRQs restored.
+            let daif = irq_save();
             let dead = *DEAD_LIST.get();
             if dead.is_null() {
+                irq_restore(daif);
                 break;
             }
-            (*DEAD_LIST.get()) = (*dead).next;
+            *DEAD_LIST.get() = (*dead).next;
+            irq_restore(daif);
 
             if !quiet_task(name_str(&(*dead).name)) {
                 kprintln!("[SCHED] Reaping task {} '{}'", (*dead).pid, name_str(&(*dead).name));

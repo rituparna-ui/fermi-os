@@ -148,6 +148,10 @@ impl Virtqueue {
             (*d).len = len;
             (*d).flags = flags;
             (*d).next = 0;
+            // Publish the descriptor contents BEFORE the avail entry that points
+            // at it — otherwise a weakly-ordered device could follow the ring
+            // into a still-stale descriptor (VirtIO 1.0 §2.6).
+            dsb_sy();
 
             let avail_idx = (*self.avail).idx;
             (*self.avail).ring[avail_idx as usize % self.size as usize] = idx;
@@ -180,6 +184,10 @@ impl Virtqueue {
 
             self.free_head = (head + n) % self.size;
 
+            // Publish all N linked descriptors before the avail entry exposes
+            // the chain head — the device may walk `next` into a descriptor
+            // whose contents haven't landed yet otherwise.
+            dsb_sy();
             let avail_idx = (*self.avail).idx;
             (*self.avail).ring[avail_idx as usize % self.size as usize] = head;
             dsb_sy();
@@ -208,7 +216,10 @@ impl Virtqueue {
             }
             dsb_sy();
             let used_idx = self.last_used as usize % self.size as usize;
-            let written = (*self.used).ring[used_idx].len;
+            // Volatile: dsb_sy() orders the CPU but is not a compiler barrier
+            // (it has no memory clobber), so read the device-written element
+            // through a volatile load to stop the optimizer caching it.
+            let written = core::ptr::read_volatile(&(*self.used).ring[used_idx].len);
             self.last_used = self.last_used.wrapping_add(1);
             written
         }

@@ -5,7 +5,7 @@
 //! (via a registered hook) and invokes an optional tick callback.
 
 use crate::exception::gic;
-use crate::klib::sync::SpinLock;
+use crate::klib::sync::SpinLockIrqSafe;
 use crate::kprintln;
 use crate::{mrs, msr};
 
@@ -23,7 +23,10 @@ struct Timer {
     wake_sleepers: Option<fn()>,
 }
 
-static TIMER: SpinLock<Timer> = SpinLock::new(Timer {
+// IRQ-safe: TIMER is locked both from task context (sleep_ms / uptime_ms via a
+// syscall, IRQs unmasked) and from the timer IRQ handler. A plain SpinLock here
+// deadlocks if a tick lands while a syscall holds the lock.
+static TIMER: SpinLockIrqSafe<Timer> = SpinLockIrqSafe::new(Timer {
     freq: 0,
     interval: 0,
     tick_count: 0,

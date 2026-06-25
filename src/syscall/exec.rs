@@ -220,6 +220,22 @@ pub fn sys_exec(arg_path: u64, arg_argv: u64, frame: &mut TrapFrame) -> i64 {
     if old_ustack_phys != 0 {
         pmm::free_pages(old_ustack_phys, USER_STACK_PAGES);
     }
+    // Free + reset the old address space's demand-grown stack pages. They belong
+    // to the image we're replacing; without this they leak now and, worse,
+    // reap() would later free these stale physical addresses (double-free /
+    // use-after-free if reallocated meanwhile) since the count carries over.
+    unsafe {
+        for i in 0..(*cur).stack_grown_count as usize {
+            let page = (*cur).stack_grown_phys[i];
+            if page != 0 {
+                pmm::free_page(page);
+            }
+        }
+        for slot in (*cur).stack_grown_phys.iter_mut() {
+            *slot = 0;
+        }
+        (*cur).stack_grown_count = 0;
+    }
     for i in 0..old_image.region_count {
         let r = old_image.regions[i];
         if r.phys != 0 && r.pages != 0 {

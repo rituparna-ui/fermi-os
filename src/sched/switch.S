@@ -92,11 +92,14 @@ context_switch:
 
 	ret
 
-// fork_return: first-instruction stub for a forked child. sched_fork lays a
-// 288-byte trap-frame slice at the top of the child's kstack and a 160-byte
-// context-switch frame just below it; context_switch pops the 160-byte frame
-// and ret's here with SP at the trap frame. We mirror the tail of
-// exception_common (vector.S) to restore ELR/SPSR/SP_EL0/x0-x30 and eret.
+// fork_return: first-instruction stub for a forked child. sched_fork copies the
+// parent's full 688-byte trap frame to the top of the child's kstack and lays a
+// 160-byte context-switch frame just below it; context_switch pops the 160-byte
+// frame and ret's here with SP at the trap frame. We mirror the FULL tail of
+// exception_common (vector.S) — sysregs, SP_EL0, the caller-saved FP/SIMD set,
+// and x0-x30 — then pop the whole 688-byte frame and eret. (Restoring the
+// FP/SIMD set matters: the copied frame carries the parent's q0-q7/q16-q31 +
+// FPSR/FPCR, and the child must resume with them, not garbage.)
 .global fork_return
 fork_return:
 	ldr		x1, [sp, #248]
@@ -109,6 +112,24 @@ fork_return:
 	ldr		x1, [sp, #280]
 	msr		sp_el0, x1
 1:
+
+	// Restore caller-saved FP/SIMD (mirrors exception_common).
+	ldr		x1, [sp, #680]
+	msr		fpcr, x1
+	ldr		x1, [sp, #672]
+	msr		fpsr, x1
+	ldp		q30, q31, [sp, #640]
+	ldp		q28, q29, [sp, #608]
+	ldp		q26, q27, [sp, #576]
+	ldp		q24, q25, [sp, #544]
+	ldp		q22, q23, [sp, #512]
+	ldp		q20, q21, [sp, #480]
+	ldp		q18, q19, [sp, #448]
+	ldp		q16, q17, [sp, #416]
+	ldp		q6,  q7,  [sp, #384]
+	ldp		q4,  q5,  [sp, #352]
+	ldp		q2,  q3,  [sp, #320]
+	ldp		q0,  q1,  [sp, #288]
 
 	ldp		x2,  x3,  [sp, #16]
 	ldp		x4,  x5,  [sp, #32]
@@ -127,5 +148,5 @@ fork_return:
 	ldr		x30,      [sp, #240]
 	ldp		x0,  x1,  [sp, #0]
 
-	add		sp, sp, #288
+	add		sp, sp, #688
 	eret

@@ -157,7 +157,9 @@ fn rx_poll_locked(dev: &mut NetDevice, dst: &mut [u8]) -> i64 {
 
     let slot = (dev.rx_vq.last_used % dev.rx_vq.size) as usize;
     let (desc_id, total_len) = unsafe {
-        let e = (*dev.rx_vq.used).ring[slot];
+        // Volatile read of the device-written used element (dsb_sy orders the
+        // CPU but isn't a compiler barrier; a plain deref could be cached).
+        let e = core::ptr::read_volatile(&(*dev.rx_vq.used).ring[slot]);
         (e.id, e.len)
     };
     dev.rx_vq.last_used = dev.rx_vq.last_used.wrapping_add(1);

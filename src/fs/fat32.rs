@@ -621,6 +621,7 @@ pub fn mkdir(path: &[u8]) -> bool {
     let zero = [0u8; SECTOR];
     for s in 0..v.sectors_per_cluster {
         if !blk::write((base + s) as u64, &zero) {
+            free_chain(&v, dir_cluster); // don't leak the cluster on failure
             return false;
         }
     }
@@ -634,11 +635,16 @@ pub fn mkdir(path: &[u8]) -> bool {
     sec[0..DIR_ENTRY_SIZE].copy_from_slice(&dot);
     sec[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&dotdot);
     if !blk::write(base as u64, &sec) {
+        free_chain(&v, dir_cluster);
         return false;
     }
 
     let de = build_dir_entry(&name83, ATTR_DIRECTORY, dir_cluster, 0);
-    dir_add_entry(&v, parent_cluster, &de)
+    if !dir_add_entry(&v, parent_cluster, &de) {
+        free_chain(&v, dir_cluster); // parent dir entry add failed
+        return false;
+    }
+    true
 }
 
 pub fn root_cluster() -> u32 {

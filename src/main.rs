@@ -14,6 +14,7 @@ mod klib;
 mod arch;
 mod drivers;
 mod exception;
+mod fs;
 mod mm;
 mod panic;
 mod sched;
@@ -138,6 +139,21 @@ pub extern "C" fn kmain() -> ! {
 
     drivers::virtio::console::init();
     drivers::virtio::balloon::init();
+
+    // Virtual filesystem + device nodes.
+    fs::vfs::init();
+    fs::devices::register();
+
+    // VFS smoke test: open /dev/rng and read through the fd path.
+    {
+        let t = fs::vfs::fd_table_create();
+        let fd = fs::vfs::fd_open(t, "/dev/rng");
+        let mut buf = [0u8; 8];
+        let n = fs::vfs::fd_read(t, fd, buf.as_mut_ptr(), buf.len());
+        kprintln!("[VFS TEST] /dev/rng fd={} read {} bytes: {:02x?}", fd, n, &buf[..]);
+        fs::vfs::fd_close(t, fd);
+        fs::vfs::fd_table_destroy(t);
+    }
 
     // Scheduler + a couple of demo kernel tasks (mirrors the original boot).
     sched::init();

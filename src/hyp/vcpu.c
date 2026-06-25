@@ -81,6 +81,27 @@ void vcpu_poweroff_current(hyp_trap_frame_t *f) {
   switch_to(next, f);
 }
 
+vcpu_t *vcpu_by_id(int id) {
+  return (id >= 0 && id < nr_vcpus) ? &vcpus[id] : (vcpu_t *)0;
+}
+
+int vcpu_ring_doorbell(vcpu_t *from) {
+  if (from->doorbell_target < 0) {
+    return -1;
+  }
+  vcpu_t *peer = vcpu_by_id(from->doorbell_target);
+  if (!peer || peer->dead) {
+    return -1;
+  }
+  if (peer == cur_vcpu) {
+    vgic_inject_ppi(DOORBELL_INTID);      /* live LR (peer is running) */
+  } else {
+    vgic_inject_to(&peer->vgic, DOORBELL_INTID); /* saved LR, presented on entry */
+  }
+  peer->runnable = 1; /* wake it if it was blocked on WFI */
+  return 0;
+}
+
 vcpu_t *vcpu_alloc(const char *name, uint64_t entry_ipa, uint64_t vttbr,
                    uint64_t sp_el1_override, const uint8_t *img_src,
                    uint64_t img_dst_pa, uint64_t img_size) {
@@ -94,6 +115,7 @@ vcpu_t *vcpu_alloc(const char *name, uint64_t entry_ipa, uint64_t vttbr,
   v->img_src = img_src;
   v->img_dst_pa = img_dst_pa;
   v->img_size = img_size;
+  v->doorbell_target = -1; /* no peer unless wired up after alloc */
 
   vcpu_init_state(v);
 

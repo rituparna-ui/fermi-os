@@ -202,6 +202,11 @@ void hyp_main(void) {
   cons->x0_init = 3;
   cons->gp.x[0] = 3;
 
+  /* Wire the doorbell: producer notifies consumer (and vice-versa, so an
+   * event-driven consumer can ACK back if it wants). */
+  prod->doorbell_target = (int)cons->id;
+  cons->doorbell_target = (int)prod->id;
+
   hyp_puts("[HYP] 4 vCPUs created. Starting EL2 scheduler.\n");
   hyp_puts("--------------------------------------------------\n\n");
 

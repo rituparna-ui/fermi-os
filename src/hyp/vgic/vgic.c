@@ -120,6 +120,7 @@ void vgic_vcpu_reset(vcpu_vgic_t *g) {
   for (uint32_t i = 0; i < vgic_nr_lr; i++) g->lr[i] = 0;
   g->gicd_ctlr = 0;
   g->gicd_isenabler0 = 0;
+  g->gicd_isenabler1 = 0;
   g->gicr_igroupr0 = 0;
   g->gicr_igrpmodr0 = 0;
   g->gicr_isenabler0 = 0;
@@ -165,6 +166,7 @@ void vgic_restore(const vcpu_vgic_t *g) {
 
 #define R_GICD_CTLR        0x0000
 #define R_GICD_ISENABLER0  0x0100
+#define R_GICD_ISENABLER1  0x0104
 #define R_GICR_WAKER       0x0014
 #define R_GICR_SGI_IGROUPR0   0x10080
 #define R_GICR_SGI_IGRPMODR0  0x10D00
@@ -198,6 +200,7 @@ void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
     switch (off) {
     case R_GICD_CTLR:        vd->gicd_ctlr = w & (GICD_CTLR_ARE_NS | GICD_CTLR_EN_G1NS); break;
     case R_GICD_ISENABLER0:  vd->gicd_isenabler0 |= w; break;
+    case R_GICD_ISENABLER1:  vd->gicd_isenabler1 |= w; break;
     case R_GICR_WAKER:       /* ProcessorSleep handled on read; ignore write */ break;
     case R_GICR_SGI_IGROUPR0:   vd->gicr_igroupr0 = w; break;
     case R_GICR_SGI_IGRPMODR0:  vd->gicr_igrpmodr0 = w; break;
@@ -212,6 +215,7 @@ void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
   switch (off) {
   case R_GICD_CTLR:        r = vd->gicd_ctlr; break;
   case R_GICD_ISENABLER0:  r = vd->gicd_isenabler0; break;
+  case R_GICD_ISENABLER1:  r = vd->gicd_isenabler1; break;
   case R_GICR_WAKER:       r = 0; /* ProcessorSleep=0, ChildrenAsleep=0 — the
                                    * guest's poll loop (gic.c:30) exits */ break;
   case R_GICR_SGI_IGROUPR0:   r = vd->gicr_igroupr0; break;
@@ -252,7 +256,7 @@ void vgic_inject_to(struct vcpu_vgic *g, uint32_t intid) {
       return;
     }
     if ((uint32_t)(g->lr[i] & 0xFFFFFFFFULL) == intid) {
-      return; /* already pending for this INTID */
+      return; /* already pending/active for this INTID */
     }
   }
 }

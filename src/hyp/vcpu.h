@@ -70,7 +70,8 @@ typedef struct vcpu_vgic {
   uint64_t lr[16];   /* ICH_LR0..15_EL2 (only [0,nr_lr) used) */
   /* GICD/GICR MMIO software model. */
   uint32_t gicd_ctlr;
-  uint32_t gicd_isenabler0;
+  uint32_t gicd_isenabler0; /* SPIs/PPIs 0..31  */
+  uint32_t gicd_isenabler1; /* SPIs 32..63 (doorbell INTID 40 lives here) */
   uint32_t gicr_igroupr0;
   uint32_t gicr_igrpmodr0;
   uint32_t gicr_isenabler0;
@@ -111,6 +112,8 @@ typedef struct vcpu {
   uint64_t       x0_init;   /* value placed in guest x0 at (re)start — used to
                              * pass a role/arg to the guest (e.g. IPC producer
                              * vs consumer). */
+  int            doorbell_target; /* vCPU id to notify on HVC_FERMI_DOORBELL,
+                                   * or -1 if this VM has no peer. */
 } vcpu_t;
 
 /* The currently-running vCPU (set by the scheduler before each guest entry).
@@ -141,6 +144,14 @@ void vcpu_reset(vcpu_t *v, hyp_trap_frame_t *f);
 /* Power off the current VM (PSCI SYSTEM_OFF): mark it permanently dead and
  * switch to another runnable VM. If it is the last one, the hypervisor halts. */
 void vcpu_poweroff_current(hyp_trap_frame_t *f);
+
+/* Ring the doorbell from `from` to its configured peer: inject DOORBELL_INTID
+ * into the peer (live List Register if it is current, saved state otherwise)
+ * and mark it runnable. Returns 0 on success, -1 if `from` has no peer. */
+int vcpu_ring_doorbell(vcpu_t *from);
+
+/* Look up a vCPU by id (for wiring peers). */
+vcpu_t *vcpu_by_id(int id);
 
 /* True once a vCPU has been powered off (never runs again). */
 int vcpu_is_dead(const vcpu_t *v);

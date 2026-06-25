@@ -134,10 +134,15 @@ static void handle_sync(uint64_t type, hyp_trap_frame_t *f) {
   switch (ec) {
   case EC_HVC_AARCH64:
     /* HVC: ELR already past the instruction — do NOT advance. */
-    if (f->regs[0] == 0xFE110000ULL) {
-      /* Fermi hypercall: cooperative yield to the other VM. */
+    if (f->regs[0] == HVC_FERMI_YIELD) {
+      /* Cooperative yield to another VM. */
       f->regs[0] = 0;
       vcpu_sched_tick(f);
+    } else if (f->regs[0] == HVC_FERMI_DOORBELL) {
+      /* Ring the doorbell: inject the doorbell vINTID into this VM's peer and
+       * make it runnable. An event-channel-style notification — the peer takes
+       * a virtual IRQ instead of polling. */
+      f->regs[0] = (uint64_t)vcpu_ring_doorbell(cur_vcpu);
     } else {
       handle_psci(f);
     }

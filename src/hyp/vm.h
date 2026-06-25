@@ -72,6 +72,14 @@ typedef struct hyp_trap_frame {
 /* ESR_EL2 ISS for WFx (EC 0x01): bit0 TI, 0 = WFI, 1 = WFE. */
 #define ISS_WFX_TI(esr) ((esr) & 0x1)
 
+/* --- Fermi hypercalls (vendor HVC ids in x0, outside the PSCI range) --- */
+#define HVC_FERMI_YIELD    0xFE110000ULL /* yield rest of time slice          */
+#define HVC_FERMI_DOORBELL 0xFE110001ULL /* notify peer VM (inject doorbell IRQ) */
+
+/* Doorbell virtual interrupt INTID injected into the notified VM. An SPI
+ * (>= 32) so it does not collide with the timer PPI (30). */
+#define DOORBELL_INTID 40
+
 /* --- PSCI (the guest's reboot path issues hvc with these in x0) --- */
 #define PSCI_VERSION_FN    0x84000000ULL
 #define PSCI_CPU_OFF_FN    0x84000002ULL

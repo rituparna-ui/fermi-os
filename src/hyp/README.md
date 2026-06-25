@@ -132,6 +132,16 @@ consumer reads back the identical value, while their private RAM stays isolated.
 This is the Xen-grant-table / KVM-ivshmem model: same-IPA→same-PA for sharing,
 same-IPA→different-PA for isolation. (`s2_build_ipc` in stage2.c.)
 
+**Doorbell (event channel).** The consumer is *event-driven*, not polling: it
+sets up its own GICv3 CPU interface + EL1 IRQ vector, enables the doorbell
+INTID, and WFIs. The producer, after writing, issues `HVC x0=0xFE110001`
+(`HVC_FERMI_DOORBELL`); the hypervisor injects the doorbell vINTID into the
+consumer (`vcpu_ring_doorbell` → a live or saved List Register depending on
+whether the consumer is current) and marks it runnable. The consumer takes a
+virtual IRQ, reads the shared value, and EOIs. A one-word readiness handshake in
+the shared page avoids ringing before the consumer's interrupt path is armed.
+This is the Xen-event-channel / virtio-notification model.
+
 ### Multi-VM world switch
 
 Each guest has a `struct vcpu` with the full context (GPRs, EL1 sysregs, FP,

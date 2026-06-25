@@ -330,6 +330,14 @@ fn dispatch(line: &str) {
                 }
             }
         }
+        "rand" => {
+            let n = parse_u64(arg1).unwrap_or(16).clamp(1, 64) as usize;
+            let mut b = [0u8; 64];
+            let got = virtio::rng::read(&mut b[..n]);
+            kprint!("{} random bytes:", got);
+            for &x in &b[..got] { kprint!(" {:02x}", x); }
+            kprintln!();
+        }
         "vlog" => {
             let rest: Vec<&str> = line.splitn(2, ' ').collect();
             if rest.len() == 2 {

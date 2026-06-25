@@ -287,10 +287,15 @@ qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on -m 8G \
   writes the shared page + rings; a consumer guest reads it back (verified
   `PC1PC2…PC6`, counter==doorbell_seq).
 
+- **M16 — interrupt-driven inter-VM doorbell (done):** the doorbell hypercall
+  now injects a **virtual SPI** (INTID 40) into the peer (consumer) VM's vGIC
+  (`vgic_inject_to`), and the consumer takes a real EL1 interrupt — installs a
+  vector table, enables the GICv3 CPU interface, WFIs, and its IRQ handler acks
+  (`ICC_IAR1_EL1`), reads the shared page, and EOIs. Verified: `PPD2PD3`,
+  doorbells=3, consumer IRQ-handler runs=2 → PASS.
+
 ## 10. What's next (not yet built)
 
-- Wire the M15 doorbell to inject an SPI into the peer's vGIC (interrupt-driven
-  consumer instead of polling).
 - A general HVC hypercall ABI, virtio passthrough (real guest disk/net), a
   non-FermiOS guest, dynamic VM lifecycle, and a guest→host security audit.
 

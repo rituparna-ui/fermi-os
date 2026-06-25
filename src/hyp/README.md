@@ -92,10 +92,11 @@ timer `CNTHP` (PPI 26) instead.
 | M13 | A real unmodified FermiOS runs as a **fully interactive** EL1 guest — its EL0 shell responds to typed `help`/`uptime`/`ps`. |
 | M14 | **Two** FermiOS guests run preemptively **and** interactively at once; `Ctrl-X` switches console focus between their shells. |
 | M15 | Inter-VM shared memory + a doorbell hypercall (a para-virt primitive). |
+| M16 | Interrupt-driven doorbell: the hypercall injects a **virtual SPI** into the peer VM, whose EL1 IRQ handler services it. |
 
 The default hypervisor build runs **two** interactive FermiOS guests (M14);
 `Ctrl-X` cycles console focus. Build with `-DHYP_RUN_DEMOS` to run the
-M3/M4/M9a/M11/M15/M9c self-tests first.
+M3/M4/M9a/M11/M15/M16/M9c self-tests first.
 
 ### M14: the hypervisor as the guest timer source
 
@@ -130,10 +131,6 @@ so config reads return "no device" without trapping.
 - Guest virtio is not passed through (PCI config space is emulated as "no
   device"), so a guest has no block/net/console virtio — its drivers detect the
   absence and no-op.
-- The M15 doorbell counts/acknowledges the hypercall and the shared page is
-  genuinely cross-mapped; wiring the doorbell to inject an SPI into the peer's
-  vGIC (so the consumer takes an interrupt instead of polling) is a small
-  extension.
 - The world switch shares one EL2 stack frame, so the serial scheduler is not
   reentrant across nested guest exits (fine as used).
 - Further out: a general HVC hypercall ABI, real virtio passthrough, a

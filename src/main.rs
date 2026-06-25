@@ -122,6 +122,11 @@ pub extern "C" fn kernel_main() -> ! {
     exception::timer::init();
     exception::timer::set_callback(|| {}); // silence default per-tick log
 
+    // Scheduler + timer must be live before device bringup so the net RX
+    // path's wfi-deadline waits make progress (timer ticks + net IRQs).
+    sched::init();
+    exception::timer::start(exception::timer::TIMER_INTERVAL_MS);
+
     // PCI enumeration + VirtIO RNG.
     pci::enumerate_bus();
     virtio::rng::init();
@@ -201,8 +206,7 @@ pub extern "C" fn kernel_main() -> ! {
         fs::vfs::fd_table_destroy(t);
     }
 
-    // Scheduler + a couple of preemptive EL1 demo tasks.
-    sched::init();
+    // Preemptive demo tasks.
     sched::create_task("netd", netd);
     sched::create_user_task("user1");
     sched::create_task("shell", shell::shell_task);
@@ -226,7 +230,6 @@ pub extern "C" fn kernel_main() -> ! {
         fs::vfs::fd_table_destroy(t);
     }
 
-    exception::timer::start(exception::timer::TIMER_INTERVAL_MS);
     kprintln!("[boot] scheduler running; idle loop reaping dead tasks");
 
     loop {

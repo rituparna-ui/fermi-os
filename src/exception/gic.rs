@@ -14,6 +14,9 @@ const GICR_BASE: usize = 0x080A_0000;
 
 const GICD_CTLR: usize = GICD_BASE + 0x0000;
 const GICD_ISENABLER: usize = GICD_BASE + 0x0100;
+const GICD_IGROUPR: usize = GICD_BASE + 0x0080;
+const GICD_IPRIORITYR: usize = GICD_BASE + 0x0400;
+const GICD_IROUTER: usize = GICD_BASE + 0x6000;
 
 const GICD_CTLR_ENABLE_G1NS: u32 = 1 << 1;
 const GICD_CTLR_ARE_NS: u32 = 1 << 4;
@@ -81,11 +84,22 @@ pub fn enable_irq(intid: u32) {
         val |= 1 << intid;
         mmio::write32(GICR_ISENABLER0, val);
     } else {
-        let reg = GICD_ISENABLER + (intid as usize / 32) * 4;
+        // SPI: on GICv3 with affinity routing, configure Group1NS, priority,
+        // and route to PE affinity 0 before enabling — otherwise the
+        // interrupt is never delivered to a CPU.
+        let n = intid as usize / 32;
         let bit = intid % 32;
-        let mut val = mmio::read32(reg);
-        val |= 1 << bit;
-        mmio::write32(reg, val);
+        // Group 1 (non-secure).
+        let gr = GICD_IGROUPR + n * 4;
+        mmio::write32(gr, mmio::read32(gr) | (1 << bit));
+        // Priority (byte per INTID); 0xA0 = mid priority, below PMR 0xFF.
+        mmio::write8(GICD_IPRIORITYR + intid as usize, 0xA0);
+        // Route to PE with affinity 0.0.0.0 (IRM=0).
+        mmio::write32(GICD_IROUTER + intid as usize * 8, 0);
+        mmio::write32(GICD_IROUTER + intid as usize * 8 + 4, 0);
+        // Enable.
+        let reg = GICD_ISENABLER + n * 4;
+        mmio::write32(reg, mmio::read32(reg) | (1 << bit));
     }
     kprintln!("[GIC] Enabled IRQ {}", intid);
 }

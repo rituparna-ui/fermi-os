@@ -25,6 +25,7 @@ pub const PCI_STATUS: u16 = 0x06;
 pub const PCI_HEADER_TYPE: u16 = 0x0E;
 pub const PCI_BAR0: u16 = 0x10;
 pub const PCI_CAP_PTR: u16 = 0x34;
+pub const PCI_INTERRUPT_PIN: u16 = 0x3D;
 pub const PCI_ENDPOINT_DEV_TYPE: u8 = 0x00;
 
 #[derive(Clone, Copy)]
@@ -247,4 +248,16 @@ pub fn enable_device(dev: &PciDevice) {
     cmd |= 1 << 2; // Bus Master Enable (DMA)
     config_write16(dev.bus as u16, dev.slot, dev.func, PCI_COMMAND, cmd);
     uart::println("[PCI] Device Enabled");
+}
+
+/// GIC INTID for a PCI device's legacy INTx pin on the QEMU virt machine.
+/// From the board's PCIe interrupt-map: SPI = 3 + ((slot + pin-1) % 4),
+/// INTID = 32 + SPI. Returns 0 if the device has no interrupt pin.
+pub fn device_intid(dev: &PciDevice) -> u32 {
+    let pin = config_read8(dev.bus as u16, dev.slot, dev.func, PCI_INTERRUPT_PIN);
+    if pin == 0 {
+        return 0;
+    }
+    let swizzle = (dev.slot as u32 + (pin as u32 - 1)) % 4;
+    35 + swizzle
 }

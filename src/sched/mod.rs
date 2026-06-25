@@ -607,6 +607,9 @@ pub fn sleep_ms(ms: u64) {
 
 pub fn wake_sleepers() {
     let s = unsafe { SCHED.get() };
+    if s.current.is_null() {
+        return; // scheduler not initialised yet
+    }
     let now = timer::get_ticks();
     let idle = &mut s.idle as *mut Task;
     unsafe {

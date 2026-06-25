@@ -6,6 +6,7 @@
 use crate::kprintln;
 use crate::sync::Racy;
 use crate::uart;
+use crate::exception::timer;
 use crate::virtio::net;
 
 pub struct NetState {
@@ -32,6 +33,13 @@ static NET: Racy<NetState> = Racy::new(NetState {
 
 fn state() -> &'static mut NetState {
     unsafe { NET.get() }
+}
+
+/// Sleep until the next interrupt (net RX SPI or timer tick) instead of
+/// busy-spinning. The kernel runs at EL1 with IRQs unmasked.
+#[inline(always)]
+fn idle_wait() {
+    unsafe { core::arch::asm!("wfi") };
 }
 
 fn my_mac() -> [u8; 6] {
@@ -399,7 +407,7 @@ pub fn dhcp_acquire() -> bool {
     }
     uart::println("[DHCP] DISCOVER sent");
 
-    let offer = poll_dhcp(&mut rx, xid, DHCP_OFFER, 5_000_000);
+    let offer = poll_dhcp(&mut rx, xid, DHCP_OFFER, 300);
     let offer = match offer {
         Some(o) => o,
         None => {
@@ -421,7 +429,7 @@ pub fn dhcp_acquire() -> bool {
     }
     uart::println("[DHCP] REQUEST sent");
 
-    let ack = poll_dhcp(&mut rx, xid, DHCP_ACK, 5_000_000);
+    let ack = poll_dhcp(&mut rx, xid, DHCP_ACK, 300);
     let ack = match ack {
         Some(a) => a,
         None => {
@@ -445,14 +453,16 @@ pub fn dhcp_acquire() -> bool {
     true
 }
 
-fn poll_dhcp(rx: &mut [u8], xid: u32, msg: u8, max_spins: u32) -> Option<DhcpReply> {
-    for _ in 0..max_spins {
+fn poll_dhcp(rx: &mut [u8], xid: u32, msg: u8, tick_budget: u64) -> Option<DhcpReply> {
+    let deadline = timer::get_ticks() + tick_budget;
+    while timer::get_ticks() < deadline {
         let n = net::rx_poll(rx);
         if n > 0 {
             if let Some(r) = dhcp_parse(&rx[..n as usize], xid, msg) {
                 return Some(r);
             }
         }
+        idle_wait();
     }
     None
 }
@@ -484,7 +494,8 @@ pub fn ping(seq: u16) -> i64 {
     if !st.have_gateway_mac {
         send_arp_probe();
         let mut rx = [0u8; 256];
-        for _ in 0..1_000_000u32 {
+        let deadline = timer::get_ticks() + 100;
+        while timer::get_ticks() < deadline {
             let n = net::rx_poll(&mut rx);
             if n > 0 {
                 parse_arp_reply(&rx[..n as usize]);
@@ -492,6 +503,7 @@ pub fn ping(seq: u16) -> i64 {
                     break;
                 }
             }
+            idle_wait();
         }
     }
     if !state().have_gateway_mac {
@@ -501,7 +513,8 @@ pub fn ping(seq: u16) -> i64 {
         return -1;
     }
     let mut rx = [0u8; 256];
-    for _ in 0..2_000_000u32 {
+    let deadline = timer::get_ticks() + 200;
+    while timer::get_ticks() < deadline {
         let n = net::rx_poll(&mut rx);
         if n >= 14 + 20 + 8 && rx[12] == 0x08 && rx[13] == 0x00 {
             let ip = &rx[14..];
@@ -510,6 +523,7 @@ pub fn ping(seq: u16) -> i64 {
                 return ip[8] as i64; // TTL
             }
         }
+        idle_wait();
     }
     -1
 }
@@ -523,7 +537,8 @@ pub fn bringup() {
 
     if send_arp_probe() > 0 {
         let mut rx = [0u8; 256];
-        for _ in 0..1_000_000u32 {
+        let deadline = timer::get_ticks() + 100;
+        while timer::get_ticks() < deadline {
             let n = net::rx_poll(&mut rx);
             if n > 0 {
                 parse_arp_reply(&rx[..n as usize]);
@@ -531,11 +546,13 @@ pub fn bringup() {
                     break;
                 }
             }
+            idle_wait();
         }
     }
     if state().have_gateway_mac && send_ping(1) > 0 {
         let mut rx = [0u8; 256];
-        for _ in 0..2_000_000u32 {
+        let deadline = timer::get_ticks() + 200;
+        while timer::get_ticks() < deadline {
             let n = net::rx_poll(&mut rx);
             if n >= 14 + 20 + 8 && rx[12] == 0x08 && rx[13] == 0x00 {
                 let ip = &rx[14..];
@@ -549,6 +566,7 @@ pub fn bringup() {
                     break;
                 }
             }
+            idle_wait();
         }
     }
 }

@@ -222,6 +222,8 @@ pub extern "C" fn exception_dispatch(type_: u64, frame: *mut TrapFrame) {
             gic::count_irq(intid as u32);
             if intid as u32 == timer::TIMER_PPI_INTID {
                 timer::handle_irq();
+            } else if intid as u32 == crate::virtio::net::irq_intid() {
+                crate::virtio::net::handle_irq();
             } else {
                 kprintln!("[IRQ] INTID {} (not implemented)", intid);
             }

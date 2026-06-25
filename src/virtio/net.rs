@@ -75,6 +75,8 @@ pub struct NetDev {
     pub rx_packets: u64,
     pub tx_packets: u64,
     pub ready: bool,
+    pub irq_intid: u32,
+    pub rx_irqs: u64,
 }
 
 static NET: Racy<NetDev> = Racy::new(NetDev {
@@ -95,6 +97,8 @@ static NET: Racy<NetDev> = Racy::new(NetDev {
     rx_packets: 0,
     tx_packets: 0,
     ready: false,
+    irq_intid: 0,
+    rx_irqs: 0,
 });
 
 pub(crate) fn dev() -> &'static mut NetDev {
@@ -282,6 +286,13 @@ pub fn init() {
 
     rx_init();
 
+    // Route the device's legacy INTx to the GIC so RX is interrupt-driven.
+    nd.irq_intid = pci::device_intid(&pdev);
+    if nd.irq_intid != 0 {
+        crate::exception::gic::enable_irq(nd.irq_intid);
+        kprintln!("[NET] INTx -> GIC INTID {}", nd.irq_intid);
+    }
+
     let dcfg = nd.caps.device_cfg;
     if guest_lo & VIRTIO_NET_F_MAC != 0 {
         for i in 0..6 {
@@ -301,4 +312,24 @@ pub fn init() {
             nd.link_status
         );
     }
+}
+
+/// GIC INTID assigned to the net device (0 if none).
+pub fn irq_intid() -> u32 {
+    dev().irq_intid
+}
+
+/// Net IRQ handler: read+clear the VirtIO ISR status and count the event.
+/// The RX ring is drained by consumers (rx_poll); this just acknowledges the
+/// device-level interrupt so it deasserts.
+pub fn handle_irq() {
+    let nd = dev();
+    if nd.caps.isr_cfg != 0 {
+        let _isr = crate::mmio::read8(nd.caps.isr_cfg); // read clears it
+    }
+    nd.rx_irqs += 1;
+}
+
+pub fn rx_irq_count() -> u64 {
+    dev().rx_irqs
 }

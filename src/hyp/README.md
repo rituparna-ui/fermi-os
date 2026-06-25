@@ -69,6 +69,7 @@ timer `CNTHP` (PPI 26) instead.
 | `vgic/vgic.{c,h}` | Virtual GICv3: enable `ICC_SRE_EL2` + the virtual CPU interface, inject via `ICH_LR<n>_EL2`, and a GICD/GICR MMIO software model (the windows are left stage-2-unmapped so they trap). Per-vCPU save/restore. |
 | `vuart/vuart.{c,h}` | Per-guest virtual PL011 console: trap-and-emulate `DR`/`FR`/init regs, line-buffered TX with a `[name]` prefix and an RX FIFO fed from the host console. |
 | `psci/psci.{c,h}` | Minimal PSCI 1.1 provider (VERSION/FEATURES/SYSTEM_RESET/SYSTEM_OFF/CPU_OFF); SYSTEM_RESET warm-resets the calling guest. |
+| `hvc/hvc.{c,h}` | Unified HVC hypercall ABI: PSCI + vendor services (VERSION/PUTC/VM_INFO/YIELD/DOORBELL) folded into one dispatcher returning an action enum. |
 | `guest_stub.S` | Small hand-written EL1 guests used by the demos/self-tests (marker write + HVC, spin, heartbeat, PSCI, interactive echo). |
 | `guest_blob.S` | `.incbin` of the reduced-RAM FermiOS guest image (`build/guest.bin`) into the hypervisor. |
 
@@ -93,10 +94,11 @@ timer `CNTHP` (PPI 26) instead.
 | M14 | **Two** FermiOS guests run preemptively **and** interactively at once; `Ctrl-X` switches console focus between their shells. |
 | M15 | Inter-VM shared memory + a doorbell hypercall (a para-virt primitive). |
 | M16 | Interrupt-driven doorbell: the hypercall injects a **virtual SPI** into the peer VM, whose EL1 IRQ handler services it. |
+| M17 | Unified **HVC hypercall ABI** (`hvc/`): SMCCC-style numbered services (VERSION/PUTC/VM_INFO/YIELD/DOORBELL) with PSCI folded in. |
 
 The default hypervisor build runs **two** interactive FermiOS guests (M14);
 `Ctrl-X` cycles console focus. Build with `-DHYP_RUN_DEMOS` to run the
-M3/M4/M9a/M11/M15/M16/M9c self-tests first.
+M3/M4/M9a/M11/M15/M16/M17/M9c self-tests first.
 
 ### M14: the hypervisor as the guest timer source
 

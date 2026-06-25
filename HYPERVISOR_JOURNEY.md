@@ -294,10 +294,16 @@ qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on -m 8G \
   (`ICC_IAR1_EL1`), reads the shared page, and EOIs. Verified: `PPD2PD3`,
   doorbells=3, consumer IRQ-handler runs=2 → PASS.
 
+- **M17 — unified HVC hypercall ABI (done):** `src/hyp/hvc/` folds the
+  scattered hypercall handling into one SMCCC-style numbered dispatcher —
+  PSCI (delegated) plus FermiOS vendor services (VERSION, PUTC = host-mediated
+  console, VM_INFO, YIELD, DOORBELL) returning a single action enum. Verified
+  with a demo guest that prints `H<vmid>` via the PUTC hypercall and yields.
+
 ## 10. What's next (not yet built)
 
-- A general HVC hypercall ABI, virtio passthrough (real guest disk/net), a
-  non-FermiOS guest, dynamic VM lifecycle, and a guest→host security audit.
+- Virtio passthrough (real guest disk/net), a non-FermiOS guest, dynamic VM
+  lifecycle, and a guest→host security audit.
 
 ---
 

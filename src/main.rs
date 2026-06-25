@@ -12,6 +12,7 @@ use core::panic::PanicInfo;
 global_asm!(include_str!("boot.S"));
 
 mod cpu;
+mod exception;
 mod mm;
 mod mmio;
 mod print;
@@ -46,6 +47,13 @@ pub extern "C" fn rust_main() -> ! {
     let big = mm::pmm::allocate_pages(8);
     uart::log_hex("[TEST] alloc 8 contiguous pages at ", big);
     mm::pmm::free_pages(big, 8);
+
+    // Enable the MMU. After this, RAM is Normal cacheable memory and
+    // core::fmt (kprintln!) + SpinLock are safe to use.
+    let l1_lo = mm::mmu::init();
+    exception::init();
+    mm::mmu::run_tests(l1_lo);
+    kprintln!("[boot] MMU on; kprintln! now safe. EL={}", cpu::current_el());
     uart::puts("UART base: ");
     uart::puthex(uart::UART_BASE as u64);
     uart::putc(b'\n');

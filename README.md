@@ -2,6 +2,12 @@
 
 Fermi OS is a bare-metal `aarch64 (ARMv8-A)` kernel built from scratch in `C` and assembly, targeting QEMU's `virt` machine with a Cortex-A72 processor.
 
+> **EL2 hypervisor mode (`fermi-hyp2` branch):** Fermi OS can also run as a
+> Type-1 hypervisor at **EL2** using VHE, hosting unmodified Fermi OS instances
+> as EL1 guest VMs — with stage-2 isolation, a virtual GICv3, virtual timer,
+> per-guest virtual PL011 consoles, PSCI, and a preemptive multi-guest
+> round-robin scheduler. Build with `-cpu max -machine virt,...,virtualization=on`
+> on QEMU ≥ 4.0. See [`src/hyp/README.md`](src/hyp/README.md).
 
 ---
 

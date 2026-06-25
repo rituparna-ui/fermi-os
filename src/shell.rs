@@ -475,10 +475,15 @@ fn dispatch(line: &str) {
     let arg2 = parts.next().unwrap_or("");
     match cmd {
         "help" => {
-            kprintln!("builtins: help uptime version ps top free meminfo ifconfig irqs");
-            kprintln!("          cat <path> ping sleep <ms> kill <pid> echo <text>");
-            kprintln!("          balloon <inflate|deflate|status> [n] vlog <text> clear");
-            kprintln!("          ls [path] write <name> <text> hexdump <path> run <elf> cpuinfo reboot");
+            kprintln!("builtins: help uptime version uname date ps top sysinfo free meminfo");
+            kprintln!("  diag  : irqs traps cpuinfo heapstat memtest <kb> smp smptest");
+            kprintln!("  net   : ifconfig ping [n] arp [ip] resolve <host> http <host> ntp [host]");
+            kprintln!("  files : ls [path] cat <path> grep <pat> <path> wc <path> stat <path>");
+            kprintln!("          write <name> <text> cp <src> <dst> mv <old> <new> rm <path>");
+            kprintln!("          hexdump <path> df run <elf>");
+            kprintln!("  blk   : blkdump <sector> blkwrite <sector> <text>");
+            kprintln!("  proc  : sleep <ms> kill <pid> echo <text> rand [n] reboot clear");
+            kprintln!("          balloon <inflate|deflate|status> [n] vlog <text>");
         }
         "uptime" => kprintln!("up {} ms ({} s)", timer::uptime_ms(), timer::uptime_seconds()),
         "smp" => {

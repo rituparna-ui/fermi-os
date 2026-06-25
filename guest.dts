@@ -18,8 +18,10 @@
 	interrupt-parent = <&gic>;
 
 	chosen {
-		bootargs = "earlycon=pl011,mmio32,0x9000000 console=ttyAMA0 nokaslr";
+		bootargs = "earlycon=pl011,mmio32,0x9000000 console=ttyAMA0 nokaslr rdinit=/init";
 		stdout-path = "/pl011@9000000";
+		linux,initrd-start = <0x0 0x4a000000>;
+		linux,initrd-end   = <0x0 0x4a200000>;
 	};
 
 	psci {

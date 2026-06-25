@@ -75,8 +75,10 @@ QEMU_FLAGS_DEBUG := -kernel $(TARGET) -s -S
 #   DTB   @ IPA 0x48000000  (phys 0x248000000)
 GUEST_IMAGE := guest/Image
 GUEST_DTB   := $(BUILD_DIR)/guest.dtb
+GUEST_INITRD := guest/initramfs.cpio.gz
 GUEST_LOAD  := -device loader,file=$(GUEST_IMAGE),addr=0x240200000,force-raw=on \
-               -device loader,file=$(GUEST_DTB),addr=0x248000000,force-raw=on
+               -device loader,file=$(GUEST_DTB),addr=0x248000000,force-raw=on \
+               -device loader,file=$(GUEST_INITRD),addr=0x24a000000,force-raw=on
 
 .PHONY: all run debug clean gdb tmux disk dump_dts compile_commands.json
 

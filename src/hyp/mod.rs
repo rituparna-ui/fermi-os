@@ -65,6 +65,24 @@ const ICH_LR_PRIO_SHIFT: u64 = 48;
 const CNTHCTL_EL1PCTEN: u64 = 1 << 0;
 const CNTHCTL_EL1PCEN: u64 = 1 << 1;
 
+// --- GIC MMIO for the hypervisor scheduling-tick PPI (CNTHP, INTID 26) -------
+// Reached physically at EL2 (MMU off), so raw volatile access — independent of
+// the mmio module's VA offset. Mirrors the bases in exception/gic.rs.
+const GICD_CTLR: usize = 0x0800_0000;
+const GICD_CTLR_ENABLE_G1NS: u32 = 1 << 1;
+const GICD_CTLR_ARE_NS: u32 = 1 << 4;
+const GICR_BASE: usize = 0x080A_0000;
+const GICR_WAKER: usize = GICR_BASE + 0x0014;
+const GICR_SGI_BASE: usize = GICR_BASE + 0x10000;
+const GICR_IGROUPR0: usize = GICR_SGI_BASE + 0x0080;
+const GICR_ISENABLER0: usize = GICR_SGI_BASE + 0x0100;
+const GICR_WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
+const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
+
+// CNTHP (EL2 physical timer) scheduling tick.
+const HYP_TIMER_INTID: u32 = 26; // PPI 26 = non-secure EL2 physical timer
+const HYP_QUANTUM_MS: u64 = 100; // preemption time-slice
+
 // --- Exception-class values in ESR_EL2[31:26] --------------------------------
 const ESR_EC_SHIFT: u64 = 26;
 const ESR_EC_MASK: u64 = 0x3F;
@@ -226,6 +244,23 @@ impl Vcpu {
 static VCPUS: SyncUnsafeCell<[Vcpu; NUM_VCPUS]> = SyncUnsafeCell::new([Vcpu::zeroed(); NUM_VCPUS]);
 #[link_section = ".hyp_tables"]
 static CURRENT_VCPU: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
+/// CNTHP quantum length in timer ticks, computed from CNTFRQ at boot.
+#[link_section = ".hyp_tables"]
+static G_QUANTUM_TICKS: SyncUnsafeCell<u64> = SyncUnsafeCell::new(0);
+
+/// Self-contained physical 32-bit MMIO read (EL2, MMU off).
+#[inline]
+fn gic_read32(addr: usize) -> u32 {
+    // SAFETY: fixed GIC MMIO; physical address valid at EL2 with the MMU off.
+    unsafe { read_volatile(addr as *const u32) }
+}
+
+/// Self-contained physical 32-bit MMIO write (EL2, MMU off).
+#[inline]
+fn gic_write32(addr: usize, val: u32) {
+    // SAFETY: as `gic_read32`.
+    unsafe { write_volatile(addr as *mut u32, val) }
+}
 
 // --- Guest 1: a tiny second guest with its own stage-2 + RAM slice -----------
 // The hole-punch in hyp_build_stage2 keeps this region invisible to guest 0.
@@ -530,7 +565,45 @@ pub extern "C" fn hyp_init() {
     hyp_create_guest1();
     hyp_puts("[HYP] created guest1 (vCPU 1) with its own stage-2\n");
 
+    // Start the preemptive scheduling tick (CNTHP / PPI 26).
+    hyp_tick_init();
+    hyp_tick_start();
+    hyp_puts("[HYP] preemptive scheduler armed (CNTHP tick)\n");
+
     hyp_puts("[HYP] stage-2 enabled (HCR_EL2.VM=1), dropping to EL1 guest...\n");
+}
+
+/// Bring up just enough of the physical GIC for the hypervisor's own timer
+/// interrupt (PPI 26, CNTHP). The primary guest re-runs its full gic_init later;
+/// these writes are idempotent / non-conflicting (set-only ISENABLER, group bit
+/// kept set). EL2 runs MMU-off, so GIC MMIO is reached physically.
+fn hyp_tick_init() {
+    // Affinity routing + Group1 NS at the distributor (idempotent w/ guest).
+    gic_write32(GICD_CTLR, GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_G1NS);
+
+    // Wake the redistributor.
+    let mut waker = gic_read32(GICR_WAKER);
+    waker &= !GICR_WAKER_PROCESSOR_SLEEP;
+    gic_write32(GICR_WAKER, waker);
+    while gic_read32(GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP != 0 {}
+
+    // PPI 26 -> Group1 NS, then enable it (ISENABLER is write-1-to-set).
+    let grp = gic_read32(GICR_IGROUPR0) | (1 << HYP_TIMER_INTID);
+    gic_write32(GICR_IGROUPR0, grp);
+    gic_write32(GICR_ISENABLER0, 1 << HYP_TIMER_INTID);
+}
+
+/// Arm CNTHP_EL2 to fire one quantum from now.
+fn hyp_tick_start() {
+    let freq = mrs!("cntfrq_el0");
+    let ticks = freq * HYP_QUANTUM_MS / 1000;
+    let now = mrs!("cntpct_el0");
+    // SAFETY (single-core): boot; set the quantum and arm the EL2 timer.
+    unsafe {
+        *G_QUANTUM_TICKS.get() = ticks;
+        msr!("cnthp_cval_el2", now + ticks);
+        msr!("cnthp_ctl_el2", 1u64); // enable, unmasked
+    }
 }
 
 // --- world switch / vCPUs ----------------------------------------------------
@@ -933,12 +1006,27 @@ fn hyp_vgic_inject_hw(intid: u32) {
 /// inject a hardware-linked virtual copy into the guest, then priority-drop
 /// (EOImode=1 means this does not deactivate — the guest will, via the HW link).
 /// The guest's existing IRQ handler runs unmodified on ICV_*.
-fn hyp_handle_irq() {
+fn hyp_handle_irq(frame: *mut El2Frame) {
     let iar = mrs!("icc_iar1_el1");
     let intid = (iar & 0xFF_FFFF) as u32;
 
     if intid >= 1020 {
         // 1020-1023 are special / spurious: no EOI needed.
+        return;
+    }
+
+    if intid == HYP_TIMER_INTID {
+        // Hypervisor scheduling tick. This interrupt is ours (not injected to a
+        // guest), so fully EOI+deactivate it, re-arm the quantum, and preempt
+        // to the next vCPU.
+        // SAFETY (single-core): EL2 timer + physical CPU interface.
+        unsafe {
+            let next = mrs!("cnthp_cval_el2") + *G_QUANTUM_TICKS.get();
+            msr!("cnthp_cval_el2", next);
+            msr!("icc_eoir1_el1", iar); // priority drop
+            msr!("icc_dir_el1", iar); // deactivate
+        }
+        hyp_world_switch(frame);
         return;
     }
 
@@ -970,7 +1058,7 @@ pub extern "C" fn el2_dispatch(index: u64, frame: *mut El2Frame) {
     // Vector slot kind: 0=sync, 1=IRQ, 2=FIQ, 3=SError (within each group).
     let kind = index & 3;
     if kind == 1 {
-        hyp_handle_irq();
+        hyp_handle_irq(frame);
         return;
     }
     if kind != 0 {
@@ -1051,15 +1139,8 @@ pub fn guest_probe() {
                 "LEAK => isolation FAILED"
             }
         );
-
-        // Cooperative multi-VM demo: yield to guest 1 a few times. Each yield
-        // world-switches to the second guest, which prints "[g1]" and yields
-        // back. After the loop guest 0 keeps the CPU (no preemption yet — M5b).
-        kprintln!("[BOOT] cooperative multi-VM demo (guest0 <-> guest1):");
-        for i in 0..4 {
-            kprintln!("[BOOT][guest0] turn {}, yielding to guest1...", i);
-            hvc_call(HVC_YIELD, 0, 0, 0);
-        }
-        kprintln!("[BOOT][guest0] done yielding; resuming normal boot");
+        // No cooperative yield loop: from M5b the CNTHP preemption tick
+        // round-robins guest0 and guest1 automatically, so guest1's "[g1]"
+        // output interleaves with guest0's boot without any guest cooperation.
     }
 }

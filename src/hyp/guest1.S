@@ -1,13 +1,13 @@
-// guest1.S — a tiny second guest (Milestone 5a).
+// guest1.S — a tiny second guest (Milestone 5b).
 //
-// A self-contained EL1 payload that uses ONLY hypercalls: it prints "[g1]\n"
-// via HVC_PUTC and then cooperatively yields (HVC_YIELD) back to the
-// hypervisor, forever. It touches no memory and uses only relative branches, so
-// it is fully position-independent — the hypervisor copies it into guest 1's
-// RAM slice and runs it there with the stage-1 MMU off.
+// A self-contained EL1 payload that NEVER yields: it prints "[g1]\n" via
+// HVC_PUTC, then spins in a delay loop, forever. Because it never cooperates,
+// the only thing that takes the CPU away from it is the hypervisor's preemptive
+// scheduling tick (CNTHP / INTID 26). Position-independent: only relative
+// branches and hypercalls, touches no memory.
 //
-// HVC function IDs are inlined as literals here (HVC_PUTC=1, HVC_YIELD=4) to
-// keep the payload free of any include/relocation; they must match hypercall.rs.
+// HVC_PUTC=1 is inlined as a literal to keep the payload free of any
+// include/relocation; it must match hypercall.rs.
 
 .section .text
 .global guest1_payload
@@ -31,8 +31,12 @@ guest1_payload:
 	mov	x1, #10			// '\n'
 	hvc	#0
 
-	mov	x0, #4			// HVC_YIELD
-	hvc	#0
+	// Busy-delay (~tens of millions of iterations) so output is paced. No
+	// yield: only the hypervisor's preemption tick interrupts this.
+	movz	x9, #0x600, lsl #16	// x9 = 0x06000000
+2:
+	subs	x9, x9, #1
+	b.ne	2b
 
 	b	1b
 guest1_payload_end:

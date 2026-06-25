@@ -157,6 +157,42 @@ fn cmd_cat(path: &str) {
     vfs::fd_table_destroy(t);
 }
 
+fn cmd_free() {
+    let total = pmm::total_pages();
+    let used = pmm::used_pages();
+    kprintln!("Pages: total {} used {} free {}", total, used, total - used);
+    kprintln!(
+        "Heap:  used {} free {} total {} bytes",
+        heap::used_bytes(),
+        heap::free_bytes(),
+        heap::total_bytes()
+    );
+}
+
+fn cmd_run(path: &str, arg: &str) {
+    let node = vfs::resolve(path);
+    if node.is_null() {
+        kprintln!("run: {}: not found", path);
+        return;
+    }
+    let t = vfs::fd_table_create();
+    let fd = vfs::fd_open(t, path);
+    if fd >= 0 {
+        let mut data: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = vfs::fd_read(t, fd, &mut chunk);
+            if n <= 0 { break; }
+            data.extend_from_slice(&chunk[..n as usize]);
+        }
+        vfs::fd_close(t, fd);
+        let args: &[&str] = if arg.is_empty() { &[] } else { &[arg] };
+        let pid = sched::spawn_elf("user", &data, args);
+        kprintln!("run: spawned pid {}", pid);
+    }
+    vfs::fd_table_destroy(t);
+}
+
 fn line_has(hay: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
@@ -216,42 +252,6 @@ fn cmd_grep(pattern: &str, path: &str) {
     kprintln!("grep: {} matching line(s)", matches);
 }
 
-fn cmd_free() {
-    let total = pmm::total_pages();
-    let used = pmm::used_pages();
-    kprintln!("Pages: total {} used {} free {}", total, used, total - used);
-    kprintln!(
-        "Heap:  used {} free {} total {} bytes",
-        heap::used_bytes(),
-        heap::free_bytes(),
-        heap::total_bytes()
-    );
-}
-
-fn cmd_run(path: &str, arg: &str) {
-    let node = vfs::resolve(path);
-    if node.is_null() {
-        kprintln!("run: {}: not found", path);
-        return;
-    }
-    let t = vfs::fd_table_create();
-    let fd = vfs::fd_open(t, path);
-    if fd >= 0 {
-        let mut data: Vec<u8> = Vec::new();
-        let mut chunk = [0u8; 512];
-        loop {
-            let n = vfs::fd_read(t, fd, &mut chunk);
-            if n <= 0 { break; }
-            data.extend_from_slice(&chunk[..n as usize]);
-        }
-        vfs::fd_close(t, fd);
-        let args: &[&str] = if arg.is_empty() { &[] } else { &[arg] };
-        let pid = sched::spawn_elf("user", &data, args);
-        kprintln!("run: spawned pid {}", pid);
-    }
-    vfs::fd_table_destroy(t);
-}
-
 fn cmd_write(name: &str, text: &str) {
     // Create a root-level FAT32 file from a string (newline-terminated).
     let mut data = alloc::vec::Vec::new();
@@ -265,12 +265,6 @@ fn cmd_hexdump(path: &str) {
     let node = vfs::resolve(path);
     if node.is_null() {
         kprintln!("hexdump: {}: not found", path);
-}
-}
-fn cmd_wc(path: &str) {
-    let node = vfs::resolve(path);
-    if node.is_null() {
-        kprintln!("wc: {}: not found", path);
         return;
     }
     let t = vfs::fd_table_create();
@@ -293,48 +287,20 @@ fn cmd_wc(path: &str) {
             }
             kprintln!("|");
             off += n;
+        }
+        vfs::fd_close(t, fd);
+    }
+    vfs::fd_table_destroy(t);
 }
-}
-}
-fn cmd_cp(src: &str, dst_name: &str) {
-    let node = vfs::resolve(src);
+
+fn cmd_wc(path: &str) {
+    let node = vfs::resolve(path);
     if node.is_null() {
-        kprintln!("cp: {}: not found", src);
+        kprintln!("wc: {}: not found", path);
         return;
     }
     let t = vfs::fd_table_create();
-    let fd = vfs::fd_open(t, src);
-    let mut data = alloc::vec::Vec::new();
-    if fd >= 0 {
-        let mut chunk = [0u8; 512];
-        loop {
-            let n = vfs::fd_read(t, fd, &mut chunk);
-            if n <= 0 { break; }
-            data.extend_from_slice(&chunk[..n as usize]);
-}
-}
-}
-fn cmd_blkdump(sector: u64) {
-    let t = vfs::fd_table_create();
-    let fd = vfs::fd_open(t, "/dev/blk");
-    if fd >= 0 {
-        vfs::fd_seek(t, fd, (sector * 512) as i64, vfs::SEEK_SET);
-        let mut b = alloc::vec![0u8; 512];
-        if vfs::fd_read(t, fd, &mut b) == 512 {
-            for row in 0..4 {
-                kprint!("{:08x}  ", sector * 512 + row * 16);
-                for i in 0..16 { kprint!("{:02x} ", b[row as usize * 16 + i]); }
-                kprint!(" |");
-                for i in 0..16 {
-                    let c = b[row as usize * 16 + i];
-                    uart::putc(if (0x20..0x7f).contains(&c) { c } else { b'.' });
-                }
-                kprintln!("|");
-            }
-        } else {
-            kprintln!("blkdump: read failed");
-}
-}
+    let fd = vfs::fd_open(t, path);
     let (mut lines, mut words, mut bytes) = (0u64, 0u64, 0u64);
     let mut in_word = false;
     if fd >= 0 {
@@ -356,7 +322,73 @@ fn cmd_blkdump(sector: u64) {
         vfs::fd_close(t, fd);
     }
     vfs::fd_table_destroy(t);
+    kprintln!("{:>6} {:>6} {:>6} {}", lines, words, bytes, path);
 }
+
+fn cmd_cp(src: &str, dst_name: &str) {
+    let node = vfs::resolve(src);
+    if node.is_null() {
+        kprintln!("cp: {}: not found", src);
+        return;
+    }
+    let t = vfs::fd_table_create();
+    let fd = vfs::fd_open(t, src);
+    let mut data = alloc::vec::Vec::new();
+    if fd >= 0 {
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = vfs::fd_read(t, fd, &mut chunk);
+            if n <= 0 { break; }
+            data.extend_from_slice(&chunk[..n as usize]);
+        }
+        vfs::fd_close(t, fd);
+    }
+    vfs::fd_table_destroy(t);
+    let ok = crate::fs::fat32::create(dst_name.as_bytes(), &data);
+    kprintln!("cp {} -> {} ({} bytes): {}", src, dst_name, data.len(),
+              if ok { "ok" } else { "failed" });
+}
+
+fn cmd_blkdump(sector: u64) {
+    let t = vfs::fd_table_create();
+    let fd = vfs::fd_open(t, "/dev/blk");
+    if fd >= 0 {
+        vfs::fd_seek(t, fd, (sector * 512) as i64, vfs::SEEK_SET);
+        let mut b = alloc::vec![0u8; 512];
+        if vfs::fd_read(t, fd, &mut b) == 512 {
+            for row in 0..4 {
+                kprint!("{:08x}  ", sector * 512 + row * 16);
+                for i in 0..16 { kprint!("{:02x} ", b[row as usize * 16 + i]); }
+                kprint!(" |");
+                for i in 0..16 {
+                    let c = b[row as usize * 16 + i];
+                    uart::putc(if (0x20..0x7f).contains(&c) { c } else { b'.' });
+                }
+                kprintln!("|");
+            }
+        } else {
+            kprintln!("blkdump: read failed");
+        }
+        vfs::fd_close(t, fd);
+    }
+    vfs::fd_table_destroy(t);
+}
+
+fn cmd_blkwrite(sector: u64, text: &str) {
+    let mut b = alloc::vec![0u8; 512];
+    let n = core::cmp::min(text.len(), 511);
+    b[..n].copy_from_slice(&text.as_bytes()[..n]);
+    let t = vfs::fd_table_create();
+    let fd = vfs::fd_open(t, "/dev/blk");
+    if fd >= 0 {
+        vfs::fd_seek(t, fd, (sector * 512) as i64, vfs::SEEK_SET);
+        let ok = vfs::fd_write(t, fd, &b) == 512;
+        kprintln!("blkwrite sector {}: {}", sector, if ok { "ok" } else { "failed" });
+        vfs::fd_close(t, fd);
+    }
+    vfs::fd_table_destroy(t);
+}
+
 fn cmd_top() {
     kprintln!("== Fermi OS top ==  uptime {} ms  cntpct {}",
               timer::uptime_ms(), timer::get_count());
@@ -366,10 +398,8 @@ fn cmd_top() {
               used, total, heap::used_bytes(), heap::free_bytes());
     kprint!("{}", sched::render_tasks());
     kprint!("{}", crate::exception::gic::render_interrupts());
-    let ok = crate::fs::fat32::create(dst_name.as_bytes(), &data);
-    kprintln!("cp {} -> {} ({} bytes): {}", src, dst_name, data.len(),
-              if ok { "ok" } else { "failed" });
 }
+
 fn cmd_memtest(kb: u64) {
     use alloc::vec::Vec;
     let n = (kb as usize) * 1024;
@@ -395,6 +425,7 @@ fn cmd_memtest(kb: u64) {
         before, during, after
     );
 }
+
 fn cmd_sysinfo() {
     kprintln!("   ___ Fermi OS (Rust) ___");
     kprintln!("  OS      : Fermi OS — bare-metal aarch64, pure Rust + asm");
@@ -412,21 +443,6 @@ fn cmd_sysinfo() {
     kprint!("{}", sched::render_tasks());
 }
 
-fn cmd_blkwrite(sector: u64, text: &str) {
-    let mut b = alloc::vec![0u8; 512];
-    let n = core::cmp::min(text.len(), 511);
-    b[..n].copy_from_slice(&text.as_bytes()[..n]);
-    let t = vfs::fd_table_create();
-    let fd = vfs::fd_open(t, "/dev/blk");
-    if fd >= 0 {
-        vfs::fd_seek(t, fd, (sector * 512) as i64, vfs::SEEK_SET);
-        let ok = vfs::fd_write(t, fd, &b) == 512;
-        kprintln!("blkwrite sector {}: {}", sector, if ok { "ok" } else { "failed" });
-        vfs::fd_close(t, fd);
-    }
-    vfs::fd_table_destroy(t);
-    kprintln!("{:>6} {:>6} {:>6} {}", lines, words, bytes, path);
-}
 fn cmd_stat(path: &str) {
     let node = vfs::resolve(path);
     if node.is_null() {

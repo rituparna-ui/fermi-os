@@ -91,7 +91,7 @@ typedef struct {
   uint64_t vttbr;    /* stage-2 base | (VMID << 48)          */
 
   /* Saved EL1 system-register context. */
-  uint64_t sp_el1, elr_el1, spsr_el1;
+  uint64_t sp_el1, sp_el0, elr_el1, spsr_el1;
   uint64_t sctlr_el1, cpacr_el1;
   uint64_t ttbr0_el1, ttbr1_el1, tcr_el1, mair_el1, amair_el1;
   uint64_t vbar_el1, contextidr_el1;

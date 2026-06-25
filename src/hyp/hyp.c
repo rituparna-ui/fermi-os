@@ -297,6 +297,7 @@ void hyp_init(void) {
 
 static void hyp_save_el1(vcpu_t *v) {
   v->sp_el1 = MRS(sp_el1);
+  v->sp_el0 = MRS(sp_el0);
   v->elr_el1 = MRS(elr_el1);
   v->spsr_el1 = MRS(spsr_el1);
   v->sctlr_el1 = MRS(sctlr_el1);
@@ -318,6 +319,7 @@ static void hyp_save_el1(vcpu_t *v) {
 
 static void hyp_restore_el1(vcpu_t *v) {
   MSR(sp_el1, v->sp_el1);
+  MSR(sp_el0, v->sp_el0);
   MSR(elr_el1, v->elr_el1);
   MSR(spsr_el1, v->spsr_el1);
   MSR(sctlr_el1, v->sctlr_el1);

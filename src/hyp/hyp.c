@@ -658,6 +658,7 @@ static void hyp_handle_hvc(el2_frame_t *f) {
     case VMSTAT_SYSREG:   ret = t->sysreg_traps; break;
     case VMSTAT_ABORT:    ret = t->abort_count; break;
     case VMSTAT_VIRQ:     ret = t->virq_injected; break;
+    case VMSTAT_MMIO:     ret = t->mmio_emulated; break;
     case VMSTAT_SWITCHES: ret = g_switch_count; break;
     default:              ret = (uint64_t)-1; break;
     }
@@ -778,8 +779,6 @@ static int hyp_emulate_gic(uint64_t ipa, int is_write, uint64_t *val) {
  * destination register on a read, and step over the access so the guest keeps
  * running. Any other abort is an unexpected (real) fault — dump and park. */
 static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
-  vcpus[current_vcpu].abort_count++;
-
   uint64_t esr = MRS(esr_el2);
   uint64_t far = MRS(far_el2);
   uint64_t hpfar = MRS(hpfar_el2);
@@ -794,6 +793,7 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
     uint64_t srt = (esr >> 16) & 0x1F; /* destination register      */
     uint64_t wnr = (esr >> 6) & 1;  /* write (1) vs read (0)         */
 
+    vcpus[current_vcpu].abort_count++;
     hyp_puts("\n[HYP] ISOLATION: blocked guest ");
     hyp_puts(wnr ? "write to" : "read from");
     hyp_puts(" hyp memory IPA=");
@@ -810,6 +810,7 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
   /* Linux guest: emulate trapped GIC distributor/redistributor MMIO. */
   if (current_vcpu == 1 &&
       ((ipa >= GICD_LO && ipa < GICD_HI) || (ipa >= GICR_LO && ipa < GICR_HI))) {
+    vcpus[current_vcpu].mmio_emulated++;
     uint64_t isv = (esr >> 24) & 1;
     uint64_t sas = (esr >> 22) & 3;
     uint64_t srt = (esr >> 16) & 0x1F;
@@ -838,6 +839,7 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
   /* Linux guest hit an unhandled fault: reap it (keeping the primary guest
    * and hypervisor alive), logging where it died. */
   if (current_vcpu == 1) {
+    vcpus[current_vcpu].abort_count++;
     hyp_puts("\n[HYP] Linux guest unhandled abort: IPA=");
     hyp_puthex(ipa);
     hyp_puts(" ESR=");
@@ -849,6 +851,7 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
     return;
   }
 
+  vcpus[current_vcpu].abort_count++;
   hyp_puts("\n[HYP] *** unexpected lower-EL abort *** vector=");
   hyp_puthex(index);
   hyp_puts(" EC=");

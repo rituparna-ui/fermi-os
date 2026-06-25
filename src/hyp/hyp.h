@@ -83,6 +83,7 @@ typedef struct {
   uint64_t sysreg_traps;
   uint64_t abort_count;
   uint64_t virq_injected;
+  uint64_t mmio_emulated;
 
   /* Saved execution state. */
   uint64_t regs[31]; /* x0..x30                              */

@@ -170,20 +170,22 @@ static int gen_vms(char *buf, size_t buflen) {
   size_t pos = 0;
   int n = ksnprintf(buf, buflen,
                     "Fermi hypervisor (EL2): %u vCPUs, %u world-switches\n"
-                    "VCPU STATE    HVCALLS SYSREG ABORT VIRQS\n"
-                    "---- -------- ------- ------ ----- -----\n",
+                    "VCPU NAME   STATE    HVC    SYSREG ABORT VIRQ   MMIO\n"
+                    "---- ------ -------- ------ ------ ----- ------ ------\n",
                     count, switches);
   pos += (n < 0) ? 0 : (size_t)n;
 
   for (uint64_t i = 0; i < count && pos < buflen; i++) {
     uint64_t st = hvc_call(HVC_VM_STAT, i, VMSTAT_STATE, 0);
     const char *sn = (st == 2) ? "RUNNING" : (st == 1) ? "READY  " : "UNUSED ";
+    const char *name = (i == 0) ? "Fermi " : (i == 1) ? "Linux " : "guest ";
     int w = ksnprintf(buf + pos, buflen - pos,
-                      "%u    %s %u %u %u %u\n", i, sn,
+                      "%u    %s %s %u %u %u %u %u\n", i, name, sn,
                       hvc_call(HVC_VM_STAT, i, VMSTAT_HVC, 0),
                       hvc_call(HVC_VM_STAT, i, VMSTAT_SYSREG, 0),
                       hvc_call(HVC_VM_STAT, i, VMSTAT_ABORT, 0),
-                      hvc_call(HVC_VM_STAT, i, VMSTAT_VIRQ, 0));
+                      hvc_call(HVC_VM_STAT, i, VMSTAT_VIRQ, 0),
+                      hvc_call(HVC_VM_STAT, i, VMSTAT_MMIO, 0));
     if (w > 0) {
       pos += (size_t)w;
     }

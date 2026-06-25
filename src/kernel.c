@@ -835,15 +835,17 @@ void kernel_main() {
   /* When running as the EL2 hypervisor (not the EL1 guest build):
    *
    * HYP_RUN_DEMOS builds the milestone self-tests (M3 smoke, M4 time-slice,
-   * M9a heartbeat round-robin, M11 PSCI, M9c dual-FermiOS) that run to
-   * completion before the interactive guest. They are opt-in because each
-   * leaves GIC/timer state that complicates the long-lived interactive guest;
-   * the default build goes straight to a single interactive FermiOS guest. */
+   * M9a heartbeat round-robin, M11 PSCI, M15 shared-mem/doorbell, M9c
+   * dual-FermiOS) that run to completion before the interactive guest. They are
+   * opt-in because each leaves GIC/timer state that complicates the long-lived
+   * interactive guest; the default build goes straight to the interactive
+   * guests. */
 #ifdef HYP_RUN_DEMOS
   hyp_run_smoke_guest();      /* M3  */
   hyp_run_timeslice_demo();   /* M4  */
   hyp_run_multi_guest_demo(); /* M9a */
   hyp_run_psci_test();        /* M11 */
+  hyp_run_shm_doorbell();     /* M15 */
   hyp_run_dual_fermios();     /* M9c */
 #endif
 

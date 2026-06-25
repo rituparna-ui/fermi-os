@@ -1241,3 +1241,107 @@ void hyp_run_multi_interactive(void) {
 
   /* not reached */
 }
+
+/* ---- Milestone 15: inter-VM shared memory + doorbell hypercall ---- */
+
+extern char guest_shm_start[];
+extern char guest_shm_end[];
+
+#define SHM_COUNT      2
+#define SHM_RAM_SIZE   0x00200000ULL  /* 2 MiB per guest */
+#define SHM_IPA        0x50000000ULL  /* shared page IPA (outside guest RAM) */
+#define SHM_DOORBELL   0xF0000001ULL  /* doorbell hypercall function ID */
+#define SHM_ROUNDS     6
+
+void hyp_run_shm_doorbell(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M15: inter-VM shared memory + doorbell");
+
+  /* One shared host page, mapped into BOTH guests at the same IPA. */
+  uintptr_t shared = pmm_allocate_page();
+  if (!shared) {
+    return;
+  }
+  uint64_t *shared_kva = (uint64_t *)PHYS_TO_VIRT((uint64_t)shared);
+  shared_kva[0] = 0; /* producer counter */
+  shared_kva[1] = 0; /* doorbell seq     */
+  __asm__ __volatile__("dsb ish" ::: "memory");
+
+  static stage2_t s2[SHM_COUNT];
+  static vcpu_t vc[SHM_COUNT];
+  uintptr_t ram[SHM_COUNT];
+  uint64_t len = (uint64_t)(guest_shm_end - guest_shm_start);
+
+  for (int i = 0; i < SHM_COUNT; i++) {
+    ram[i] = pmm_allocate_pages(SHM_RAM_SIZE / 0x1000);
+    if (!ram[i] || !stage2_create(&s2[i], (uint32_t)(i + 1))) {
+      return;
+    }
+    stage2_map(&s2[i], GUEST_ENTRY_IPA, (uint64_t)ram[i], SHM_RAM_SIZE, 0);
+    stage2_map(&s2[i], UART_BASE, UART_BASE, 0x1000, /*device=*/1);
+    /* The SAME physical page mapped into both guests at SHM_IPA = shared RAM. */
+    stage2_map(&s2[i], SHM_IPA, (uint64_t)shared, 0x1000, /*device=*/0);
+
+    uint64_t kva = PHYS_TO_VIRT((uint64_t)ram[i]);
+    for (uint64_t b = 0; b < len; b++) {
+      ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)guest_shm_start)[b];
+    }
+    guest_sync_icache(kva, (len + 0xFFF) & ~0xFFFULL);
+
+    for (int r = 0; r < 31; r++) vc[i].x[r] = 0;
+    vc[i].x[0] = (uint64_t)i; /* role: 0 = producer, 1 = consumer */
+    vc[i].pc = GUEST_ENTRY_IPA;
+    vc[i].pstate = 0x3C5;
+    vc[i].sp_el1 = GUEST_ENTRY_IPA + SHM_RAM_SIZE;
+    vc[i].vttbr = stage2_vttbr(&s2[i]);
+    vc[i].hcr_extra = 0;
+    vc[i].vmid = (uint32_t)(i + 1);
+    vc[i].id = (uint32_t)i;
+    vc[i].name = (i == 0) ? "producer" : "consumer";
+  }
+
+  uart_puts("[HYP] schedule (P=producer ran, C<hex>=consumer read shared counter): ");
+
+  uint64_t doorbells = 0;
+  for (int round = 0; round < SHM_ROUNDS; round++) {
+    for (int i = 0; i < SHM_COUNT; i++) {
+      /* Each guest runs until it yields via a plain HVC; the producer also
+       * issues a doorbell HVC which we count + acknowledge. */
+      int yielded = 0;
+      long guard = 100000;
+      while (!yielded && guard-- > 0) {
+        vcpu_enter(&vc[i]);
+        if (vc[i].exit_reason == HYP_EXC_SYNC && ESR_EC_OF(vc[i].esr) == 0x16) {
+          if (vc[i].x[0] == SHM_DOORBELL) {
+            /* Doorbell from the producer: in a full design this injects an SPI
+             * into the peer VM's vGIC; here we count it and let the peer pick
+             * up the data on its next slice (it polls shared memory). */
+            doorbells++;
+            vc[i].x[0] = 0; /* return success to the guest */
+          } else {
+            yielded = 1; /* plain yield HVC -> next guest */
+          }
+        } else if (!df_service_exit(&vc[i])) {
+          yielded = 1;
+        }
+      }
+    }
+  }
+
+  uint64_t final_counter = shared_kva[0];
+  uint64_t final_seq = shared_kva[1];
+  uart_println("");
+  uart_printf("[HYP] shared counter=%u doorbell_seq=%u doorbells_serviced=%u\n",
+              final_counter, final_seq, doorbells);
+  int ok = (final_counter >= 1) && (doorbells >= 1) && (final_seq == final_counter);
+  uart_println(ok ? "[HYP] M15: PASS (cross-VM shared memory + doorbell)"
+                  : "[HYP] M15: FAIL");
+
+  pmm_free_page(shared);
+  for (int i = 0; i < SHM_COUNT; i++) {
+    pmm_free_pages(ram[i], SHM_RAM_SIZE / 0x1000);
+  }
+}

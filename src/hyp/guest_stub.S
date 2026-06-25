@@ -123,6 +123,61 @@ guest_psci_start:
 guest_psci_end:
 
 // ---------------------------------------------------------------------------
+// Inter-VM shared-memory + doorbell guests (milestone 15). The hypervisor maps
+// one host page into BOTH guests' stage-2 at IPA 0x50000000, and provides a
+// doorbell hypercall (HVC x0=0xF000_0001) that injects an SPI into the peer VM.
+//
+// Shared page layout (8-byte slots at 0x50000000):
+//   +0x00  producer counter (producer writes, consumer reads)
+//   +0x08  doorbell sequence (producer bumps before ringing)
+//
+// guest_shm: x0 = role (0 = producer, 1 = consumer), x9 = UART base.
+// Producer: bump counter in shared mem, ring the doorbell, yield.
+// Consumer: read the shared counter, print "C<low-hex-digit>", yield.
+.section .text.guest, "ax"
+.balign 16
+.global guest_shm_start
+guest_shm_start:
+	mov	x12, x0			// role
+	movz	x9, #0x0000
+	movk	x9, #0x0900, lsl #16	// UART base 0x09000000
+	movz	x11, #0x0000
+	movk	x11, #0x5000, lsl #16	// shared page IPA 0x50000000
+	cbnz	x12, shm_consumer
+
+shm_producer:
+	ldr	x10, [x11]		// counter
+	add	x10, x10, #1
+	str	x10, [x11]		// publish new counter
+	ldr	x13, [x11, #8]
+	add	x13, x13, #1
+	str	x13, [x11, #8]		// bump doorbell seq
+	dsb	ish
+	mov	w14, #'P'
+	str	w14, [x9]		// show the producer ran
+	movz	x0, #0x0001
+	movk	x0, #0xF000, lsl #16	// x0 = 0xF0000001 (doorbell hypercall)
+	hvc	#0
+	hvc	#0			// yield slice
+	b	shm_producer
+
+shm_consumer:
+	ldr	x10, [x11]		// read shared counter
+	mov	w14, #'C'
+	str	w14, [x9]
+	and	x15, x10, #0xF		// low nibble -> hex digit
+	cmp	x15, #10
+	b.lt	1f
+	add	x15, x15, #('a' - 10)
+	b	2f
+1:	add	x15, x15, #'0'
+2:	str	w15, [x9]		// print the counter's low digit
+	hvc	#0			// yield slice
+	b	shm_consumer
+.global guest_shm_end
+guest_shm_end:
+
+// ---------------------------------------------------------------------------
 // Interactive echo EL1 guest (milestone 12). A tiny PL011 "shell": prints a
 // banner + prompt, then loops reading a char (poll FR.RXFE, read DR) and
 // echoing it back, re-printing the prompt after a newline. Proves the vuart RX

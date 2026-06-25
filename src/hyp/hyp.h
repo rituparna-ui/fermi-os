@@ -96,4 +96,10 @@ void hyp_run_interactive_guest(void);
  * No-op at EL1. */
 void hyp_run_multi_interactive(void);
 
+/* Milestone 15: demonstrate inter-VM shared memory + a doorbell hypercall.
+ * One host page is mapped into BOTH guests' stage-2 at a fixed IPA; a producer
+ * guest writes it and rings a doorbell (HVC), and a consumer guest reads it.
+ * No-op at EL1; runs before the host timer. */
+void hyp_run_shm_doorbell(void);
+
 #endif /* HYP_HYP_H */

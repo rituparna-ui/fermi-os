@@ -240,6 +240,142 @@ pub fn read_file(node: *mut Vnode, offset: u64, buf: &mut [u8]) -> i32 {
     avail as i32
 }
 
+/// Write a 32-bit FAT entry (preserving the top 4 reserved bits).
+fn fat_write(cluster: u32, value: u32) -> bool {
+    let v = unsafe { VOL.get() };
+    let fat_offset = cluster * 4;
+    let sector = v.fat_start_sector + fat_offset / SECTOR as u32;
+    let offset = (fat_offset % SECTOR as u32) as usize;
+    if !blk::read(sector as u64, sec()) {
+        return false;
+    }
+    let b = sec();
+    let existing = u32::from_le_bytes([b[offset], b[offset + 1], b[offset + 2], b[offset + 3]]);
+    let val = (existing & 0xF000_0000) | (value & 0x0FFF_FFFF);
+    b[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+    blk::write(sector as u64, sec())
+}
+
+/// Scan the FAT for a free cluster, mark it end-of-chain, return it (0 = fail).
+fn fat_alloc_cluster() -> u32 {
+    let v = unsafe { VOL.get() };
+    let mut c = 2u32;
+    loop {
+        let fat_offset = c * 4;
+        let sector = v.fat_start_sector + fat_offset / SECTOR as u32;
+        if sector >= v.data_start_sector {
+            return 0; // past end of FAT
+        }
+        let offset = (fat_offset % SECTOR as u32) as usize;
+        if !blk::read(sector as u64, sec()) {
+            return 0;
+        }
+        let b = sec();
+        let val = u32::from_le_bytes([b[offset], b[offset + 1], b[offset + 2], b[offset + 3]]) & 0x0FFF_FFFF;
+        if val == 0 {
+            if !fat_write(c, 0x0FFF_FFFF) {
+                return 0;
+            }
+            return c;
+        }
+        c += 1;
+    }
+}
+
+/// Find a free directory slot and write `entry` (32 bytes) into it.
+fn dir_add_entry(dir_cluster: u32, entry: &[u8; 32]) -> bool {
+    let v = unsafe { VOL.get() };
+    let mut cluster = dir_cluster;
+    while cluster < FAT32_EOC {
+        let base = cluster_to_sector(cluster);
+        for srel in 0..v.sectors_per_cluster {
+            if !blk::read((base + srel) as u64, sec()) {
+                return false;
+            }
+            let mut off = 0;
+            while off < SECTOR {
+                let first = sec()[off];
+                if first == 0x00 || first == 0xE5 {
+                    sec()[off..off + 32].copy_from_slice(entry);
+                    return blk::write((base + srel) as u64, sec());
+                }
+                off += DIR_ENTRY_SIZE;
+            }
+        }
+        cluster = fat_next(cluster);
+    }
+    false
+}
+
+/// Write file data along a cluster chain, one sector at a time.
+fn cluster_write_data(first_cluster: u32, data: &[u8]) -> bool {
+    let v = unsafe { VOL.get() };
+    let mut remaining = data.len();
+    let mut src = 0usize;
+    let mut cluster = first_cluster;
+    while remaining > 0 && cluster < FAT32_EOC {
+        let base = cluster_to_sector(cluster);
+        for srel in 0..v.sectors_per_cluster {
+            if remaining == 0 {
+                break;
+            }
+            let chunk = core::cmp::min(remaining, SECTOR);
+            let buf = sec();
+            for x in buf.iter_mut() {
+                *x = 0;
+            }
+            buf[..chunk].copy_from_slice(&data[src..src + chunk]);
+            if !blk::write((base + srel) as u64, sec()) {
+                return false;
+            }
+            src += chunk;
+            remaining -= chunk;
+        }
+        cluster = fat_next(cluster);
+    }
+    true
+}
+
+/// Create a root-level file `name` (8.3) with `data`. Returns success.
+pub fn create(name: &[u8], data: &[u8]) -> bool {
+    let v = unsafe { VOL.get() };
+    if !v.mounted {
+        return false;
+    }
+    let bytes_per_cluster = v.sectors_per_cluster * SECTOR as u32;
+    let clusters_needed = if data.is_empty() {
+        0
+    } else {
+        (data.len() as u32 + bytes_per_cluster - 1) / bytes_per_cluster
+    };
+    let mut first_cluster = 0u32;
+    let mut prev = 0u32;
+    for i in 0..clusters_needed {
+        let c = fat_alloc_cluster();
+        if c == 0 {
+            return false;
+        }
+        if i == 0 {
+            first_cluster = c;
+        }
+        if prev != 0 && !fat_write(prev, c) {
+            return false;
+        }
+        prev = c;
+    }
+    if !data.is_empty() && first_cluster != 0 && !cluster_write_data(first_cluster, data) {
+        return false;
+    }
+    // Build the 32-byte directory entry.
+    let mut e = [0u8; 32];
+    e[..11].copy_from_slice(&to_83(name));
+    e[11] = 0x20; // ATTR_ARCHIVE
+    e[20..22].copy_from_slice(&((first_cluster >> 16) as u16).to_le_bytes());
+    e[26..28].copy_from_slice(&(first_cluster as u16).to_le_bytes());
+    e[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    dir_add_entry(v.root_cluster, &e)
+}
+
 /// Attach the mounted FAT32 root to an existing empty VFS directory.
 pub fn vfs_mount(path: &str) {
     let v = unsafe { VOL.get() };

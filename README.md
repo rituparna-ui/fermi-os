@@ -71,6 +71,7 @@ It also doubles as a minimal **Type-1 (bare-metal) hypervisor**: when launched w
 - **Two guests** — vCPU 0 is Fermi itself (running unmodified at EL1); vCPU 1 is a tiny position-independent payload in its own isolated RAM slice. Both make progress concurrently under preemption
 - **PSCI guest lifecycle** — `PSCI_VERSION` and `SYSTEM_OFF`/`SYSTEM_RESET`: a guest can power itself off, and the hypervisor reaps the vCPU and stops scheduling it
 - **Introspection** — `cat /proc/vms` from the EL0 shell renders a live vCPU table (state, hypercall/sysreg/abort/vIRQ counts, world-switch total) by hypercalling from the EL1 `/proc` generator
+- **Linux guest** — an unmodified aarch64 Linux kernel boots as the second guest, all the way to an interactive BusyBox userspace shell, concurrently with Fermi. The hypervisor provides a hand-written device tree, a 1 GiB stage-2 RAM window in Fermi-invisible physical memory, an emulated GICv3 distributor/redistributor, the architected virtual timer (`CNTV`), PSCI-over-HVC, and per-vCPU context (including `SP_EL0`, which holds Linux's `current`). The `Image` + DTB + busybox initramfs are staged into guest RAM via QEMU's generic loader. Use an SCS-free kernel (e.g. an older Ubuntu generic build) — `CONFIG_SHADOW_CALL_STACK` kernels hit a guest-internal fault under this minimal boot. Stage `guest/Image` and `guest/initramfs.cpio.gz`, then `make run`
 
 ---
 

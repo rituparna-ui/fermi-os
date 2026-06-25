@@ -2,10 +2,18 @@
 
 Fermi OS is a bare-metal `aarch64 (ARMv8-A)` kernel built from scratch in **pure Rust and assembly**, targeting QEMU's `virt` machine with a Cortex-A72 processor.
 
-> **Port in progress.** This branch (`fermi-claude-rs`) is a ground-up Rust
-> re-implementation of the original C kernel, rebuilt feature by feature
-> following the original commit history. The C sources remain available in git
-> history as the reference.
+> This branch (`fermi-claude-rs`) is a complete, ground-up Rust
+> re-implementation of the original C kernel, ported feature by feature
+> following the original commit history. The build is pure Rust — `rustc`
+> targeting `aarch64-unknown-none`, linked with the bundled `rust-lld`, with
+> assembly assembled by LLVM's integrated assembler. **No GCC or GNU binutils
+> required.** The original C sources remain available in git history.
+>
+> Every subsystem is boot-verified under QEMU: MMU/heap self-tests pass, the
+> EL0 shell is interactive, DHCP acquires a lease and ICMP pings the gateway,
+> FAT32 files read through the VFS, and demand-paged/kill-on-fault handling
+> works. Module layout mirrors the original tree: `src/{arch,klib,mm,exception,
+> sched,syscall,drivers,fs,user}`.
 
 
 ---

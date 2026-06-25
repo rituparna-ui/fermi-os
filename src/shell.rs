@@ -127,7 +127,7 @@ fn dispatch(line: &str) {
             kprintln!("builtins: help uptime version ps free meminfo ifconfig irqs");
             kprintln!("          cat <path> ping sleep <ms> kill <pid> echo <text>");
             kprintln!("          balloon <inflate|deflate|status> [n] vlog <text> clear");
-            kprintln!("          run <elf-path> cpuinfo reboot");
+            kprintln!("          ls [path] run <elf-path> cpuinfo reboot");
         }
         "uptime" => kprintln!("up {} ms ({} s)", timer::uptime_ms(), timer::uptime_seconds()),
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
@@ -135,6 +135,10 @@ fn dispatch(line: &str) {
         "free" | "meminfo" => cmd_free(),
         "ifconfig" => kprint!("{}", net::render_info()),
         "irqs" => kprint!("{}", gic::render_interrupts()),
+        "ls" => {
+            let path = if arg1.is_empty() { "/" } else { arg1 };
+            kprint!("{}", vfs::list(path));
+        }
         "cat" => {
             if arg1.is_empty() {
                 kprintln!("usage: cat <path>");

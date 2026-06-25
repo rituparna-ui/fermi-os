@@ -177,6 +177,40 @@ pub fn resolve(path: &str) -> *mut Vnode {
     cur
 }
 
+/// List a directory: in-memory children plus on-disk entries for FAT32 dirs.
+pub fn list(path: &str) -> alloc::string::String {
+    use core::fmt::Write;
+    let mut out = alloc::string::String::new();
+    let dir = resolve(path);
+    if dir.is_null() {
+        let _ = writeln!(out, "ls: {}: not found", path);
+        return out;
+    }
+    unsafe {
+        if (*dir).vtype != VnodeType::Dir {
+            let _ = writeln!(out, "{}", path);
+            return out;
+        }
+        if (*dir).is_dir_fat32 {
+            return crate::fs::fat32::list_dir((*dir).private0 as u32);
+        }
+        let mut c = (*dir).children;
+        while !c.is_null() {
+            let len = (*c).name.iter().position(|&b| b == 0).unwrap_or(64);
+            let name = core::str::from_utf8(&(*c).name[..len]).unwrap_or("?");
+            let kind = match (*c).vtype {
+                VnodeType::Dir => "<DIR>",
+                VnodeType::Chr => "<chr>",
+                VnodeType::Blk => "<blk>",
+                VnodeType::Reg => "",
+            };
+            let _ = writeln!(out, "{:<14} {}", name, kind);
+            c = (*c).next;
+        }
+    }
+    out
+}
+
 pub fn register_chardev(name: &str, dev: DevOps) -> *mut Vnode {
     let mut d = resolve("/dev");
     if d.is_null() {

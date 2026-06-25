@@ -181,6 +181,56 @@ fn read_chain(first_cluster: u32, size: u32, buf: &mut [u8]) -> i32 {
     (total - remaining) as i32
 }
 
+/// Enumerate an on-disk FAT32 directory into a String (name + size/<DIR>).
+pub fn list_dir(dir_cluster: u32) -> alloc::string::String {
+    use core::fmt::Write;
+    let v = unsafe { VOL.get() };
+    let mut out = alloc::string::String::new();
+    let mut cluster = dir_cluster;
+    while cluster < FAT32_EOC {
+        let base = cluster_to_sector(cluster);
+        for srel in 0..v.sectors_per_cluster {
+            if !blk::read((base + srel) as u64, sec()) {
+                return out;
+            }
+            let b = sec();
+            let mut off = 0;
+            while off < SECTOR {
+                let e = &b[off..off + DIR_ENTRY_SIZE];
+                if e[0] == 0x00 {
+                    return out;
+                }
+                if e[0] == 0xE5 || e[11] == ATTR_LFN || e[11] & ATTR_VOLUME_ID != 0 {
+                    off += DIR_ENTRY_SIZE;
+                    continue;
+                }
+                // Render 8.3 name "NAME    EXT" -> "name.ext".
+                let mut name = alloc::string::String::new();
+                for &c in &e[0..8] {
+                    if c != b' ' { name.push(c as char); }
+                }
+                let has_ext = e[8] != b' ';
+                if has_ext {
+                    name.push('.');
+                    for &c in &e[8..11] {
+                        if c != b' ' { name.push(c as char); }
+                    }
+                }
+                let is_dir = e[11] & ATTR_DIRECTORY != 0;
+                let size = u32::from_le_bytes([e[28], e[29], e[30], e[31]]);
+                if is_dir {
+                    let _ = writeln!(out, "{:<14} <DIR>", name);
+                } else {
+                    let _ = writeln!(out, "{:<14} {} bytes", name, size);
+                }
+                off += DIR_ENTRY_SIZE;
+            }
+        }
+        cluster = fat_next(cluster);
+    }
+    out
+}
+
 /// VFS lazy lookup: resolve `name` inside FAT32 directory vnode `dir`,
 /// creating a child vnode on demand.
 pub fn lookup(dir: *mut Vnode, name: &[u8]) -> *mut Vnode {

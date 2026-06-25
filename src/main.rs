@@ -19,6 +19,7 @@ mod mm;
 mod mmio;
 mod panic;
 mod print;
+mod strings;
 mod sync;
 mod uart;
 

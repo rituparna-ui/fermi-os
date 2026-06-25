@@ -146,8 +146,7 @@ pub fn dispatch(frame: &mut TrapFrame) {
             ret = crate::exception::timer::uptime_ms() as i64;
         }
         SYS_NET_PING => {
-            // Networking not yet ported; report failure.
-            ret = -1;
+            ret = crate::drivers::virtio::net::send_ping(arg0 as u16);
         }
         SYS_KILL => {
             ret = sched::kill_task(arg0);

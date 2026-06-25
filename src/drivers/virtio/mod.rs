@@ -7,6 +7,7 @@
 pub mod balloon;
 pub mod blk;
 pub mod console;
+pub mod net;
 pub mod rng;
 pub mod virtqueue;
 

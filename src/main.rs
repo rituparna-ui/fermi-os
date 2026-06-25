@@ -139,6 +139,7 @@ pub extern "C" fn kmain() -> ! {
         kprintln!("[BLK TEST] write+read sector 1 round-trip: {}", if ok { "PASS" } else { "FAIL" });
     }
 
+    drivers::virtio::net::init();
     drivers::virtio::console::init();
     drivers::virtio::balloon::init();
 

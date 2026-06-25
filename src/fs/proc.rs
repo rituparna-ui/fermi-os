@@ -89,10 +89,7 @@ fn gen_tasks(out: &mut [u8]) -> usize {
 }
 
 fn gen_netinfo(out: &mut [u8]) -> usize {
-    // Networking not yet ported.
-    let mut w = FmtBuf::new(out);
-    let _ = write!(w, "net: not available\n");
-    w.len()
+    crate::drivers::virtio::net::get_info(out)
 }
 
 fn gen_interrupts(out: &mut [u8]) -> usize {

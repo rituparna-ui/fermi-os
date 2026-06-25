@@ -119,6 +119,7 @@ __attribute__((section(".hyp_tables"))) static uint32_t g_lrx_tail; /* read  */
 __attribute__((section(".hyp_tables"))) static uint32_t g_pl011_imsc; /* mask */
 
 #define PL011_RXIM (1u << 4) /* IMSC/RIS/MIS receive-interrupt bit */
+#define PL011_RTIM (1u << 6) /* IMSC/RIS/MIS receive-timeout-interrupt bit */
 #define UART_SPI_INTID 33    /* DT: pl011 interrupts = <0 1 4> => SPI 1 => 33 */
 
 static inline int lrx_empty(void) { return g_lrx_head == g_lrx_tail; }
@@ -1174,9 +1175,10 @@ static int hyp_emulate_pl011(uint64_t ipa, int is_write, uint64_t *val) {
     *val = (1u << 7) | (lrx_empty() ? (1u << 4) : 0);
     break;
   case 0x038: *val = g_pl011_imsc; break;                 /* IMSC            */
-  case 0x03C: *val = lrx_empty() ? 0 : PL011_RXIM; break; /* RIS: raw RX     */
+  case 0x03C: *val = lrx_empty() ? 0 : (PL011_RXIM | PL011_RTIM); break; /* RIS */
   case 0x040: /* MIS = RIS & IMSC */
-    *val = (!lrx_empty() && (g_pl011_imsc & PL011_RXIM)) ? PL011_RXIM : 0;
+    *val = lrx_empty() ? 0
+                       : ((PL011_RXIM | PL011_RTIM) & g_pl011_imsc);
     break;
   case 0xFE0: *val = 0x11; break;       /* PeriphID0                          */
   case 0xFE4: *val = 0x10; break;       /* PeriphID1                          */
@@ -1406,7 +1408,7 @@ static void hyp_vgic_inject_ex(int target, uint32_t intid, int hw) {
  * handler drains the RX FIFO. Called each scheduling tick, so delivery is
  * robust regardless of when the guest's driver came up. */
 static void hyp_uart_rx_kick(void) {
-  if (!lrx_empty() && (g_pl011_imsc & PL011_RXIM))
+  if (!lrx_empty() && (g_pl011_imsc & (PL011_RXIM | PL011_RTIM)))
     hyp_vgic_inject_ex(1 /* Linux vCPU */, UART_SPI_INTID, 0 /* SW */);
 }
 

@@ -27,6 +27,7 @@ core::arch::global_asm!(
 
 static mut SECONDARY_UP: u64 = 0;
 static mut SECONDARY_MPIDR: u64 = 0;
+static mut SECONDARY_HEARTBEAT: u64 = 0;
 
 const PSCI_CPU_ON: u64 = 0xC400_0003;
 
@@ -38,9 +39,35 @@ pub extern "C" fn rust_secondary() -> ! {
         core::ptr::write_volatile(core::ptr::addr_of_mut!(SECONDARY_MPIDR), mpidr);
         core::ptr::write_volatile(core::ptr::addr_of_mut!(SECONDARY_UP), 1);
     }
+    // Run a continuous heartbeat so the primary can observe the secondary
+    // executing over time. MMU is off here, so use plain volatile stores
+    // (no atomics / no upper-half MMIO).
+    let mut beat: u64 = 0;
     loop {
-        unsafe { core::arch::asm!("wfi") };
+        beat = beat.wrapping_add(1);
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(SECONDARY_HEARTBEAT), beat);
+        }
+        // Modest delay between beats so the counter is human-readable.
+        for _ in 0..2_000_000u64 {
+            core::hint::spin_loop();
+        }
     }
+}
+
+/// Current secondary-core heartbeat (0 if not online).
+pub fn heartbeat() -> u64 {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SECONDARY_HEARTBEAT)) }
+}
+
+/// Secondary core MPIDR (0 if not online).
+pub fn secondary_mpidr() -> u64 {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SECONDARY_MPIDR)) }
+}
+
+/// Whether the secondary reported online.
+pub fn secondary_online() -> bool {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SECONDARY_UP)) != 0 }
 }
 
 /// Bring up core 1 (PSCI CPU_ON) and wait for it to report online.

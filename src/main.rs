@@ -12,6 +12,7 @@ extern crate alloc;
 mod klib;
 #[macro_use]
 mod arch;
+mod drivers;
 mod exception;
 mod mm;
 mod panic;
@@ -107,6 +108,9 @@ pub extern "C" fn kmain() -> ! {
     // Interrupt controller. (Timer is started after the scheduler is up so the
     // first preemption has tasks to choose from.)
     exception::gic::init();
+
+    // PCI bus enumeration (device drivers attach next).
+    drivers::pci::enumerate_bus();
 
     // Scheduler + a couple of demo kernel tasks (mirrors the original boot).
     sched::init();

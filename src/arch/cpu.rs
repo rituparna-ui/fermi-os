@@ -7,6 +7,17 @@
 use crate::klib::uart::Uart;
 use crate::{mrs, msr};
 
+/// Full-system data synchronization barrier (`dsb sy`). Required after MMIO
+/// writes that change device state and before dependent reads — the canonical
+/// barrier reused by every VirtIO driver.
+#[inline(always)]
+#[allow(dead_code)]
+pub fn dsb_sy() {
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+    }
+}
+
 /// Enable FP/SIMD at EL1 (CPACR_EL1.FPEN = 0b11).
 ///
 /// The Rust compiler — like GCC for varargs — uses SIMD registers, including in

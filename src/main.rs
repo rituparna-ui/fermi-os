@@ -12,7 +12,10 @@ use core::panic::PanicInfo;
 global_asm!(include_str!("boot.S"));
 
 mod cpu;
+mod mm;
 mod mmio;
+mod print;
+mod sync;
 mod uart;
 
 /// Kernel entry point, called from `boot.S` after low-level setup.
@@ -24,6 +27,25 @@ pub extern "C" fn rust_main() -> ! {
     uart::println("  Fermi OS (Rust) is booting");
     uart::println("================================");
     cpu::print_current_el();
+
+    // Physical memory manager.
+    mm::pmm::init(mm::pmm::MEM_START, mm::pmm::MEM_SIZE);
+    mm::pmm::print_info();
+
+    // PMM smoke test: allocate a few pages, free one, re-allocate.
+    let a = mm::pmm::allocate_page();
+    let b = mm::pmm::allocate_page();
+    uart::log_hex("[TEST] alloc a=", a);
+    uart::log_hex("[TEST] alloc b=", b);
+    mm::pmm::free_page(a);
+    let c = mm::pmm::allocate_page();
+    uart::log_hex("[TEST] freed a, re-alloc c= (expect==a) ", c);
+    mm::pmm::free_page(b);
+    mm::pmm::free_page(c);
+
+    let big = mm::pmm::allocate_pages(8);
+    uart::log_hex("[TEST] alloc 8 contiguous pages at ", big);
+    mm::pmm::free_pages(big, 8);
     uart::puts("UART base: ");
     uart::puthex(uart::UART_BASE as u64);
     uart::putc(b'\n');

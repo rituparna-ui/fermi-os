@@ -109,3 +109,19 @@ pub fn putbin(value: u64) {
         i -= 1;
     }
 }
+
+/// Pre-MMU log helper: `prefix` then a decimal value then newline.
+/// Uses only aligned byte stores (no core::fmt), so it is safe on Device
+/// memory before the MMU is enabled.
+pub fn log_dec(prefix: &str, v: u64) {
+    puts(prefix);
+    putdec(v);
+    putc(b'\n');
+}
+
+/// Pre-MMU log helper: `prefix` then a hex value then newline.
+pub fn log_hex(prefix: &str, v: u64) {
+    puts(prefix);
+    puthex(v);
+    putc(b'\n');
+}

@@ -33,6 +33,9 @@ SECTIONS
     . = . + 0x10000;          /* 64 KiB boot stack */
     __stack_top = .;
 
+    . = ALIGN(4096);
+    __kernel_end = .;         /* Everything after this is free for the PMM */
+
     /DISCARD/ : {
         *(.comment)
         *(.note .note.*)

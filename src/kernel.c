@@ -4,6 +4,7 @@
 #include "exception.h"
 #include "fat32/fat32.h"
 #include "gic/gic.h"
+#include "hyp/hyp.h"
 #include "mm/heap/heap.h"
 #include "mm/mmu/mmu.h"
 #include "mm/pmm/pmm.h"
@@ -793,6 +794,10 @@ void kernel_main() {
   heap_init();
 
   gic_init();
+
+  /* Bring up the EL2 hypervisor trap layer (no-op on legacy EL1 boot).
+   * Milestone 2: self-tests the dedicated EL2 vector table via a host HVC. */
+  hyp_init();
 
   pci_enumerate_bus();
   pci_virtio_rng_init();

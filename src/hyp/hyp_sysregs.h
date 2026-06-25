@@ -38,6 +38,14 @@
  * mappings, so FMO/IMO/AMO stay 0 until the vGIC milestone. */
 #define HCR_EL2_M2    (HCR_EL2_RW | HCR_EL2_VM)
 
+/* Milestone 3/4: route physical IRQ/FIQ/SError to EL2 (the host CNTHP timer
+ * PPI now lands at EL2 for vGIC injection), and trap guest WFI + SMC. The
+ * guest's ICC_*_EL1 CPU-interface accesses are hardware-redirected to the
+ * virtual interface once IMO=1. TGE stays 0 (EL1 is a real guest); HCD stays 0
+ * (guest HVC traps to EL2 for PSCI). GIC/ECAM MMIO is still straight-through. */
+#define HCR_EL2_M3    (HCR_EL2_RW | HCR_EL2_VM | HCR_EL2_FMO | HCR_EL2_IMO | \
+                       HCR_EL2_AMO | HCR_EL2_TWI | HCR_EL2_TSC)
+
 /* ---------------------------------------------------------------------------
  * CPTR_EL2 — Architectural Feature Trap Register (non-VHE, E2H=0)
  *

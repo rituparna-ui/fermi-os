@@ -60,8 +60,10 @@ ASFLAGS := -g -MMD -MP
 LDFLAGS := -nostdlib -g -T linker.ld
 
 # Hypervisor image: same freestanding flags, its own include dir + linker script.
+# -mgeneral-regs-only forbids FP/SIMD in EL2 codegen so the GPR-only world-switch
+# trap frame can never silently clobber the guest's caller-saved q-registers.
 HYP_CFLAGS  := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 \
-               -mstrict-align -fno-pic -MMD -MP -I $(HYP_DIR)
+               -mstrict-align -fno-pic -mgeneral-regs-only -MMD -MP -I $(HYP_DIR)
 HYP_LDFLAGS := -nostdlib -g -T $(HYP_DIR)/linker_hyp.ld
 
 # QEMU Config

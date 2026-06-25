@@ -1,7 +1,10 @@
 #include "hyp.h"
 #include "hyp_alloc.h"
+#include "hyp_gic.h"
 #include "hyp_sysregs.h"
 #include "stage2.h"
+#include "timer/vtimer.h"
+#include "vgic/vgic.h"
 #include <stdint.h>
 
 /* ---------------------------------------------------------------------------
@@ -141,21 +144,29 @@ void hyp_main(void) {
   /* Place the embedded guest image at its physical load base. */
   hyp_load_guest();
 
-  /* Milestone 2: build the stage-2 identity tables and program VTCR/VTTBR,
-   * then enable stage-2 by setting HCR_EL2.VM=1. From this point the guest
-   * runs in a real VM address space: every stage-1 output (IPA) is walked
-   * through our stage-2 tables before reaching host PA. */
+  /* Stage-2: build the identity IPA->PA tables and program VTCR/VTTBR. */
   s2_init();
 
-  uint64_t hcr2 = HCR_EL2_M2;
-  __asm__ __volatile__("msr hcr_el2, %0\n\tisb" ::"r"(hcr2));
+  /* Interrupt + timer virtualization (M3/M4):
+   *   - host GIC: EL2 physical CPU interface + CNTHP PPI 26 enabled
+   *   - vGIC:     virtual CPU interface enabled, ready to inject via LRs
+   *   - vtimer:   trap guest CNTP_*, drive the EL2 timer, inject vINTID 30
+   * Order matters: enable HCR_EL2.IMO (route IRQ to EL2) only AFTER the host
+   * GIC + vGIC are ready, or a stray physical IRQ would hit an unprepared
+   * dispatcher. */
+  hyp_gic_init();
+  vgic_init();
+  vtimer_init();
+
+  uint64_t hcr3 = HCR_EL2_M3;
+  __asm__ __volatile__("msr hcr_el2, %0\n\tisb" ::"r"(hcr3));
   __asm__ __volatile__("mrs %0, hcr_el2" : "=r"(hcr));
   hyp_puts("[HYP] HCR_EL2   = ");
   hyp_puthex(hcr);
-  hyp_puts("  (VM=1, stage-2 ON)\n");
+  hyp_puts("  (VM=1 stage-2, IMO/FMO/AMO route IRQ->EL2, TWI/TSC)\n");
 
   hyp_puts("[HYP] guest @ IPA ");
   hyp_puthex(GUEST_ENTRY_IPA);
-  hyp_puts(" -> eret to EL1 (now translated)...\n");
+  hyp_puts(" -> eret to EL1 (virtualized timer+GIC)...\n");
   hyp_puts("--------------------------------------------------\n\n");
 }

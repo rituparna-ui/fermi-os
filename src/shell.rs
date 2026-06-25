@@ -135,6 +135,7 @@ fn dispatch(line: &str) {
         "free" | "meminfo" => cmd_free(),
         "ifconfig" => kprint!("{}", net::render_info()),
         "irqs" => kprint!("{}", gic::render_interrupts()),
+        "traps" => kprint!("{}", crate::exception::render_stats()),
         "ls" => {
             let path = if arg1.is_empty() { "/" } else { arg1 };
             kprint!("{}", vfs::list(path));

@@ -272,6 +272,19 @@ static int read_linux_console(struct vnode *n, file_t *f, void *buf,
   return (int)to_copy;
 }
 
+/* Writing to /proc/linux_console feeds bytes into the Linux guest's emulated
+ * UART RX (HVC_LCON_PUT); the hypervisor injects the UART SPI so the guest's
+ * shell receives them. This is the input side of the dedicated console. */
+static int write_linux_console(struct vnode *n, file_t *f, const void *buf,
+                               size_t count) {
+  (void)n;
+  (void)f;
+  const unsigned char *p = (const unsigned char *)buf;
+  for (size_t i = 0; i < count; i++)
+    hvc_call(HVC_LCON_PUT, (uint64_t)p[i], 0, 0);
+  return (int)count;
+}
+
 static file_operations_t uptime_ops  = {.read = read_uptime,  .write = 0};
 static file_operations_t meminfo_ops = {.read = read_meminfo, .write = 0};
 static file_operations_t tasks_ops   = {.read = read_tasks,   .write = 0};
@@ -288,7 +301,7 @@ static file_operations_t cpuinfo_ops = {.read = read_cpuinfo, .write = 0};
 
 static file_operations_t version_ops = {.read = read_version, .write = 0};
 static file_operations_t vms_ops = {.read = read_vms, .write = 0};
-static file_operations_t linux_console_ops = {.read = read_linux_console, .write = 0};
+static file_operations_t linux_console_ops = {.read = read_linux_console, .write = write_linux_console};
 
 /* ------------------------------------------------------------------ */
 /* Init                                                                */

@@ -101,6 +101,21 @@ __attribute__((section(".hyp_tables"))) static uint64_t g_switch_count;
 #define LCON_SZ (32 * 1024)
 __attribute__((section(".hyp_tables"))) static uint8_t g_lcon[LCON_SZ];
 __attribute__((section(".hyp_tables"))) static uint32_t g_lcon_len;
+
+/* Emulated PL011 RX side (for interactive input to the Linux guest). Bytes
+ * pushed via HVC_LCON_PUT land in this FIFO; when the guest has enabled the RX
+ * interrupt (IMSC.RXIM) the hypervisor injects the UART SPI so Linux's pl011
+ * IRQ handler drains the FIFO (via DR reads) into its tty. */
+#define LRX_SZ 256
+__attribute__((section(".hyp_tables"))) static uint8_t g_lrx[LRX_SZ];
+__attribute__((section(".hyp_tables"))) static uint32_t g_lrx_head; /* write */
+__attribute__((section(".hyp_tables"))) static uint32_t g_lrx_tail; /* read  */
+__attribute__((section(".hyp_tables"))) static uint32_t g_pl011_imsc; /* mask */
+
+#define PL011_RXIM (1u << 4) /* IMSC/RIS/MIS receive-interrupt bit */
+#define UART_SPI_INTID 33    /* DT: pl011 interrupts = <0 1 4> => SPI 1 => 33 */
+
+static inline int lrx_empty(void) { return g_lrx_head == g_lrx_tail; }
 /* CNTHP (EL2 physical timer) scheduling tick. */
 #define HYP_TIMER_INTID 26   /* PPI 26 = non-secure EL2 physical timer */
 #define HYP_QUANTUM_MS 100   /* preemption time-slice */
@@ -708,6 +723,16 @@ static void hyp_handle_hvc(el2_frame_t *f) {
   case HVC_LCON_LEN:
     ret = g_lcon_len;
     break;
+  case HVC_LCON_PUT: {
+    /* Enqueue one input byte for the Linux guest's emulated UART RX FIFO. */
+    uint32_t nh = (g_lrx_head + 1) % LRX_SZ;
+    if (nh != g_lrx_tail) { /* drop if full */
+      g_lrx[g_lrx_head] = (uint8_t)a1;
+      g_lrx_head = nh;
+    }
+    ret = 0;
+    break;
+  }
   case HVC_LCON_GET: {
     /* Return up to 8 console bytes starting at offset a1, packed little-endian
      * (bytes past the end read as 0). */
@@ -823,16 +848,37 @@ __attribute__((section(".hyp_tables"))) static struct {
 static int hyp_emulate_pl011(uint64_t ipa, int is_write, uint64_t *val) {
   uint64_t off = ipa - PL011_LO;
   if (is_write) {
-    if (off == 0x000) { /* DR: capture the byte */
+    switch (off) {
+    case 0x000: /* DR: capture output byte */
       if (g_lcon_len < LCON_SZ)
         g_lcon[g_lcon_len++] = (uint8_t)*val;
+      break;
+    case 0x038: /* IMSC: interrupt mask (track RXIM) */
+      g_pl011_imsc = (uint32_t)*val;
+      break;
+    /* CR, baud, ICR, ... accepted + ignored */
+    default:
+      break;
     }
-    /* all other registers (control, baud, IRQ mask, ...) accepted + ignored */
     return 1;
   }
   switch (off) {
-  case 0x000: *val = 0; break;          /* DR: no input                      */
-  case 0x018: *val = 0x90; break;       /* FR: TXFE|RXFE (TX ready, RX empty) */
+  case 0x000: /* DR: pop one RX byte (0 if none) */
+    if (!lrx_empty()) {
+      *val = g_lrx[g_lrx_tail];
+      g_lrx_tail = (g_lrx_tail + 1) % LRX_SZ;
+    } else {
+      *val = 0;
+    }
+    break;
+  case 0x018: /* FR: TXFE always; RXFE when RX FIFO empty */
+    *val = (1u << 7) | (lrx_empty() ? (1u << 4) : 0);
+    break;
+  case 0x038: *val = g_pl011_imsc; break;                 /* IMSC            */
+  case 0x03C: *val = lrx_empty() ? 0 : PL011_RXIM; break; /* RIS: raw RX     */
+  case 0x040: /* MIS = RIS & IMSC */
+    *val = (!lrx_empty() && (g_pl011_imsc & PL011_RXIM)) ? PL011_RXIM : 0;
+    break;
   case 0xFE0: *val = 0x11; break;       /* PeriphID0                          */
   case 0xFE4: *val = 0x10; break;       /* PeriphID1                          */
   case 0xFE8: *val = 0x14; break;       /* PeriphID2 (=> id 0x..041011)       */
@@ -1006,15 +1052,16 @@ static int hyp_intid_owner(uint32_t intid) {
   return 0;
 }
 
-/* Inject a hardware-linked virtual interrupt into `target`'s vGIC. If the
- * target is the running vCPU we write a live list register; otherwise we
- * stash it in the target's saved LR state, to be loaded when it is resumed.
- * HW=1 ties the vINTID to the physical one so the guest's own EOI deactivates
- * the physical interrupt. */
-static void hyp_vgic_inject(int target, uint32_t intid) {
-  uint64_t lr = ((uint64_t)intid) |
-                (((uint64_t)intid) << ICH_LR_PINTID_SHIFT) |
-                ICH_LR_GROUP1 | ICH_LR_HW | ICH_LR_STATE_PENDING;
+/* Inject a virtual interrupt into `target`'s vGIC. If the target is the running
+ * vCPU we write a live list register; otherwise we stash it in the target's
+ * saved LR state, to be loaded when it is resumed. `hw` selects a
+ * hardware-linked LR (HW=1, vINTID mapped to the same physical INTID, so the
+ * guest's EOI deactivates the physical interrupt) versus a purely software /
+ * emulated interrupt (HW=0, e.g. an emulated device's SPI). */
+static void hyp_vgic_inject_ex(int target, uint32_t intid, int hw) {
+  uint64_t lr = ((uint64_t)intid) | ICH_LR_GROUP1 | ICH_LR_STATE_PENDING;
+  if (hw)
+    lr |= (((uint64_t)intid) << ICH_LR_PINTID_SHIFT) | ICH_LR_HW;
 
   if (target == current_vcpu) {
     uint64_t lr0, lr1;
@@ -1043,6 +1090,15 @@ static void hyp_vgic_inject(int target, uint32_t intid) {
   }
 }
 
+/* If the Linux guest has pending input AND has enabled the PL011 RX interrupt,
+ * inject the UART SPI (a software/emulated virtual interrupt) so its pl011 IRQ
+ * handler drains the RX FIFO. Called each scheduling tick, so delivery is
+ * robust regardless of when the guest's driver came up. */
+static void hyp_uart_rx_kick(void) {
+  if (!lrx_empty() && (g_pl011_imsc & PL011_RXIM))
+    hyp_vgic_inject_ex(1 /* Linux vCPU */, UART_SPI_INTID, 0 /* SW */);
+}
+
 /* Physical IRQ taken at EL2 (HCR_EL2.IMO). Ack on the physical CPU interface,
  * inject a hardware-linked virtual copy into the guest, then priority-drop
  * (EOImode=1 means this does not deactivate — the guest will, via the HW
@@ -1062,13 +1118,14 @@ static void hyp_handle_irq(el2_frame_t *frame) {
     MSR(cnthp_cval_el2, MRS(cnthp_cval_el2) + g_quantum_ticks);
     __asm__ __volatile__("msr icc_eoir1_el1, %0" ::"r"(iar)); /* prio drop  */
     __asm__ __volatile__("msr icc_dir_el1, %0" ::"r"(iar));   /* deactivate */
+    hyp_uart_rx_kick(); /* deliver any pending Linux console input */
     hyp_world_switch(frame);
     return;
   }
 
   int owner = hyp_intid_owner(intid);
   uint64_t n = ++vcpus[owner].virq_injected;
-  hyp_vgic_inject(owner, intid);
+  hyp_vgic_inject_ex(owner, intid, 1);
   __asm__ __volatile__("msr icc_eoir1_el1, %0" ::"r"(iar));
 
   if (n <= 3) {

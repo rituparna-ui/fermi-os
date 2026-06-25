@@ -189,10 +189,14 @@ own registers and needs no context switch.
   accepts the configuration writes. The data-abort ISS gives access size,
   direction, and register, so the load/store is emulated and `ELR_EL2` stepped.
 - **Emulated PL011 UART**: the Linux guest's UART is likewise unmapped and
-  emulated. DR writes are captured into a hypervisor ring buffer; the flag
-  register reports "TX ready, RX empty" and the PrimeCell/peripheral ID
-  registers are emulated so Linux's amba bus binds the pl011 driver (ttyAMA0).
-  The console is output-only by design (RX always empty); see §10.
+  emulated. DR writes are captured into a hypervisor ring buffer; DR reads pop
+  from an RX FIFO; the flag/IMSC/RIS/MIS registers and the PrimeCell/peripheral
+  IDs are emulated so Linux's amba bus binds the pl011 driver (ttyAMA0).
+  **Input** is supported: bytes pushed (via `HVC_LCON_PUT`, e.g. writing to
+  `/proc/linux_console`) enter the RX FIFO, and when the guest has enabled the
+  RX interrupt the hypervisor injects the **UART SPI** (INTID 33) as a software
+  virtual interrupt (see §6) so the guest's IRQ handler drains the FIFO. The
+  output side is captured to `/proc/linux_console` (§10).
 
 ---
 
@@ -275,9 +279,12 @@ BusyBox shell interleaved on the same serial console.
 - The emulated GICv3 covers what Linux's boot path needs (PPIs via injection +
   distributor/redistributor identity reads); SPI routing for emulated devices is
   not modelled.
-- The Linux guest's PL011 is emulated and its output is captured to a
-  hypervisor buffer exposed as `/proc/linux_console` (output-only — RX reads
-  empty, so the Linux shell cannot currently be typed into). This keeps the
-  shared serial clean for Fermi; a truly separate *interactive* console would
-  need a second UART, which QEMU `virt` does not provide.
+- The Linux guest's PL011 is emulated: output is captured to a hypervisor
+  buffer exposed as `/proc/linux_console`, and input is fed back via
+  `HVC_LCON_PUT` (writing to `/proc/linux_console`) with the UART interrupt
+  delivered as an injected software SPI. This keeps the shared serial clean for
+  Fermi while still making the Linux console both viewable and interactive
+  through `/proc`. (Fermi's minimal EL0 shell has no `>` redirection, so
+  driving the input side from Fermi interactively isn't wired up; the path is
+  exercised by a canned-command demo at boot.)
 - Requires an SCS-free guest kernel (see §9).

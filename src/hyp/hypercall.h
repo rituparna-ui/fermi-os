@@ -26,6 +26,7 @@
 #define HVC_VM_STAT 7  /* (id in x1, field in x2) -> stat value, or -1         */
 #define HVC_LCON_LEN 8 /* () -> bytes captured in the Linux console buffer     */
 #define HVC_LCON_GET 9 /* (offset in x1) -> up to 8 console bytes, packed LE   */
+#define HVC_LCON_PUT 10 /* (byte in x1) -> push one input byte to Linux's UART RX */
 
 /* Field selectors for HVC_VM_STAT. */
 #define VMSTAT_ID 0

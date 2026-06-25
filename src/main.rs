@@ -27,6 +27,7 @@ mod arch;
 mod drivers;
 mod exception;
 mod fs;
+mod hyp;
 mod mm;
 mod panic;
 mod sched;

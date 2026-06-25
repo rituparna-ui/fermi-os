@@ -7,6 +7,8 @@
 #![no_main]
 
 mod arch;
+#[macro_use]
+mod klib;
 mod panic;
 
 use core::arch::global_asm;
@@ -19,14 +21,14 @@ global_asm!(include_str!("arch/boot.S"));
 /// already set up. Never returns.
 #[no_mangle]
 pub extern "C" fn kmain() -> ! {
-    // The UART driver lands in the next step; for now prove the boot path by
-    // writing a banner directly to the PL011 data register.
-    let uart = 0x0900_0000 as *mut u8;
-    for &b in b"Fermi OS (Rust) - Booting Up...\n" {
-        unsafe { core::ptr::write_volatile(uart, b) };
-    }
+    klib::uart::init();
 
+    kprintln!("Fermi OS (Rust) - Booting Up...");
+
+    // Echo received bytes, mirroring the original early kernel loop.
+    let uart = klib::uart::Uart;
     loop {
-        unsafe { core::arch::asm!("wfe") };
+        let c = uart.getc();
+        uart.putc(c);
     }
 }

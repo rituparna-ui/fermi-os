@@ -327,6 +327,48 @@ static const char *hyp_ec_name(uint64_t ec) {
   }
 }
 
+/* PCI windows the guest's pci.c / virtio drivers touch. We emulate them as
+ * "no device present": reads return all-1s (vendor 0xFFFF), writes are dropped.
+ * This lets the guest's PCI enumeration + virtio init cleanly find nothing and
+ * proceed to its scheduler/shell. (Real device pass-through is a later step.) */
+#define PCI_ECAM_IPA   0x4010000000ULL
+#define PCI_ECAM_END   0x4020000000ULL /* 256 MiB ECAM */
+#define PCI_MMIO32_IPA 0x10000000ULL
+#define PCI_MMIO32_END 0x3F000000ULL
+#define PCI_MMIO64_IPA 0x8000000000ULL
+#define PCI_MMIO64_END 0x10000000000ULL
+
+static int pci_absent_is_target(uint64_t ipa) {
+  return (ipa >= PCI_ECAM_IPA && ipa < PCI_ECAM_END) ||
+         (ipa >= PCI_MMIO32_IPA && ipa < PCI_MMIO32_END) ||
+         (ipa >= PCI_MMIO64_IPA && ipa < PCI_MMIO64_END);
+}
+
+/* Decode a guest stage-2 data abort (ESR_EL2 ISS, ISV=1 single-register
+ * load/store) and apply an emulated MMIO access. `read_val` supplies the value
+ * for guest reads (masked to access width). Writes are dropped. Returns 1 if
+ * handled, 0 if the syndrome can't be decoded (ISV=0). Advances v->pc on
+ * success. */
+static int hyp_emulate_mmio(vcpu_t *v, uint64_t read_val) {
+  uint64_t iss = v->esr & 0x1FFFFFFULL;
+  if (!((iss >> 24) & 1)) {
+    return 0; /* ISV=0: no decoded syndrome */
+  }
+  int is_write = (int)((iss >> 6) & 1);
+  int sas = (int)((iss >> 22) & 3);
+  int srt = (int)((iss >> 16) & 0x1F);
+  int sf = (int)((iss >> 15) & 1);
+  uint32_t size_mask = (sas >= 2) ? 0xFFFFFFFFU : ((1U << (8 << sas)) - 1U);
+
+  if (!is_write && srt != 31) {
+    uint64_t val = read_val & size_mask;
+    v->x[srt] = sf ? val : (val & 0xFFFFFFFFULL);
+  }
+  /* writes: dropped */
+  v->pc += 4;
+  return 1;
+}
+
 void hyp_boot_fermios_guest(void) {
   if (!hyp_at_el2()) {
     return;
@@ -387,23 +429,20 @@ void hyp_boot_fermios_guest(void) {
     vcpu_enter(&v);
     uint64_t ec = ESR_EC_OF(v.esr);
 
-    /* Stage-2 data abort: emulate if it targets the vGIC MMIO windows. */
+    /* Stage-2 data abort: emulate vGIC MMIO and absent-PCI windows. */
     if (v.exit_reason == HYP_EXC_SYNC && ec == 0x24) {
       uint64_t ipa = ((v.hpfar >> 4) << 12) | (v.far & 0xFFF);
+
       if (vgic_mmio_is_target(ipa)) {
         uint64_t iss = v.esr & 0x1FFFFFFULL;
-        int isv = (int)((iss >> 24) & 1);
-        if (!isv) {
-          uart_printf("\n[HYP] vGIC MMIO with ISV=0 at IPA=%x — cannot decode\n",
-                      ipa);
+        if (!((iss >> 24) & 1)) {
+          uart_printf("\n[HYP] vGIC MMIO ISV=0 at IPA=%x — cannot decode\n", ipa);
           break;
         }
         int is_write = (int)((iss >> 6) & 1);
-        int sas = (int)((iss >> 22) & 3);
         int srt = (int)((iss >> 16) & 0x1F);
         int sf = (int)((iss >> 15) & 1);
-        int size_bytes = 1 << sas;
-
+        int size_bytes = 1 << (int)((iss >> 22) & 3);
         uint64_t val = 0;
         if (is_write) {
           val = (srt == 31) ? 0 : v.x[srt];
@@ -414,12 +453,23 @@ void hyp_boot_fermios_guest(void) {
             v.x[srt] = sf ? val : (val & 0xFFFFFFFFULL);
           }
         }
-        v.pc += 4; /* advance past the trapped load/store */
+        v.pc += 4;
         mmio_count++;
         continue;
       }
+
+      if (pci_absent_is_target(ipa)) {
+        /* No device: reads see all-1s (vendor 0xFFFF), writes dropped. */
+        if (hyp_emulate_mmio(&v, 0xFFFFFFFFFFFFFFFFULL)) {
+          mmio_count++;
+          continue;
+        }
+        uart_printf("\n[HYP] PCI MMIO ISV=0 at IPA=%x — cannot decode\n", ipa);
+        break;
+      }
+
       /* A real stage-2 fault elsewhere — report and stop. */
-      uart_printf("\n[HYP] guest stage-2 data abort OUTSIDE vGIC: IPA=%x pc=%x ESR=%x\n",
+      uart_printf("\n[HYP] guest stage-2 data abort OUTSIDE emulated MMIO: IPA=%x pc=%x ESR=%x\n",
                   ipa, v.pc, v.esr);
       break;
     }

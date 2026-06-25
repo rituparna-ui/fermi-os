@@ -137,6 +137,13 @@ int blk_read(uint64_t sector, void *buf) {
   static struct virtio_blk_req hdr __attribute__((aligned(16)));
   static volatile uint8_t status __attribute__((aligned(16)));
 
+  /* If init never found the device, the virtqueue rings are NULL. Fail cleanly
+   * instead of dereferencing them (e.g. when running as a guest with no
+   * virtio-blk passed through). */
+  if (!blk_dev.vq.desc) {
+    return EERROR;
+  }
+
   hdr.type = VIRTIO_BLK_T_IN;
   hdr.reserved = 0;
   hdr.sector = sector;
@@ -165,6 +172,10 @@ int blk_read(uint64_t sector, void *buf) {
 int blk_write(uint64_t sector, const void *buf) {
   static struct virtio_blk_req hdr __attribute__((aligned(16)));
   static volatile uint8_t status __attribute__((aligned(16)));
+
+  if (!blk_dev.vq.desc) {
+    return EERROR;
+  }
 
   hdr.type = VIRTIO_BLK_T_OUT;
   hdr.reserved = 0;

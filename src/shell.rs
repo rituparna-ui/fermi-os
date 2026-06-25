@@ -115,6 +115,28 @@ fn cmd_run(path: &str) {
     vfs::fd_table_destroy(t);
 }
 
+fn cmd_stat(path: &str) {
+    let node = vfs::resolve(path);
+    if node.is_null() {
+        kprintln!("stat: {}: not found", path);
+        return;
+    }
+    unsafe {
+        let kind = match (*node).vtype {
+            vfs::VnodeType::Reg => "regular file",
+            vfs::VnodeType::Dir => "directory",
+            vfs::VnodeType::Chr => "character device",
+            vfs::VnodeType::Blk => "block device",
+        };
+        kprintln!("  File : {}", path);
+        kprintln!("  Type : {}", kind);
+        kprintln!("  Size : {} bytes", (*node).size);
+        if (*node).dev == vfs::DevOps::Fat32File || (*node).is_dir_fat32 {
+            kprintln!("  FAT32 first cluster: {}", (*node).private0);
+        }
+    }
+}
+
 fn dispatch(line: &str) {
     let mut parts = line.split_whitespace();
     let cmd = match parts.next() {
@@ -138,6 +160,9 @@ fn dispatch(line: &str) {
         "ls" => {
             let path = if arg1.is_empty() { "/" } else { arg1 };
             kprint!("{}", vfs::list(path));
+        }
+        "stat" => {
+            if arg1.is_empty() { kprintln!("usage: stat <path>"); } else { cmd_stat(arg1); }
         }
         "cat" => {
             if arg1.is_empty() {

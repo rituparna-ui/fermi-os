@@ -1,5 +1,7 @@
 #include "hyp.h"
+#include "hyp_alloc.h"
 #include "hyp_sysregs.h"
+#include "stage2.h"
 #include <stdint.h>
 
 /* ---------------------------------------------------------------------------
@@ -78,13 +80,44 @@ __attribute__((noreturn)) void hyp_panic(const char *msg) {
   }
 }
 
+/* Guest flat image embedded in the hyp (see guest_blob.S). */
+extern const uint8_t __guest_blob_start[];
+extern const uint8_t __guest_blob_end[];
+
+/* Copy the embedded guest image to its physical load base (0x40000000) so the
+ * eret lands on real guest bytes. Done with the EL2 MMU off (physical stores).
+ * The guest's first LOAD segment starts at PA 0x40000000 and the flat blob
+ * preserves inter-segment gaps, so one linear copy places every PT_LOAD. */
+static void hyp_load_guest(void) {
+  const uint8_t *src = __guest_blob_start;
+  uint64_t size = (uint64_t)(__guest_blob_end - __guest_blob_start);
+  volatile uint8_t *dst = (volatile uint8_t *)(uintptr_t)GUEST_ENTRY_IPA;
+
+  /* Word copy for the aligned bulk, byte copy for the tail. */
+  uint64_t words = size / 8;
+  const uint64_t *s64 = (const uint64_t *)src;
+  volatile uint64_t *d64 = (volatile uint64_t *)dst;
+  for (uint64_t i = 0; i < words; i++) {
+    d64[i] = s64[i];
+  }
+  for (uint64_t i = words * 8; i < size; i++) {
+    dst[i] = src[i];
+  }
+  /* Ensure the stores are visible and instruction-coherent before the guest
+   * (at EL1) fetches them: clean D-cache then invalidate I-cache to PoU. */
+  hyp_dcache_clean_range(GUEST_ENTRY_IPA, size);
+  __asm__ __volatile__("ic ialluis\n\tdsb ish\n\tisb" ::: "memory");
+
+  hyp_puts("[HYP] guest image copied to ");
+  hyp_puthex(GUEST_ENTRY_IPA);
+  hyp_puts(" (");
+  hyp_puthex(size);
+  hyp_puts(" bytes)\n");
+}
+
 /* Called from hyp_boot.S after the EL2 register context is established and
- * just before the eret into the guest. For Milestone 1 there is no stage-2,
- * no vGIC and no vtimer: the guest image has already been placed at physical
- * 0x40000000 by QEMU '-device loader', and the eret will land on its _start.
- *
- * We read back a couple of registers purely as a sanity announcement so the
- * serial log makes the EL2 -> EL1 transition observable. */
+ * just before the eret into the guest. Places the guest image, builds stage-2,
+ * enables HCR_EL2.VM, and returns; hyp_boot.S then erets into the guest. */
 void hyp_main(void) {
   uint64_t current_el, hcr, cptr;
   __asm__ __volatile__("mrs %0, CurrentEL" : "=r"(current_el));
@@ -104,8 +137,25 @@ void hyp_main(void) {
   hyp_puts("[HYP] CPTR_EL2  = ");
   hyp_puthex(cptr);
   hyp_puts("  (FP/SVE not trapped)\n");
+
+  /* Place the embedded guest image at its physical load base. */
+  hyp_load_guest();
+
+  /* Milestone 2: build the stage-2 identity tables and program VTCR/VTTBR,
+   * then enable stage-2 by setting HCR_EL2.VM=1. From this point the guest
+   * runs in a real VM address space: every stage-1 output (IPA) is walked
+   * through our stage-2 tables before reaching host PA. */
+  s2_init();
+
+  uint64_t hcr2 = HCR_EL2_M2;
+  __asm__ __volatile__("msr hcr_el2, %0\n\tisb" ::"r"(hcr2));
+  __asm__ __volatile__("mrs %0, hcr_el2" : "=r"(hcr));
+  hyp_puts("[HYP] HCR_EL2   = ");
+  hyp_puthex(hcr);
+  hyp_puts("  (VM=1, stage-2 ON)\n");
+
   hyp_puts("[HYP] guest @ IPA ");
   hyp_puthex(GUEST_ENTRY_IPA);
-  hyp_puts(" -> eret to EL1...\n");
+  hyp_puts(" -> eret to EL1 (now translated)...\n");
   hyp_puts("--------------------------------------------------\n\n");
 }

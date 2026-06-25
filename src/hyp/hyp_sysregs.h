@@ -33,6 +33,11 @@
  * no physical-interrupt routing to EL2 yet (guest drives the real GIC). */
 #define HCR_EL2_M1    (HCR_EL2_RW)
 
+/* Milestone 2: enable stage-2 (VM=1). Still no interrupt routing to EL2 — the
+ * guest keeps driving the real GIC/timer through the straight-through device
+ * mappings, so FMO/IMO/AMO stay 0 until the vGIC milestone. */
+#define HCR_EL2_M2    (HCR_EL2_RW | HCR_EL2_VM)
+
 /* ---------------------------------------------------------------------------
  * CPTR_EL2 — Architectural Feature Trap Register (non-VHE, E2H=0)
  *

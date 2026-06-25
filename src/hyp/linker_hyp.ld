@@ -34,6 +34,7 @@ SECTIONS
 	} :text
 
 	.rodata ALIGN(4096) : {
+		*(.rodata.guest)   /* embedded guest flat image (guest_blob.S) */
 		*(.rodata*)
 	} :rodata
 

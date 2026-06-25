@@ -85,13 +85,13 @@ QEMU_DEVICES := -netdev user,id=n0 \
 	-device virtio-balloon-pci,disable-legacy=on
 QEMU_BASE := qemu-system-aarch64 -machine $(QEMU_MACHINE) -nographic -cpu $(QEMU_CPU) $(QEMU_DEVICES)
 
-# '-kernel' loads the HYPERVISOR (entered at EL2). The GUEST FermiOS ELF is
-# placed by '-device loader' at its physical link addresses (0x40000000+); the
-# hyp's eret lands on the guest _start there. QEMU honours the ELF's own
-# PhysAddr fields for a loader ELF.
-GUEST_LOADER := -device loader,file=$(TARGET),force-raw=off
-QEMU_FLAGS_RUN   := -kernel $(HYP_TARGET) $(GUEST_LOADER)
-QEMU_FLAGS_DEBUG := -kernel $(HYP_TARGET) $(GUEST_LOADER) -s -S
+# '-kernel' loads the HYPERVISOR (entered at EL2). The GUEST FermiOS image is
+# EMBEDDED inside the hyp (build/guest.bin -> .rodata.guest via guest_blob.S)
+# and memcpy'd to its physical load base (0x40000000) by the hyp before the
+# eret. This makes hyp.elf the ONLY ROM QEMU loads, so the auto-placed DTB at
+# 0x40000000 does not collide with a separately-loaded guest ELF.
+QEMU_FLAGS_RUN   := -kernel $(HYP_TARGET)
+QEMU_FLAGS_DEBUG := -kernel $(HYP_TARGET) -s -S
 
 .PHONY: all run debug clean gdb tmux disk dump_dts compile_commands.json
 
@@ -103,6 +103,18 @@ $(TARGET): $(OBJECTS)
 	@echo "LD  $@"
 	@mkdir -p $(dir $@)
 	@$(LD) $(LDFLAGS) -o $@ $^
+
+# Flat guest image embedded into the hypervisor (incbin'd by guest_blob.S).
+# objcopy -O binary lays bytes out by LMA starting at guest PA 0x40000000,
+# preserving inter-segment gaps, so the hyp's single memcpy to 0x40000000
+# reconstructs every guest PT_LOAD.
+GUEST_BIN := $(BUILD_DIR)/guest.bin
+$(GUEST_BIN): $(TARGET)
+	@echo "OBJCOPY $@ (flat guest image)"
+	@$(CROSS_COMPILE)objcopy -O binary $(TARGET) $@
+
+# The guest blob object incbin's $(GUEST_BIN); make it an explicit prerequisite.
+$(BUILD_DIR)/hyp/guest_blob.o: $(GUEST_BIN)
 
 # Hypervisor (EL2) — separate image, its own linker script.
 $(HYP_TARGET): $(HYP_OBJECTS)

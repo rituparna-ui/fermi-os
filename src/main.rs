@@ -103,6 +103,7 @@ pub extern "C" fn kernel_main() -> ! {
 
     // Exception vectors (VBAR now resolves to the upper-half VA).
     exception::init();
+    cpu::init();
     mm::mmu::run_tests(0);
 
     // Kernel heap (backs the global allocator: Vec/Box/String).

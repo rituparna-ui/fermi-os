@@ -204,8 +204,7 @@ fn dispatch(line: &str) {
             }
         }
         "cpuinfo" => {
-            let el = crate::cpu::current_el();
-            kprintln!("EL{} | timer {} Hz", el, timer::get_frequency());
+            kprint!("{}", crate::cpu::render_info());
         }
         "clear" => kprint!("\x1b[2J\x1b[H"),
         "reboot" => {

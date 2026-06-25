@@ -64,6 +64,7 @@ struct Sched {
     current: *mut Task,
     next_pid: u64,
     dead_list: *mut Task,
+    ctxt_switches: u64,
 }
 
 static SCHED: Racy<Sched> = Racy::new(Sched {
@@ -92,6 +93,7 @@ static SCHED: Racy<Sched> = Racy::new(Sched {
     current: core::ptr::null_mut(),
     next_pid: 0,
     dead_list: core::ptr::null_mut(),
+    ctxt_switches: 0,
 });
 
 fn copy_name(dst: &mut [u8; 16], src: &str) {
@@ -120,6 +122,11 @@ pub fn init() {
     s.next_pid += 1;
     s.current = idle;
     uart::println("[SCHED] Initialized! Idle task registered");
+}
+
+/// Total context switches since boot.
+pub fn context_switches() -> u64 {
+    unsafe { SCHED.get() }.ctxt_switches
 }
 
 /// Pointer to the currently running task.
@@ -611,6 +618,7 @@ pub fn schedule() {
 
         (*next).state = TASK_RUNNING;
         s.current = next;
+        s.ctxt_switches += 1;
         context_switch(prev, next);
     }
 }
@@ -741,6 +749,7 @@ pub fn render_tasks() -> alloc::string::String {
             }
         }
     }
+    let _ = writeln!(out, "ctxt-switches: {}", s.ctxt_switches);
     out
 }
 

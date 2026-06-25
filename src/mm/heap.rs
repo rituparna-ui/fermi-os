@@ -439,7 +439,10 @@ unsafe impl GlobalAlloc for KernelAllocator {
         let base = raw as usize + core::mem::size_of::<usize>();
         let aligned = (base + align - 1) & !(align - 1);
         // Stash the original pointer immediately before the aligned address.
-        ((aligned - core::mem::size_of::<usize>()) as *mut usize).write(raw as usize);
+        // SAFETY: the slot lies within the over-allocation we just made.
+        unsafe {
+            ((aligned - core::mem::size_of::<usize>()) as *mut usize).write(raw as usize);
+        }
         aligned as *mut u8
     }
 
@@ -449,7 +452,9 @@ unsafe impl GlobalAlloc for KernelAllocator {
             return;
         }
         // Recover the original payload pointer stored just before `ptr`.
-        let raw = ((ptr as usize - core::mem::size_of::<usize>()) as *const usize).read();
+        // SAFETY: `ptr` came from `alloc` above, which stored the raw pointer in
+        // the preceding usize slot.
+        let raw = unsafe { ((ptr as usize - core::mem::size_of::<usize>()) as *const usize).read() };
         kfree(raw as *mut u8);
     }
 }

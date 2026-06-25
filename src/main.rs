@@ -5,6 +5,7 @@
 
 #![no_std]
 #![no_main]
+#![deny(unsafe_op_in_unsafe_fn)]
 // Clippy lints we intentionally accept: register/offset definitions keep
 // `+ 0x00` and `<< 0` for symmetry with the hardware spec; some ABI structs
 // have many fields; writeln-style newline endings are deliberate in the kernel

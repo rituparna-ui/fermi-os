@@ -193,13 +193,17 @@ pub fn init() {
 /// Insert `t` at the tail of the circular run queue (IRQs masked by caller or
 /// during boot).
 unsafe fn enqueue(t: *mut Task) {
-    let current = *CURRENT.get();
-    let mut tail = current;
-    while (*tail).next != current {
-        tail = (*tail).next;
+    // SAFETY (single-core): the run queue is mutated only with IRQs masked;
+    // CURRENT and every `next` link points at a live task.
+    unsafe {
+        let current = *CURRENT.get();
+        let mut tail = current;
+        while (*tail).next != current {
+            tail = (*tail).next;
+        }
+        (*tail).next = t;
+        (*t).next = current;
     }
-    (*tail).next = t;
-    (*t).next = current;
 }
 
 /// Create an EL1 kernel-mode task.

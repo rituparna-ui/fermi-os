@@ -1,0 +1,257 @@
+//! Preemptive round-robin scheduler (EL1 tasks) with tick-based sleep.
+//!
+//! Port of the early `src/sched/sched.c` (EL1-only). Per-task kernel stacks,
+//! a circular run queue, timer-driven preemption via `schedule()`, voluntary
+//! `yield`/`sleep_ms`, and dead-task reaping. EL0/userspace, per-task TTBR0,
+//! and demand paging are added at the syscall/userspace milestone.
+
+use crate::exception::timer;
+use crate::kprintln;
+use crate::mm::mmu::phys_to_virt;
+use crate::mm::pmm::{self, PAGE_SIZE};
+use crate::mm::heap::{kfree, kmalloc};
+use crate::sync::Racy;
+use crate::uart;
+use core::arch::global_asm;
+
+global_asm!(include_str!("switch.S"));
+
+pub const TASK_STACK_PAGES: u64 = 4; // 16 KiB
+
+pub const TASK_READY: u32 = 0;
+pub const TASK_RUNNING: u32 = 1;
+pub const TASK_SLEEPING: u32 = 2;
+pub const TASK_DEAD: u32 = 3;
+
+pub type TaskEntry = extern "C" fn();
+
+#[repr(C)]
+pub struct Task {
+    pub sp: u64, // offset 0 — MUST match switch.S
+    pub pid: u64,
+    pub state: u32,
+    _pad: u32,
+    pub sleep_until: u64,
+    pub stack_phys: u64,
+    pub name: [u8; 16],
+    pub next: u64, // *mut Task as usize, 0 = null
+}
+
+extern "C" {
+    fn context_switch(prev: *mut Task, next: *mut Task);
+    fn task_trampoline();
+}
+
+struct Sched {
+    idle: Task,
+    current: *mut Task,
+    next_pid: u64,
+    dead_list: *mut Task,
+}
+
+static SCHED: Racy<Sched> = Racy::new(Sched {
+    idle: Task {
+        sp: 0,
+        pid: 0,
+        state: TASK_RUNNING,
+        _pad: 0,
+        sleep_until: 0,
+        stack_phys: 0,
+        name: [0; 16],
+        next: 0,
+    },
+    current: core::ptr::null_mut(),
+    next_pid: 0,
+    dead_list: core::ptr::null_mut(),
+});
+
+fn copy_name(dst: &mut [u8; 16], src: &str) {
+    let bytes = src.as_bytes();
+    let n = core::cmp::min(bytes.len(), 15);
+    dst[..n].copy_from_slice(&bytes[..n]);
+    dst[n] = 0;
+}
+
+fn name_str(t: &Task) -> &str {
+    let len = t.name.iter().position(|&b| b == 0).unwrap_or(16);
+    core::str::from_utf8(&t.name[..len]).unwrap_or("?")
+}
+
+pub fn init() {
+    uart::println("[SCHED] Initializing scheduler");
+    let s = unsafe { SCHED.get() };
+    let idle = &mut s.idle as *mut Task;
+    unsafe {
+        (*idle).pid = s.next_pid;
+        (*idle).state = TASK_RUNNING;
+        (*idle).stack_phys = 0;
+        (*idle).next = idle as u64;
+        copy_name(&mut (*idle).name, "idle");
+    }
+    s.next_pid += 1;
+    s.current = idle;
+    uart::println("[SCHED] Initialized! Idle task registered");
+}
+
+/// Pointer to the currently running task.
+pub fn current() -> *mut Task {
+    unsafe { SCHED.get() }.current
+}
+
+pub fn create_task(name: &str, entry: TaskEntry) -> i64 {
+    let s = unsafe { SCHED.get() };
+    let t = kmalloc(core::mem::size_of::<Task>()) as *mut Task;
+    if t.is_null() {
+        uart::errorln("[SCHED] Failed to allocate task struct");
+        return -1;
+    }
+    unsafe { core::ptr::write_bytes(t as *mut u8, 0, core::mem::size_of::<Task>()) };
+
+    let stack_phys = pmm::allocate_pages(TASK_STACK_PAGES);
+    if stack_phys == 0 {
+        uart::errorln("[SCHED] Failed to allocate task stack");
+        kfree(t as usize);
+        return -1;
+    }
+    let stack_va = phys_to_virt(stack_phys);
+    let stack_size = TASK_STACK_PAGES * PAGE_SIZE;
+    let stack_top = stack_va + stack_size;
+    unsafe { core::ptr::write_bytes(stack_va as *mut u8, 0, stack_size as usize) };
+
+    // Initial context_switch frame (160 bytes): x19 = entry, x30 = trampoline.
+    let frame = (stack_top - 160) as *mut u64;
+    unsafe {
+        *frame.add(0) = entry as usize as u64; // x19
+        *frame.add(11) = task_trampoline as usize as u64; // x30
+        (*t).sp = frame as u64;
+        (*t).pid = s.next_pid;
+        (*t).state = TASK_READY;
+        (*t).stack_phys = stack_phys;
+        copy_name(&mut (*t).name, name);
+
+        // Tail-insert into the circular queue.
+        let cur = s.current;
+        let mut tail = cur;
+        while (*tail).next != cur as u64 {
+            tail = (*tail).next as *mut Task;
+        }
+        (*tail).next = t as u64;
+        (*t).next = cur as u64;
+    }
+    s.next_pid += 1;
+    let pid = unsafe { (*t).pid };
+    kprintln!(
+        "[SCHED] Created task {} '{}' | stack: {:#x} - {:#x}",
+        pid,
+        name,
+        stack_va,
+        stack_top
+    );
+    pid as i64
+}
+
+pub fn schedule() {
+    let s = unsafe { SCHED.get() };
+    let prev = s.current;
+    if prev.is_null() {
+        return;
+    }
+    unsafe {
+        let mut next = (*prev).next as *mut Task;
+        while next != prev {
+            if (*next).state == TASK_READY {
+                break;
+            }
+            next = (*next).next as *mut Task;
+        }
+        if next == prev {
+            return; // no other runnable task
+        }
+
+        if (*prev).state == TASK_RUNNING {
+            (*prev).state = TASK_READY;
+        }
+
+        // If prev is dead, unlink and defer cleanup.
+        if (*prev).state == TASK_DEAD {
+            let mut p = prev;
+            while (*p).next != prev as u64 {
+                p = (*p).next as *mut Task;
+            }
+            (*p).next = (*prev).next;
+            (*prev).next = s.dead_list as u64;
+            s.dead_list = prev;
+        }
+
+        (*next).state = TASK_RUNNING;
+        s.current = next;
+        context_switch(prev, next);
+    }
+}
+
+pub fn r#yield() {
+    schedule();
+}
+
+#[no_mangle]
+pub extern "C" fn task_exit() {
+    let s = unsafe { SCHED.get() };
+    unsafe {
+        let cur = &*s.current;
+        kprintln!("[SCHED] Task {} '{}' exiting", cur.pid, name_str(cur));
+        (*s.current).state = TASK_DEAD;
+    }
+    schedule();
+}
+
+pub fn sleep_ms(ms: u64) {
+    let s = unsafe { SCHED.get() };
+    let mut ticks_needed = ms / timer::TIMER_INTERVAL_MS;
+    if ticks_needed == 0 {
+        ticks_needed = 1;
+    }
+    unsafe {
+        (*s.current).sleep_until = timer::get_ticks() + ticks_needed;
+        (*s.current).state = TASK_SLEEPING;
+        let cur = &*s.current;
+        kprintln!(
+            "[SCHED] Task {} '{}' sleeping for {} ms ({} ticks)",
+            cur.pid,
+            name_str(cur),
+            ms,
+            ticks_needed
+        );
+    }
+    schedule();
+}
+
+pub fn wake_sleepers() {
+    let s = unsafe { SCHED.get() };
+    let now = timer::get_ticks();
+    let idle = &mut s.idle as *mut Task;
+    unsafe {
+        let mut t = (*idle).next as *mut Task;
+        while t != idle {
+            if (*t).state == TASK_SLEEPING && now >= (*t).sleep_until {
+                (*t).state = TASK_READY;
+                (*t).sleep_until = 0;
+            }
+            t = (*t).next as *mut Task;
+        }
+    }
+}
+
+pub fn reap() {
+    let s = unsafe { SCHED.get() };
+    unsafe {
+        while !s.dead_list.is_null() {
+            let dead = s.dead_list;
+            s.dead_list = (*dead).next as *mut Task;
+            kprintln!("[SCHED] Reaping task {} '{}'", (*dead).pid, name_str(&*dead));
+            if (*dead).stack_phys != 0 {
+                pmm::free_pages((*dead).stack_phys, TASK_STACK_PAGES);
+            }
+            kfree(dead as usize);
+        }
+    }
+}

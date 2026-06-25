@@ -19,15 +19,34 @@ mod mm;
 mod mmio;
 mod panic;
 mod print;
+mod sched;
 mod strings;
 mod sync;
 mod uart;
 
-/// Timer-tick hook to wake sleeping tasks. No-op until the scheduler lands.
-pub fn sched_wake_sleepers_hook() {}
+/// Timer-tick hook to wake sleeping tasks.
+pub fn sched_wake_sleepers_hook() {
+    sched::wake_sleepers();
+}
 
-/// Post-IRQ scheduling hook. No-op until the scheduler lands.
-pub fn schedule_hook() {}
+/// Post-IRQ scheduling hook: round-robin preemption.
+pub fn schedule_hook() {
+    sched::schedule();
+}
+
+extern "C" fn task_a() {
+    for i in 0..5 {
+        kprintln!("    [task_a] iteration {}", i);
+        sched::sleep_ms(300);
+    }
+}
+
+extern "C" fn task_b() {
+    for i in 0..4 {
+        kprintln!("    [task_b] iteration {}", i);
+        sched::sleep_ms(500);
+    }
+}
 
 /// Kernel entry point, called from `boot.S` after low-level setup.
 #[no_mangle]
@@ -78,15 +97,20 @@ pub extern "C" fn rust_main() -> ! {
     // GICv3 + generic timer (10ms tick). Enables IRQs.
     exception::gic::init();
     exception::timer::init();
+
+    // Scheduler + a couple of preemptive EL1 demo tasks.
+    sched::init();
+    sched::create_task("task_a", task_a);
+    sched::create_task("task_b", task_b);
     exception::timer::start(exception::timer::TIMER_INTERVAL_MS);
-    kprintln!("[boot] timer running; waiting for ticks (1 line/sec)...");
+    kprintln!("[boot] scheduler running; idle loop reaping dead tasks");
     uart::puts("UART base: ");
     uart::puthex(uart::UART_BASE as u64);
     uart::putc(b'\n');
 
-    uart::println("[boot] reached idle loop");
     loop {
-        unsafe { core::arch::asm!("wfe") };
+        sched::reap();
+        unsafe { core::arch::asm!("wfi") };
     }
 }
 

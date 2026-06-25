@@ -75,17 +75,6 @@ void early_init() {
   volatile uint64_t leaked = *(volatile uint64_t *)hyp_base;
   uart_printf("[BOOT]   read back %x (0 => stage-2 isolation held)\n", leaked);
 
-  /* Interactive-console demo (M17): queue a canned command into the Linux
-   * guest's emulated UART RX. It buffers in the hypervisor until Linux's shell
-   * opens the tty, after which it is delivered via an injected UART SPI,
-   * executed, and its output appears in `cat /proc/linux_console`. */
-  {
-    const char *cmd = "echo HVTEST_OK; head -c 16 /dev/vda; echo\n";
-    for (const char *p = cmd; *p; p++)
-      hvc_call(HVC_LCON_PUT, (uint64_t)(uint8_t)*p, 0, 0);
-    uart_println("[BOOT] queued 'echo HVTEST_OK' to Linux guest console");
-  }
-
   exceptions_init();
 
   pmm_init(MEM_START, MEM_SIZE);

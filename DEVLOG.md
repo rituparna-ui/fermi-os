@@ -251,12 +251,21 @@ MBR**.
 virtqueue and detects `vda: vda1` — proving block reads return correct data,
 *independent of the shell*.
 
-### PL011 RX-timeout (partial fix; documented)
-Asserted `RTMIS` for a more faithful PL011, but this did **not** fully fix the
-interactive-input bug: long/bursty console input (more than ~the FIFO depth,
-~32 bytes) still arrives at the guest shell truncated/split. Short input works.
-Committed honestly as a partial improvement with the limitation documented; it
-does not affect virtio (verified via the partition scan, not the shell).
+### Interactive console: cursor-query terminal emulation (the real fix)
+A long canned command first appeared truncated at the guest shell. I asserted
+the PL011 RX-timeout interrupt (`RTMIS`) on a hunch — a correctness improvement,
+but it did *not* fix the symptom. Instead of guessing further, I **traced the
+exact bytes the guest reads** from the UART (a debug dump on each `DR` pop) and
+found the guest received the *entire correct line* — so the hypervisor's RX
+delivery was never the problem. The output stream contained `ESC[6n`: busybox's
+line editor was sending a **cursor-position query** and blocking to read the
+reply, eating real input when no terminal answered. Fix: the emulated PL011 now
+**acts as a minimal terminal** — it detects `ESC[6n` in the guest's UART writes
+and injects a cursor report (`ESC[1;1R`) into the RX FIFO; the demo command is
+injected right after the first prompt query (so it can't be eaten). *Verified:*
+the shell runs the full command and prints the `/dev/vda` signature
+`VBLKOK_FERMI_HV`. Lesson: trace before theorizing — the bug was a console-
+emulation gap, not byte loss.
 
 ---
 
@@ -319,9 +328,15 @@ Pushed to `git@github.com:rituparna-ui/fermi-os.git`:
 
 ## 5. Known limitations / future work
 
-- **Interactive console input drops bytes for long/bursty input** (>~32 bytes,
-  the PL011 FIFO depth) — a real bug needing runtime tracing of the RX-FIFO vs
-  guest `n_tty` interaction. Short input and all output work.
+- **Interactive console input** now works (including long commands). The earlier
+  "byte loss" was *not* a delivery bug — the hypervisor delivered every byte
+  correctly (proven by tracing the guest's UART reads). The real cause was that
+  busybox's line editor sends `ESC[6n` (cursor-position query) and blocks reading
+  the reply; with no terminal answering, it consumed real input. Fixed by having
+  the emulated PL011 act as a minimal terminal: detect `ESC[6n` in the guest's
+  UART output and reply with a cursor report (`ESC[1;1R`). Verified: the shell
+  now runs `echo HVTEST_OK; head -c 16 /dev/vda; echo` correctly, printing
+  `HVTEST_OK` and the `/dev/vda` signature `VBLKOK_FERMI_HV`.
 - **Single physical CPU**; guests are one vCPU each (the DT advertises 1 CPU to
   Linux).
 - Emulated **GICv3** covers what the boot path needs (PPIs via injection +

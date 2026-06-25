@@ -196,6 +196,10 @@ own registers and needs no context switch.
   `/proc/linux_console`) enter the RX FIFO, and when the guest has enabled the
   RX interrupt the hypervisor injects the **UART SPI** (INTID 33) as a software
   virtual interrupt (see §6) so the guest's IRQ handler drains the FIFO. The
+  emulated UART also acts as a **minimal terminal**: it detects the line
+  editor's cursor-position query (`ESC[6n`) in the guest's output and injects a
+  cursor report (`ESC[1;1R`) into the RX FIFO, so a line-edited shell (busybox)
+  doesn't consume real input while waiting for a terminal response. The
   output side is captured to `/proc/linux_console` (§10).
 - **Emulated virtio-rng (virtio-mmio)**: a full virtio device at IPA
   `0x0a000000` (unmapped → trapped). The hypervisor emulates the virtio-mmio v2

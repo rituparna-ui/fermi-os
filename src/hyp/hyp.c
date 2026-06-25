@@ -123,6 +123,20 @@ __attribute__((section(".hyp_tables"))) static uint32_t g_pl011_imsc; /* mask */
 #define UART_SPI_INTID 33    /* DT: pl011 interrupts = <0 1 4> => SPI 1 => 33 */
 
 static inline int lrx_empty(void) { return g_lrx_head == g_lrx_tail; }
+
+/* Push one byte / a string into the guest UART RX FIFO (dropping on overflow). */
+static void lrx_push(uint8_t b) {
+  uint32_t nh = (g_lrx_head + 1) % LRX_SZ;
+  if (nh != g_lrx_tail) {
+    g_lrx[g_lrx_head] = b;
+    g_lrx_head = nh;
+  }
+}
+static void lrx_push_str(const char *s) {
+  while (*s)
+    lrx_push((uint8_t)*s++);
+}
+static void hyp_uart_rx_kick(void);
 /* CNTHP (EL2 physical timer) scheduling tick. */
 #define HYP_TIMER_INTID 26   /* PPI 26 = non-secure EL2 physical timer */
 #define HYP_QUANTUM_MS 100   /* preemption time-slice */
@@ -1025,11 +1039,7 @@ static void hyp_handle_hvc(el2_frame_t *f) {
     break;
   case HVC_LCON_PUT: {
     /* Enqueue one input byte for the Linux guest's emulated UART RX FIFO. */
-    uint32_t nh = (g_lrx_head + 1) % LRX_SZ;
-    if (nh != g_lrx_tail) { /* drop if full */
-      g_lrx[g_lrx_head] = (uint8_t)a1;
-      g_lrx_head = nh;
-    }
+    lrx_push((uint8_t)a1);
     ret = 0;
     break;
   }
@@ -1149,10 +1159,32 @@ static int hyp_emulate_pl011(uint64_t ipa, int is_write, uint64_t *val) {
   uint64_t off = ipa - PL011_LO;
   if (is_write) {
     switch (off) {
-    case 0x000: /* DR: capture output byte */
+    case 0x000: { /* DR: capture output byte + answer terminal cursor query */
+      uint8_t c = (uint8_t)*val;
       if (g_lcon_len < LCON_SZ)
-        g_lcon[g_lcon_len++] = (uint8_t)*val;
+        g_lcon[g_lcon_len++] = c;
+      /* The busybox line editor sends ESC[6n (cursor-position request) and
+       * blocks reading the reply; without a terminal answering, it consumes
+       * real input. Detect the query and reply with a cursor report so
+       * line-edited input works. On the first prompt, also inject a demo
+       * command (proves the interactive RX path end-to-end). */
+      static const uint8_t q[4] = {0x1b, '[', '6', 'n'};
+      static int m, demo_done;
+      if (c == q[m]) {
+        if (++m == 4) {
+          m = 0;
+          lrx_push_str("\x1b[1;1R"); /* cursor at row 1, col 1 */
+          if (!demo_done) {
+            demo_done = 1;
+            lrx_push_str("echo HVTEST_OK; head -c 16 /dev/vda; echo\n");
+          }
+          hyp_uart_rx_kick();
+        }
+      } else {
+        m = (c == q[0]) ? 1 : 0;
+      }
       break;
+    }
     case 0x038: /* IMSC: interrupt mask (track RXIM) */
       g_pl011_imsc = (uint32_t)*val;
       break;

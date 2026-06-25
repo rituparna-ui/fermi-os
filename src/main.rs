@@ -17,6 +17,7 @@ mod cpu;
 mod exception;
 mod mm;
 mod mmio;
+mod net;
 mod panic;
 mod pci;
 mod print;
@@ -121,6 +122,7 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
     virtio::net::init();
+    net::bringup();
 
     // Scheduler + a couple of preemptive EL1 demo tasks.
     sched::init();

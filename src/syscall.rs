@@ -21,6 +21,7 @@ pub const SYS_SLEEP: u64 = 6;
 pub const SYS_GETPID: u64 = 7;
 pub const SYS_LSEEK: u64 = 8;
 pub const SYS_UPTIME: u64 = 9;
+pub const SYS_NET_PING: u64 = 10;
 
 /// Validate that a user buffer lies wholly within the EL0 address window.
 fn user_ptr_ok(ptr: u64, len: u64) -> bool {
@@ -63,6 +64,7 @@ pub fn syscall_dispatch(frame: &mut TrapFrame) {
             0
         }
         SYS_UPTIME => timer::uptime_ms() as i64,
+        SYS_NET_PING => crate::net::ping(a0 as u16),
         SYS_EXIT => {
             kprintln!("[SYS] exit({})", a0 as i64);
             sched::task_exit(); // does not return

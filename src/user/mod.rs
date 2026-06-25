@@ -75,6 +75,9 @@ fn sys_kill(pid: u64) -> i64 {
 fn sys_fork() -> i64 {
     syscall3(SYS_FORK, 0, 0, 0)
 }
+fn sys_exec(path: *const u8, argv: *const *const u8) -> i64 {
+    syscall3(SYS_EXEC, path as u64, argv as u64, 0)
+}
 fn sys_balloon(op: u64, n: u64) -> i64 {
     syscall3(SYS_BALLOON, op, n, 0)
 }
@@ -211,6 +214,7 @@ fn sh_help() {
           \x20 echo <text>     - print text\n\
           \x20 kill <pid>      - terminate a task by pid\n\
           \x20 fork            - spawn a child task; both print\n\
+          \x20 exec <path>     - replace this task with an ELF from disk\n\
           \x20 balloon         - virtio-balloon: status / inflate N / deflate N\n\
           \x20 top             - 5x refresh of tasks/mem/net (1 s)\n\
           \x20 ping            - ICMP echo the slirp gateway (10.0.2.2)\n\
@@ -306,6 +310,40 @@ pub extern "C" fn task_shell() {
                 print(b"killed.\n");
             } else {
                 print(b"kill: no such pid (or pid is idle)\n");
+            }
+        } else if starts_with(cmd, b"exec ") {
+            // Tokenize the tail in-place: NUL-terminate each word and record
+            // argv pointers. On success exec never returns (the image is
+            // replaced); on failure it returns -1.
+            let mut argv: [*const u8; 16] = [core::ptr::null(); 16];
+            let mut argc = 0usize;
+            let tail = &mut line[5..n + 1]; // include the NUL slot at [n]
+            let mut i = 0usize;
+            let len = tail.len();
+            while i < len && argc < 15 {
+                while i < len && tail[i] == b' ' {
+                    i += 1;
+                }
+                if i >= len || tail[i] == 0 {
+                    break;
+                }
+                argv[argc] = tail[i..].as_ptr();
+                argc += 1;
+                while i < len && tail[i] != b' ' && tail[i] != 0 {
+                    i += 1;
+                }
+                if i < len && tail[i] == b' ' {
+                    tail[i] = 0; // terminate this word
+                    i += 1;
+                }
+            }
+            if argc == 0 {
+                print(b"exec: usage: exec <path> [args...]\n");
+            } else {
+                let r = sys_exec(argv[0], argv.as_ptr());
+                if r < 0 {
+                    print(b"exec: failed (open / read / alloc)\n");
+                }
             }
         } else if starts_with(cmd, b"echo ") {
             print(&cmd[5..]);

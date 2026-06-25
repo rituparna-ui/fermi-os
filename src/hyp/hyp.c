@@ -471,6 +471,15 @@ static void hyp_build_linux_stage2(void) {
 static void hyp_create_linux_guest(void) {
   hyp_build_linux_stage2();
 
+  /* Isolation: remove the Linux guest's RAM window (and its staged Image/DTB/
+   * initramfs) from the PRIMARY guest's stage-2, so Fermi cannot see or
+   * corrupt Linux's memory. The window is a whole number of 1 GiB stage-2
+   * blocks in Fermi's map; clearing them is enough (done before the first
+   * eret to EL1, so no stage-2 TLB flush is required). */
+  for (uint64_t i = 0; i < LINUX_RAM_SIZE / _1GB; i++)
+    s2_l1_low[LINUX_PHYS_BASE / _1GB + i] = 0;
+  __asm__ __volatile__("dsb ish");
+
   /* The Linux Image and DTB are staged into the guest's high RAM by QEMU's
    * generic loader (see Makefile), at IPAs 0x40200000 and 0x48000000. We just
    * enter per the arm64 boot protocol: PC = Image base, x0 = DTB, EL1h, MMU

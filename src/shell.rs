@@ -198,6 +198,16 @@ fn dispatch(line: &str) {
                 cmd_cat(arg1);
             }
         }
+        "mv" => {
+            let rest: Vec<&str> = line.splitn(3, ' ').collect();
+            if rest.len() < 3 {
+                kprintln!("usage: mv <oldpath> <newpath>");
+            } else if vfs::rename(rest[1], rest[2]) {
+                kprintln!("renamed {} -> {}", rest[1], rest[2]);
+            } else {
+                kprintln!("mv: failed (missing source, dest exists, or not a FAT32 file)");
+            }
+        }
         "rm" => {
             if arg1.is_empty() {
                 kprintln!("usage: rm <path>");

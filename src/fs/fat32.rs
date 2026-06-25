@@ -491,6 +491,30 @@ pub fn delete(name: &[u8]) -> bool {
     blk::write(sector as u64, sec())
 }
 
+/// Rename a root-level file in place (clusters unchanged). Fails if `old` is
+/// missing or `new` already exists.
+pub fn rename(old: &[u8], new: &[u8]) -> bool {
+    let v = unsafe { VOL.get() };
+    if !v.mounted {
+        return false;
+    }
+    let ot = to_83(old);
+    let nt = to_83(new);
+    if dir_find_loc(v.root_cluster, &nt).is_some() {
+        return false; // destination already exists
+    }
+    let (sector, off, _start) = match dir_find_loc(v.root_cluster, &ot) {
+        Some(x) => x,
+        None => return false,
+    };
+    if !blk::read(sector as u64, sec()) {
+        return false;
+    }
+    let b = sec();
+    b[off..off + 11].copy_from_slice(&nt);
+    blk::write(sector as u64, sec())
+}
+
 /// Attach the mounted FAT32 root to an existing empty VFS directory.
 pub fn vfs_mount(path: &str) {
     let v = unsafe { VOL.get() };

@@ -8,7 +8,7 @@ use crate::kprintln;
 use crate::mm::mmu::virt_to_phys;
 use crate::mmio;
 use crate::pci;
-use crate::sync::Racy;
+use crate::sync::{Racy, SpinLock};
 use crate::uart;
 
 pub const VIRTIO_BLK_VENDOR_ID: u16 = 0x1AF4;
@@ -145,7 +145,13 @@ pub fn is_ready() -> bool {
     unsafe { BLK.get() }.ready
 }
 
+/// Serializes block requests: there is a single shared request header and
+/// virtqueue, so concurrent callers (e.g. boot ELF loads racing shell FS ops)
+/// would corrupt it. Busy-poll completion means a plain spinlock is safe.
+static BLK_LOCK: SpinLock<()> = SpinLock::new(());
+
 fn rw(sector: u64, buf_pa: u64, write: bool) -> bool {
+    let _guard = BLK_LOCK.lock();
     let blk = unsafe { BLK.get() };
     if !blk.ready {
         return false;

@@ -198,6 +198,15 @@ fn dispatch(line: &str) {
                 cmd_cat(arg1);
             }
         }
+        "rm" => {
+            if arg1.is_empty() {
+                kprintln!("usage: rm <path>");
+            } else if vfs::unlink(arg1) {
+                kprintln!("removed {}", arg1);
+            } else {
+                kprintln!("rm: {}: not found or not a FAT32 file", arg1);
+            }
+        }
         "ping" => {
             let ttl = net::ping(1);
             if ttl >= 0 {

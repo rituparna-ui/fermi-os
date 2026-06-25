@@ -39,7 +39,7 @@ Only four hand-written assembly files remain (everything else is Rust):
   (`uptime/meminfo/tasks/interrupts/netinfo/cmdline/version`).
 - **Shell** — an interactive shell with builtins: `help, uptime, version, ps,
   free, ifconfig, irqs, cat, ping, sleep, kill, echo, balloon, vlog, cpuinfo,
-  clear, reboot`.
+  clear, reboot, run`.
 
 ## Prerequisites
 
@@ -63,9 +63,16 @@ balloon devices attached and drops you at the `fermi>` shell prompt.
 
 To exit QEMU: `Ctrl-A` then `X`.
 
+## ELF programs
+
+A standalone aarch64 `ET_EXEC` user binary (`user/hello.S`) is built into the
+FAT32 image as `HELLO.ELF`. The kernel's ELF64 loader maps its PT_LOAD segments
+(W^X) into a fresh user address space and runs it at EL0 — both automatically at
+boot and interactively via the shell's `run /mnt/fat32/HELLO.ELF`.
+
 ## Deferred from the original
 
-- ELF64 loader + `fork`/`exec` (the kernel runs an embedded EL0 program rather
-  than loading binaries from disk).
+- `fork`/`exec` **syscalls** + a user libc (the ELF loader and run-from-disk are
+  done; process self-replacement and duplication are not wired).
 - FAT32 create/write (read path only).
 - Demand-paged user-stack growth (a user stack fault currently kills the task).

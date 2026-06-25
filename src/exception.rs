@@ -176,6 +176,12 @@ pub extern "C" fn exception_dispatch(type_: u64, frame: *mut TrapFrame) {
             }
             EC_DATA_ABORT_LO => {
                 let dfsc = esr_iss_dfsc(frame.esr);
+                // Translation fault in the stack-growth zone -> demand-page it.
+                if (dfsc == 0x05 || dfsc == 0x06 || dfsc == 0x07)
+                    && crate::sched::try_grow_stack(frame.far)
+                {
+                    return; // eret resumes the faulting instruction
+                }
                 kprintln!(
                     "[FAULT] user data abort: {} FAR={:#x} region={}",
                     dfsc_str(dfsc),

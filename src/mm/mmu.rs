@@ -77,11 +77,16 @@ pub const fn ttbr_pack(baddr: u64, asid: u16) -> u64 {
 pub const fn ttbr_baddr(ttbr: u64) -> u64 {
     ttbr & TTBR_BADDR_MASK
 }
+#[inline(always)]
+pub const fn ttbr_asid(ttbr: u64) -> u16 {
+    (ttbr >> TTBR_ASID_SHIFT) as u16
+}
 
 // User-space address layout (TTBR0).
 pub const USER_TEXT_BASE: u64 = 0x0040_0000;
 pub const USER_STACK_TOP: u64 = 0x0080_0000;
 pub const USER_STACK_PAGES: u64 = 4;
+pub const USER_STACK_PAGES_MAX: u64 = 20; // demand-grown up to 80 KiB
 
 #[inline(always)]
 fn pte_next_table(entry: u64) -> u64 {

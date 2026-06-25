@@ -45,6 +45,8 @@ pub struct Task {
     pub exec_phys: [u64; 4],   // ELF PT_LOAD region phys bases (for reap)
     pub exec_pages: [u64; 4],
     pub exec_count: u32,
+    pub stack_grown: [u64; 16],  // demand-paged stack pages (for reap)
+    pub stack_grown_count: u32,
 }
 
 extern "C" {
@@ -82,6 +84,8 @@ static SCHED: Racy<Sched> = Racy::new(Sched {
         exec_phys: [0; 4],
         exec_pages: [0; 4],
         exec_count: 0,
+        stack_grown: [0; 16],
+        stack_grown_count: 0,
     },
     current: core::ptr::null_mut(),
     next_pid: 0,
@@ -617,6 +621,45 @@ pub fn wake_sleepers() {
     }
 }
 
+/// Demand-paged user-stack growth: on a translation fault in the stack-growth
+/// zone, map a fresh RW page and let the faulting instruction resume.
+pub fn try_grow_stack(far: u64) -> bool {
+    let s = unsafe { SCHED.get() };
+    let t = s.current;
+    unsafe {
+        if t.is_null() || (*t).ttbr0 == 0 {
+            return false;
+        }
+        let stack_max_lo = mmu::USER_STACK_TOP - mmu::USER_STACK_PAGES_MAX * PAGE_SIZE;
+        let stack_init_lo = mmu::USER_STACK_TOP - mmu::USER_STACK_PAGES * PAGE_SIZE;
+        if far < stack_max_lo || far >= stack_init_lo {
+            return false;
+        }
+        if (*t).stack_grown_count as usize >= 16 {
+            uart::errorln("[STACK] grow refused: cap hit");
+            return false;
+        }
+        let pa = pmm::allocate_page();
+        if pa == 0 {
+            return false;
+        }
+        core::ptr::write_bytes(phys_to_virt(pa) as *mut u8, 0, PAGE_SIZE as usize);
+        let va = far & !(PAGE_SIZE - 1);
+        let l0 = mmu::ttbr_baddr((*t).ttbr0);
+        mmu::map_user_range(l0, va, pa, 1,
+            mmu::PTE_AP_RW_EL0 | mmu::PTE_UXN | mmu::PTE_PXN | mmu::pte_attridx(1));
+        // Invalidate just this (VA, ASID) entry.
+        let asid = mmu::ttbr_asid((*t).ttbr0) as u64;
+        let arg = (asid << 48) | (va >> 12);
+        core::arch::asm!("dsb ish", "tlbi vae1, {}", "dsb ish", "isb", in(reg) arg);
+        let i = (*t).stack_grown_count as usize;
+        (*t).stack_grown[i] = pa;
+        (*t).stack_grown_count += 1;
+        kprintln!("[STACK] grew task {} by 1 page at {:#x} ({} dyn)", (*t).pid, va, (*t).stack_grown_count);
+    }
+    true
+}
+
 /// Kill a task by pid. Returns 0 on success, -1 if not found / not killable.
 /// Render the run-queue as a /proc/tasks table.
 pub fn render_tasks() -> alloc::string::String {
@@ -699,6 +742,11 @@ pub fn reap() {
             for i in 0..(*dead).exec_count as usize {
                 if (*dead).exec_phys[i] != 0 {
                     pmm::free_pages((*dead).exec_phys[i], (*dead).exec_pages[i]);
+                }
+            }
+            for i in 0..(*dead).stack_grown_count as usize {
+                if (*dead).stack_grown[i] != 0 {
+                    pmm::free_page((*dead).stack_grown[i]);
                 }
             }
             kfree(dead as usize);

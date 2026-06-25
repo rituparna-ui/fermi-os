@@ -34,7 +34,7 @@ Only four hand-written assembly files remain (everything else is Rust):
   slirp gateway), a minimal DHCP client, and a `netd` background pinger.
 - **Filesystem** — Unix-style VFS (vnode tree, path resolution), per-process
   fd table (fd 0/1/2 → `/dev/console`), char/block device nodes
-  (`/dev/{console,null,zero,rng,vcons,blk}`), read-only **FAT32** mounted at
+  (`/dev/{console,null,zero,rng,vcons,blk}`), **FAT32** (read + create) mounted at
   `/mnt/fat32`, and a `/proc` synthetic filesystem
   (`uptime/meminfo/tasks/interrupts/netinfo/cmdline/version`).
 - **Shell** — an interactive shell with builtins: `help, uptime, version, ps,
@@ -75,9 +75,10 @@ space (child resumes in the same SVC with `x0 = 0`); `exec()` replaces the
 current image with an ELF loaded from the filesystem. The embedded EL0 demo
 forks and the child `exec()`s `HELLO.ELF`.
 
-## Deferred from the original
+## Notes
 
-- A C user libc (user programs here are written directly in aarch64 assembly
-  against the raw syscall ABI).
-- FAT32 create/write (read path only).
-- Demand-paged user-stack growth (a user stack fault currently kills the task).
+- User programs are written directly in aarch64 assembly against the raw
+  syscall ABI (there is no C user libc).
+- FAT32 supports read and create/write of root-level files.
+- User stacks grow on demand: a fault in the stack-growth zone maps a fresh
+  page (up to 80 KiB) and resumes the faulting instruction.

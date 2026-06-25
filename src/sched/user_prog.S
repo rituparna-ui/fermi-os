@@ -8,6 +8,13 @@
 .globl user_prog_end
 
 user_prog_start:
+    // Probe demand-paged stack growth: write ~20 KiB below SP (below the
+    // initial 16 KiB stack). The kernel maps a fresh page and we resume.
+    mov x9, sp
+    mov x10, #0x5000
+    sub x9, x9, x10
+    str xzr, [x9]
+
     mov x8, #12                 // SYS_FORK
     svc #0
     cbz x0, child               // x0 == 0 -> child

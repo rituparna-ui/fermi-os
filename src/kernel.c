@@ -51,6 +51,13 @@ void early_init() {
   uart_println("Fermi OS - Booting Up...");
   print_current_el();
 
+  /* Milestone-1 hypervisor check: fire a hypercall from the EL1 guest. If a
+   * hypervisor is present beneath us it traps to EL2, logs the HVC, and erets
+   * back here. If we booted bare (no EL2 layer) this is harmless on QEMU. */
+  uart_println("[BOOT] issuing test HVC #0xABCD from EL1 guest...");
+  __asm__ __volatile__("hvc #0xABCD");
+  uart_println("[BOOT] returned from HVC (guest resumed)");
+
   exceptions_init();
 
   pmm_init(MEM_START, MEM_SIZE);

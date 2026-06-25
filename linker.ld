@@ -51,6 +51,17 @@ SECTIONS
 		__bss_end = .;
 	} :data
 
+	/* Hypervisor-private data (stage-2 page tables + EL2 trap stack).
+	 * Placed AFTER __bss_end so the EL1 guest's zero_bss() never wipes the
+	 * live stage-2 tables, and BEFORE __kernel_end so the guest PMM reserves
+	 * these pages instead of handing them back out as free RAM. Filled
+	 * explicitly by hyp_init(), so NOLOAD (no boot-time zeroing) is fine. */
+	.hyp ALIGN(4096) (NOLOAD) : {
+		__hyp_start = .;
+		*(.hyp_tables)
+		__hyp_end = .;
+	} :data
+
 	. = ALIGN(4096);
 	. = . + 0x10000;		/* 64 KiB kernel stack */
 	__stack_top = .;		/* Stack grows downward */

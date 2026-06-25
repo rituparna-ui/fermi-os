@@ -40,6 +40,9 @@ pub const SYS_REBOOT: u64 = 15;
 /// directory at `path` into the user buffer (cap 256). Returns name length, or
 /// -1 past the end / not a directory. Extends the original ABI.
 pub const SYS_READDIR: u64 = 16;
+/// mkdir(path): create a directory. Returns 0 on success, -1 on failure
+/// (bad path, parent missing, or already exists). Extends the original ABI.
+pub const SYS_MKDIR: u64 = 17;
 
 pub const BALLOON_OP_INFLATE: u64 = 0;
 pub const BALLOON_OP_DEFLATE: u64 = 1;
@@ -89,6 +92,14 @@ fn user_str<'a>(ptr: u64) -> Option<&'a str> {
     // SAFETY: validated range + NUL within bound.
     let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
     core::str::from_utf8(bytes).ok()
+}
+
+/// Map a VFS path under the FAT32 mount (`/mnt/fat32`) to a volume-relative
+/// path the fat32 driver understands. Returns None if not under the mount.
+fn fat32_relative(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/mnt/fat32")?;
+    // Strip a leading slash; an empty remainder means the mount root itself.
+    Some(rest.strip_prefix('/').unwrap_or(rest))
 }
 
 /// SVC dispatch entry, called from the exception handler with the trap frame.
@@ -177,6 +188,13 @@ pub fn dispatch(frame: &mut TrapFrame) {
             } else {
                 crate::klib::uart::Uart.errorln("[SYSCALL] SYS_READDIR rejected: bad args");
             }
+        }
+        SYS_MKDIR => {
+            // arg0 = path under the FAT32 mount, e.g. "/mnt/fat32/SUB".
+            ret = match user_str(arg0).and_then(fat32_relative) {
+                Some(rel) if crate::fs::fat32::mkdir(rel.as_bytes()) => 0,
+                _ => -1,
+            };
         }
         SYS_BALLOON => {
             ret = match arg0 {

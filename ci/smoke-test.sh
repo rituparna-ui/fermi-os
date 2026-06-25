@@ -74,6 +74,7 @@ require "[HEAP STRESS] PASS"
 require "[FD STRESS] PASS"
 require "[FORK STRESS] parent forked 16 children PASS"
 require "[FAT32 STRESS] PASS: created + verified 30 files"
+require "[FAT32 SUBDIR] mkdir RDIR + create RDIR/INNER.TXT + read: PASS"
 require "[ASID WRAP] PASS"
 require "[KERNEL] Ready!"
 
@@ -96,7 +97,7 @@ SHLOG="$(mktemp /tmp/fermi-ci-shell.XXXXXX.log)"
 trap 'rm -f "$DISK" "$VCONS" "$LOG" "$SHLOG"' EXIT
 echo "Driving the EL0 shell..."
 # Leading newlines absorb the first-byte-eaten race on QEMU stdin.
-printf '\n\npid\nls /mnt/fat32\nfork\nballoon inflate 4\nballoon\nhexdump /mnt/fat32/HELLO.TXT\nexec /mnt/fat32/HELLO.ELF a b\nexit\n' | \
+printf '\n\npid\nmkdir /mnt/fat32/CIDIR\nls /mnt/fat32\nfork\nballoon inflate 4\nballoon\nhexdump /mnt/fat32/HELLO.TXT\nexec /mnt/fat32/HELLO.ELF a b\nexit\n' | \
 	timeout 35 qemu-system-aarch64 \
 		-machine virt,gic-version=3 -cpu cortex-a72 -m 8G -nographic \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on \
@@ -119,7 +120,9 @@ shell_require() {
 echo "Checking shell builtins:"
 shell_require "Welcome to the Fermi shell"
 shell_require "pid = 1"
+shell_require "mkdir: ok"                     # mkdir created a directory
 shell_require "HELLO.TXT"                     # ls listed the FAT32 dir
+shell_require "CIDIR"                         # ls shows the new directory
 shell_require "fork: child pid="
 shell_require "balloon: inflated 4 pages"
 shell_require "|Hello from Fermi"           # hexdump ASCII gutter

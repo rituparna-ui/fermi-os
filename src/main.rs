@@ -411,6 +411,27 @@ fn fat32_stress() {
     } else {
         kprintln!("[FAT32 STRESS] FAIL: verified={} of {}", verified, N);
     }
+
+    // Subdirectory test: mkdir a dir, create a file inside it, read it back via
+    // the nested path. Idempotent across re-used disks (mkdir/create refuse
+    // duplicates; the read-back is the assertion).
+    let _ = fs::fat32::mkdir(b"RDIR");
+    let inner = b"deep file contents\n";
+    let _ = fs::fat32::create(b"RDIR/INNER.TXT", inner);
+    let t3 = vfs::fd_table_create();
+    let fd = vfs::fd_open(t3, "/mnt/fat32/RDIR/INNER.TXT");
+    let mut ok = false;
+    if fd >= 0 {
+        let mut buf = [0u8; 64];
+        let n = vfs::fd_read(t3, fd, buf.as_mut_ptr(), buf.len());
+        ok = n as usize == inner.len() && &buf[..n as usize] == inner;
+        vfs::fd_close(t3, fd);
+    }
+    vfs::fd_table_destroy(t3);
+    kprintln!(
+        "[FAT32 SUBDIR] mkdir RDIR + create RDIR/INNER.TXT + read: {}",
+        if ok { "PASS" } else { "FAIL" }
+    );
 }
 
 /// fd-table stress: open the max number of fds, confirm the table rejects the

@@ -24,6 +24,7 @@ const SYS_EXEC: u64 = 13;
 const SYS_BALLOON: u64 = 14;
 const SYS_REBOOT: u64 = 15;
 const SYS_READDIR: u64 = 16;
+const SYS_MKDIR: u64 = 17;
 
 // --- raw syscall wrappers ---------------------------------------------------
 
@@ -85,6 +86,9 @@ fn sys_reboot() -> i64 {
 }
 fn sys_readdir(path: *const u8, index: u64, name_out: *mut u8) -> i64 {
     syscall3(SYS_READDIR, path as u64, index, name_out as u64)
+}
+fn sys_mkdir(path: *const u8) -> i64 {
+    syscall3(SYS_MKDIR, path as u64, 0, 0)
 }
 fn sys_balloon(op: u64, n: u64) -> i64 {
     syscall3(SYS_BALLOON, op, n, 0)
@@ -244,6 +248,7 @@ fn sh_help() {
           \x20 cpuinfo         - cat /proc/cpuinfo\n\
           \x20 stack           - stress demand-paged user stack growth\n\
           \x20 ls [path]       - list a directory (default /mnt/fat32)\n\
+          \x20 mkdir <path>    - create a directory (under /mnt/fat32)\n\
           \x20 cat <path>      - print a file\n\
           \x20 hexdump <path>  - hex+ascii dump of a file\n\
           \x20 echo <text>     - print text\n\
@@ -290,6 +295,14 @@ pub extern "C" fn task_shell() {
             let arg: &[u8] = if cmd.len() > 3 { &cmd[3..] } else { b"/mnt/fat32" };
             let plen = copy_cstr(&mut path, arg);
             ls(&path[..plen]);
+        } else if starts_with(cmd, b"mkdir ") {
+            let mut path = [0u8; 120];
+            let plen = copy_cstr(&mut path, &cmd[6..]);
+            if sys_mkdir(path[..plen].as_ptr()) == 0 {
+                print(b"mkdir: ok\n");
+            } else {
+                print(b"mkdir: failed (bad path / parent missing / exists)\n");
+            }
         } else if streq(cmd, b"ps") {
             cat(b"/proc/tasks\0");
         } else if streq(cmd, b"free") {

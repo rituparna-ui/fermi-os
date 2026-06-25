@@ -385,23 +385,70 @@ fn cluster_write_data(v: &Volume, first_cluster: u32, data: &[u8]) -> bool {
     true
 }
 
-/// Create a file at `path` (in the root dir for now) with `data`. Returns true
-/// on success. Allocates a cluster chain, writes the data, and adds a directory
-/// entry. Only root-directory paths are supported (matches typical usage).
-pub fn create(name: &[u8], data: &[u8]) -> bool {
+/// Split `path` into (parent dir cluster, final 8.3 name). Walks all leading
+/// path components as directories starting from the root, returning None if any
+/// component is missing or not a directory. A leading '/' is tolerated.
+fn resolve_parent(v: &Volume, path: &[u8]) -> Option<(u32, [u8; 11])> {
+    let mut i = 0;
+    while i < path.len() && path[i] == b'/' {
+        i += 1;
+    }
+    let mut dir_cluster = v.root_cluster;
+    loop {
+        // Extract the next component [i, j).
+        let start = i;
+        while i < path.len() && path[i] != b'/' {
+            i += 1;
+        }
+        let comp = &path[start..i];
+        if comp.is_empty() {
+            return None; // trailing slash / empty component
+        }
+        // Skip the separator(s).
+        while i < path.len() && path[i] == b'/' {
+            i += 1;
+        }
+        if i >= path.len() {
+            // Last component — this is the name to create in dir_cluster.
+            return Some((dir_cluster, to_83(comp)));
+        }
+        // Intermediate component: must be an existing directory; descend.
+        let (c, _sz, attr) = dir_lookup(v, dir_cluster, &to_83(comp))?;
+        if attr & ATTR_DIRECTORY == 0 {
+            return None;
+        }
+        dir_cluster = c;
+    }
+}
+
+/// Build a directory entry into `de`. `attr` is ATTR_ARCHIVE for files /
+/// ATTR_DIRECTORY for dirs.
+fn build_dir_entry(name83: &[u8; 11], attr: u8, first_cluster: u32, size: u32) -> [u8; DIR_ENTRY_SIZE] {
+    let mut de = [0u8; DIR_ENTRY_SIZE];
+    de[..11].copy_from_slice(name83);
+    de[11] = attr;
+    de[20..22].copy_from_slice(&((first_cluster >> 16) as u16).to_le_bytes()); // hi
+    de[26..28].copy_from_slice(&(first_cluster as u16).to_le_bytes()); // lo
+    de[28..32].copy_from_slice(&size.to_le_bytes());
+    de
+}
+
+/// Create a file at `path` with `data` (supports subdirectory paths, e.g.
+/// "SUBDIR/FILE.TXT"). Allocates a cluster chain, writes the data, and adds a
+/// directory entry in the parent. Refuses duplicates. Returns true on success.
+pub fn create(path: &[u8], data: &[u8]) -> bool {
     let v = vol();
     if !v.mounted {
         return false;
     }
-    let dir_cluster = v.root_cluster;
+    let (dir_cluster, name83) = match resolve_parent(&v, path) {
+        Some(p) => p,
+        None => return false,
+    };
     let len = data.len() as u32;
 
-    // Refuse to create a duplicate: if a file with this 8.3 name already
-    // exists, do nothing (no overwrite, no duplicate entry). The original C
-    // create() lacked this check, which let repeated runs append duplicate
-    // directory entries for the same name.
-    let target = to_83(name);
-    if dir_lookup(&v, dir_cluster, &target).is_some() {
+    // Refuse duplicates: no overwrite, no duplicate dir entry.
+    if dir_lookup(&v, dir_cluster, &name83).is_some() {
         return false;
     }
 
@@ -431,15 +478,53 @@ pub fn create(name: &[u8], data: &[u8]) -> bool {
         return false;
     }
 
-    // Build the 8.3 directory entry.
-    let mut de = [0u8; DIR_ENTRY_SIZE];
-    de[..11].copy_from_slice(&to_83(name));
-    de[11] = 0x20; // ATTR_ARCHIVE
-    de[20..22].copy_from_slice(&((first_cluster >> 16) as u16).to_le_bytes()); // hi
-    de[26..28].copy_from_slice(&(first_cluster as u16).to_le_bytes()); // lo
-    de[28..32].copy_from_slice(&len.to_le_bytes()); // size
-
+    let de = build_dir_entry(&name83, 0x20 /* ATTR_ARCHIVE */, first_cluster, len);
     dir_add_entry(&v, dir_cluster, &de)
+}
+
+/// Create a directory at `path` (supports nested paths whose parent exists).
+/// Allocates one cluster, zero-initializes it, writes the `.` and `..` entries,
+/// and adds a directory entry in the parent. Refuses duplicates.
+pub fn mkdir(path: &[u8]) -> bool {
+    let v = vol();
+    if !v.mounted {
+        return false;
+    }
+    let (parent_cluster, name83) = match resolve_parent(&v, path) {
+        Some(p) => p,
+        None => return false,
+    };
+    if dir_lookup(&v, parent_cluster, &name83).is_some() {
+        return false;
+    }
+
+    // Allocate the new directory's first cluster and zero every sector.
+    let dir_cluster = fat_alloc_cluster(&v);
+    if dir_cluster == 0 {
+        return false;
+    }
+    let base = cluster_to_sector(&v, dir_cluster);
+    let zero = [0u8; SECTOR];
+    for s in 0..v.sectors_per_cluster {
+        if !blk::write((base + s) as u64, &zero) {
+            return false;
+        }
+    }
+
+    // Write the "." (self) and ".." (parent; 0 means root, per FAT convention)
+    // entries into the first sector.
+    let mut sec = [0u8; SECTOR];
+    let dot = build_dir_entry(b".          ", ATTR_DIRECTORY, dir_cluster, 0);
+    let parent_link = if parent_cluster == v.root_cluster { 0 } else { parent_cluster };
+    let dotdot = build_dir_entry(b"..         ", ATTR_DIRECTORY, parent_link, 0);
+    sec[0..DIR_ENTRY_SIZE].copy_from_slice(&dot);
+    sec[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&dotdot);
+    if !blk::write(base as u64, &sec) {
+        return false;
+    }
+
+    let de = build_dir_entry(&name83, ATTR_DIRECTORY, dir_cluster, 0);
+    dir_add_entry(&v, parent_cluster, &de)
 }
 
 pub fn root_cluster() -> u32 {

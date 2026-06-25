@@ -847,6 +847,7 @@ void kernel_main() {
   hyp_run_psci_test();        /* M11 */
   hyp_run_shm_doorbell();     /* M15 */
   hyp_run_doorbell_irq();     /* M16 */
+  hyp_run_hvc_abi();          /* M17 */
   hyp_run_dual_fermios();     /* M9c */
 #endif
 

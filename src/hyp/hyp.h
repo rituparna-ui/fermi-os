@@ -108,4 +108,10 @@ void hyp_run_shm_doorbell(void);
  * No-op at EL1; runs before the host timer. */
 void hyp_run_doorbell_irq(void);
 
+/* Milestone 17: exercise the unified HVC hypercall ABI. Two demo guests call
+ * VERSION / VM_INFO / PUTC / YIELD through hvc_dispatch(); their PUTC output
+ * appears via their per-guest virtual consoles. No-op at EL1; runs before the
+ * host timer. */
+void hyp_run_hvc_abi(void);
+
 #endif /* HYP_HYP_H */

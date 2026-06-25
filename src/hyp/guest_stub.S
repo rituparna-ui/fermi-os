@@ -329,3 +329,53 @@ gi_prompt: .asciz "vguest> "
 .balign 16
 .global guest_echo_end
 guest_echo_end:
+
+// ---------------------------------------------------------------------------
+// HVC ABI demo guest (milestone 17). Exercises the unified hypercall ABI: asks
+// the hypervisor its ABI VERSION and VM_INFO, prints a couple of characters via
+// the PUTC hypercall (proving host-mediated console output without touching the
+// UART directly), then YIELDs. Loops. Function IDs match src/hyp/hvc/hvc.h.
+.equ HVC_VERSION,  0xC6000000
+.equ HVC_PUTC,     0xC6000001
+.equ HVC_VM_INFO,  0xC6000002
+.equ HVC_YIELD,    0xC6000003
+
+.section .text.guest, "ax"
+.balign 16
+.global guest_hvc_start
+guest_hvc_start:
+	// VERSION -> x0
+	movz	x0, #0x0000
+	movk	x0, #0xC600, lsl #16	// 0xC6000000 = HVC_VERSION
+	hvc	#0
+	// (x0 now holds the ABI version; ignored here)
+
+	// VM_INFO -> x0 = vmid, x1 = vm_count
+	movz	x0, #0x0002
+	movk	x0, #0xC600, lsl #16	// 0xC6000002 = HVC_VM_INFO
+	hvc	#0
+	mov	x20, x0			// x20 = our vmid (1 or 2)
+
+hvc_loop:
+	// PUTC('H')
+	movz	x0, #0x0001
+	movk	x0, #0xC600, lsl #16	// 0xC6000001 = HVC_PUTC
+	mov	x1, #'H'
+	hvc	#0
+	// PUTC(vmid as a digit) -> shows which VM via host-mediated console
+	movz	x0, #0x0001
+	movk	x0, #0xC600, lsl #16
+	add	x1, x20, #'0'
+	hvc	#0
+	// PUTC('\n')
+	movz	x0, #0x0001
+	movk	x0, #0xC600, lsl #16
+	mov	x1, #'\n'
+	hvc	#0
+	// YIELD
+	movz	x0, #0x0003
+	movk	x0, #0xC600, lsl #16	// 0xC6000003 = HVC_YIELD
+	hvc	#0
+	b	hvc_loop
+.global guest_hvc_end
+guest_hvc_end:

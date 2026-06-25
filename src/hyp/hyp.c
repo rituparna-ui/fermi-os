@@ -4,6 +4,7 @@
 #include "vcpu.h"
 #include "vgic/vgic.h"
 #include "psci/psci.h"
+#include "hvc/hvc.h"
 #include "gic/gic.h" /* gic_enable_irq, gic_ack_irq, gic_end_irq */
 #include "mm/pmm/pmm.h"
 #include "mm/mmu/mmu.h" /* PHYS_TO_VIRT */
@@ -1479,5 +1480,87 @@ void hyp_run_doorbell_irq(void) {
   pmm_free_page(shared);
   for (int i = 0; i < SHM_COUNT; i++) {
     pmm_free_pages(ram[i], SHM_RAM_SIZE / 0x1000);
+  }
+}
+
+/* ---- Milestone 17: unified HVC hypercall ABI demo ---- */
+
+extern char guest_hvc_start[];
+extern char guest_hvc_end[];
+
+#define HVC_COUNT     2
+#define HVC_RAM_SIZE  0x00200000ULL
+#define HVC_ROUNDS    3
+
+void hyp_run_hvc_abi(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M17: unified HVC hypercall ABI (VERSION/VM_INFO/PUTC/YIELD)");
+
+  static stage2_t s2[HVC_COUNT];
+  static vcpu_t vc[HVC_COUNT];
+  uintptr_t ram[HVC_COUNT];
+  uint64_t len = (uint64_t)(guest_hvc_end - guest_hvc_start);
+  hvc_env_t env = {.vm_count = HVC_COUNT};
+
+  for (int i = 0; i < HVC_COUNT; i++) {
+    ram[i] = pmm_allocate_pages(HVC_RAM_SIZE / 0x1000);
+    if (!ram[i] || !stage2_create(&s2[i], (uint32_t)(i + 1))) {
+      return;
+    }
+    stage2_map(&s2[i], GUEST_ENTRY_IPA, (uint64_t)ram[i], HVC_RAM_SIZE, 0);
+
+    uint64_t kva = PHYS_TO_VIRT((uint64_t)ram[i]);
+    for (uint64_t b = 0; b < len; b++) {
+      ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)guest_hvc_start)[b];
+    }
+    guest_sync_icache(kva, (len + 0xFFF) & ~0xFFFULL);
+
+    for (int r = 0; r < 31; r++) vc[i].x[r] = 0;
+    vc[i].pc = GUEST_ENTRY_IPA;
+    vc[i].pstate = 0x3C5;
+    vc[i].sp_el1 = GUEST_ENTRY_IPA + HVC_RAM_SIZE;
+    vc[i].vttbr = stage2_vttbr(&s2[i]);
+    vc[i].hcr_extra = 0;
+    vc[i].vmid = (uint32_t)(i + 1);
+    vc[i].id = (uint32_t)i;
+    vc[i].name = (i == 0) ? "vm0" : "vm1";
+    vuart_init(&vc[i].vuart, vc[i].name);
+  }
+
+  uint64_t host_daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(host_daif));
+  __asm__ __volatile__("msr daifset, #3");
+
+  /* Cooperative: each guest runs until it YIELDs (or makes a non-yield HVC we
+   * handle in place and resume). Round-robin for a few rounds. */
+  for (int round = 0; round < HVC_ROUNDS; round++) {
+    for (int i = 0; i < HVC_COUNT; i++) {
+      vcpu_t *v = &vc[i];
+      int yielded = 0;
+      long guard = 100000;
+      while (!yielded && guard-- > 0) {
+        vcpu_enter(v);
+        if (v->exit_reason == HYP_EXC_SYNC && ESR_EC_OF(v->esr) == 0x16) {
+          hvc_action_t act = hvc_dispatch(v, &env);
+          if (act == HVC_ACT_YIELD) {
+            yielded = 1; /* end slice -> next guest */
+          }
+          /* HVC_ACT_NONE (VERSION/VM_INFO/PUTC): x0/x1 set, resume the guest. */
+        } else if (!df_service_exit(v)) {
+          yielded = 1;
+        }
+      }
+      vuart_flush(&v->vuart);
+    }
+  }
+
+  __asm__ __volatile__("msr daif, %0" ::"r"(host_daif));
+  uart_println("[HYP] M17: done (each guest printed 'H<vmid>' via the PUTC hypercall)");
+
+  for (int i = 0; i < HVC_COUNT; i++) {
+    pmm_free_pages(ram[i], HVC_RAM_SIZE / 0x1000);
   }
 }

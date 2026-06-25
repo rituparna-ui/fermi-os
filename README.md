@@ -2,6 +2,8 @@
 
 Fermi OS is a bare-metal `aarch64 (ARMv8-A)` kernel built from scratch in `C` and assembly, targeting QEMU's `virt` machine with a Cortex-A72 processor.
 
+It also doubles as a minimal **Type-1 (bare-metal) hypervisor**: when launched with QEMU's `virtualization=on`, Fermi boots at **EL2**, sets up stage-2 translation, and runs *itself* as an EL1 guest alongside a second isolated guest — with virtual interrupts, preemptive scheduling, per-guest context switching, and PSCI-based guest lifecycle. See the **Hypervisor (EL2)** section below.
+
 
 ---
 
@@ -54,6 +56,21 @@ Fermi OS is a bare-metal `aarch64 (ARMv8-A)` kernel built from scratch in `C` an
 
 ### EL0 Shell (interactive)
 - **`task_shell`** — An EL0 task that loops reading lines from `/dev/console` (with backspace/DEL editing and echo) and dispatches built-ins. Pure user-space — talks to the kernel only via `svc`. Built-ins: `help`, `pid`, `uptime`, `ps`, `free`, `ifconfig`, `irqs`, `version`, `cat <path>`, `kill <pid>`, `top` (5× refresh tasks/mem/net), `ping`, `sleep <ms>`, `clear`, `exit`
+
+### Hypervisor (EL2 Type-1 VMM)
+> Requires QEMU `virt,gic-version=3,virtualization=on` (already set in the Makefile). Without it the image boots straight at EL1 as a plain kernel — the EL2 layer is skipped cleanly.
+
+- **EL2 bring-up** — `boot.S` detects entry at EL2 via `CurrentEL`, configures the hypervisor, then `eret`s to EL1. A dedicated EL2 vector table (`VBAR_EL2`) and private EL2 stack handle all guest traps
+- **Stage-2 translation** — Per-guest second-stage (IPA→PA) page tables via `VTTBR_EL2`/`VTCR_EL2` with distinct VMIDs (no TLB flush on switch). The primary guest gets a 1 TB identity map (1 GiB blocks); the hypervisor's own RAM is split to 4 KiB granularity and **unmapped** from every guest
+- **Hypervisor isolation** — A guest read/write to hypervisor-private memory faults to EL2, is reported, poisoned, and stepped over — the guest can never see or corrupt VMM state
+- **Hypercall ABI** — SMCCC-style `HVC` interface (function ID in `x0`, args `x1`–`x3`, result in `x0`): `VERSION`, `PUTC` (paravirt console), `PING`, `YIELD`, `VM_INFO`, plus introspection (`VM_COUNT`/`VM_STAT`)
+- **Trap-and-emulate** — `HCR_EL2.TID3` traps guest `ID_AA64*` reads; the handler decodes `ESR_EL2` and emulates them, stepping the guest PC past the trapped instruction
+- **Virtual interrupts (vGIC)** — Physical IRQs are routed to EL2 (`HCR_EL2.IMO`) and re-injected as hardware-linked virtual interrupts via the GICv3 list registers (`ICH_LR<n>_EL2`, HW=1), so the guest's unmodified IRQ handler runs on the virtual CPU interface and its EOI auto-deactivates the physical interrupt. Interrupts are routed to their owning vCPU
+- **Preemptive scheduler** — The EL2 physical timer (`CNTHP_EL2`, PPI 26) drives a 100 ms quantum; on each tick the hypervisor world-switches between vCPUs round-robin. No guest cooperation required
+- **Full vCPU context switch** — Per-guest save/restore of GP regs, PC/PSTATE, the EL1 system-register bank (`SCTLR`/`TTBR0/1`/`TCR`/`MAIR`/`VBAR`/…), vGIC state (`ICH_LR`/`ICH_VMCR`/`ICH_AP1R0`), and FP/SIMD (`q0`–`q31`, `FPSR`/`FPCR`)
+- **Two guests** — vCPU 0 is Fermi itself (running unmodified at EL1); vCPU 1 is a tiny position-independent payload in its own isolated RAM slice. Both make progress concurrently under preemption
+- **PSCI guest lifecycle** — `PSCI_VERSION` and `SYSTEM_OFF`/`SYSTEM_RESET`: a guest can power itself off, and the hypervisor reaps the vCPU and stops scheduling it
+- **Introspection** — `cat /proc/vms` from the EL0 shell renders a live vCPU table (state, hypercall/sysreg/abort/vIRQ counts, world-switch total) by hypercalling from the EL1 `/proc` generator
 
 ---
 

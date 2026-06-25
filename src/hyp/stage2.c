@@ -124,11 +124,10 @@ uint64_t s2_init(void) {
    * we deliberately leave invalid). */
   s2_map_range(0x09000000ULL, 0x09000000ULL, S2_PAGE, /*device=*/1);
 
-  /* GICv3 distributor (0x08000000, 64 KiB) + redistributor (0x080A0000,
-   * GICR_BASE through SGI frame, ~0x100000 covered by 0x080A0000..0x080C0000).
-   * Map 0x08000000..0x08200000 (one 2 MiB block) Device-nGnRE — covers GICD,
-   * GICR and the ITS. (M5 removes this to trap GIC MMIO into the vGIC.) */
-  s2_map_range(0x08000000ULL, 0x08000000ULL, S2_2MB, /*device=*/1);
+  /* GICv3 distributor (0x08000000) + redistributor (0x080A0000) are LEFT
+   * STAGE-2 INVALID so guest MMIO faults to EL2 (EC=0x24) and is serviced by
+   * the vGIC software model (vgic_mmio_emulate). The ITS at 0x08080000 is also
+   * left invalid — the guest does not use it. */
 
   /* PCI MMIO32 window 0x10000000..0x3EFEFFFF. Round the size down/up safely:
    * map [0x10000000, 0x3F000000) = 0x2F000000 (752 MiB). 0x10000000 is 2 MiB

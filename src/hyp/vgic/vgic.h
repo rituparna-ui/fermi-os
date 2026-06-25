@@ -33,4 +33,15 @@ void vgic_init(void);
  * guest is simply behind and will catch up). */
 void vgic_inject_ppi(uint32_t intid);
 
+/* --- M5: GICD/GICR MMIO emulation --------------------------------------- */
+
+/* True if `ipa` falls in the emulated GICD or GICR window. */
+int vgic_mmio_is_target(uint64_t ipa);
+
+/* Emulate a trapped GICD/GICR access. `is_write` selects direction; `val`
+ * points at the source (write) or destination (read) value, `size_bytes` is
+ * the access width (1/2/4/8). The distributor/redistributor state lives in a
+ * software model so the guest never touches the real GIC distributor. */
+void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val, int size_bytes);
+
 #endif /* HYP_VGIC_H */

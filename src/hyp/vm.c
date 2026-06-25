@@ -68,6 +68,55 @@ static void handle_psci(hyp_trap_frame_t *f) {
   }
 }
 
+/* Reconstruct the faulting guest IPA from HPFAR_EL2 (IPA[47:12]) + FAR_EL2
+ * (page offset[11:0]). */
+static uint64_t fault_ipa(hyp_trap_frame_t *f) {
+  uint64_t ipa_hi = (f->hpfar >> 4) << 12; /* HPFAR[39:4] -> IPA[47:12] */
+  return ipa_hi | (f->far & 0xFFF);
+}
+
+static void handle_data_abort(uint64_t type, hyp_trap_frame_t *f) {
+  uint64_t ipa = fault_ipa(f);
+
+  if (!vgic_mmio_is_target(ipa)) {
+    hyp_puts("\n[HYP] stage-2 data abort outside emulated MMIO, IPA=");
+    hyp_puthex(ipa);
+    hyp_putc('\n');
+    hyp_fatal_trap(type, f);
+  }
+
+  uint64_t esr = f->esr;
+  if (!ISS_ISV(esr)) {
+    /* No decoded syndrome — would require software instruction decode at
+     * ELR_EL2. The guest's gic.c uses plain 32-bit str/ldr which QEMU decodes,
+     * so we expect ISV=1; surface loudly if not. */
+    hyp_puts("\n[HYP] GIC MMIO abort with ISV=0 (need insn decode), IPA=");
+    hyp_puthex(ipa);
+    hyp_putc('\n');
+    hyp_fatal_trap(type, f);
+  }
+
+  int is_write = (int)ISS_WNR(esr);
+  uint32_t srt = ISS_SRT(esr);
+  int sas = (int)ISS_SAS(esr);
+  int size_bytes = 1 << sas;
+
+  uint64_t val = 0;
+  if (is_write) {
+    /* xzr (reg 31) reads as 0. */
+    val = (srt == 31) ? 0 : f->regs[srt];
+    vgic_mmio_emulate(ipa, 1, &val, size_bytes);
+  } else {
+    vgic_mmio_emulate(ipa, 0, &val, size_bytes);
+    if (srt != 31) {
+      /* SF=0 (32-bit) zero-extends into the 64-bit reg, which writing the
+       * masked value already achieves. */
+      f->regs[srt] = ISS_SF(esr) ? val : (val & 0xFFFFFFFFULL);
+    }
+  }
+  advance_elr(f);
+}
+
 static void handle_sync(uint64_t type, hyp_trap_frame_t *f) {
   uint64_t ec = ESR_EC(f->esr);
   switch (ec) {
@@ -94,6 +143,10 @@ static void handle_sync(uint64_t type, hyp_trap_frame_t *f) {
      * List Register and will be presented on eret. Just skip the instruction
      * so the guest re-checks rather than spinning on the same WFI. */
     advance_elr(f);
+    break;
+
+  case EC_DATA_ABORT_LO:
+    handle_data_abort(type, f);
     break;
 
   default:

@@ -108,6 +108,83 @@ void vgic_init(void) {
   hyp_puts(" (virtual CPU interface enabled)\n");
 }
 
+/* ---------------------------------------------------------------------------
+ * GICD/GICR MMIO emulation (M5).
+ *
+ * The guest's gic.c touches a small, fixed set of registers (verified against
+ * src/exception/gic/gic.h): GICD_CTLR, GICD_ISENABLER; GICR_WAKER, and in the
+ * redistributor SGI/PPI frame GICR_IGROUPR0 / GICR_IGRPMODR0 / GICR_ISENABLER0.
+ * We model just enough state to make the guest's bring-up succeed; the real
+ * distributor is never programmed by the guest once these pages trap.
+ * ------------------------------------------------------------------------- */
+
+#define GICD_IPA_BASE 0x08000000ULL
+#define GICD_IPA_END  0x08010000ULL /* 64 KiB distributor */
+#define GICR_IPA_BASE 0x080A0000ULL
+#define GICR_IPA_END  0x080C0000ULL /* RD + SGI frames (128 KiB) */
+
+#define R_GICD_CTLR        0x0000
+#define R_GICD_ISENABLER0  0x0100
+#define R_GICR_WAKER       0x0014
+#define R_GICR_SGI_IGROUPR0   0x10080
+#define R_GICR_SGI_IGRPMODR0  0x10D00
+#define R_GICR_SGI_ISENABLER0 0x10100
+
+#define GICD_CTLR_ARE_NS  (1U << 4)
+#define GICD_CTLR_EN_G1NS (1U << 1)
+
+static struct {
+  uint32_t gicd_ctlr;
+  uint32_t gicd_isenabler0; /* SPIs 0..31 (guest only enables PPIs though) */
+  uint32_t gicr_igroupr0;
+  uint32_t gicr_igrpmodr0;
+  uint32_t gicr_isenabler0; /* SGIs/PPIs 0..31 — guest enables INTID 30 here */
+} vd;
+
+int vgic_mmio_is_target(uint64_t ipa) {
+  return (ipa >= GICD_IPA_BASE && ipa < GICD_IPA_END) ||
+         (ipa >= GICR_IPA_BASE && ipa < GICR_IPA_END);
+}
+
+void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
+                       int size_bytes) {
+  (void)size_bytes;
+  uint64_t off;
+  if (ipa >= GICR_IPA_BASE) {
+    off = ipa - GICR_IPA_BASE;
+  } else {
+    off = ipa - GICD_IPA_BASE;
+  }
+
+  if (is_write) {
+    uint32_t w = (uint32_t)*val;
+    switch (off) {
+    case R_GICD_CTLR:        vd.gicd_ctlr = w & (GICD_CTLR_ARE_NS | GICD_CTLR_EN_G1NS); break;
+    case R_GICD_ISENABLER0:  vd.gicd_isenabler0 |= w; break;
+    case R_GICR_WAKER:       /* ProcessorSleep handled on read; ignore write */ break;
+    case R_GICR_SGI_IGROUPR0:   vd.gicr_igroupr0 = w; break;
+    case R_GICR_SGI_IGRPMODR0:  vd.gicr_igrpmodr0 = w; break;
+    case R_GICR_SGI_ISENABLER0: vd.gicr_isenabler0 |= w; break;
+    default: /* unmodelled write — drop silently */ break;
+    }
+    return;
+  }
+
+  /* Read. */
+  uint32_t r = 0;
+  switch (off) {
+  case R_GICD_CTLR:        r = vd.gicd_ctlr; break;
+  case R_GICD_ISENABLER0:  r = vd.gicd_isenabler0; break;
+  case R_GICR_WAKER:       r = 0; /* ProcessorSleep=0, ChildrenAsleep=0 — the
+                                   * guest's poll loop (gic.c:30) exits */ break;
+  case R_GICR_SGI_IGROUPR0:   r = vd.gicr_igroupr0; break;
+  case R_GICR_SGI_IGRPMODR0:  r = vd.gicr_igrpmodr0; break;
+  case R_GICR_SGI_ISENABLER0: r = vd.gicr_isenabler0; break;
+  default: r = 0; break;
+  }
+  *val = r;
+}
+
 void vgic_inject_ppi(uint32_t intid) {
   /* Find a free LR (State == Invalid) that does not already hold this INTID. */
   for (uint32_t i = 0; i < vgic_nr_lr; i++) {

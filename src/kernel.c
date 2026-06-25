@@ -49,6 +49,9 @@ void early_init() {
   uart_init();
 
   uart_println("Fermi OS - Booting Up...");
+  // Under VHE (boot.S sets HCR_EL2.E2H) this reports EL2 ("Hyper Space"): the
+  // kernel runs as the hypervisor host and every _EL1 sysreg access below is
+  // redirected to its EL2 bank. Legacy EL1 boot still reports "Kernel Space".
   print_current_el();
 
   exceptions_init();

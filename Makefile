@@ -50,8 +50,13 @@ LDFLAGS := -nostdlib -g -T linker.ld
 DISK_IMG := $(BUILD_DIR)/disk.img
 DISK_SIZE := 1G
 
-QEMU_CPU := cortex-a72
-QEMU_MACHINE := virt,gic-version=3 -m 8G
+# cortex-a72 is ARMv8.0-A and has NO FEAT_VHE (HCR_EL2.E2H is RES0), so it
+# cannot host the VHE EL2 hypervisor. `max` is the only VHE-capable core this
+# QEMU exposes (cortex-a76/neoverse-n1 need QEMU >= ~4.x).
+QEMU_CPU := max
+# virtualization=on is MANDATORY: without it QEMU lands -kernel at EL1 and the
+# boot.S EL2/VHE preamble is never taken (the hypervisor silently no-ops).
+QEMU_MACHINE := virt,gic-version=3,virtualization=on -m 8G
 QEMU_DEVICES := -netdev user,id=n0 \
 	-device virtio-net-pci,netdev=n0,disable-legacy=on \
 	-device virtio-rng-pci,disable-legacy=on \
@@ -61,8 +66,9 @@ QEMU_DEVICES := -netdev user,id=n0 \
 	-device virtio-serial-pci,disable-legacy=on \
 	-device virtconsole,chardev=vc \
 	-device virtio-balloon-pci,disable-legacy=on
-# QEMU_MACHINE := virt,gic-version=3,virtualization=on -m 8G
-# QEMU_MACHINE := virt,gic-version=3,virtualization=on,secure=on -m 8G
+# Variants:
+# QEMU_MACHINE := virt,gic-version=3 -m 8G                              # legacy EL1-only boot (pre-hypervisor)
+# QEMU_MACHINE := virt,gic-version=3,virtualization=on,secure=on -m 8G  # adds EL3/secure firmware
 QEMU_BASE := qemu-system-aarch64 -machine $(QEMU_MACHINE) -nographic -cpu $(QEMU_CPU) $(QEMU_DEVICES)
 
 QEMU_FLAGS_RUN   := -kernel $(TARGET)

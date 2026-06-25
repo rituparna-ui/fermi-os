@@ -75,16 +75,6 @@ void early_init() {
   volatile uint64_t leaked = *(volatile uint64_t *)hyp_base;
   uart_printf("[BOOT]   read back %x (0 => stage-2 isolation held)\n", leaked);
 
-  /* Cooperative multi-VM demo: yield to guest 1 a few times. Each yield
-   * world-switches to the second guest, which prints "[g1]" and yields back.
-   * After the loop guest 0 keeps the CPU (no preemption yet — that's M5b). */
-  uart_println("[BOOT] cooperative multi-VM demo (guest0 <-> guest1):");
-  for (int i = 0; i < 4; i++) {
-    uart_printf("[BOOT][guest0] turn %d, yielding to guest1...\n", i);
-    hvc_call(HVC_YIELD, 0, 0, 0);
-  }
-  uart_println("[BOOT][guest0] done yielding; resuming normal boot");
-
   exceptions_init();
 
   pmm_init(MEM_START, MEM_SIZE);

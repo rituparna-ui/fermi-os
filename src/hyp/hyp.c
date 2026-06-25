@@ -1,5 +1,7 @@
 #include "hyp.h"
 #include "hyp/hypercall.h" /* HVC_* ABI */
+#include "gic/gic.h"    /* GICR_* / GICD_* for the hypervisor timer PPI */
+#include "mmio/mmio.h"  /* mmio_read32 / mmio_write32 */
 #include "mm/mmu/mmu.h" /* _1GB, _512GB */
 #include "mm/pmm/pmm.h" /* MEM_START, MEM_SIZE */
 #include "strings/strings.h" /* memset, memcpy */
@@ -80,8 +82,14 @@ extern uint8_t guest1_payload_end[];
  * (NOLOAD); initialised explicitly in hyp_init(). */
 __attribute__((section(".hyp_tables"))) static vcpu_t vcpus[NUM_VCPUS];
 __attribute__((section(".hyp_tables"))) static int current_vcpu;
+/* CNTHP (EL2 physical timer) scheduling tick. */
+#define HYP_TIMER_INTID 26   /* PPI 26 = non-secure EL2 physical timer */
+#define HYP_QUANTUM_MS 100   /* preemption time-slice */
+__attribute__((section(".hyp_tables"))) static uint64_t g_quantum_ticks;
 
 static void hyp_create_guest1(void);
+static void hyp_tick_init(void);
+static void hyp_tick_start(void);
 
 /* --- self-contained PL011 output (no driver state, safe pre-uart_init) --- */
 static void hyp_putc(char c) {
@@ -266,6 +274,11 @@ void hyp_init(void) {
   hyp_create_guest1();
   hyp_puts("[HYP] created guest1 (vCPU 1) with its own stage-2\n");
 
+  /* Start the preemptive scheduling tick (CNTHP / PPI 26). */
+  hyp_tick_init();
+  hyp_tick_start();
+  hyp_puts("[HYP] preemptive scheduler armed (CNTHP tick)\n");
+
   hyp_puts("[HYP] stage-2 enabled (HCR_EL2.VM=1), dropping to EL1 guest...\n");
 }
 
@@ -401,6 +414,37 @@ static void hyp_create_guest1(void) {
   v->sp_el1 = (uint64_t)guest1_ram + GUEST1_RAM_SIZE;
   v->vttbr = ((uint64_t)g1_l0) | (1ULL << 48); /* VMID 1                    */
   /* EL1 sysregs left 0 => guest 1 runs with its stage-1 MMU off. */
+}
+
+/* Bring up just enough of the physical GIC for the hypervisor's own timer
+ * interrupt (PPI 26, CNTHP). The primary guest re-runs its full gic_init
+ * later; these writes are idempotent / non-conflicting (set-only ISENABLER,
+ * group bit kept set). EL2 runs MMU-off, so GIC MMIO is reached physically. */
+static void hyp_tick_init(void) {
+  /* Affinity routing + Group1 NS at the distributor (idempotent w/ guest). */
+  mmio_write32(GICD_CTLR, GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_G1NS);
+
+  /* Wake the redistributor. */
+  uint32_t waker = mmio_read32(GICR_WAKER);
+  waker &= ~GICR_WAKER_PROCESSOR_SLEEP;
+  mmio_write32(GICR_WAKER, waker);
+  while (mmio_read32(GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP) {
+  }
+
+  /* PPI 26 -> Group1 NS, then enable it (ISENABLER is write-1-to-set). */
+  uint32_t grp = mmio_read32(GICR_IGROUPR0);
+  grp |= (1u << HYP_TIMER_INTID);
+  mmio_write32(GICR_IGROUPR0, grp);
+  mmio_write32(GICR_ISENABLER0, (1u << HYP_TIMER_INTID));
+}
+
+/* Arm CNTHP_EL2 to fire one quantum from now. */
+static void hyp_tick_start(void) {
+  uint64_t freq = MRS(cntfrq_el0);
+  g_quantum_ticks = freq * HYP_QUANTUM_MS / 1000;
+  uint64_t now = MRS(cntpct_el0);
+  MSR(cnthp_cval_el2, now + g_quantum_ticks);
+  MSR(cnthp_ctl_el2, 1ULL); /* enable, unmasked */
 }
 
 /* ------------------------------- traps ------------------------------------ */
@@ -597,13 +641,24 @@ static void hyp_vgic_inject_hw(uint32_t intid) {
  * inject a hardware-linked virtual copy into the guest, then priority-drop
  * (EOImode=1 means this does not deactivate — the guest will, via the HW
  * link). The guest's existing IRQ handler runs unmodified on ICV_*. */
-static void hyp_handle_irq(void) {
+static void hyp_handle_irq(el2_frame_t *frame) {
   uint64_t iar;
   __asm__ __volatile__("mrs %0, icc_iar1_el1" : "=r"(iar));
   uint32_t intid = (uint32_t)(iar & 0xFFFFFF);
 
   if (intid >= 1020) /* 1020-1023 are special / spurious: no EOI needed */
     return;
+
+  if (intid == HYP_TIMER_INTID) {
+    /* Hypervisor scheduling tick. This interrupt is ours (not injected to a
+     * guest), so fully EOI+deactivate it, re-arm the quantum, and preempt to
+     * the next vCPU. */
+    MSR(cnthp_cval_el2, MRS(cnthp_cval_el2) + g_quantum_ticks);
+    __asm__ __volatile__("msr icc_eoir1_el1, %0" ::"r"(iar)); /* prio drop  */
+    __asm__ __volatile__("msr icc_dir_el1, %0" ::"r"(iar));   /* deactivate */
+    hyp_world_switch(frame);
+    return;
+  }
 
   vcpu_t *cur = &vcpus[current_vcpu];
   cur->virq_injected++;
@@ -624,7 +679,7 @@ void el2_dispatch(uint64_t index, el2_frame_t *frame) {
   uint64_t kind = index & 3;
 
   if (kind == 1) {
-    hyp_handle_irq();
+    hyp_handle_irq(frame);
     return;
   }
   if (kind != 0) {

@@ -276,6 +276,7 @@ fn dispatch(line: &str) {
         "top" => cmd_top(),
         "free" | "meminfo" => cmd_free(),
         "memtest" => cmd_memtest(parse_u64(arg1).unwrap_or(64).clamp(1, 512)),
+        "heapstat" => kprint!("{}", heap::render_stats()),
         "ifconfig" => kprint!("{}", net::render_info()),
         "arp" => {
             if arg1.is_empty() {

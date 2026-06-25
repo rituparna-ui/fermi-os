@@ -104,14 +104,18 @@ extern "C" {
     static __user_text_end: u8;
 }
 
-// Scheduler state — single-core, IRQ-masked mutation, hence raw statics. The
-// idle task is heap-allocated at init (it's too big for a static initializer
+// Scheduler state — single-core, mutated only with IRQs masked or during
+// single-threaded boot. Held in SyncUnsafeCell (not `static mut`) so the
+// hand-managed-aliasing invariant is explicit; every access is `*X.get()`
+// inside an `unsafe` block with a `// SAFETY (single-core)` justification.
+// The idle task is heap-allocated at init (too big for a static initializer
 // with the ElfImage + grown-page arrays, and lives forever anyway).
-static mut IDLE_TASK: *mut Task = ptr::null_mut();
-static mut CURRENT: *mut Task = ptr::null_mut();
-static mut NEXT_PID: u64 = 0;
-static mut DEAD_LIST: *mut Task = ptr::null_mut();
-static mut NEXT_ASID: u16 = 1;
+use crate::klib::sync::SyncUnsafeCell;
+static IDLE_TASK: SyncUnsafeCell<*mut Task> = SyncUnsafeCell::new(ptr::null_mut());
+static CURRENT: SyncUnsafeCell<*mut Task> = SyncUnsafeCell::new(ptr::null_mut());
+static NEXT_PID: SyncUnsafeCell<u64> = SyncUnsafeCell::new(0);
+static DEAD_LIST: SyncUnsafeCell<*mut Task> = SyncUnsafeCell::new(ptr::null_mut());
+static NEXT_ASID: SyncUnsafeCell<u16> = SyncUnsafeCell::new(1);
 
 fn copy_name(dst: &mut [u8; 16], src: &str) {
     for (i, b) in src.bytes().take(15).enumerate() {
@@ -141,13 +145,14 @@ fn irq_restore(daif: u64) {
 
 /// Allocate a fresh ASID in [1, 65535]; flush all TLBs on wraparound.
 pub fn asid_alloc() -> u16 {
-    // SAFETY (single-core): boot/creation path.
+    // SAFETY (single-core): boot/creation path; ASID counter touched only here.
     unsafe {
-        let a = NEXT_ASID;
-        NEXT_ASID = NEXT_ASID.wrapping_add(1);
-        if NEXT_ASID == 0 {
+        let next = NEXT_ASID.get();
+        let a = *next;
+        *next = a.wrapping_add(1);
+        if *next == 0 {
             core::arch::asm!("tlbi vmalle1", "dsb ish", "isb");
-            NEXT_ASID = 1;
+            *next = 1;
             kprintln!("[SCHED] ASID space wrapped — flushed all TLBs");
         }
         a
@@ -169,14 +174,14 @@ pub fn init() {
     // SAFETY (single-core): boot-time init.
     unsafe {
         let idle = alloc_task();
-        (*idle).pid = NEXT_PID;
-        NEXT_PID += 1;
+        (*idle).pid = *NEXT_PID.get();
+        (*NEXT_PID.get()) += 1;
         // READY (not RUNNING) so schedule() can pick idle as a fallback.
         (*idle).state = TaskState::Ready;
         (*idle).next = idle; // circular
         copy_name(&mut (*idle).name, "idle");
-        IDLE_TASK = idle;
-        CURRENT = idle;
+        (*IDLE_TASK.get()) = idle;
+        (*CURRENT.get()) = idle;
     }
 
     exception::set_schedule_hook(schedule_hook);
@@ -188,7 +193,7 @@ pub fn init() {
 /// Insert `t` at the tail of the circular run queue (IRQs masked by caller or
 /// during boot).
 unsafe fn enqueue(t: *mut Task) {
-    let current = CURRENT;
+    let current = *CURRENT.get();
     let mut tail = current;
     while (*tail).next != current {
         tail = (*tail).next;
@@ -222,8 +227,8 @@ pub fn create_kernel_task(name: &str, entry: TaskEntry) -> i64 {
         frame.add(11).write(kernel_task_trampoline as usize as u64); // x30
 
         (*t).sp = frame as u64;
-        (*t).pid = NEXT_PID;
-        NEXT_PID += 1;
+        (*t).pid = *NEXT_PID.get();
+        (*NEXT_PID.get()) += 1;
         (*t).state = TaskState::Ready;
         (*t).stack_phys = kstack_phys;
         (*t).ttbr0 = 0; // EL1: no TTBR0 swap
@@ -320,8 +325,8 @@ pub fn create_task(name: &str, entry: TaskEntry) -> i64 {
         frame.add(11).write(task_trampoline as usize as u64);
 
         (*t).sp = frame as u64;
-        (*t).pid = NEXT_PID;
-        NEXT_PID += 1;
+        (*t).pid = *NEXT_PID.get();
+        (*NEXT_PID.get()) += 1;
         (*t).state = TaskState::Ready;
         (*t).stack_phys = kstack_phys;
         (*t).ttbr0 = ttbr_pack(user_l0, asid_alloc());
@@ -358,8 +363,8 @@ pub fn schedule() {
     reap();
     // SAFETY (single-core): callers mask IRQs or are in IRQ context.
     unsafe {
-        let prev = CURRENT;
-        let idle = IDLE_TASK;
+        let prev = *CURRENT.get();
+        let idle = *IDLE_TASK.get();
         let mut next = (*prev).next;
         let mut fallback: *mut Task = ptr::null_mut();
 
@@ -395,12 +400,12 @@ pub fn schedule() {
                 p = (*p).next;
             }
             (*p).next = (*prev).next;
-            (*prev).next = DEAD_LIST;
-            DEAD_LIST = prev;
+            (*prev).next = *DEAD_LIST.get();
+            (*DEAD_LIST.get()) = prev;
         }
 
         (*next).state = TaskState::Running;
-        CURRENT = next;
+        (*CURRENT.get()) = next;
         context_switch(prev as *mut u8, next as *mut u8);
     }
 }
@@ -419,10 +424,10 @@ pub extern "C" fn task_exit() {
     unsafe {
         kprintln!(
             "[SCHED] Task {} '{}' exiting",
-            (*CURRENT).pid,
-            name_str(&(*CURRENT).name)
+            (*(*CURRENT.get())).pid,
+            name_str(&(*(*CURRENT.get())).name)
         );
-        (*CURRENT).state = TaskState::Dead;
+        (*(*CURRENT.get())).state = TaskState::Dead;
     }
     schedule();
 }
@@ -435,14 +440,14 @@ pub fn kill_task(pid: u64) -> i64 {
     }
     // SAFETY (single-core): traversal + mutation under IRQ mask.
     unsafe {
-        let head = IDLE_TASK;
+        let head = *IDLE_TASK.get();
         let mut t = head;
         loop {
             if (*t).pid == pid {
                 if (*t).state == TaskState::Dead {
                     return -1;
                 }
-                if t == CURRENT {
+                if t == (*CURRENT.get()) {
                     task_exit();
                     return 0;
                 }
@@ -453,8 +458,8 @@ pub fn kill_task(pid: u64) -> i64 {
                     p = (*p).next;
                 }
                 (*p).next = (*t).next;
-                (*t).next = DEAD_LIST;
-                DEAD_LIST = t;
+                (*t).next = *DEAD_LIST.get();
+                (*DEAD_LIST.get()) = t;
                 (*t).state = TaskState::Dead;
                 irq_restore(daif);
                 return 0;
@@ -472,12 +477,12 @@ pub fn kill_task(pid: u64) -> i64 {
 pub fn sleep_ms(ms: u64) {
     let ticks = core::cmp::max(1, ms / exception::timer::TIMER_INTERVAL_MS);
     unsafe {
-        (*CURRENT).sleep_until = exception::timer::get_ticks() + ticks;
-        (*CURRENT).state = TaskState::Sleeping;
+        (*(*CURRENT.get())).sleep_until = exception::timer::get_ticks() + ticks;
+        (*(*CURRENT.get())).state = TaskState::Sleeping;
         kprintln!(
             "[SCHED] Task {} '{}' sleeping for {} ms ({} ticks)",
-            (*CURRENT).pid,
-            name_str(&(*CURRENT).name),
+            (*(*CURRENT.get())).pid,
+            name_str(&(*(*CURRENT.get())).name),
             ms,
             ticks
         );
@@ -489,7 +494,7 @@ pub fn sleep_ms(ms: u64) {
 pub fn wake_sleepers() {
     let now = exception::timer::get_ticks();
     unsafe {
-        let idle = IDLE_TASK;
+        let idle = *IDLE_TASK.get();
         let mut t = (*idle).next;
         while t != idle {
             if (*t).state == TaskState::Sleeping && now >= (*t).sleep_until {
@@ -553,11 +558,11 @@ pub fn try_grow_stack(t: *mut Task, far: u64) -> bool {
 pub fn reap() {
     unsafe {
         loop {
-            let dead = DEAD_LIST;
+            let dead = *DEAD_LIST.get();
             if dead.is_null() {
                 break;
             }
-            DEAD_LIST = (*dead).next;
+            (*DEAD_LIST.get()) = (*dead).next;
 
             kprintln!("[SCHED] Reaping task {} '{}'", (*dead).pid, name_str(&(*dead).name));
 
@@ -598,7 +603,7 @@ pub fn reap() {
 }
 
 pub fn current() -> *mut Task {
-    unsafe { CURRENT }
+    unsafe { *CURRENT.get() }
 }
 
 /// The task's name as a &str (for logging). The returned slice borrows the
@@ -610,7 +615,7 @@ pub fn task_name<'a>(t: *mut Task) -> &'a str {
 }
 
 pub fn first_task() -> *mut Task {
-    unsafe { IDLE_TASK }
+    unsafe { *IDLE_TASK.get() }
 }
 
 pub fn state_name(s: TaskState) -> &'static str {
@@ -703,8 +708,8 @@ pub fn fork(parent: *mut Task, frame: *mut TrapFrame) -> i64 {
         }
 
         (*t).sp = switch_frame as u64;
-        (*t).pid = NEXT_PID;
-        NEXT_PID += 1;
+        (*t).pid = *NEXT_PID.get();
+        (*NEXT_PID.get()) += 1;
         (*t).state = TaskState::Ready;
         (*t).stack_phys = kstack_phys;
         (*t).ttbr0 = ttbr_pack(user_l0, asid_alloc());

@@ -85,19 +85,26 @@ pub struct FdTable {
 }
 
 // Vnode pool + root. Single-core, set up at boot and mutated during device/fs
-// registration (which happens before user tasks run).
-static mut NODE_POOL: [Vnode; MAX_VNODES] = [const { Vnode::zeroed() }; MAX_VNODES];
-static mut NODE_COUNT: usize = 0;
-static mut ROOT: *mut Vnode = ptr::null_mut();
+// registration (which happens before user tasks run). Held in SyncUnsafeCell
+// rather than `static mut` so the "single-core, hand-managed aliasing" intent
+// is explicit and references-to-static-mut are avoided.
+use crate::klib::sync::SyncUnsafeCell;
+static NODE_POOL: SyncUnsafeCell<[Vnode; MAX_VNODES]> =
+    SyncUnsafeCell::new([const { Vnode::zeroed() }; MAX_VNODES]);
+static NODE_COUNT: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
+static ROOT: SyncUnsafeCell<*mut Vnode> = SyncUnsafeCell::new(ptr::null_mut());
 
 fn alloc_vnode(name: &[u8], vtype: VnodeType) -> *mut Vnode {
-    // SAFETY (single-core): vnode allocation happens during boot/registration.
+    // SAFETY (single-core): vnode allocation happens during boot/registration;
+    // no other context touches the pool concurrently.
     unsafe {
-        if NODE_COUNT >= MAX_VNODES {
+        let count = NODE_COUNT.get();
+        if *count >= MAX_VNODES {
             return ptr::null_mut();
         }
-        let n = core::ptr::addr_of_mut!(NODE_POOL[NODE_COUNT]);
-        NODE_COUNT += 1;
+        let pool = NODE_POOL.get() as *mut Vnode;
+        let n = pool.add(*count);
+        *count += 1;
         ptr::write(n, Vnode::zeroed());
         (*n).vtype = vtype;
         let copy = core::cmp::min(name.len(), 63);
@@ -110,14 +117,14 @@ fn alloc_vnode(name: &[u8], vtype: VnodeType) -> *mut Vnode {
 pub fn init() {
     // SAFETY (single-core): boot-time init.
     unsafe {
-        ROOT = alloc_vnode(b"/", VnodeType::Dir);
+        *ROOT.get() = alloc_vnode(b"/", VnodeType::Dir);
     }
     kprintln!("[VFS] Initialized");
 }
 
 pub fn root() -> *mut Vnode {
     // SAFETY (single-core): read of a pointer static set at init.
-    unsafe { ROOT }
+    unsafe { *ROOT.get() }
 }
 
 /// Create a node `name` of `vtype` under `parent`, linking it into the tree.

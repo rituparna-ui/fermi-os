@@ -10,6 +10,38 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
+/// A `Sync` `UnsafeCell` for kernel statics whose access discipline is enforced
+/// by hand rather than by a lock — single-core state mutated only with IRQs
+/// masked or during single-threaded boot. Using this instead of `static mut`
+/// keeps the "I manage the aliasing" intent explicit in one audited place and
+/// avoids the `static mut` reference footgun (a hard error in Rust 2024).
+///
+/// All access goes through `get()` (a raw pointer); every dereference still
+/// needs `unsafe` and a `// SAFETY (single-core)` justification at the call
+/// site naming the invariant that makes it sound.
+#[repr(transparent)]
+pub struct SyncUnsafeCell<T> {
+    value: UnsafeCell<T>,
+}
+
+// SAFETY: the kernel guarantees exclusive access by convention (single core +
+// IRQ masking). This mirrors the unstable std `SyncUnsafeCell`.
+unsafe impl<T> Sync for SyncUnsafeCell<T> {}
+
+impl<T> SyncUnsafeCell<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    /// Raw pointer to the contained value. Deref under the single-core invariant.
+    #[inline(always)]
+    pub fn get(&self) -> *mut T {
+        self.value.get()
+    }
+}
+
 /// A spin lock guarding a value of type `T`.
 pub struct SpinLock<T> {
     locked: AtomicBool,

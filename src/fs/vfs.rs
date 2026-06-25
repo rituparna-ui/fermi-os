@@ -177,6 +177,75 @@ pub fn resolve(path: &str) -> *mut Vnode {
     cur
 }
 
+/// Unlink (delete) a FAT32-backed regular file: remove its cached vnode and
+/// free it on disk. Returns false if the path is not a deletable FAT32 file.
+pub fn unlink(path: &str) -> bool {
+    let node = resolve(path);
+    if node.is_null() {
+        return false;
+    }
+    unsafe {
+        if (*node).dev != DevOps::Fat32File {
+            return false; // only FAT32 regular files are deletable
+        }
+        // Unlink the cached vnode from its parent's child list.
+        let parent = (*node).parent;
+        if !parent.is_null() {
+            let mut c = (*parent).children;
+            if c == node {
+                (*parent).children = (*node).next;
+            } else {
+                while !c.is_null() && (*c).next != node {
+                    c = (*c).next;
+                }
+                if !c.is_null() {
+                    (*c).next = (*node).next;
+                }
+            }
+        }
+    }
+    // Derive the final path component as the on-disk name.
+    let name = path.rsplit('/').next().unwrap_or("");
+    crate::fs::fat32::delete(name.as_bytes())
+}
+
+/// Drop a cached child vnode from its parent's list (does not free on disk).
+unsafe fn drop_cached(node: *mut Vnode) {
+    let parent = (*node).parent;
+    if parent.is_null() {
+        return;
+    }
+    let mut c = (*parent).children;
+    if c == node {
+        (*parent).children = (*node).next;
+        return;
+    }
+    while !c.is_null() && (*c).next != node {
+        c = (*c).next;
+    }
+    if !c.is_null() {
+        (*c).next = (*node).next;
+    }
+}
+
+/// Rename a FAT32-backed regular file. Drops the stale cached vnode so a fresh
+/// lookup re-reads the new on-disk name.
+pub fn rename(oldp: &str, newp: &str) -> bool {
+    let node = resolve(oldp);
+    if node.is_null() {
+        return false;
+    }
+    unsafe {
+        if (*node).dev != DevOps::Fat32File {
+            return false;
+        }
+        drop_cached(node);
+    }
+    let oldn = oldp.rsplit('/').next().unwrap_or("");
+    let newn = newp.rsplit('/').next().unwrap_or("");
+    crate::fs::fat32::rename(oldn.as_bytes(), newn.as_bytes())
+}
+
 /// List a directory: in-memory children plus on-disk entries for FAT32 dirs.
 pub fn list(path: &str) -> alloc::string::String {
     use core::fmt::Write;

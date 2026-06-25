@@ -426,6 +426,95 @@ pub fn create(name: &[u8], data: &[u8]) -> bool {
     dir_add_entry(v.root_cluster, &e)
 }
 
+/// Locate a file's directory entry: returns (sector, byte_offset, first_cluster).
+fn dir_find_loc(dir_cluster: u32, target: &[u8; 11]) -> Option<(u32, usize, u32)> {
+    let v = unsafe { VOL.get() };
+    let mut cluster = dir_cluster;
+    while cluster < FAT32_EOC {
+        let base = cluster_to_sector(cluster);
+        for s in 0..v.sectors_per_cluster {
+            let sector = base + s;
+            if !blk::read(sector as u64, sec()) {
+                return None;
+            }
+            let b = sec();
+            let mut off = 0;
+            while off < SECTOR {
+                let e = &b[off..off + DIR_ENTRY_SIZE];
+                if e[0] == 0x00 {
+                    return None;
+                }
+                if e[0] == 0xE5 || e[11] == ATTR_LFN || e[11] & ATTR_VOLUME_ID != 0 {
+                    off += DIR_ENTRY_SIZE;
+                    continue;
+                }
+                if e[..11] == target[..] {
+                    let hi = u16::from_le_bytes([e[20], e[21]]) as u32;
+                    let lo = u16::from_le_bytes([e[26], e[27]]) as u32;
+                    return Some((sector, off, (hi << 16) | lo));
+                }
+                off += DIR_ENTRY_SIZE;
+            }
+        }
+        cluster = fat_next(cluster);
+    }
+    None
+}
+
+/// Delete a root-level file: free its FAT cluster chain and mark the directory
+/// entry deleted (0xE5). Returns false if not found or not mounted.
+pub fn delete(name: &[u8]) -> bool {
+    let v = unsafe { VOL.get() };
+    if !v.mounted {
+        return false;
+    }
+    let target = to_83(name);
+    let (sector, off, start) = match dir_find_loc(v.root_cluster, &target) {
+        Some(x) => x,
+        None => return false,
+    };
+    // Free the file's cluster chain.
+    let mut c = start;
+    while c >= 2 && c < FAT32_EOC {
+        let next = fat_next(c);
+        if !fat_write(c, 0) {
+            return false;
+        }
+        c = next;
+    }
+    // Re-read the directory sector and mark the entry deleted.
+    if !blk::read(sector as u64, sec()) {
+        return false;
+    }
+    let b = sec();
+    b[off] = 0xE5;
+    blk::write(sector as u64, sec())
+}
+
+/// Rename a root-level file in place (clusters unchanged). Fails if `old` is
+/// missing or `new` already exists.
+pub fn rename(old: &[u8], new: &[u8]) -> bool {
+    let v = unsafe { VOL.get() };
+    if !v.mounted {
+        return false;
+    }
+    let ot = to_83(old);
+    let nt = to_83(new);
+    if dir_find_loc(v.root_cluster, &nt).is_some() {
+        return false; // destination already exists
+    }
+    let (sector, off, _start) = match dir_find_loc(v.root_cluster, &ot) {
+        Some(x) => x,
+        None => return false,
+    };
+    if !blk::read(sector as u64, sec()) {
+        return false;
+    }
+    let b = sec();
+    b[off..off + 11].copy_from_slice(&nt);
+    blk::write(sector as u64, sec())
+}
+
 /// Attach the mounted FAT32 root to an existing empty VFS directory.
 pub fn vfs_mount(path: &str) {
     let v = unsafe { VOL.get() };

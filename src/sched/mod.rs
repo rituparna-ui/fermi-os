@@ -7,7 +7,7 @@
 
 use crate::exception::timer;
 use crate::kprintln;
-use crate::mm::mmu::phys_to_virt;
+use crate::mm::mmu::{self, phys_to_virt};
 use crate::mm::pmm::{self, PAGE_SIZE};
 use crate::mm::heap::{kfree, kmalloc};
 use crate::sync::Racy;
@@ -15,6 +15,7 @@ use crate::uart;
 use core::arch::global_asm;
 
 global_asm!(include_str!("switch.S"));
+global_asm!(include_str!("user_prog.S"));
 
 pub const TASK_STACK_PAGES: u64 = 4; // 16 KiB
 
@@ -27,19 +28,27 @@ pub type TaskEntry = extern "C" fn();
 
 #[repr(C)]
 pub struct Task {
-    pub sp: u64, // offset 0 — MUST match switch.S
-    pub pid: u64,
-    pub state: u32,
+    pub sp: u64,        // 0  — kernel SP (switch.S saves/restores here)
+    pub ttbr0: u64,     // 8  — packed TTBR0 (0 = kernel task, no swap)
+    pub pid: u64,       // 16
+    pub state: u32,     // 24
     _pad: u32,
-    pub sleep_until: u64,
-    pub stack_phys: u64,
-    pub name: [u8; 16],
-    pub next: u64, // *mut Task as usize, 0 = null
+    pub sleep_until: u64, // 32
+    pub stack_phys: u64,  // 40 — kernel stack phys
+    pub user_sp: u64,     // 48
+    pub ustack_phys: u64, // 56 — user stack phys (for freeing)
+    pub user_l0: u64,     // 64 — user L0 table phys (for freeing)
+    pub utext_phys: u64,  // 72 — user text page phys (for freeing)
+    pub name: [u8; 16],   // 80
+    pub next: u64,        // 96 — *mut Task, 0 = null
 }
 
 extern "C" {
     fn context_switch(prev: *mut Task, next: *mut Task);
     fn task_trampoline();
+    fn user_trampoline();
+    static user_prog_start: u8;
+    static user_prog_end: u8;
 }
 
 struct Sched {
@@ -52,11 +61,16 @@ struct Sched {
 static SCHED: Racy<Sched> = Racy::new(Sched {
     idle: Task {
         sp: 0,
+        ttbr0: 0,
         pid: 0,
         state: TASK_RUNNING,
         _pad: 0,
         sleep_until: 0,
         stack_phys: 0,
+        user_sp: 0,
+        ustack_phys: 0,
+        user_l0: 0,
+        utext_phys: 0,
         name: [0; 16],
         next: 0,
     },
@@ -147,6 +161,99 @@ pub fn create_task(name: &str, entry: TaskEntry) -> i64 {
         stack_va,
         stack_top
     );
+    pid as i64
+}
+
+/// Create an EL0 user task running the embedded user program. Sets up a
+/// per-task TTBR0 with the user text mapped RX at USER_TEXT_BASE and a user
+/// stack mapped RW below USER_STACK_TOP, then arranges an eret to EL0.
+pub fn create_user_task(name: &str) -> i64 {
+    let s = unsafe { SCHED.get() };
+    let t = kmalloc(core::mem::size_of::<Task>()) as *mut Task;
+    if t.is_null() {
+        uart::errorln("[SCHED] user: alloc task failed");
+        return -1;
+    }
+    unsafe { core::ptr::write_bytes(t as *mut u8, 0, core::mem::size_of::<Task>()) };
+
+    // Kernel stack for the task.
+    let kstack_phys = pmm::allocate_pages(TASK_STACK_PAGES);
+    if kstack_phys == 0 {
+        kfree(t as usize);
+        return -1;
+    }
+    let kstack_top = phys_to_virt(kstack_phys) + TASK_STACK_PAGES * PAGE_SIZE;
+    unsafe { core::ptr::write_bytes(phys_to_virt(kstack_phys) as *mut u8, 0, (TASK_STACK_PAGES * PAGE_SIZE) as usize) };
+
+    // Per-task user page tables.
+    let l0 = mmu::create_user_tables();
+    if l0 == 0 {
+        pmm::free_pages(kstack_phys, TASK_STACK_PAGES);
+        kfree(t as usize);
+        return -1;
+    }
+
+    // User text page: copy the embedded program and map RX at USER_TEXT_BASE.
+    let utext_phys = pmm::allocate_page();
+    let prog_len = unsafe {
+        (&user_prog_end as *const u8 as usize) - (&user_prog_start as *const u8 as usize)
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            &user_prog_start as *const u8,
+            phys_to_virt(utext_phys) as *mut u8,
+            prog_len,
+        );
+    }
+    // EL0 read+execute, kernel no-execute (PXN), Normal memory.
+    mmu::map_user_range(
+        l0,
+        mmu::USER_TEXT_BASE,
+        utext_phys,
+        1,
+        mmu::PTE_AP_RO_EL0 | mmu::PTE_PXN | mmu::pte_attridx(1),
+    );
+
+    // User stack: USER_STACK_PAGES below USER_STACK_TOP, RW, non-exec.
+    let ustack_phys = pmm::allocate_pages(mmu::USER_STACK_PAGES);
+    let ustack_size = mmu::USER_STACK_PAGES * PAGE_SIZE;
+    let ustack_base = mmu::USER_STACK_TOP - ustack_size;
+    mmu::map_user_range(
+        l0,
+        ustack_base,
+        ustack_phys,
+        mmu::USER_STACK_PAGES,
+        mmu::PTE_AP_RW_EL0 | mmu::PTE_UXN | mmu::PTE_PXN | mmu::pte_attridx(1),
+    );
+
+    // Kernel stack frame: x19 = user entry, x20 = user SP, x30 = user_trampoline.
+    let frame = (kstack_top - 160) as *mut u64;
+    let pid = s.next_pid;
+    unsafe {
+        *frame.add(0) = mmu::USER_TEXT_BASE; // x19
+        *frame.add(1) = mmu::USER_STACK_TOP; // x20
+        *frame.add(11) = user_trampoline as usize as u64; // x30
+        (*t).sp = frame as u64;
+        (*t).ttbr0 = mmu::ttbr_pack(l0, pid as u16);
+        (*t).pid = pid;
+        (*t).state = TASK_READY;
+        (*t).stack_phys = kstack_phys;
+        (*t).user_sp = mmu::USER_STACK_TOP;
+        (*t).ustack_phys = ustack_phys;
+        (*t).user_l0 = l0;
+        (*t).utext_phys = utext_phys;
+        copy_name(&mut (*t).name, name);
+
+        let cur = s.current;
+        let mut tail = cur;
+        while (*tail).next != cur as u64 {
+            tail = (*tail).next as *mut Task;
+        }
+        (*tail).next = t as u64;
+        (*t).next = cur as u64;
+    }
+    s.next_pid += 1;
+    kprintln!("[SCHED] Created EL0 task {} '{}' (ttbr0 l0={:#x})", pid, name, l0);
     pid as i64
 }
 
@@ -250,6 +357,15 @@ pub fn reap() {
             kprintln!("[SCHED] Reaping task {} '{}'", (*dead).pid, name_str(&*dead));
             if (*dead).stack_phys != 0 {
                 pmm::free_pages((*dead).stack_phys, TASK_STACK_PAGES);
+            }
+            if (*dead).ustack_phys != 0 {
+                pmm::free_pages((*dead).ustack_phys, mmu::USER_STACK_PAGES);
+            }
+            if (*dead).utext_phys != 0 {
+                pmm::free_page((*dead).utext_phys);
+            }
+            if (*dead).user_l0 != 0 {
+                mmu::free_user_tables((*dead).user_l0);
             }
             kfree(dead as usize);
         }

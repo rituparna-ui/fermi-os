@@ -168,26 +168,35 @@ pub extern "C" fn exception_dispatch(type_: u64, frame: *mut TrapFrame) {
     match type_ {
         EXCEPTION_SYNC => match ec {
             EC_SVC_AARCH64 => {
-                // Wired to syscall_dispatch at the syscall milestone.
-                kprintln!("[EXCEPTION] SVC call (not implemented yet)");
-                dump_trap_frame(type_, frame);
+                crate::syscall::syscall_dispatch(frame);
             }
             EC_DATA_ABORT_CUR => {
                 dump_trap_frame(type_, frame);
                 kernel_panic("Data abort (kernel)");
             }
             EC_DATA_ABORT_LO => {
-                // Demand-paged stack growth + task kill wired at sched milestone.
-                dump_trap_frame(type_, frame);
-                kernel_panic("Data abort (user)");
+                let dfsc = esr_iss_dfsc(frame.esr);
+                kprintln!(
+                    "[FAULT] user data abort: {} FAR={:#x} region={}",
+                    dfsc_str(dfsc),
+                    frame.far,
+                    va_classify_user(frame.far)
+                );
+                kprintln!("  -> killing task");
+                crate::sched::task_exit();
             }
             EC_INST_ABORT_CUR => {
                 dump_trap_frame(type_, frame);
                 kernel_panic("Instruction abort (kernel)");
             }
             EC_INST_ABORT_LO => {
-                dump_trap_frame(type_, frame);
-                kernel_panic("Instruction abort (user)");
+                kprintln!(
+                    "[FAULT] user instruction abort FAR={:#x} region={}",
+                    frame.far,
+                    va_classify_user(frame.far)
+                );
+                kprintln!("  -> killing task");
+                crate::sched::task_exit();
             }
             EC_BRK => {
                 kprintln!("[EXCEPTION] Breakpoint hit");

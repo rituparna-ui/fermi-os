@@ -1,23 +1,28 @@
 // context_switch(prev: *mut Task, next: *mut Task)   x0=prev, x1=next
-// Saves callee-saved GPRs (x19-x30) and SIMD/FP (d8-d15) on prev's stack,
-// stores updated sp at prev->sp (offset 0), loads next->sp, restores.
+// Task layout: [0]=kernel sp, [8]=ttbr0 (packed; 0 => kernel task, no swap).
 //
-// Frame (160 bytes):
-//   [sp+0]  x19  [sp+8]  x20 ... [sp+80] x29 [sp+88] x30
-//   [sp+96] d8 ... [sp+152] d15
-//
-// d8-d15 must be preserved because the kernel uses FP/SIMD (core::fmt uses
-// SIMD registers); without this a task that formats output would corrupt
-// another task's callee-saved FP state.
+// Saves callee-saved GPRs (x19-x30) + FP (d8-d15) on prev's stack, stores sp
+// at prev->sp, loads next->sp, swaps TTBR0_EL1 if next is a user task, restores.
 
-// Task trampoline: first code a new EL1 task runs after context_switch ret's.
-// x19 = real entry point. IRQs are masked on entry (we were switched-in from
-// inside the timer IRQ), so unmask first.
+// EL0 task trampoline: first code a new user task runs after context_switch
+// ret's here. x19 = user entry VA, x20 = user SP (SP_EL0). TTBR0 is already
+// the task's user table (swapped by context_switch). Drop to EL0 via eret.
+.global user_trampoline
+user_trampoline:
+    msr daifclr, #2         // unmask IRQs
+    msr sp_el0, x20         // user stack pointer
+    msr elr_el1, x19        // user entry point
+    mov x0, #0              // SPSR = EL0t (all flags/EL bits zero)
+    msr spsr_el1, x0
+    isb
+    eret
+
+// EL1 kernel-task trampoline: x19 = entry fn. No privilege change.
 .global task_trampoline
 task_trampoline:
-    msr daifclr, #2     // unmask IRQs
-    blr x19             // call the task entry
-    bl  task_exit       // clean up + schedule away if it returns
+    msr daifclr, #2
+    blr x19
+    bl  task_exit
 1:  wfi
     b   1b
 
@@ -36,11 +41,21 @@ context_switch:
     stp d14, d15, [sp, #144]
 
     mov x2, sp
-    str x2, [x0, #0]    // prev->sp = sp
+    str x2, [x0, #0]        // prev->sp = sp
 
-    ldr x2, [x1, #0]    // sp = next->sp
+    ldr x2, [x1, #0]        // sp = next->sp
     mov sp, x2
 
+    // Swap TTBR0_EL1 for user tasks (next->ttbr0 != 0).
+    ldr x3, [x1, #8]
+    cbz x3, 2f
+    msr ttbr0_el1, x3
+    dsb ish
+    isb
+    tlbi vmalle1
+    dsb ish
+    isb
+2:
     ldp x19, x20, [sp, #0]
     ldp x21, x22, [sp, #16]
     ldp x23, x24, [sp, #32]

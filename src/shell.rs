@@ -92,7 +92,7 @@ fn cmd_free() {
     );
 }
 
-fn cmd_run(path: &str) {
+fn cmd_run(path: &str, arg: &str) {
     let node = vfs::resolve(path);
     if node.is_null() {
         kprintln!("run: {}: not found", path);
@@ -109,7 +109,8 @@ fn cmd_run(path: &str) {
             data.extend_from_slice(&chunk[..n as usize]);
         }
         vfs::fd_close(t, fd);
-        let pid = sched::spawn_elf("user", &data);
+        let args: &[&str] = if arg.is_empty() { &[] } else { &[arg] };
+        let pid = sched::spawn_elf("user", &data, args);
         kprintln!("run: spawned pid {}", pid);
     }
     vfs::fd_table_destroy(t);
@@ -350,7 +351,7 @@ fn dispatch(line: &str) {
             if arg1.is_empty() {
                 kprintln!("usage: run <elf-path>");
             } else {
-                cmd_run(arg1);
+                cmd_run(arg1, parts.next().unwrap_or(""));
             }
         }
         "cpuinfo" => {

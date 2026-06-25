@@ -18,6 +18,8 @@ mod fs;
 mod mm;
 mod panic;
 mod sched;
+mod syscall;
+mod user;
 
 use core::arch::global_asm;
 
@@ -155,10 +157,10 @@ pub extern "C" fn kmain() -> ! {
         fs::vfs::fd_table_destroy(t);
     }
 
-    // Scheduler + a couple of demo kernel tasks (mirrors the original boot).
+    // Scheduler + an EL0 user task and an EL1 kernel task.
     sched::init();
-    sched::create_task("task_a", task_a);
-    sched::create_task("task_b", task_b);
+    sched::create_task("task_user", user::task_user);
+    sched::create_kernel_task("task_k", task_k);
 
     // Start the periodic timer: from here, timer IRQs drive preemption.
     exception::timer::init();
@@ -171,20 +173,11 @@ pub extern "C" fn kmain() -> ! {
     }
 }
 
-/// Demo task: prints a few iterations, yielding between each, then exits.
-extern "C" fn task_a() {
-    for i in 0..5 {
-        kprintln!("[Task A] iteration {}", i);
-        sched::r#yield();
-    }
-    kprintln!("[Task A] done! exiting");
-}
-
-/// Demo task: prints periodically forever (preempted by the timer).
-extern "C" fn task_b() {
+/// Demo EL1 kernel task: prints periodically forever (preempted by the timer).
+extern "C" fn task_k() {
     loop {
-        kprintln!("[Task B] running");
-        for _ in 0..1_000_000 {
+        kprintln!("[Task K] (kernel) running");
+        for _ in 0..2_000_000 {
             core::hint::spin_loop();
         }
     }

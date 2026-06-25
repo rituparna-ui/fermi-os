@@ -154,6 +154,61 @@ pub fn dfsc_str(dfsc: u8) -> &'static str {
     }
 }
 
+/// Classify a user FAR against the fixed EL0 address regions for one-glance
+/// fault diagnosis.
+fn va_classify_user(far: u64) -> &'static str {
+    use crate::mm::consts::{USER_STACK_TOP, USER_TEXT_BASE};
+    let stack_pages = crate::sched::USER_STACK_PAGES_MAX; // active growth window upper bound
+    let _ = stack_pages;
+    if far >= 0xFFFF_0000_0000_0000 {
+        return "kernel-half VA (kernel-pointer leak?)";
+    }
+    if far < 0x1000 {
+        return "NULL-page (nullptr deref)";
+    }
+    let stack_lo = USER_STACK_TOP - 4 * 0x1000; // initial 16 KiB stack
+    if far >= USER_TEXT_BASE && far < stack_lo {
+        return "user code / data region";
+    }
+    if far >= stack_lo && far < USER_STACK_TOP {
+        return "user stack (active)";
+    }
+    if far >= stack_lo - 0x1000 && far < stack_lo {
+        return "just below user stack — STACK OVERFLOW likely";
+    }
+    if far >= USER_STACK_TOP {
+        return "above user range — wild pointer";
+    }
+    "user lower-half (unmapped)"
+}
+
+/// Compact decoded user-fault dump (data + instruction aborts from EL0).
+fn dump_user_abort(what: &str, t: *mut crate::sched::Task, frame: &TrapFrame) {
+    let ttbr0 = mrs!("ttbr0_el1");
+    let asid = (ttbr0 >> 48) as u16;
+    let dfsc = esr_iss_dfsc(frame.esr);
+    let (pid, name) = unsafe { ((*t).pid, crate::sched::task_name(t)) };
+
+    kprintln!("[FAULT] {} in task {} '{}' ASID={}", what, pid, name, asid);
+    kprintln!(
+        "  ELR={:#x}  FAR={:#x}  ESR={:#x}  SPSR={:#x}",
+        frame.elr,
+        frame.far,
+        frame.esr,
+        frame.spsr
+    );
+    kprintln!(
+        "  cause: {} (DFSC={:#x}){}{}{}",
+        dfsc_str(dfsc),
+        dfsc,
+        if esr_iss_wnr(frame.esr) { "  write" } else { "  read" },
+        if esr_iss_cm(frame.esr) { "  cache-maint" } else { "" },
+        if esr_iss_ea(frame.esr) { "  external-abort" } else { "" }
+    );
+    kprintln!("  FAR region: {}", va_classify_user(frame.far));
+    kprintln!("  -> killing task");
+}
+
 fn dump_trap_frame(t: u64, frame: &TrapFrame) {
     kprintln!("");
     kprintln!("========== EXCEPTION ==========");
@@ -198,26 +253,34 @@ pub extern "C" fn exception_dispatch(exc_type: u64, frame: &mut TrapFrame) {
     match exc_type {
         EXCEPTION_SYNC => match ec {
             EC_SVC_AARCH64 => {
-                // syscall_dispatch lands with the syscall subsystem.
-                dump_trap_frame(exc_type, frame);
-                kernel_panic("SVC before syscall subsystem is ported");
+                crate::syscall::dispatch(frame);
             }
             EC_DATA_ABORT_CUR => {
                 dump_trap_frame(exc_type, frame);
                 kernel_panic("Data abort (kernel)");
             }
             EC_DATA_ABORT_LO => {
-                // Demand-paged stack growth + task kill land with the scheduler.
-                dump_trap_frame(exc_type, frame);
-                kernel_panic("Data abort (user) before scheduler is ported");
+                // Translation faults in the user stack-growth zone => demand
+                // page and resume; everything else kills the offending task.
+                let t = crate::sched::current();
+                let dfsc = esr_iss_dfsc(frame.esr);
+                if (dfsc == 0x05 || dfsc == 0x06 || dfsc == 0x07)
+                    && crate::sched::try_grow_stack(t, frame.far)
+                {
+                    // resume the faulting instruction
+                } else {
+                    dump_user_abort("data abort", t, frame);
+                    crate::sched::task_exit();
+                }
             }
             EC_INST_ABORT_CUR => {
                 dump_trap_frame(exc_type, frame);
                 kernel_panic("Instruction abort (kernel)");
             }
             EC_INST_ABORT_LO => {
-                dump_trap_frame(exc_type, frame);
-                kernel_panic("Instruction abort (user) before scheduler is ported");
+                let t = crate::sched::current();
+                dump_user_abort("instruction abort", t, frame);
+                crate::sched::task_exit();
             }
             EC_BRK => {
                 kprintln!("[EXCEPTION] Breakpoint hit");

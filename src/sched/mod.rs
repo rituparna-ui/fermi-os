@@ -174,8 +174,7 @@ pub fn init() {
     // SAFETY (single-core): boot-time init.
     unsafe {
         let idle = alloc_task();
-        (*idle).pid = *NEXT_PID.get();
-        (*NEXT_PID.get()) += 1;
+        (*idle).pid = next_pid();
         // READY (not RUNNING) so schedule() can pick idle as a fallback.
         (*idle).state = TaskState::Ready;
         (*idle).next = idle; // circular
@@ -231,8 +230,7 @@ pub fn create_kernel_task(name: &str, entry: TaskEntry) -> i64 {
         frame.add(11).write(kernel_task_trampoline as usize as u64); // x30
 
         (*t).sp = frame as u64;
-        (*t).pid = *NEXT_PID.get();
-        (*NEXT_PID.get()) += 1;
+        (*t).pid = next_pid();
         (*t).state = TaskState::Ready;
         (*t).stack_phys = kstack_phys;
         (*t).ttbr0 = 0; // EL1: no TTBR0 swap
@@ -329,8 +327,7 @@ pub fn create_task(name: &str, entry: TaskEntry) -> i64 {
         frame.add(11).write(task_trampoline as usize as u64);
 
         (*t).sp = frame as u64;
-        (*t).pid = *NEXT_PID.get();
-        (*NEXT_PID.get()) += 1;
+        (*t).pid = next_pid();
         (*t).state = TaskState::Ready;
         (*t).stack_phys = kstack_phys;
         (*t).ttbr0 = ttbr_pack(user_l0, asid_alloc());
@@ -404,12 +401,13 @@ pub fn schedule() {
                 p = (*p).next;
             }
             (*p).next = (*prev).next;
-            (*prev).next = *DEAD_LIST.get();
-            (*DEAD_LIST.get()) = prev;
+            let dead = DEAD_LIST.get();
+            (*prev).next = *dead;
+            *dead = prev;
         }
 
         (*next).state = TaskState::Running;
-        (*CURRENT.get()) = next;
+        *CURRENT.get() = next;
         context_switch(prev as *mut u8, next as *mut u8);
     }
 }
@@ -425,13 +423,11 @@ pub fn r#yield() {
 /// Terminate the current task.
 #[no_mangle]
 pub extern "C" fn task_exit() {
+    let cur = current();
+    // SAFETY (single-core): cur is the running task.
     unsafe {
-        kprintln!(
-            "[SCHED] Task {} '{}' exiting",
-            (*(*CURRENT.get())).pid,
-            name_str(&(*(*CURRENT.get())).name)
-        );
-        (*(*CURRENT.get())).state = TaskState::Dead;
+        kprintln!("[SCHED] Task {} '{}' exiting", (*cur).pid, name_str(&(*cur).name));
+        (*cur).state = TaskState::Dead;
     }
     schedule();
 }
@@ -480,13 +476,15 @@ pub fn kill_task(pid: u64) -> i64 {
 /// Sleep the current task for `ms` milliseconds (>= one tick).
 pub fn sleep_ms(ms: u64) {
     let ticks = core::cmp::max(1, ms / exception::timer::TIMER_INTERVAL_MS);
+    let cur = current();
+    // SAFETY (single-core): cur is the running task; only it updates its fields.
     unsafe {
-        (*(*CURRENT.get())).sleep_until = exception::timer::get_ticks() + ticks;
-        (*(*CURRENT.get())).state = TaskState::Sleeping;
+        (*cur).sleep_until = exception::timer::get_ticks() + ticks;
+        (*cur).state = TaskState::Sleeping;
         kprintln!(
             "[SCHED] Task {} '{}' sleeping for {} ms ({} ticks)",
-            (*(*CURRENT.get())).pid,
-            name_str(&(*(*CURRENT.get())).name),
+            (*cur).pid,
+            name_str(&(*cur).name),
             ms,
             ticks
         );
@@ -607,7 +605,32 @@ pub fn reap() {
 }
 
 pub fn current() -> *mut Task {
+    // SAFETY (single-core): read of a pointer cell.
     unsafe { *CURRENT.get() }
+}
+
+#[inline]
+fn set_current(t: *mut Task) {
+    // SAFETY (single-core): mutated only with IRQs masked / from the sched path.
+    unsafe { *CURRENT.get() = t };
+}
+
+#[inline]
+fn idle() -> *mut Task {
+    // SAFETY (single-core): set once at init.
+    unsafe { *IDLE_TASK.get() }
+}
+
+/// Return the current NEXT_PID and post-increment it.
+#[inline]
+fn next_pid() -> u64 {
+    // SAFETY (single-core): pid counter touched only on the creation path.
+    unsafe {
+        let p = NEXT_PID.get();
+        let v = *p;
+        *p += 1;
+        v
+    }
 }
 
 /// The task's name as a &str (for logging). The returned slice borrows the
@@ -712,8 +735,7 @@ pub fn fork(parent: *mut Task, frame: *mut TrapFrame) -> i64 {
         }
 
         (*t).sp = switch_frame as u64;
-        (*t).pid = *NEXT_PID.get();
-        (*NEXT_PID.get()) += 1;
+        (*t).pid = next_pid();
         (*t).state = TaskState::Ready;
         (*t).stack_phys = kstack_phys;
         (*t).ttbr0 = ttbr_pack(user_l0, asid_alloc());

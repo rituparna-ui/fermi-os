@@ -23,6 +23,7 @@
 
 guest1_payload:
 	fmov	d5, #2.0           // sentinel; must survive every preemption
+	mov	x20, #0            // iteration counter (survives preemption in regs[])
 1:
 	mov	x0, #HVC_PUTC
 	mov	x1, #'['
@@ -55,6 +56,16 @@ guest1_payload:
 	fmul	d3, d2, d0
 	fmov	d4, #-3.0
 
+	// After 6 iterations, voluntarily power off via PSCI SYSTEM_OFF. The
+	// hypervisor reaps this vCPU and stops scheduling it.
+	add	x20, x20, #1
+	cmp	x20, #6
+	b.lt	4f
+	movz	x0, #0x0008
+	movk	x0, #0x8400, lsl #16   // x0 = 0x84000008 (PSCI SYSTEM_OFF)
+	hvc	#0
+	// not reached
+4:
 	// Busy-delay so output is paced; no yield.
 	movz	x9, #0x600, lsl #16   // x9 = 0x06000000
 2:

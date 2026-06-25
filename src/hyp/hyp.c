@@ -532,6 +532,59 @@ static const char *ec_name(uint64_t ec) {
  * ELR_EL2 already points past the HVC, so no PC adjustment is needed. */
 static void hyp_world_switch(el2_frame_t *f);
 
+/* PSCI function IDs (SMC Calling Convention, 32-bit space). */
+#define PSCI_VERSION_FN 0x84000000
+#define PSCI_SYSTEM_OFF 0x84000008
+#define PSCI_SYSTEM_RESET 0x84000009
+
+/* Reap the running vCPU and switch to the next runnable one without saving
+ * the dying vCPU's state. If none remain, halt. */
+static void hyp_vcpu_exit(el2_frame_t *f) {
+  vcpu_t *cur = &vcpus[current_vcpu];
+  hyp_puts("[HYP] vCPU ");
+  hyp_puthex(cur->id);
+  hyp_puts(" powered off (PSCI)\n");
+  cur->state = VCPU_UNUSED;
+
+  int next = hyp_pick_next(current_vcpu);
+  if (next == current_vcpu) {
+    hyp_puts("[HYP] no runnable vCPUs left; halting\n");
+    for (;;)
+      __asm__ __volatile__("wfi");
+  }
+
+  vcpu_t *nv = &vcpus[next];
+  current_vcpu = next;
+  nv->state = VCPU_RUNNING;
+  g_switch_count++;
+
+  for (int i = 0; i < 31; i++)
+    f->x[i] = nv->regs[i];
+  MSR(elr_el2, nv->pc);
+  MSR(spsr_el2, nv->pstate);
+  MSR(vttbr_el2, nv->vttbr);
+  __asm__ __volatile__("isb");
+  hyp_restore_el1(nv);
+  hyp_restore_vgic(nv);
+  hyp_restore_fp(nv);
+}
+
+/* Minimal PSCI: report a version, and treat SYSTEM_OFF / SYSTEM_RESET from a
+ * guest as "this VM is done" — reap it. Returns nonzero if handled. */
+static int hyp_handle_psci(el2_frame_t *f, uint64_t fn) {
+  switch (fn) {
+  case PSCI_VERSION_FN:
+    f->x[0] = 0x00010001; /* PSCI v1.1 */
+    return 1;
+  case PSCI_SYSTEM_OFF:
+  case PSCI_SYSTEM_RESET:
+    hyp_vcpu_exit(f); /* does not return to the caller's vCPU */
+    return 1;
+  default:
+    return 0;
+  }
+}
+
 static void hyp_handle_hvc(el2_frame_t *f) {
   uint64_t fn = f->x[0];
   uint64_t a1 = f->x[1];
@@ -540,6 +593,16 @@ static void hyp_handle_hvc(el2_frame_t *f) {
   vcpu_t *cur = &vcpus[current_vcpu];
 
   cur->hvc_count++;
+
+  /* PSCI calls use the 0x8400_00xx / 0xC400_00xx function-ID space, distinct
+   * from our small-integer hypercall ABI. Dispatch them first. */
+  if ((fn & 0xFFFFFF00U) == 0x84000000U ||
+      (fn & 0xFFFFFF00U) == 0xC4000000U) {
+    if (hyp_handle_psci(f, fn))
+      return;
+    f->x[0] = (uint64_t)-1; /* PSCI NOT_SUPPORTED */
+    return;
+  }
 
   switch (fn) {
   case HVC_VERSION:

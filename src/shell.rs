@@ -115,6 +115,17 @@ fn cmd_run(path: &str) {
     vfs::fd_table_destroy(t);
 }
 
+fn cmd_top() {
+    kprintln!("== Fermi OS top ==  uptime {} ms  cntpct {}",
+              timer::uptime_ms(), timer::get_count());
+    let total = pmm::total_pages();
+    let used = pmm::used_pages();
+    kprintln!("mem: {}/{} pages used  heap {} used / {} free bytes",
+              used, total, heap::used_bytes(), heap::free_bytes());
+    kprint!("{}", sched::render_tasks());
+    kprint!("{}", crate::exception::gic::render_interrupts());
+}
+
 fn dispatch(line: &str) {
     let mut parts = line.split_whitespace();
     let cmd = match parts.next() {
@@ -124,7 +135,7 @@ fn dispatch(line: &str) {
     let arg1 = parts.next().unwrap_or("");
     match cmd {
         "help" => {
-            kprintln!("builtins: help uptime version ps free meminfo ifconfig irqs");
+            kprintln!("builtins: help uptime version ps top free meminfo ifconfig irqs");
             kprintln!("          cat <path> ping sleep <ms> kill <pid> echo <text>");
             kprintln!("          balloon <inflate|deflate|status> [n] vlog <text> clear");
             kprintln!("          ls [path] run <elf-path> cpuinfo reboot");
@@ -132,6 +143,7 @@ fn dispatch(line: &str) {
         "uptime" => kprintln!("up {} ms ({} s)", timer::uptime_ms(), timer::uptime_seconds()),
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
         "ps" => kprint!("{}", sched::render_tasks()),
+        "top" => cmd_top(),
         "free" | "meminfo" => cmd_free(),
         "ifconfig" => kprint!("{}", net::render_info()),
         "irqs" => kprint!("{}", gic::render_interrupts()),

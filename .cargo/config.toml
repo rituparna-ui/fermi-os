@@ -1,0 +1,10 @@
+[build]
+target = "aarch64-unknown-none"
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tlinker.ld",
+    "-C", "link-arg=--no-rosegment",
+    "-C", "force-frame-pointers=yes",
+]
+runner = "qemu-system-aarch64 -machine virt,gic-version=3 -cpu cortex-a72 -m 8G -nographic -device virtio-rng-pci,disable-legacy=on -kernel"

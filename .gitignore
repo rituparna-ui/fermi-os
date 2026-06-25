@@ -1,11 +1,6 @@
-build/
-compile_commands.json
-.cache/
-.DS_Store
-*.swp
+/build
+/target
+qemu-virt.dts
+qemu-virt.dtb
 *.o
-*.d
-user/*.elf
-user/*.bin
-wasabi-toolbag/
-
+*.elf

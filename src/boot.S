@@ -1,27 +1,31 @@
+// Fermi OS boot stub (aarch64 assembly).
+// Mirrors the original src/boot.S: set up the stack and jump into the kernel.
+// Additions over the very first C commit: mask interrupts and zero the BSS
+// before entering Rust (Rust statics in .bss require a zeroed region).
+
 .section .text.boot
-.global _start
-
-.equ KERNEL_VA_OFFSET, 0xFFFF000000000000
-
+.globl _start
 _start:
-	// Symbols are now linked at upper-half VAs.
-	// Before MMU is on, we need PHYSICAL addresses, so subtract the offset.
-	ldr x0, =__stack_top
-	ldr x1, =KERNEL_VA_OFFSET
-	sub x0, x0, x1			// physical stack top
-	mov sp, x0
+    // Mask all interrupts (D, A, I, F) until we are ready.
+    msr     daifset, #0xf
 
-	// PC is physical. early_init is linked at upper-half but bl is PC-relative,
-	// so it branches to physical early_init. early_init enables MMU.
-	bl early_init
+    // Set up the boot stack.
+    ldr     x0, =__stack_top
+    mov     sp, x0
 
-	// MMU now on, TTBR1 maps upper half. Switch to upper-half VAs directly.
-	ldr x0, =__stack_top
-	mov sp, x0
+    // Zero the BSS: [__bss_start, __bss_end).
+    ldr     x1, =__bss_start
+    ldr     x2, =__bss_end
+1:
+    cmp     x1, x2
+    b.hs    2f
+    str     xzr, [x1], #8
+    b       1b
+2:
+    // Enter the Rust kernel.
+    bl      rust_main
 
-	ldr x1, =kernel_main
-	br x1
-
-	// panic if kernel_main returns
-	ldr x1, =kernel_panic_return
-	br x1
+    // rust_main should never return; park the core if it does.
+3:
+    wfe
+    b       3b

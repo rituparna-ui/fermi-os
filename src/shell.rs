@@ -171,12 +171,26 @@ fn dispatch(line: &str) {
                 cmd_cat(arg1);
             }
         }
+        "http" => {
+            if arg1.is_empty() { kprintln!("usage: http <host>"); }
+            else if !net::http_get(arg1) { kprintln!("http: failed"); }
+        }
         "ping" => {
             let ttl = net::ping(1);
             if ttl >= 0 {
                 kprintln!("reply from gateway ttl={}", ttl);
             } else {
                 kprintln!("ping: no reply");
+            }
+        }
+        "resolve" => {
+            if arg1.is_empty() {
+                kprintln!("usage: resolve <hostname>");
+            } else {
+                match net::resolve(arg1) {
+                    Some(ip) => kprintln!("{} -> {}.{}.{}.{}", arg1, ip[0], ip[1], ip[2], ip[3]),
+                    None => kprintln!("resolve: {}: no answer", arg1),
+                }
             }
         }
         "sleep" => {

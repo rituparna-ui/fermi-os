@@ -353,6 +353,32 @@ pub fn wake_sleepers() {
 }
 
 /// Kill a task by pid. Returns 0 on success, -1 if not found / not killable.
+/// Render the run-queue as a /proc/tasks table.
+pub fn render_tasks() -> alloc::string::String {
+    use core::fmt::Write;
+    let s = unsafe { SCHED.get() };
+    let mut out = alloc::string::String::new();
+    let _ = writeln!(out, "PID  STATE     NAME");
+    unsafe {
+        let idle = &mut s.idle as *mut Task;
+        let mut t = idle;
+        loop {
+            let state = match (*t).state {
+                TASK_READY => "READY",
+                TASK_RUNNING => "RUNNING",
+                TASK_SLEEPING => "SLEEPING",
+                _ => "DEAD",
+            };
+            let _ = writeln!(out, "{:<4} {:<9} {}", (*t).pid, state, name_str(&*t));
+            t = (*t).next as *mut Task;
+            if t == idle {
+                break;
+            }
+        }
+    }
+    out
+}
+
 pub fn kill(pid: u64) -> i64 {
     let s = unsafe { SCHED.get() };
     unsafe {

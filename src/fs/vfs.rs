@@ -26,6 +26,17 @@ pub enum VnodeType {
 
 /// Device behaviour for a vnode (replaces the C file_operations vtable).
 #[derive(Clone, Copy, PartialEq)]
+pub enum ProcKind {
+    Uptime,
+    Meminfo,
+    Tasks,
+    Interrupts,
+    Netinfo,
+    Cmdline,
+    Version,
+}
+
+#[derive(Clone, Copy, PartialEq)]
 pub enum DevOps {
     None,
     Console,
@@ -36,6 +47,8 @@ pub enum DevOps {
     Vcons,
     /// FAT32 regular file: private = (first_cluster, size) read via fat32.
     Fat32File,
+    /// /proc synthetic file regenerated per read.
+    Proc(ProcKind),
 }
 
 #[repr(C)]
@@ -223,6 +236,17 @@ fn dev_read(node: *mut Vnode, offset: i64, buf: &mut [u8]) -> i32 {
             buf.len() as i32
         }
         DevOps::Fat32File => crate::fs::fat32::read_file(node, offset as u64, buf),
+        DevOps::Proc(kind) => {
+            let content = crate::fs::proc::generate(kind);
+            let bytes = content.as_bytes();
+            let off = offset as usize;
+            if off >= bytes.len() {
+                return 0;
+            }
+            let n = core::cmp::min(buf.len(), bytes.len() - off);
+            buf[..n].copy_from_slice(&bytes[off..off + n]);
+            n as i32
+        }
         DevOps::None => -1,
     }
 }
@@ -258,7 +282,7 @@ fn dev_write(node: *mut Vnode, offset: i64, buf: &[u8]) -> i32 {
             }
             buf.len() as i32
         }
-        DevOps::Rng | DevOps::Fat32File | DevOps::None => -1,
+        DevOps::Rng | DevOps::Fat32File | DevOps::Proc(_) | DevOps::None => -1,
     }
 }
 

@@ -46,6 +46,20 @@ extern "C" fn task_a() {
     }
 }
 
+extern "C" fn netd() {
+    let mut seq: u16 = 1;
+    loop {
+        sched::sleep_ms(5000);
+        let ttl = net::ping(seq);
+        if ttl >= 0 {
+            kprintln!("[netd] ping seq={} reply ttl={}", seq, ttl);
+        } else {
+            kprintln!("[netd] ping seq={} no reply", seq);
+        }
+        seq = seq.wrapping_add(1);
+    }
+}
+
 extern "C" fn task_b() {
     for i in 0..4 {
         kprintln!("    [task_b] iteration {}", i);
@@ -153,6 +167,22 @@ pub extern "C" fn kernel_main() -> ! {
     let mnt = fs::vfs::create_node(fs::vfs::resolve("/"), "mnt", fs::vfs::VnodeType::Dir);
     fs::vfs::create_node(mnt, "fat32", fs::vfs::VnodeType::Dir);
     fs::fat32::vfs_mount("/mnt/fat32");
+    fs::proc::mount();
+    {
+        let t = fs::vfs::fd_table_create();
+        for path in ["/proc/uptime", "/proc/meminfo", "/proc/version"].iter() {
+            let fd = fs::vfs::fd_open(t, path);
+            if fd >= 0 {
+                let mut b = [0u8; 256];
+                let n = fs::vfs::fd_read(t, fd, &mut b);
+                let txt = core::str::from_utf8(&b[..n.max(0) as usize]).unwrap_or("?");
+                kprintln!("[boot] cat {}:", path);
+                crate::kprint!("{}", txt);
+                fs::vfs::fd_close(t, fd);
+            }
+        }
+        fs::vfs::fd_table_destroy(t);
+    }
     {
         let t = fs::vfs::fd_table_create();
         let fd = fs::vfs::fd_open(t, "/mnt/fat32/HELLO.TXT");
@@ -172,6 +202,7 @@ pub extern "C" fn kernel_main() -> ! {
     // Scheduler + a couple of preemptive EL1 demo tasks.
     sched::init();
     sched::create_task("task_a", task_a);
+    sched::create_task("netd", netd);
     sched::create_user_task("user1");
     exception::timer::start(exception::timer::TIMER_INTERVAL_MS);
     kprintln!("[boot] scheduler running; idle loop reaping dead tasks");

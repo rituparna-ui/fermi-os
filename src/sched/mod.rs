@@ -125,6 +125,50 @@ pub fn current() -> *mut Task {
     unsafe { SCHED.get() }.current
 }
 
+/// Allocate and initialize an EL1 kernel task WITHOUT linking it into core 0's
+/// run queue. Used by the secondary core to build its own task set. `pid` is
+/// caller-chosen to avoid racing core 0's pid counter.
+pub fn make_kernel_task(name: &str, pid: u64, entry: TaskEntry) -> *mut Task {
+    let t = kmalloc(core::mem::size_of::<Task>()) as *mut Task;
+    if t.is_null() {
+        return t;
+    }
+    unsafe { core::ptr::write_bytes(t as *mut u8, 0, core::mem::size_of::<Task>()) };
+    let stack_phys = pmm::allocate_pages(TASK_STACK_PAGES);
+    if stack_phys == 0 {
+        kfree(t as usize);
+        return core::ptr::null_mut();
+    }
+    let stack_va = phys_to_virt(stack_phys);
+    let stack_top = stack_va + TASK_STACK_PAGES * PAGE_SIZE;
+    unsafe {
+        core::ptr::write_bytes(stack_va as *mut u8, 0, (TASK_STACK_PAGES * PAGE_SIZE) as usize);
+        let frame = (stack_top - 160) as *mut u64;
+        *frame.add(0) = entry as usize as u64; // x19
+        *frame.add(11) = task_trampoline as usize as u64; // x30
+        (*t).sp = frame as u64;
+        (*t).pid = pid;
+        (*t).state = TASK_READY;
+        (*t).stack_phys = stack_phys;
+        copy_name(&mut (*t).name, name);
+    }
+    t
+}
+
+/// Raw context switch (for the secondary core's own scheduler).
+pub unsafe fn raw_context_switch(prev: *mut Task, next: *mut Task) {
+    context_switch(prev, next);
+}
+
+/// Allocate a bare (zeroed) Task struct (e.g. a core's idle context).
+pub fn alloc_bare_task() -> *mut Task {
+    let t = kmalloc(core::mem::size_of::<Task>()) as *mut Task;
+    if !t.is_null() {
+        unsafe { core::ptr::write_bytes(t as *mut u8, 0, core::mem::size_of::<Task>()) };
+    }
+    t
+}
+
 pub fn create_task(name: &str, entry: TaskEntry) -> i64 {
     let s = unsafe { SCHED.get() };
     let t = kmalloc(core::mem::size_of::<Task>()) as *mut Task;

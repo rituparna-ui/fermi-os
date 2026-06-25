@@ -135,8 +135,12 @@ fn dispatch(line: &str) {
                 let h1 = crate::smp::heartbeat();
                 sched::sleep_ms(300);
                 let h2 = crate::smp::heartbeat();
-                kprintln!("core1 (higher half) MPIDR={:#x} heartbeat {} -> {} (+{})",
-                          crate::smp::secondary_mpidr(), h1, h2, h2 - h1);
+                kprintln!("core1 MPIDR={:#x} idle-beats {} -> {}", crate::smp::secondary_mpidr(), h1, h2);
+                let (a1, b1) = crate::smp::task_beats();
+                sched::sleep_ms(300);
+                let (a2, b2) = crate::smp::task_beats();
+                kprintln!("  core1 task c1a: {} -> {} (+{})", a1, a2, a2 - a1);
+                kprintln!("  core1 task c1b: {} -> {} (+{})", b1, b2, b2 - b1);
             } else {
                 kprintln!("secondary not online (-smp 2)");
             }

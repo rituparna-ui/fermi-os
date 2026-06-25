@@ -78,9 +78,26 @@ __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_dev
 /* Third guest (vCPU 2): a tiny silent bare-metal payload in its own isolated
  * 2 MiB slice of Fermi-invisible high RAM (just past the Linux window). It
  * uses only hypercalls — no UART, no GIC — so its stage-2 maps only its RAM. */
-#define GUEST2_PHYS_BASE 0x280000000ULL /* 10 GiB                              */
-#define GUEST2_IPA_BASE 0x40000000ULL   /* its own private IPA view            */
-#define GUEST2_RAM_SIZE _2MB
+
+/* Migratable guest (vCPU 3) for the live-migration demo. Its 2 MiB RAM lives in
+ * Fermi-invisible high RAM past the ext4 disk image; it can be relocated SRC ->
+ * DEST while running. Its stage-2 is page-granular (4 KiB) so we can
+ * write-protect pages and track which ones the guest dirties during pre-copy. */
+#define MIG_IPA_BASE 0x40000000ULL      /* the guest's own IPA view            */
+#define MIG_RAM_SIZE _2MB
+#define MIG_PAGES (MIG_RAM_SIZE / 4096)  /* 512 pages                          */
+#define MIG_SRC 0x281000000ULL          /* source window  (~10 GiB + 16 MiB)   */
+#define MIG_DEST 0x281200000ULL         /* destination window (SRC + 2 MiB)    */
+#define MIG_COUNTER_OFF 0x10000ULL       /* guest keeps its counter here        */
+
+extern uint8_t guest3_payload[];
+extern uint8_t guest3_payload_end[];
+
+/* Live-migration state machine, driven from the scheduler tick so the guest
+ * keeps running between phases. */
+#define MIGS_NONE 0
+#define MIGS_LIVE 1     /* pre-copied; guest running with dirty tracking on */
+#define MIGS_DONE 2
 
 /* The vCPUs and the index of the one currently running. In .hyp_tables
  * (NOLOAD); initialised explicitly in hyp_init(). */
@@ -89,6 +106,15 @@ __attribute__((section(".hyp_tables"))) static int current_vcpu;
 __attribute__((section(".hyp_tables"))) static uint64_t g_switch_count;
 __attribute__((section(".hyp_tables"))) static uint64_t g_wfi_count;
 __attribute__((section(".hyp_tables"))) static uint64_t g_midr;
+/* Migration bookkeeping. */
+__attribute__((section(".hyp_tables"))) static int g_mig_state;
+__attribute__((section(".hyp_tables"))) static uint64_t g_mig_live_ticks;
+__attribute__((section(".hyp_tables"))) static uint64_t g_mig_post_logs;
+__attribute__((section(".hyp_tables"))) static uint8_t g_mig_dirty[MIG_PAGES];
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t mig_l0[512];
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t mig_l1[512];
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t mig_l2[512];
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t mig_l3[512];
 
 /* Captured Linux-guest console. The Linux PL011 is left unmapped in its
  * stage-2, so its UART MMIO traps to EL2 and is emulated (hyp_emulate_pl011);
@@ -146,6 +172,8 @@ __attribute__((section(".hyp_tables"))) static uint64_t g_quantum_ticks;
 
 static void hyp_create_linux_guest(void);
 static void hyp_create_linux_secondary(void);
+static void hyp_create_mig_guest(void);
+static void hyp_migration_step(void);
 static void hyp_tick_init(void);
 static void hyp_vgic_inject_ex(int target, uint32_t intid, int hw);
 static void hyp_tick_start(void);
@@ -357,6 +385,8 @@ void hyp_init(void) {
   hyp_puts("[HYP] created Linux-slot guest (vCPU 1): 1 GiB @ IPA 0x40000000\n");
   hyp_create_linux_secondary();
   hyp_puts("[HYP] prepared Linux SMP secondary (vCPU 2), parked for CPU_ON\n");
+  hyp_create_mig_guest();
+  hyp_puts("[HYP] created migratable guest (vCPU 3): 2 MiB @ live-migration demo\n");
 
   /* Start the preemptive scheduling tick (CNTHP / PPI 26). */
   hyp_tick_init();
@@ -587,6 +617,37 @@ static void hyp_create_linux_secondary(void) {
   v->state = VCPU_UNUSED;                        /* parked until CPU_ON       */
   v->mpidr = 0x80000001ULL;                      /* core 1 (aff0=1)           */
   v->vttbr = ((uint64_t)lx_l0) | (1ULL << 48);   /* shares Linux VMID 1       */
+}
+
+/* Migratable guest (vCPU 3): a tiny counter payload in its own 2 MiB window,
+ * with a page-granular (4 KiB) stage-2 so the hypervisor can write-protect
+ * pages and track dirty ones during a live migration. */
+static void hyp_create_mig_guest(void) {
+  for (int i = 0; i < 512; i++) {
+    mig_l0[i] = 0; mig_l1[i] = 0; mig_l2[i] = 0; mig_l3[i] = 0;
+  }
+  uint64_t gb = MIG_IPA_BASE / _1GB;          /* L1 index */
+  uint64_t mb = (MIG_IPA_BASE % _1GB) / _2MB; /* L2 index */
+  mig_l0[0] = ((uint64_t)mig_l1) | S2_TABLE | S2_VALID;
+  mig_l1[gb] = ((uint64_t)mig_l2) | S2_TABLE | S2_VALID;
+  mig_l2[mb] = ((uint64_t)mig_l3) | S2_TABLE | S2_VALID; /* L2 -> L3 (4K pages) */
+  for (uint64_t i = 0; i < MIG_PAGES; i++)
+    mig_l3[i] = (MIG_SRC + i * 4096) | S2_PAGE | S2_AF | S2_SH_INNER |
+                S2_AP_RW | S2_MEM_NORMAL;
+  __asm__ __volatile__("dsb ish");
+
+  /* Copy the payload into the source window (physical, MMU off). */
+  uint64_t len = (uint64_t)(guest3_payload_end - guest3_payload);
+  memcpy((void *)MIG_SRC, guest3_payload, len);
+
+  vcpu_t *v = &vcpus[3];
+  memset(v, 0, sizeof(*v));
+  v->id = 3;
+  v->state = VCPU_READY;
+  v->mpidr = 0x80000003ULL;
+  v->pc = MIG_IPA_BASE;                          /* entry (IPA)               */
+  v->pstate = 0x3c5;                             /* EL1h, DAIF masked         */
+  v->vttbr = ((uint64_t)mig_l0) | (3ULL << 48);  /* VMID 3                    */
 }
 
 /* Bring up just enough of the physical GIC for the hypervisor's own timer
@@ -1672,6 +1733,22 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
   uint64_t ipa_page = (hpfar >> 4) << 12; /* HPFAR[43:4] = IPA[51:12] */
   uint64_t ipa = ipa_page | (far & 0xFFF);
 
+  /* Live-migration dirty tracking: a write by the migratable guest (vCPU 3) to
+   * one of its write-protected pages during the live window. Record the page as
+   * dirty, re-grant write permission, and RE-EXECUTE the store (do not advance
+   * ELR). */
+  if (current_vcpu == 3 && g_mig_state == MIGS_LIVE && ((esr >> 6) & 1) &&
+      ipa >= MIG_IPA_BASE && ipa < MIG_IPA_BASE + MIG_RAM_SIZE) {
+    uint64_t idx = (ipa - MIG_IPA_BASE) / 4096;
+    if (idx < MIG_PAGES) {
+      g_mig_dirty[idx] = 1;
+      mig_l3[idx] = (MIG_SRC + idx * 4096) | S2_PAGE | S2_AF | S2_SH_INNER |
+                    S2_AP_RW | S2_MEM_NORMAL;
+      __asm__ __volatile__("dsb ish; tlbi alle1is; dsb ish; isb");
+    }
+    return; /* re-execute the store with write permission now granted */
+  }
+
   uint64_t hs = (uint64_t)__hyp_start;
   uint64_t he = (uint64_t)__hyp_end;
 
@@ -1751,9 +1828,9 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
 
   /* Linux guest hit an unhandled fault: reap it (keeping the primary guest
    * and hypervisor alive), logging where it died. */
-  if (current_vcpu == 1 || current_vcpu == 2) {
+  if (current_vcpu != 0) {
     vcpus[current_vcpu].abort_count++;
-    hyp_puts("\n[HYP] Linux guest unhandled abort: IPA=");
+    hyp_puts("\n[HYP] guest vCPU unhandled abort: IPA=");
     hyp_puthex(ipa);
     hyp_puts(" ESR=");
     hyp_puthex(esr);
@@ -1849,6 +1926,73 @@ static void hyp_uart_rx_kick(void) {
     hyp_vgic_inject_ex(1 /* Linux vCPU */, UART_SPI_INTID, 0 /* SW */);
 }
 
+/* Drive the live migration of vCPU 3 across scheduler ticks (so the guest keeps
+ * running between phases). One pre-copy round + a live window with stage-2
+ * dirty tracking + a final stop-and-copy that re-points the guest's stage-2 to
+ * the destination window and poisons the source. */
+static void hyp_migration_step(void) {
+  const uint64_t page_rw = S2_PAGE | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
+
+  if (g_mig_state == MIGS_NONE) {
+    if (vcpus[3].state == VCPU_UNUSED || vcpus[3].hvc_count <= 60)
+      return; /* wait until the guest has been running for a while */
+    uint64_t pre = *(volatile uint64_t *)(MIG_SRC + MIG_COUNTER_OFF);
+    hyp_puts("[HYP] live-migrate vCPU3: pre-copy 2 MiB SRC->DEST; counter=");
+    hyp_puthex(pre);
+    hyp_puts("\n");
+    /* Write-protect every page and clear the dirty set, then copy it all. */
+    for (uint64_t i = 0; i < MIG_PAGES; i++) {
+      g_mig_dirty[i] = 0;
+      mig_l3[i] = (MIG_SRC + i * 4096) | S2_PAGE | S2_AF | S2_SH_INNER |
+                  S2_AP_RO | S2_MEM_NORMAL;
+    }
+    __asm__ __volatile__("dsb ish; tlbi alle1is; dsb ish; isb");
+    memcpy((void *)MIG_DEST, (void *)MIG_SRC, MIG_RAM_SIZE);
+    g_mig_state = MIGS_LIVE;
+    g_mig_live_ticks = 0;
+    return;
+  }
+
+  if (g_mig_state == MIGS_LIVE) {
+    if (++g_mig_live_ticks < 40)
+      return; /* let the guest run and dirty pages (tracked via write faults) */
+    int dirty = 0;
+    for (uint64_t i = 0; i < MIG_PAGES; i++)
+      if (g_mig_dirty[i]) {
+        memcpy((void *)(MIG_DEST + i * 4096), (void *)(MIG_SRC + i * 4096), 4096);
+        dirty++;
+      }
+    /* Re-point the guest's stage-2 from SRC to DEST (write-enabled), flush. */
+    for (uint64_t i = 0; i < MIG_PAGES; i++)
+      mig_l3[i] = (MIG_DEST + i * 4096) | page_rw;
+    __asm__ __volatile__("dsb ish; tlbi alle1is; dsb ish; isb");
+    uint64_t cnt = *(volatile uint64_t *)(MIG_DEST + MIG_COUNTER_OFF);
+    memset((void *)MIG_SRC, 0xEE, MIG_RAM_SIZE); /* poison the old window */
+    hyp_puts("[HYP] live-migrate: stop-copy synced ");
+    hyp_puthex((uint64_t)dirty);
+    hyp_puts(" dirty page(s); stage-2 now SRC->DEST; SRC poisoned; counter(DEST)=");
+    hyp_puthex(cnt);
+    hyp_puts("\n");
+    g_mig_state = MIGS_DONE;
+    g_mig_live_ticks = 0;
+    g_mig_post_logs = 0;
+    return;
+  }
+
+  if (g_mig_state == MIGS_DONE) {
+    if (g_mig_post_logs < 3 && (g_mig_live_ticks++ % 25) == 0) {
+      uint64_t cnt = *(volatile uint64_t *)(MIG_DEST + MIG_COUNTER_OFF);
+      uint64_t poison = *(volatile uint64_t *)(MIG_SRC + MIG_COUNTER_OFF);
+      hyp_puts("[HYP] post-migrate: vCPU3 counter(DEST)=");
+      hyp_puthex(cnt);
+      hyp_puts(" climbing; SRC still poisoned=");
+      hyp_puthex(poison);
+      hyp_puts("\n");
+      g_mig_post_logs++;
+    }
+  }
+}
+
 /* Physical IRQ taken at EL2 (HCR_EL2.IMO). Ack on the physical CPU interface,
  * inject a hardware-linked virtual copy into the guest, then priority-drop
  * (EOImode=1 means this does not deactivate — the guest will, via the HW
@@ -1869,6 +2013,7 @@ static void hyp_handle_irq(el2_frame_t *frame) {
     __asm__ __volatile__("msr icc_eoir1_el1, %0" ::"r"(iar)); /* prio drop  */
     __asm__ __volatile__("msr icc_dir_el1, %0" ::"r"(iar));   /* deactivate */
     hyp_uart_rx_kick(); /* deliver any pending Linux console input */
+    hyp_migration_step(); /* advance the live-migration demo */
     hyp_world_switch(frame);
     return;
   }

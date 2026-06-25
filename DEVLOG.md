@@ -364,6 +364,30 @@ printed by the pivoted init, then `nproc` 2 + `ping` working from the disk root.
 No soft lockup, no anomalies. Lesson: time-sliced SMP guests are pathologically
 sensitive to IPI latency — `stop_machine` is the canary.
 
+### Live migration (local, pre-copy + dirty tracking)
+*Why:* the migration *mechanism* — relocating a running guest's RAM + CPU state
+transparently. True cross-host migration isn't possible here (one QEMU process,
+no second hypervisor / transport), so this demonstrates the algorithm locally:
+move a live guest's memory from one physical window to another and resume it
+there, with the guest none the wiser.
+- A small migratable guest (vCPU 3, `guest3.S`) increments a counter in its RAM
+  every loop — observable proof of liveness/continuity. Its 2 MiB window has a
+  **page-granular (4 KiB) stage-2** so individual pages can be write-protected.
+- **Pre-copy:** write-protect all 512 pages, copy SRC→DEST while the guest runs.
+- **Dirty tracking:** a guest write to a protected page faults to EL2; the
+  handler marks that page dirty, re-grants write, TLBIs, and *re-executes* the
+  store (ELR not advanced).
+- **Stop-and-copy:** after a live window, re-copy only the dirtied pages, then
+  re-point the guest's stage-2 (`mig_l3`) SRC→DEST, `tlbi`, and poison SRC.
+The whole state machine is driven from the scheduler tick so the guest keeps
+running between phases.
+*Verified:* `pre-copy … counter=0x3d` → `stop-copy synced 0x1 dirty page(s)`
+(exactly the counter page) → `counter(DEST)=0x47` and then `0x51`, `0x5b`
+climbing, while `SRC poisoned=0xeeeeeeeeeeeeeeee` — the counter is continuous
+across the move and the guest provably runs from the destination (the source is
+poisoned yet it keeps counting). All concurrent with the SMP Linux guest booting
+from its ext4 root disk. No anomalies.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)
@@ -401,6 +425,8 @@ under preemptive scheduling**:
   (can `ping` the hypervisor host `10.0.0.1`).
 - **vCPU 2:** Linux's **second core** (SMP secondary), brought online by the boot
   CPU via PSCI `CPU_ON`; `nproc` reports 2.
+- **vCPU 3:** a small **migratable** guest that is live-migrated between two
+  physical RAM windows (pre-copy + stage-2 dirty tracking + stop-and-copy).
 
 Full per-guest context is switched: GP regs, PC/PSTATE, the EL1 system-register
 bank (including `SP_EL0`), vGIC state, and FP/SIMD. Memory is mutually isolated

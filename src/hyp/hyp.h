@@ -27,6 +27,8 @@
 #define S2_AF (1ULL << 10)        /* Access flag */
 #define S2_SH_INNER (3ULL << 8)   /* Inner shareable */
 #define S2_AP_RW (3ULL << 6)      /* S2AP = read/write at EL0 & EL1 */
+#define S2_AP_RO (1ULL << 6)      /* S2AP = read-only (write -> stage-2 fault) */
+#define S2_PAGE (3ULL << 0)       /* L3 page descriptor (bits[1:0]=11) */
 #define S2_MEM_NORMAL (0xFULL << 2) /* MemAttr = Normal Inner+Outer WB        */
 #define S2_MEM_DEVICE (0x0ULL << 2) /* MemAttr = Device-nGnRnE                */
 
@@ -68,7 +70,7 @@
 #define VCPU_READY 1
 #define VCPU_RUNNING 2
 
-#define NUM_VCPUS 3
+#define NUM_VCPUS 4 /* 0=Fermi, 1=Linux core0, 2=Linux core1, 3=migratable guest */
 
 /* Per-vCPU control block: everything needed to suspend a guest at EL2 and
  * later resume it. Lives in hypervisor-private memory (.hyp_tables) so guests

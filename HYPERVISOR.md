@@ -12,6 +12,10 @@ scheduling:
   PSCI `CPU_ON`. It shares vCPU 1's stage-2 (same VMID) but has its own MPIDR,
   register/sysreg/vGIC context, and virtual timer. `nproc` in the guest reports
   2. See §6 for the SGI/IPI emulation that makes cross-core IPIs work.
+- **vCPU 3** — a small **migratable** guest used to demonstrate the live-
+  migration mechanism: the hypervisor relocates its running RAM + CPU state
+  between two physical windows (pre-copy with stage-2 dirty-page tracking, then
+  a stop-and-copy that re-points its stage-2 and poisons the old window).
 
 The vCPU count is just `NUM_VCPUS`; the round-robin scheduler and per-guest
 stage-2 (one VMID per VM; cores of one VM share it) scale to N.

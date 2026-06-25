@@ -12,8 +12,19 @@ pub const HVC_VERSION: u64 = 0; // () -> ABI version
 pub const HVC_PUTC: u64 = 1; // (char in x1) -> 0 ; paravirt console putc
 pub const HVC_PING: u64 = 2; // (val in x1) -> val + 1 ; liveness / echo
 pub const HVC_VM_INFO: u64 = 3; // () -> hypercalls serviced for this vCPU
-pub const HVC_YIELD: u64 = 4; // () -> 0 ; cooperative yield (stub until M5)
+pub const HVC_YIELD: u64 = 4; // () -> 0 ; cooperative yield
 pub const HVC_HYP_BASE: u64 = 5; // () -> base IPA of the hypervisor-private region
+pub const HVC_VM_COUNT: u64 = 6; // () -> number of vCPUs
+pub const HVC_VM_STAT: u64 = 7; // (id in x1, field in x2) -> stat value, or -1
+
+// Field selectors for HVC_VM_STAT.
+pub const VMSTAT_ID: u64 = 0;
+pub const VMSTAT_STATE: u64 = 1; // 0=unused, 1=ready, 2=running
+pub const VMSTAT_HVC: u64 = 2;
+pub const VMSTAT_SYSREG: u64 = 3;
+pub const VMSTAT_ABORT: u64 = 4;
+pub const VMSTAT_VIRQ: u64 = 5;
+pub const VMSTAT_SWITCHES: u64 = 6; // global world-switch count (same for all ids)
 
 pub const HYP_ABI_VERSION: u64 = 0x0001_0000; // 1.0
 pub const HVC_ERR_BADCALL: u64 = u64::MAX; // unknown function ID

@@ -129,6 +129,51 @@ fn gen_cpuinfo(out: &mut [u8]) -> usize {
     cpu::render_info(out)
 }
 
+/// `/proc/vms` — live hypervisor / vCPU state, queried over the hypercall ABI.
+/// Generated at EL1 (which may issue HVC); the EL0 shell just cats the file. If
+/// no hypervisor is present beneath us, report that instead of trapping.
+fn gen_vms(out: &mut [u8]) -> usize {
+    use crate::hyp::hypercall::*;
+    let mut w = FmtBuf::new(out);
+
+    if !crate::hyp::booted_via_el2() {
+        let _ = write!(w, "no hypervisor (booted bare at EL1)\n");
+        return w.len();
+    }
+
+    // SAFETY: gated on booted_via_el2(), so a hypervisor is present at EL2.
+    unsafe {
+        let count = hvc_call(HVC_VM_COUNT, 0, 0, 0);
+        let switches = hvc_call(HVC_VM_STAT, 0, VMSTAT_SWITCHES, 0);
+        let _ = write!(
+            w,
+            "Fermi hypervisor (EL2): {} vCPUs, {} world-switches\n\
+             VCPU STATE    HVCALLS SYSREG ABORT VIRQS\n\
+             ---- -------- ------- ------ ----- -----\n",
+            count, switches
+        );
+        for i in 0..count {
+            let st = hvc_call(HVC_VM_STAT, i, VMSTAT_STATE, 0);
+            let sn = match st {
+                2 => "RUNNING",
+                1 => "READY  ",
+                _ => "UNUSED ",
+            };
+            let _ = write!(
+                w,
+                "{}    {} {} {} {} {}\n",
+                i,
+                sn,
+                hvc_call(HVC_VM_STAT, i, VMSTAT_HVC, 0),
+                hvc_call(HVC_VM_STAT, i, VMSTAT_SYSREG, 0),
+                hvc_call(HVC_VM_STAT, i, VMSTAT_ABORT, 0),
+                hvc_call(HVC_VM_STAT, i, VMSTAT_VIRQ, 0)
+            );
+        }
+    }
+    w.len()
+}
+
 // --- file_operations wrappers (one read fn per generator) -------------------
 
 macro_rules! proc_file {
@@ -152,6 +197,7 @@ proc_file!(read_cmdline, gen_cmdline, CMDLINE_OPS);
 proc_file!(read_balloon, gen_balloon, BALLOON_OPS);
 proc_file!(read_cpuinfo, gen_cpuinfo, CPUINFO_OPS);
 proc_file!(read_version, gen_version, VERSION_OPS);
+proc_file!(read_vms, gen_vms, VMS_OPS);
 
 fn register_file(parent: *mut Vnode, name: &str, ops: *const FileOperations) {
     let n = vfs::create_node(parent, name, VnodeType::Reg);
@@ -180,6 +226,7 @@ pub fn init() {
     register_file(proc, "balloon", &BALLOON_OPS);
     register_file(proc, "cpuinfo", &CPUINFO_OPS);
     register_file(proc, "version", &VERSION_OPS);
+    register_file(proc, "vms", &VMS_OPS);
 
-    kprintln!("[PROC] Mounted at /proc (uptime, meminfo, tasks, interrupts, netinfo, cmdline, version, balloon, cpuinfo)");
+    kprintln!("[PROC] Mounted at /proc (uptime, meminfo, tasks, interrupts, netinfo, cmdline, version, balloon, cpuinfo, vms)");
 }

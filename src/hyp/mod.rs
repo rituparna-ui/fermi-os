@@ -260,6 +260,9 @@ impl Vcpu {
 static VCPUS: SyncUnsafeCell<[Vcpu; NUM_VCPUS]> = SyncUnsafeCell::new([Vcpu::zeroed(); NUM_VCPUS]);
 #[link_section = ".hyp_tables"]
 static CURRENT_VCPU: SyncUnsafeCell<usize> = SyncUnsafeCell::new(0);
+/// Global count of world switches performed (for /proc/vms).
+#[link_section = ".hyp_tables"]
+static G_SWITCH_COUNT: SyncUnsafeCell<u64> = SyncUnsafeCell::new(0);
 /// CNTHP quantum length in timer ticks, computed from CNTFRQ at boot.
 #[link_section = ".hyp_tables"]
 static G_QUANTUM_TICKS: SyncUnsafeCell<u64> = SyncUnsafeCell::new(0);
@@ -812,6 +815,7 @@ fn hyp_world_switch(frame: *mut El2Frame) {
         let nv = &mut (*VCPUS.get())[next] as *mut Vcpu;
         *CURRENT_VCPU.get() = next;
         (*nv).state = VCPU_RUNNING;
+        *G_SWITCH_COUNT.get() += 1;
 
         for i in 0..31 {
             (*frame).x[i] = (*nv).regs[i];
@@ -930,6 +934,7 @@ fn hyp_handle_hvc(frame: *mut El2Frame) {
     use hypercall::*;
     let fn_id = frame_x(frame, 0);
     let a1 = frame_x(frame, 1);
+    let a2 = frame_x(frame, 2);
 
     // SAFETY (single-core, pre-guest-concurrency): the vCPU block is touched
     // only from EL2 trap context, which cannot reenter on a single core.
@@ -954,6 +959,8 @@ fn hyp_handle_hvc(frame: *mut El2Frame) {
         // Introspection probe (test build): expose the hyp region base so the
         // guest can attempt — and be denied — an access to hypervisor memory.
         HVC_HYP_BASE => hyp_region().0,
+        HVC_VM_COUNT => NUM_VCPUS as u64,
+        HVC_VM_STAT => hvc_vm_stat(a1, a2),
         _ => {
             hyp_puts("[HYP] unknown hypercall fn=");
             hyp_puthex(fn_id);
@@ -963,6 +970,30 @@ fn hyp_handle_hvc(frame: *mut El2Frame) {
     };
 
     set_frame_x(frame, 0, ret);
+}
+
+/// HVC_VM_STAT: read a per-vCPU (or global) statistic. `id` selects the vCPU,
+/// `field` selects the stat (see VMSTAT_* in `hypercall`). Returns `-1` for an
+/// out-of-range id or unknown field.
+fn hvc_vm_stat(id: u64, field: u64) -> u64 {
+    use hypercall::*;
+    if id >= NUM_VCPUS as u64 {
+        return u64::MAX;
+    }
+    // SAFETY (single-core): EL2 trap context; read-only view of the vCPU table.
+    unsafe {
+        let t = &(*VCPUS.get())[id as usize];
+        match field {
+            VMSTAT_ID => t.id,
+            VMSTAT_STATE => t.state as u64,
+            VMSTAT_HVC => t.hvc_count,
+            VMSTAT_SYSREG => t.sysreg_traps,
+            VMSTAT_ABORT => t.abort_count,
+            VMSTAT_VIRQ => t.virq_injected,
+            VMSTAT_SWITCHES => *G_SWITCH_COUNT.get(),
+            _ => u64::MAX,
+        }
+    }
 }
 
 /// Trapped system-register access (EC=0x18), produced here by HCR_EL2.TID3 for

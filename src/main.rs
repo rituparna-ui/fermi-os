@@ -236,6 +236,22 @@ pub extern "C" fn kmain() -> ! {
         fs::vfs::fd_table_destroy(t);
     }
 
+    // /proc/vms smoke test: read the hypervisor introspection file. Under a
+    // hypervisor it lists both vCPUs + world-switch count; bare it reports none.
+    {
+        let t = fs::vfs::fd_table_create();
+        let fd = fs::vfs::fd_open(t, "/proc/vms");
+        let mut buf = [0u8; 512];
+        let n = fs::vfs::fd_read(t, fd, buf.as_mut_ptr(), buf.len());
+        if n > 0 {
+            if let Ok(s) = core::str::from_utf8(&buf[..n as usize]) {
+                kprintln!("[PROC TEST] /proc/vms:\n{}", s);
+            }
+        }
+        fs::vfs::fd_close(t, fd);
+        fs::vfs::fd_table_destroy(t);
+    }
+
     // VFS smoke test: open /dev/rng and read through the fd path.
     {
         let t = fs::vfs::fd_table_create();

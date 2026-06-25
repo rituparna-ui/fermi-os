@@ -11,10 +11,14 @@
 
 #![allow(dead_code)]
 
+pub mod gic;
+pub mod timer;
+
 use crate::kprintln;
 use crate::panic::kernel_panic;
 use crate::{mrs, msr};
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 global_asm!(include_str!("vector.S"));
 
@@ -167,6 +171,25 @@ fn dump_trap_frame(t: u64, frame: &TrapFrame) {
     kprintln!("===============================");
 }
 
+/// Hook invoked at the end of IRQ handling to let the scheduler preempt. Set by
+/// the scheduler when it starts; a null pointer means "no scheduler yet".
+static SCHEDULE_HOOK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Register the scheduler's preemption entry point.
+pub fn set_schedule_hook(hook: extern "C" fn()) {
+    SCHEDULE_HOOK.store(hook as *mut (), Ordering::SeqCst);
+}
+
+#[inline]
+fn run_schedule_hook() {
+    let p = SCHEDULE_HOOK.load(Ordering::SeqCst);
+    if !p.is_null() {
+        // SAFETY: only ever set to a valid `extern "C" fn()` by set_schedule_hook.
+        let f: extern "C" fn() = unsafe { core::mem::transmute(p) };
+        f();
+    }
+}
+
 /// Called from `exception_common` (vector.S) with `type` and the trap frame.
 #[no_mangle]
 pub extern "C" fn exception_dispatch(exc_type: u64, frame: &mut TrapFrame) {
@@ -208,9 +231,24 @@ pub extern "C" fn exception_dispatch(exc_type: u64, frame: &mut TrapFrame) {
         },
 
         EXCEPTION_IRQ => {
-            // GIC ack/EOI + timer + schedule land with those subsystems.
-            dump_trap_frame(exc_type, frame);
-            kernel_panic("IRQ before GIC/timer are ported");
+            let intid = gic::ack_irq();
+            if intid == gic::GIC_INTID_NO_PENDING {
+                return;
+            }
+            gic::count_irq(intid as u32);
+
+            if intid as u32 == timer::TIMER_PPI_INTID {
+                timer::handle_irq();
+            } else {
+                kprintln!("[IRQ] INTID {} (not implemented)", intid);
+            }
+
+            gic::end_irq(intid);
+
+            // Schedule after EOI so the GIC can deliver future IRQs. The
+            // scheduler registers this hook when it starts; until then it's a
+            // no-op (the kernel just returns to whatever it preempted).
+            run_schedule_hook();
         }
 
         EXCEPTION_FIQ => {

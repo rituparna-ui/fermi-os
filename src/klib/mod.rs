@@ -4,6 +4,7 @@
 // subsystems ported in later steps.
 #![allow(dead_code)]
 
+pub mod fmtbuf;
 pub mod mmio;
 pub mod sync;
 pub mod uart;

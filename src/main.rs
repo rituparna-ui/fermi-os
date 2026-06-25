@@ -103,7 +103,13 @@ pub extern "C" fn kmain() -> ! {
     unsafe { core::arch::asm!("brk #0") };
     kprintln!("[EXC TEST] Survived BRK — vector table works.");
 
-    kprintln!("[KERNEL] Ready! Entering idle loop.");
+    // Interrupt controller + periodic timer. Once the timer is started, IRQs
+    // fire through the GIC into the exception dispatch IRQ arm.
+    exception::gic::init();
+    exception::timer::init();
+    exception::timer::start(exception::timer::TIMER_INTERVAL_MS);
+
+    kprintln!("[KERNEL] Ready! Entering idle loop (timer IRQs active).");
     loop {
         unsafe { core::arch::asm!("wfi") };
     }

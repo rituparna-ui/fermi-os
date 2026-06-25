@@ -206,6 +206,12 @@ fn cmd_hexdump(path: &str) {
     let node = vfs::resolve(path);
     if node.is_null() {
         kprintln!("hexdump: {}: not found", path);
+}
+}
+fn cmd_wc(path: &str) {
+    let node = vfs::resolve(path);
+    if node.is_null() {
+        kprintln!("wc: {}: not found", path);
         return;
     }
     let t = vfs::fd_table_create();
@@ -268,6 +274,25 @@ fn cmd_blkdump(sector: u64) {
             }
         } else {
             kprintln!("blkdump: read failed");
+}
+}
+    let (mut lines, mut words, mut bytes) = (0u64, 0u64, 0u64);
+    let mut in_word = false;
+    if fd >= 0 {
+        let mut buf = [0u8; 256];
+        loop {
+            let n = vfs::fd_read(t, fd, &mut buf);
+            if n <= 0 { break; }
+            for &c in &buf[..n as usize] {
+                bytes += 1;
+                if c == b'\n' { lines += 1; }
+                if c == b' ' || c == b'\n' || c == b'\t' || c == b'\r' {
+                    in_word = false;
+                } else if !in_word {
+                    in_word = true;
+                    words += 1;
+                }
+            }
         }
         vfs::fd_close(t, fd);
     }
@@ -341,6 +366,7 @@ fn cmd_blkwrite(sector: u64, text: &str) {
         vfs::fd_close(t, fd);
     }
     vfs::fd_table_destroy(t);
+    kprintln!("{:>6} {:>6} {:>6} {}", lines, words, bytes, path);
 }
 
 fn dispatch(line: &str) {
@@ -452,6 +478,9 @@ fn dispatch(line: &str) {
                 (Some(sec), Some(txt)) => cmd_blkwrite(sec, txt),
                 _ => kprintln!("usage: blkwrite <sector> <text>"),
             }
+}
+        "wc" => {
+            if arg1.is_empty() { kprintln!("usage: wc <path>"); } else { cmd_wc(arg1); }
         }
         "cat" => {
             if arg1.is_empty() {

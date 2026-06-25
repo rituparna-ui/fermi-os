@@ -24,6 +24,28 @@ void vuart_init(vuart_t *u, const char *name) {
   u->name = name;
   u->len = 0;
   u->at_line_start = 1;
+  u->rx_head = 0;
+  u->rx_tail = 0;
+}
+
+void vuart_rx_push(vuart_t *u, uint8_t c) {
+  uint32_t next = (u->rx_tail + 1) % VUART_RX_MAX;
+  if (next == u->rx_head) {
+    return; /* FIFO full — drop */
+  }
+  u->rx[u->rx_tail] = c;
+  u->rx_tail = next;
+}
+
+static int vuart_rx_empty(vuart_t *u) { return u->rx_head == u->rx_tail; }
+
+static uint8_t vuart_rx_pop(vuart_t *u) {
+  if (vuart_rx_empty(u)) {
+    return 0;
+  }
+  uint8_t c = u->rx[u->rx_head];
+  u->rx_head = (u->rx_head + 1) % VUART_RX_MAX;
+  return c;
 }
 
 /* Emit a "[name] " prefix to the host UART once per output line. */
@@ -79,12 +101,12 @@ void vuart_emulate(vuart_t *u, uint64_t ipa, int is_write, uint64_t *val,
   /* Reads. */
   switch (off) {
   case R_FR:
-    /* TX always ready (TXFF=0), nothing to receive (RXFE=1). This lets the
-     * guest's TX poll loop proceed and its RX poll loop see an empty FIFO. */
-    *val = FR_RXFE;
+    /* TX always ready (TXFF=0). RXFE set only when our RX FIFO is empty, so a
+     * guest polling FR.RXFE before reading DR will see queued input. */
+    *val = vuart_rx_empty(u) ? FR_RXFE : 0;
     break;
   case R_DR:
-    *val = 0; /* no input wired yet */
+    *val = vuart_rx_pop(u);
     break;
   default:
     *val = 0;

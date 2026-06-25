@@ -85,4 +85,9 @@ void hyp_run_dual_fermios(void);
  * cleared). No-op at EL1; runs before the host timer. */
 void hyp_run_psci_test(void);
 
+/* Milestone 12: run ONE FermiOS guest interactively — route physical UART input
+ * to the guest's virtual console so you can type at its EL0 shell. Does not
+ * return (owns the console). No-op at EL1. */
+void hyp_run_interactive_guest(void);
+
 #endif /* HYP_HYP_H */

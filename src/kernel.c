@@ -832,23 +832,24 @@ void kernel_main() {
   sched_create_kernel_task("netd", netd);
 
 #ifndef GUEST_BUILD
-  /* Milestone 3: run the trivial EL1 guest smoke test BEFORE the timer starts,
-   * so no preemption/IRQ-routing is involved (the guest exits via HVC). */
-  hyp_run_smoke_guest();
+  /* When running as the EL2 hypervisor (not the EL1 guest build):
+   *
+   * HYP_RUN_DEMOS builds the milestone self-tests (M3 smoke, M4 time-slice,
+   * M9a heartbeat round-robin, M11 PSCI, M9c dual-FermiOS) that run to
+   * completion before the interactive guest. They are opt-in because each
+   * leaves GIC/timer state that complicates the long-lived interactive guest;
+   * the default build goes straight to a single interactive FermiOS guest. */
+#ifdef HYP_RUN_DEMOS
+  hyp_run_smoke_guest();      /* M3  */
+  hyp_run_timeslice_demo();   /* M4  */
+  hyp_run_multi_guest_demo(); /* M9a */
+  hyp_run_psci_test();        /* M11 */
+  hyp_run_dual_fermios();     /* M9c */
+#endif
 
-  /* Milestone 4: time-slice a spinning EL1 guest off the EL2 physical timer.
-   * Also runs before the host timer so the two timers don't interleave yet. */
-  hyp_run_timeslice_demo();
-
-  /* Milestone 9: round-robin two isolated heartbeat EL1 guests. */
-  hyp_run_multi_guest_demo();
-
-  /* Milestone 11: PSCI SYSTEM_RESET self-test (guest warm reset). */
-  hyp_run_psci_test();
-
-  /* Milestone 9c: preemptively time-slice TWO full FermiOS guests with full
-   * per-vCPU context save/restore. (Supersedes the single-guest M8 boot.) */
-  hyp_run_dual_fermios();
+  /* Hand the console to ONE interactive FermiOS guest. Does not return — the
+   * guest's EL0 shell owns the terminal from here. */
+  hyp_run_interactive_guest();
 #endif
 
   timer_init();

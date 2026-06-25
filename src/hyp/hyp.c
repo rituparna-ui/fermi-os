@@ -7,6 +7,7 @@
 #include "gic/gic.h" /* gic_enable_irq, gic_ack_irq, gic_end_irq */
 #include "mm/pmm/pmm.h"
 #include "mm/mmu/mmu.h" /* PHYS_TO_VIRT */
+#include "mmio/mmio.h"  /* mmio_read32 (host UART RX poll) */
 #include "uart/uart.h"
 
 /* FermiOS EL2 hypervisor — milestone 2: EL2 trap plumbing + self-test.
@@ -944,5 +945,86 @@ void hyp_run_psci_test(void) {
   uart_printf("[HYP] psci test: post-reset beats=%u -> %s\n", post_reset_x10,
               ok ? "PASS (guest warm-reset + resumed)" : "FAIL");
 
+  pmm_free_pages(ram_phys, MG_RAM_SIZE / 0x1000);
+}
+
+/* ---- Milestone 12: one interactive FermiOS guest ---- */
+
+/* Non-blocking physical-UART read: returns -1 if no byte is pending. */
+static int host_uart_rx_poll(void) {
+  if (mmio_read32(UART_FR) & (1U << 4)) { /* RXFE: receive FIFO empty */
+    return -1;
+  }
+  return (int)(mmio_read32(UART_DR) & 0xFF);
+}
+
+extern char guest_echo_start[];
+extern char guest_echo_end[];
+
+void hyp_run_interactive_guest(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M12: launching an interactive EL1 guest console");
+  uart_println("[HYP] (host input is routed to the guest; output prefixed [vm])");
+
+  uintptr_t ram_phys = pmm_allocate_pages(MG_RAM_SIZE / 0x1000);
+  if (!ram_phys) {
+    return;
+  }
+  static stage2_t s2;
+  if (!stage2_create(&s2, /*vmid=*/1)) {
+    return;
+  }
+  /* Guest RAM only; UART left unmapped so it traps to the per-guest vuart. */
+  stage2_map(&s2, GUEST_ENTRY_IPA, (uint64_t)ram_phys, MG_RAM_SIZE, 0);
+
+  uint64_t len = (uint64_t)(guest_echo_end - guest_echo_start);
+  uint64_t kva = PHYS_TO_VIRT((uint64_t)ram_phys);
+  for (uint64_t b = 0; b < len; b++) {
+    ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)guest_echo_start)[b];
+  }
+  guest_sync_icache(kva, (len + 0xFFF) & ~0xFFFULL);
+
+  static vcpu_t v;
+  for (int i = 0; i < 31; i++) v.x[i] = 0;
+  v.pc = GUEST_ENTRY_IPA;
+  v.pstate = 0x3C5;
+  v.sp_el1 = GUEST_ENTRY_IPA + MG_RAM_SIZE;
+  v.vttbr = stage2_vttbr(&s2);
+  v.hcr_extra = 0; /* echo guest is poll-driven; no IRQ routing needed */
+  v.vmid = 1;
+  v.name = "vm";
+  vuart_init(&v.vuart, "vm");
+
+  uint64_t host_daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(host_daif));
+  __asm__ __volatile__("msr daifset, #3");
+
+  /* The echo guest is poll-driven: it spins reading the (trapping) PL011. On
+   * each UART-MMIO exit we pump any pending host console input into the guest's
+   * virtual UART so its FR.RXFE clears and its DR read returns the byte. */
+  for (;;) {
+    vcpu_enter(&v);
+
+    int c;
+    while ((c = host_uart_rx_poll()) >= 0) {
+      vuart_rx_push(&v.vuart, (uint8_t)c);
+    }
+
+    if (v.exit_reason == HYP_EXC_SYNC && ESR_EC_OF(v.esr) == 0x16) {
+      if (psci_handle(&v) == PSCI_ACT_OFF) break;
+      continue;
+    }
+    if (!df_service_exit(&v)) {
+      uint64_t ipa = ((v.hpfar >> 4) << 12) | (v.far & 0xFFF);
+      uart_printf("\n[HYP] guest fatal exit reason=%u EC=%x pc=%x IPA=%x\n",
+                  v.exit_reason, ESR_EC_OF(v.esr), v.pc, ipa);
+      break;
+    }
+  }
+
+  __asm__ __volatile__("msr daif, %0" ::"r"(host_daif));
   pmm_free_pages(ram_phys, MG_RAM_SIZE / 0x1000);
 }

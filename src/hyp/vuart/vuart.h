@@ -16,12 +16,17 @@
  * ------------------------------------------------------------------------- */
 
 #define VUART_LINE_MAX 256
+#define VUART_RX_MAX   64
 
 typedef struct vuart {
   const char *name;            /* console tag, e.g. "vm0" */
   char        line[VUART_LINE_MAX];
   uint32_t    len;
   int         at_line_start;   /* whether the prefix is still pending */
+  /* RX FIFO: bytes the hypervisor has routed to this guest's console. */
+  uint8_t     rx[VUART_RX_MAX];
+  uint32_t    rx_head;         /* next byte the guest will read */
+  uint32_t    rx_tail;         /* next slot the host will fill   */
 } vuart_t;
 
 /* True if `ipa` falls in the emulated PL011 window. */
@@ -38,5 +43,9 @@ void vuart_emulate(vuart_t *u, uint64_t ipa, int is_write, uint64_t *val,
 /* Flush any buffered partial line (called when a guest is descheduled so its
  * tail does not get attributed to the next guest). */
 void vuart_flush(vuart_t *u);
+
+/* Queue an input byte for the guest to read via its UART RX path. Dropped if
+ * the RX FIFO is full. */
+void vuart_rx_push(vuart_t *u, uint8_t c);
 
 #endif /* HYP_VUART_H */

@@ -121,3 +121,52 @@ guest_psci_start:
 	b	1b
 .global guest_psci_end
 guest_psci_end:
+
+// ---------------------------------------------------------------------------
+// Interactive echo EL1 guest (milestone 12). A tiny PL011 "shell": prints a
+// banner + prompt, then loops reading a char (poll FR.RXFE, read DR) and
+// echoing it back, re-printing the prompt after a newline. Proves the vuart RX
+// path (host console input -> guest) end to end, without the full FermiOS boot
+// (no PCI scan, no MMU) so it reaches input handling immediately.
+//
+// Strings are inlined in .text.guest (with the code) so the single blob copy
+// includes them and the PC-relative `adr` resolves at the guest load address.
+.section .text.guest, "ax"
+.balign 16
+.global guest_echo_start
+guest_echo_start:
+	// x9 = UART base (IPA 0x09000000)
+	movz	x9, #0x0000
+	movk	x9, #0x0900, lsl #16
+	adr	x20, gi_banner
+	bl	gi_puts
+gi_prompt_loop:
+	adr	x20, gi_prompt
+	bl	gi_puts
+gi_readloop:
+	// wait for RX: poll FR (off 0x18) bit4 RXFE == 0
+1:	ldr	w10, [x9, #0x18]
+	tbnz	w10, #4, 1b		// RXFE set -> empty, keep polling
+	ldr	w11, [x9, #0x00]	// read DR
+	str	w11, [x9, #0x00]	// echo it back
+	cmp	w11, #'\n'
+	b.eq	gi_prompt_loop
+	cmp	w11, #'\r'
+	b.eq	gi_prompt_loop
+	b	gi_readloop
+
+// gi_puts: write the NUL-terminated string at x20 to the UART (x9=base).
+gi_puts:
+2:	ldrb	w11, [x20], #1
+	cbz	w11, 3f
+	str	w11, [x9, #0x00]
+	b	2b
+3:	ret
+
+.balign 4
+gi_banner: .asciz "vguest: type and I echo it back\n"
+.balign 4
+gi_prompt: .asciz "vguest> "
+.balign 16
+.global guest_echo_end
+guest_echo_end:

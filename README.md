@@ -2,7 +2,7 @@
 
 Fermi OS is a bare-metal `aarch64 (ARMv8-A)` kernel built from scratch in `C` and assembly, targeting QEMU's `virt` machine with a Cortex-A72 processor.
 
-It also doubles as a minimal **Type-1 (bare-metal) hypervisor**: when launched with QEMU's `virtualization=on`, Fermi boots at **EL2**, sets up stage-2 translation, and runs *itself* as an EL1 guest alongside a second isolated guest — with virtual interrupts, preemptive scheduling, per-guest context switching, and PSCI-based guest lifecycle. See the **Hypervisor (EL2)** section below.
+It also doubles as a minimal **Type-1 (bare-metal) hypervisor**: when launched with QEMU's `virtualization=on`, Fermi boots at **EL2**, sets up stage-2 translation, and runs *itself* as an EL1 guest alongside a second isolated guest — with virtual interrupts, preemptive scheduling, per-guest context switching, and PSCI-based guest lifecycle. See the **Hypervisor (EL2)** section below, and [`HYPERVISOR.md`](HYPERVISOR.md) for full design notes.
 
 
 ---

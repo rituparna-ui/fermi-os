@@ -5,6 +5,8 @@
 //! This is a progressive port of the original C+asm Fermi OS, built up in the
 //! same subsystem order as the original git history.
 
+extern crate alloc;
+
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
@@ -54,6 +56,16 @@ pub extern "C" fn rust_main() -> ! {
     exception::init();
     mm::mmu::run_tests(l1_lo);
     kprintln!("[boot] MMU on; kprintln! now safe. EL={}", cpu::current_el());
+
+    // Kernel heap (backs the global allocator: Vec/Box/String).
+    mm::heap::init();
+    mm::heap::run_tests();
+    {
+        use alloc::vec::Vec;
+        let mut v: Vec<u64> = Vec::new();
+        for i in 0..8 { v.push(i * i); }
+        kprintln!("[boot] alloc::Vec works: {:?}", v.as_slice());
+    }
     uart::puts("UART base: ");
     uart::puthex(uart::UART_BASE as u64);
     uart::putc(b'\n');

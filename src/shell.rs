@@ -216,7 +216,7 @@ fn cmd_grep(pattern: &str, path: &str) {
         let mut b = [0u8; 256];
         let mut line = [0u8; 1024];
         let mut ll = 0usize;
-        let mut emit = |line: &[u8]| {
+        let emit = |line: &[u8]| {
             if line_has(line, needle) {
                 for &c in line {
                     uart::putc(c);
@@ -627,14 +627,6 @@ fn dispatch(line: &str) {
                 kprintln!("usage: grep <pattern> <path>");
             } else {
                 cmd_grep(arg1, arg2);
-            }
-        }
-        "ping" => {
-            let ttl = net::ping(1);
-            if ttl >= 0 {
-                kprintln!("reply from gateway ttl={}", ttl);
-            } else {
-                kprintln!("mv: failed (missing source, dest exists, or not a FAT32 file)");
             }
         }
         "rm" => {

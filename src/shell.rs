@@ -124,13 +124,20 @@ fn dispatch(line: &str) {
     let arg1 = parts.next().unwrap_or("");
     match cmd {
         "help" => {
-            kprintln!("builtins: help uptime version ps free meminfo ifconfig irqs");
+            kprintln!("builtins: help uptime version uname ps free meminfo ifconfig irqs");
             kprintln!("          cat <path> ping sleep <ms> kill <pid> echo <text>");
             kprintln!("          balloon <inflate|deflate|status> [n] vlog <text> clear");
             kprintln!("          ls [path] run <elf-path> cpuinfo reboot");
         }
         "uptime" => kprintln!("up {} ms ({} s)", timer::uptime_ms(), timer::uptime_seconds()),
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
+        "uname" => {
+            if arg1 == "-a" {
+                kprintln!("Fermi 0.1.0 fermi-os aarch64 ARMv8-A QEMU-virt Rust+asm");
+            } else {
+                kprintln!("Fermi");
+            }
+        }
         "ps" => kprint!("{}", sched::render_tasks()),
         "free" | "meminfo" => cmd_free(),
         "ifconfig" => kprint!("{}", net::render_info()),

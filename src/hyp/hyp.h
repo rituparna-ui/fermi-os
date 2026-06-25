@@ -65,7 +65,7 @@
 #define VCPU_READY 1
 #define VCPU_RUNNING 2
 
-#define NUM_VCPUS 2
+#define NUM_VCPUS 3
 
 /* Per-vCPU control block: everything needed to suspend a guest at EL2 and
  * later resume it. Lives in hypervisor-private memory (.hyp_tables) so guests

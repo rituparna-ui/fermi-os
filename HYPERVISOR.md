@@ -2,11 +2,18 @@
 
 This document describes the Type-1 (bare-metal) hypervisor layer that Fermi OS
 grows into when launched at **EL2**. It boots first at EL2, sets up second-stage
-translation, and runs two mutually-isolated guests under preemptive scheduling:
+translation, and runs several mutually-isolated guests under preemptive
+scheduling:
 
 - **vCPU 0** — Fermi itself, running unmodified at EL1.
 - **vCPU 1** — an unmodified aarch64 **Linux** kernel, booted to a BusyBox
-  userspace shell.
+  userspace shell (its console is captured; see §10).
+- **vCPU 2** — a tiny silent bare-metal payload demonstrating that the vCPU
+  table / scheduler / per-guest stage-2 generalise past two guests. Its
+  progress is visible via `/proc/vms`.
+
+The vCPU count is just `NUM_VCPUS`; the round-robin scheduler and per-guest
+stage-2 (one VMID each) scale to N.
 
 It targets QEMU's `virt` machine with `gic-version=3,virtualization=on` and a
 Cortex-A72 (ARMv8.0-A, **no VHE**). The code lives in `src/hyp/`.

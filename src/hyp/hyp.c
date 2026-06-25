@@ -75,6 +75,19 @@ __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l1[512
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_ram[512]; /* IPA 1-2 GiB (RAM)     */
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_dev[512]; /* IPA 0-1 GiB (devices) */
 
+/* Third guest (vCPU 2): a tiny silent bare-metal payload in its own isolated
+ * 2 MiB slice of Fermi-invisible high RAM (just past the Linux window). It
+ * uses only hypercalls — no UART, no GIC — so its stage-2 maps only its RAM. */
+#define GUEST2_PHYS_BASE 0x280000000ULL /* 10 GiB                              */
+#define GUEST2_IPA_BASE 0x40000000ULL   /* its own private IPA view            */
+#define GUEST2_RAM_SIZE _2MB
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g2_l0[512];
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g2_l1[512];
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g2_l2[512];
+
+extern uint8_t guest2_payload[];
+extern uint8_t guest2_payload_end[];
+
 /* The vCPUs and the index of the one currently running. In .hyp_tables
  * (NOLOAD); initialised explicitly in hyp_init(). */
 __attribute__((section(".hyp_tables"))) static vcpu_t vcpus[NUM_VCPUS];
@@ -94,6 +107,7 @@ __attribute__((section(".hyp_tables"))) static uint32_t g_lcon_len;
 __attribute__((section(".hyp_tables"))) static uint64_t g_quantum_ticks;
 
 static void hyp_create_linux_guest(void);
+static void hyp_create_guest2(void);
 static void hyp_tick_init(void);
 static void hyp_tick_start(void);
 
@@ -289,6 +303,8 @@ void hyp_init(void) {
   current_vcpu = 0;
   hyp_create_linux_guest();
   hyp_puts("[HYP] created Linux-slot guest (vCPU 1): 1 GiB @ IPA 0x40000000\n");
+  hyp_create_guest2();
+  hyp_puts("[HYP] created guest2 (vCPU 2): 2 MiB bare-metal payload\n");
 
   /* Start the preemptive scheduling tick (CNTHP / PPI 26). */
   hyp_tick_init();
@@ -499,6 +515,41 @@ static void hyp_create_linux_guest(void) {
   v->pstate = 0x3c5;                            /* EL1h, DAIF masked         */
   v->vttbr = ((uint64_t)lx_l0) | (1ULL << 48);  /* VMID 1                    */
   /* sctlr_el1 = 0 => stage-1 MMU off, as Linux's early entry expects. */
+}
+
+/* Third guest: map only its 2 MiB slice (IPA GUEST2_IPA_BASE -> high RAM) as a
+ * single stage-2 2 MiB block; everything else is unmapped (sandboxed). */
+static void hyp_create_guest2(void) {
+  for (int i = 0; i < 512; i++) {
+    g2_l0[i] = 0;
+    g2_l1[i] = 0;
+    g2_l2[i] = 0;
+  }
+  uint64_t gb = GUEST2_IPA_BASE / _1GB;          /* 1 GiB region index        */
+  uint64_t mb = (GUEST2_IPA_BASE % _1GB) / _2MB; /* 2 MiB block within region */
+  g2_l0[0] = ((uint64_t)g2_l1) | S2_TABLE | S2_VALID;
+  g2_l1[gb] = ((uint64_t)g2_l2) | S2_TABLE | S2_VALID;
+  g2_l2[mb] = GUEST2_PHYS_BASE | S2_VALID | S2_AF | S2_SH_INNER | S2_AP_RW |
+              S2_MEM_NORMAL;
+  __asm__ __volatile__("dsb ish");
+
+  /* Isolate guest2's RAM from the primary guest (its 1 GiB block in Fermi's
+   * stage-2). */
+  s2_l1_low[GUEST2_PHYS_BASE / _1GB] = 0;
+  __asm__ __volatile__("dsb ish");
+
+  /* Copy the payload into guest2's RAM (physical, MMU off). */
+  uint64_t len = (uint64_t)(guest2_payload_end - guest2_payload);
+  memcpy((void *)GUEST2_PHYS_BASE, guest2_payload, len);
+
+  vcpu_t *v = &vcpus[2];
+  memset(v, 0, sizeof(*v));
+  v->id = 2;
+  v->state = VCPU_READY;
+  v->pc = GUEST2_IPA_BASE;                       /* entry (IPA)               */
+  v->pstate = 0x3c5;                             /* EL1h, DAIF masked         */
+  v->sp_el1 = GUEST2_IPA_BASE + GUEST2_RAM_SIZE;
+  v->vttbr = ((uint64_t)g2_l0) | (2ULL << 48);   /* VMID 2                    */
 }
 
 /* Bring up just enough of the physical GIC for the hypervisor's own timer

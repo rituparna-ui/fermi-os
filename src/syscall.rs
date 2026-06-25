@@ -24,6 +24,7 @@ pub const SYS_UPTIME: u64 = 9;
 pub const SYS_NET_PING: u64 = 10;
 pub const SYS_KILL: u64 = 11;
 pub const SYS_FORK: u64 = 12;
+pub const SYS_GETRANDOM: u64 = 16;
 pub const SYS_EXEC: u64 = 13;
 
 fn user_ptr_ok(ptr: u64, len: u64) -> bool {
@@ -85,6 +86,14 @@ pub fn syscall_dispatch(frame: &mut TrapFrame) {
         SYS_NET_PING => crate::net::ping(a0 as u16),
         SYS_KILL => sched::kill(a0 as u64),
         SYS_FORK => sched::fork(frame as *mut TrapFrame),
+        SYS_GETRANDOM => {
+            if !user_ptr_ok(a0, a1) {
+                -1
+            } else {
+                let buf = unsafe { core::slice::from_raw_parts_mut(a0 as *mut u8, a1 as usize) };
+                crate::virtio::rng::read(buf) as i64
+            }
+        }
         SYS_EXEC => {
             // a0 = path (user C-string). Read the ELF from the filesystem.
             if !user_ptr_ok(a0, 1) {

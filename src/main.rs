@@ -15,6 +15,7 @@ global_asm!(include_str!("boot.S"));
 
 mod cpu;
 mod exception;
+mod fs;
 mod mm;
 mod mmio;
 mod net;
@@ -130,6 +131,21 @@ pub extern "C" fn kernel_main() -> ! {
         let inf = virtio::balloon::inflate(64);
         let (a2, _) = virtio::balloon::status();
         kprintln!("[boot] balloon: actual {}->{} (inflated {}), host_target {}", a, a2, inf, t);
+    }
+
+    // VFS + device nodes + fd table.
+    fs::vfs::init();
+    fs::devices::register();
+    {
+        let t = fs::vfs::fd_table_create();
+        let fd = fs::vfs::fd_open(t, "/dev/rng");
+        let mut b = [0u8; 8];
+        let n = fs::vfs::fd_read(t, fd, &mut b);
+        kprintln!("[boot] vfs: /dev/rng fd={} read {} bytes {:02x?}", fd, n, b);
+        fs::vfs::fd_write(t, 1, b"    [vfs] hello via fd_write -> /dev/console (fd 1)
+");
+        fs::vfs::fd_close(t, fd);
+        fs::vfs::fd_table_destroy(t);
     }
 
     // Scheduler + a couple of preemptive EL1 demo tasks.

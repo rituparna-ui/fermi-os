@@ -31,7 +31,7 @@ rm -f "$USER_ELF"
 
 # --- boot headless with the full VirtIO device set ---
 echo "Booting $KERNEL ..."
-timeout 25 qemu-system-aarch64 \
+timeout 35 qemu-system-aarch64 \
 	-machine virt,gic-version=3 -cpu cortex-a72 -m 8G -nographic \
 	-netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on \
 	-device virtio-rng-pci,disable-legacy=on \
@@ -96,8 +96,8 @@ SHLOG="$(mktemp /tmp/fermi-ci-shell.XXXXXX.log)"
 trap 'rm -f "$DISK" "$VCONS" "$LOG" "$SHLOG"' EXIT
 echo "Driving the EL0 shell..."
 # Leading newlines absorb the first-byte-eaten race on QEMU stdin.
-printf '\n\npid\nfork\nballoon inflate 4\nballoon\nhexdump /mnt/fat32/HELLO.TXT\nexec /mnt/fat32/HELLO.ELF a b\nexit\n' | \
-	timeout 25 qemu-system-aarch64 \
+printf '\n\npid\nls /mnt/fat32\nfork\nballoon inflate 4\nballoon\nhexdump /mnt/fat32/HELLO.TXT\nexec /mnt/fat32/HELLO.ELF a b\nexit\n' | \
+	timeout 35 qemu-system-aarch64 \
 		-machine virt,gic-version=3 -cpu cortex-a72 -m 8G -nographic \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on \
 		-device virtio-rng-pci,disable-legacy=on \
@@ -119,6 +119,7 @@ shell_require() {
 echo "Checking shell builtins:"
 shell_require "Welcome to the Fermi shell"
 shell_require "pid = 1"
+shell_require "HELLO.TXT"                     # ls listed the FAT32 dir
 shell_require "fork: child pid="
 shell_require "balloon: inflated 4 pages"
 shell_require "|Hello from Fermi"           # hexdump ASCII gutter

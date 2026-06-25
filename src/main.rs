@@ -187,22 +187,22 @@ pub extern "C" fn kmain() -> ! {
 
         // Write round-trip: create a file, then read it back through the VFS.
         let payload = b"written by the Rust kernel\n";
-        if fs::fat32::create(b"RUSTW.TXT", payload) {
-            let fd = fs::vfs::fd_open(t, "/mnt/fat32/RUSTW.TXT");
-            if fd >= 0 {
-                let mut buf = [0u8; 64];
-                let n = fs::vfs::fd_read(t, fd, buf.as_mut_ptr(), buf.len());
-                let ok = n as usize == payload.len() && &buf[..n as usize] == payload;
-                kprintln!(
-                    "[FAT32 TEST] create+read RUSTW.TXT round-trip: {}",
-                    if ok { "PASS" } else { "FAIL" }
-                );
-                fs::vfs::fd_close(t, fd);
-            } else {
-                kprintln!("[FAT32 TEST] create+read RUSTW.TXT round-trip: FAIL (reopen)");
-            }
+        // create() may return false if RUSTW.TXT already exists from a prior
+        // boot on a re-used disk (duplicates are now refused) — that's fine;
+        // the read-back below is the real assertion and is idempotent.
+        let _ = fs::fat32::create(b"RUSTW.TXT", payload);
+        let fd = fs::vfs::fd_open(t, "/mnt/fat32/RUSTW.TXT");
+        if fd >= 0 {
+            let mut buf = [0u8; 64];
+            let n = fs::vfs::fd_read(t, fd, buf.as_mut_ptr(), buf.len());
+            let ok = n as usize == payload.len() && &buf[..n as usize] == payload;
+            kprintln!(
+                "[FAT32 TEST] create+read RUSTW.TXT round-trip: {}",
+                if ok { "PASS" } else { "FAIL" }
+            );
+            fs::vfs::fd_close(t, fd);
         } else {
-            kprintln!("[FAT32 TEST] create RUSTW.TXT FAILED");
+            kprintln!("[FAT32 TEST] create+read RUSTW.TXT round-trip: FAIL (reopen)");
         }
         fs::vfs::fd_table_destroy(t);
     }
@@ -400,10 +400,16 @@ fn fat32_stress() {
     }
     vfs::fd_table_destroy(t);
 
-    if created == N && verified == N {
+    // `verified` is the real assertion: all N files are present with correct
+    // contents. `created` may be < N on a re-used disk where they already exist
+    // (duplicates are refused), so it isn't required to equal N — only that no
+    // creation spuriously failed for a *new* file (created + already-present
+    // together cover all N, which `verified == N` proves).
+    let _ = created;
+    if verified == N {
         kprintln!("[FAT32 STRESS] PASS: created + verified {} files", N);
     } else {
-        kprintln!("[FAT32 STRESS] FAIL: created={} verified={} of {}", created, verified, N);
+        kprintln!("[FAT32 STRESS] FAIL: verified={} of {}", verified, N);
     }
 }
 

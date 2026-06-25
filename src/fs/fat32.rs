@@ -186,6 +186,67 @@ pub fn lookup_in_dir(dir_cluster: u32, name: &[u8]) -> Option<(u32, u32, bool)> 
     dir_lookup(&v, dir_cluster, &target).map(|(c, s, attr)| (c, s, attr & ATTR_DIRECTORY != 0))
 }
 
+/// Return the raw 11-byte 8.3 name of the `index`-th real entry in
+/// `dir_cluster` (skipping free / LFN / volume-id slots), or None past the end.
+fn dir_nth_name(v: &Volume, dir_cluster: u32, index: usize) -> Option<[u8; 11]> {
+    let mut cluster = dir_cluster;
+    let mut buf = [0u8; SECTOR];
+    let mut seen = 0usize;
+    while cluster < FAT32_EOC {
+        let base = cluster_to_sector(v, cluster);
+        for s in 0..v.sectors_per_cluster {
+            if !blk::read((base + s) as u64, &mut buf) {
+                return None;
+            }
+            let mut off = 0;
+            while off < SECTOR {
+                let e = &buf[off..off + DIR_ENTRY_SIZE];
+                if e[0] == 0x00 {
+                    return None; // end of directory
+                }
+                if e[0] != 0xE5 && e[11] != ATTR_LFN && (e[11] & ATTR_VOLUME_ID) == 0 {
+                    if seen == index {
+                        let mut name = [0u8; 11];
+                        name.copy_from_slice(&e[0..11]);
+                        return Some(name);
+                    }
+                    seen += 1;
+                }
+                off += DIR_ENTRY_SIZE;
+            }
+        }
+        cluster = fat_next(v, cluster);
+    }
+    None
+}
+
+/// Format an 8.3 padded name ("HELLO   TXT") into "HELLO.TXT" in `out`.
+/// Returns bytes written.
+fn fmt_83(raw: &[u8; 11], out: &mut [u8]) -> usize {
+    let mut p = 0;
+    // base (trim trailing spaces)
+    let base_len = (0..8).rev().find(|&i| raw[i] != b' ').map_or(0, |i| i + 1);
+    for i in 0..base_len {
+        if p < out.len() {
+            out[p] = raw[i];
+            p += 1;
+        }
+    }
+    // extension
+    let ext_len = (0..3).rev().find(|&i| raw[8 + i] != b' ').map_or(0, |i| i + 1);
+    if ext_len > 0 && p < out.len() {
+        out[p] = b'.';
+        p += 1;
+        for i in 0..ext_len {
+            if p < out.len() {
+                out[p] = raw[8 + i];
+                p += 1;
+            }
+        }
+    }
+    p
+}
+
 /// Read `size` bytes of a cluster chain starting at `first_cluster` into `buf`.
 /// Returns bytes read, or -1 on error.
 pub fn read_file(first_cluster: u32, size: u32, buf: &mut [u8]) -> i64 {
@@ -335,6 +396,15 @@ pub fn create(name: &[u8], data: &[u8]) -> bool {
     let dir_cluster = v.root_cluster;
     let len = data.len() as u32;
 
+    // Refuse to create a duplicate: if a file with this 8.3 name already
+    // exists, do nothing (no overwrite, no duplicate entry). The original C
+    // create() lacked this check, which let repeated runs append duplicate
+    // directory entries for the same name.
+    let target = to_83(name);
+    if dir_lookup(&v, dir_cluster, &target).is_some() {
+        return false;
+    }
+
     // Allocate + chain clusters for the data.
     let clusters_needed = if len == 0 {
         0
@@ -391,7 +461,31 @@ static FILE_OPS: FileOperations = FileOperations {
 };
 static DIR_OPS: VnodeOperations = VnodeOperations {
     lookup: Some(fat32_lookup),
+    readdir: Some(fat32_readdir),
 };
+
+fn fat32_readdir(dir: *mut Vnode, index: usize, name_out: *mut u8, cap: usize) -> i64 {
+    // SAFETY: dir is a live FAT32-backed directory vnode.
+    let pd = unsafe { (*dir).private_data as *const Fat32Priv };
+    if pd.is_null() {
+        return -1;
+    }
+    let v = vol();
+    if !v.mounted {
+        return -1;
+    }
+    let first_cluster = unsafe { (*pd).first_cluster };
+    match dir_nth_name(&v, first_cluster, index) {
+        Some(raw) => {
+            let mut tmp = [0u8; 13];
+            let n = fmt_83(&raw, &mut tmp);
+            let copy = core::cmp::min(n, cap);
+            unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), name_out, copy) };
+            copy as i64
+        }
+        None => -1,
+    }
+}
 
 fn fat32_lookup(dir: *mut Vnode, name: *const u8, namelen: usize) -> *mut Vnode {
     unsafe {

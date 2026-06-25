@@ -36,6 +36,10 @@ pub const SYS_BALLOON: u64 = 14;
 /// original ABI — the C shell issued HVC directly from EL0, which faults on a
 /// QEMU virt machine without EL2/EL3, so reboot never worked there.
 pub const SYS_REBOOT: u64 = 15;
+/// readdir(path, index, name_buf): copy the index-th entry name of the
+/// directory at `path` into the user buffer (cap 256). Returns name length, or
+/// -1 past the end / not a directory. Extends the original ABI.
+pub const SYS_READDIR: u64 = 16;
 
 pub const BALLOON_OP_INFLATE: u64 = 0;
 pub const BALLOON_OP_DEFLATE: u64 = 1;
@@ -162,6 +166,17 @@ pub fn dispatch(frame: &mut TrapFrame) {
         }
         SYS_REBOOT => {
             ret = crate::arch::cpu::reboot();
+        }
+        SYS_READDIR => {
+            // arg0 = path (user str), arg1 = index, arg2 = name buffer (>= 256).
+            const NAME_CAP: u64 = 256;
+            if user_str(arg0).is_some() && user_buf_ok(arg2, NAME_CAP) {
+                let path = user_str(arg0).unwrap();
+                let dir = vfs::resolve(path);
+                ret = vfs::readdir(dir, arg1 as usize, arg2 as *mut u8, NAME_CAP as usize);
+            } else {
+                crate::klib::uart::Uart.errorln("[SYSCALL] SYS_READDIR rejected: bad args");
+            }
         }
         SYS_BALLOON => {
             ret = match arg0 {

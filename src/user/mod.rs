@@ -23,6 +23,7 @@ const SYS_FORK: u64 = 12;
 const SYS_EXEC: u64 = 13;
 const SYS_BALLOON: u64 = 14;
 const SYS_REBOOT: u64 = 15;
+const SYS_READDIR: u64 = 16;
 
 // --- raw syscall wrappers ---------------------------------------------------
 
@@ -81,6 +82,9 @@ fn sys_exec(path: *const u8, argv: *const *const u8) -> i64 {
 }
 fn sys_reboot() -> i64 {
     syscall3(SYS_REBOOT, 0, 0, 0)
+}
+fn sys_readdir(path: *const u8, index: u64, name_out: *mut u8) -> i64 {
+    syscall3(SYS_READDIR, path as u64, index, name_out as u64)
 }
 fn sys_balloon(op: u64, n: u64) -> i64 {
     syscall3(SYS_BALLOON, op, n, 0)
@@ -201,6 +205,31 @@ fn cat(path: &[u8]) {
     sys_close(fd as i32);
 }
 
+/// `ls`: enumerate a directory via SYS_READDIR, one name per line.
+fn ls(path: &[u8]) {
+    let mut name = [0u8; 256];
+    let mut i = 0u64;
+    let mut any = false;
+    loop {
+        let n = sys_readdir(path.as_ptr(), i, name.as_mut_ptr());
+        if n < 0 {
+            break;
+        }
+        if n > 0 {
+            sys_write(1, &name[..n as usize]);
+            sys_write(1, b"\n");
+            any = true;
+        }
+        i += 1;
+        if i > 4096 {
+            break; // safety cap
+        }
+    }
+    if !any {
+        print(b"ls: empty or not a directory\n");
+    }
+}
+
 fn sh_help() {
     print(
         b"Fermi shell built-ins:\n\
@@ -214,6 +243,7 @@ fn sh_help() {
           \x20 version         - cat /proc/version\n\
           \x20 cpuinfo         - cat /proc/cpuinfo\n\
           \x20 stack           - stress demand-paged user stack growth\n\
+          \x20 ls [path]       - list a directory (default /mnt/fat32)\n\
           \x20 cat <path>      - print a file\n\
           \x20 hexdump <path>  - hex+ascii dump of a file\n\
           \x20 echo <text>     - print text\n\
@@ -254,6 +284,12 @@ pub extern "C" fn task_shell() {
             let mut path = [0u8; 120];
             let plen = copy_cstr(&mut path, &cmd[4..]);
             cat(&path[..plen]);
+        } else if starts_with(cmd, b"ls ") || streq(cmd, b"ls") {
+            // `ls` with no arg lists the FAT32 mount; `ls <path>` lists <path>.
+            let mut path = [0u8; 120];
+            let arg: &[u8] = if cmd.len() > 3 { &cmd[3..] } else { b"/mnt/fat32" };
+            let plen = copy_cstr(&mut path, arg);
+            ls(&path[..plen]);
         } else if streq(cmd, b"ps") {
             cat(b"/proc/tasks\0");
         } else if streq(cmd, b"free") {

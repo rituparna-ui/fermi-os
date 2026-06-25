@@ -36,10 +36,15 @@ pub struct FileOperations {
     pub write: Option<fn(node: *mut Vnode, f: *mut File, buf: *const u8, count: usize) -> i64>,
 }
 
-/// Per-directory tree-traversal vtable: resolve a name on demand (lazy fs).
+/// Per-directory tree-traversal vtable: resolve a name on demand (lazy fs), and
+/// enumerate entries by index for `readdir`.
 #[repr(C)]
 pub struct VnodeOperations {
     pub lookup: Option<fn(dir: *mut Vnode, name: *const u8, namelen: usize) -> *mut Vnode>,
+    /// Copy the `index`-th entry's name into `name_out` (capacity `cap`).
+    /// Returns the name length on success, or -1 when there is no such entry.
+    pub readdir:
+        Option<fn(dir: *mut Vnode, index: usize, name_out: *mut u8, cap: usize) -> i64>,
 }
 
 #[repr(C)]
@@ -253,6 +258,41 @@ pub fn resolve(path: &str) -> *mut Vnode {
         }
     }
     cur
+}
+
+/// Enumerate the `index`-th entry of directory `dir`, copying its name into
+/// `name_out` (capacity `cap`). Returns the name length, or -1 past the end /
+/// on a non-directory. Filesystem-backed dirs (FAT32) use their `readdir` vop;
+/// in-memory dirs (`/`, `/dev`, `/proc`) fall back to walking the child list.
+pub fn readdir(dir: *mut Vnode, index: usize, name_out: *mut u8, cap: usize) -> i64 {
+    if dir.is_null() {
+        return -1;
+    }
+    // SAFETY: dir is a live tree node.
+    unsafe {
+        if (*dir).vtype != VnodeType::Dir {
+            return -1;
+        }
+        if !(*dir).v_ops.is_null() {
+            if let Some(rd) = (*(*dir).v_ops).readdir {
+                return rd(dir, index, name_out, cap);
+            }
+        }
+        // In-memory fallback: children are a LIFO list, so walk to `index`.
+        let mut c = (*dir).children;
+        let mut i = 0;
+        while !c.is_null() {
+            if i == index {
+                let nlen = (*c).name.iter().position(|&b| b == 0).unwrap_or(64);
+                let n = core::cmp::min(nlen, cap);
+                core::ptr::copy_nonoverlapping((*c).name.as_ptr(), name_out, n);
+                return n as i64;
+            }
+            c = (*c).next;
+            i += 1;
+        }
+    }
+    -1
 }
 
 // --- File-descriptor tables --------------------------------------------------

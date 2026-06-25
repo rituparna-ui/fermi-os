@@ -832,6 +832,10 @@ void kernel_main() {
    * so no preemption/IRQ-routing is involved (the guest exits via HVC). */
   hyp_run_smoke_guest();
 
+  /* Milestone 4: time-slice a spinning EL1 guest off the EL2 physical timer.
+   * Also runs before the host timer so the two timers don't interleave yet. */
+  hyp_run_timeslice_demo();
+
   timer_init();
   timer_start(TIMER_INTERVAL_MS);
 

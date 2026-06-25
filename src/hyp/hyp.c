@@ -2,6 +2,7 @@
 #include "exception.h" /* ESR_EC, EC_HVC_AARCH64, ESR_ISS_* */
 #include "stage2.h"
 #include "vcpu.h"
+#include "gic/gic.h" /* gic_enable_irq, gic_ack_irq, gic_end_irq */
 #include "mm/pmm/pmm.h"
 #include "mm/mmu/mmu.h" /* PHYS_TO_VIRT */
 #include "uart/uart.h"
@@ -186,5 +187,120 @@ void hyp_run_smoke_guest(void) {
 
   /* Release the guest RAM; the stage-2 tables are a static leak (one guest,
    * torn down at milestone 9). */
+  pmm_free_pages(ram_phys, GUEST_RAM_SIZE / 0x1000);
+}
+
+/* ---- Milestone 4: EL2-physical-timer (CNTHP) time-slicing ---- */
+
+extern char guest_spin_start[];
+extern char guest_spin_end[];
+
+#define HCR_IMO        (1ULL << 4)   /* route phys IRQ to EL2 */
+#define HYP_CNTHP_PPI  26            /* EL2 physical timer PPI */
+#define TIMESLICE_COUNT 5
+
+/* Arm the EL2 physical timer to fire `ticks` from now (absolute CVAL). */
+static void cnthp_arm(uint64_t ticks) {
+  uint64_t now;
+  __asm__ __volatile__("mrs %0, cntpct_el0" : "=r"(now));
+  __asm__ __volatile__("msr cnthp_cval_el2, %0" ::"r"(now + ticks));
+  __asm__ __volatile__("msr cnthp_ctl_el2, %0\n\tisb" ::"r"(1ULL)); /* enable */
+}
+
+/* Disable the EL2 physical timer (deassert its level-triggered IRQ line). */
+static void cnthp_disarm(void) {
+  __asm__ __volatile__("msr cnthp_ctl_el2, %0\n\tisb" ::"r"(0ULL));
+}
+
+void hyp_run_timeslice_demo(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M4 demo: EL2-timer time-slicing a spinning EL1 guest");
+
+  uintptr_t ram_phys = pmm_allocate_pages(GUEST_RAM_SIZE / 0x1000);
+  if (!ram_phys) {
+    uart_errorln("[HYP] M4: failed to allocate guest RAM");
+    return;
+  }
+
+  static stage2_t s2;
+  if (!stage2_create(&s2, /*vmid=*/1)) {
+    return;
+  }
+  stage2_map(&s2, GUEST_ENTRY_IPA, (uint64_t)ram_phys, GUEST_RAM_SIZE, /*device=*/0);
+
+  uint64_t ram_kva = PHYS_TO_VIRT((uint64_t)ram_phys);
+  uint64_t spin_len = (uint64_t)(guest_spin_end - guest_spin_start);
+  for (uint64_t i = 0; i < spin_len; i++) {
+    ((volatile uint8_t *)ram_kva)[i] = ((volatile uint8_t *)guest_spin_start)[i];
+  }
+  guest_sync_icache(ram_kva, GUEST_RAM_SIZE);
+
+  static vcpu_t v;
+  for (int i = 0; i < 31; i++) {
+    v.x[i] = 0;
+  }
+  v.pc = GUEST_ENTRY_IPA;
+  v.pstate = 0x3C5; /* EL1h, DAIF masked — but EL2-routed IRQ ignores PSTATE.I */
+  v.sp_el1 = GUEST_ENTRY_IPA + GUEST_RAM_SIZE;
+  v.vttbr = stage2_vttbr(&s2);
+  v.hcr_extra = HCR_IMO; /* route physical IRQ to EL2 so the timer preempts */
+  v.vmid = 1;
+  v.id = 0;
+  v.name = "spin";
+
+  /* Frequency -> a ~5 ms slice. */
+  uint64_t freq;
+  __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
+  uint64_t slice = freq / 200; /* 5 ms */
+
+  /* Enable the EL2 physical-timer PPI at the redistributor. The host's own
+   * IRQs are masked for the whole demo, so this only fires into our world
+   * switch (which runs with IMO so the IRQ exits the guest to EL2). */
+  gic_enable_irq(HYP_CNTHP_PPI);
+
+  uint64_t host_daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(host_daif));
+  __asm__ __volatile__("msr daifset, #3"); /* mask host IRQ+FIQ */
+
+  uint64_t last_x10 = 0;
+  int slices_done = 0;
+  for (int s = 0; s < TIMESLICE_COUNT; s++) {
+    cnthp_arm(slice);
+    vcpu_enter(&v);
+
+    /* Expect an IRQ exit. Ack on the physical interface, confirm it is our
+     * EL2-timer PPI, disarm (deassert the level line), then EOI. */
+    if (v.exit_reason == HYP_EXC_IRQ) {
+      uint64_t intid = gic_ack_irq();
+      cnthp_disarm();
+      if (intid != GIC_INTID_NO_PENDING) {
+        gic_end_irq(intid);
+      }
+      slices_done++;
+      uart_printf("[HYP] slice %u: guest preempted at pc=%x, x10=%u (intid=%u)\n",
+                  (uint64_t)(s + 1), v.pc, v.x[10], intid);
+      last_x10 = v.x[10];
+    } else {
+      cnthp_disarm();
+      uart_printf("[HYP] slice %u: unexpected exit reason=%u ESR=%x\n",
+                  (uint64_t)(s + 1), v.exit_reason, v.esr);
+      break;
+    }
+  }
+
+  cnthp_disarm();
+  __asm__ __volatile__("msr daif, %0" ::"r"(host_daif)); /* restore host mask */
+
+  int ok = (slices_done == TIMESLICE_COUNT) && (last_x10 > 0);
+  if (ok) {
+    uart_printf("[HYP] M4 demo: PASS (%u slices, guest counter reached %u)\n",
+                (uint64_t)slices_done, last_x10);
+  } else {
+    uart_println("[HYP] M4 demo: FAIL");
+  }
+
   pmm_free_pages(ram_phys, GUEST_RAM_SIZE / 0x1000);
 }

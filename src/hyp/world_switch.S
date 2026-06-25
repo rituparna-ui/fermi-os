@@ -29,6 +29,7 @@
 .equ VCPU_ESR,         304
 .equ VCPU_FAR,         312
 .equ VCPU_HPFAR,       320
+.equ VCPU_HCR_EXTRA,   328
 
 // Host frame built on the EL2 stack by vcpu_enter (160 bytes, 16-aligned):
 //   [sp+0]  x19,x20  [sp+16] x21,x22  [sp+32] x23,x24  [sp+48] x25,x26
@@ -90,12 +91,15 @@ vcpu_enter:
 	dsb	ish
 	isb
 
-	// Guest HCR_EL2 = E2H(34) | RW(31) | VM(0). TGE=0, no IMO/FMO/AMO.
+	// Guest HCR_EL2 = E2H(34) | RW(31) | VM(0), plus any per-vcpu extra bits
+	// (e.g. IMO for interrupt-driven time-slicing). TGE stays 0 for the guest.
 	mov	x2, #1
 	lsl	x2, x2, #34		// E2H
 	mov	x3, #1
 	orr	x2, x2, x3, lsl #31	// RW
 	orr	x2, x2, #1		// VM
+	ldr	x3, [x0, #VCPU_HCR_EXTRA]
+	orr	x2, x2, x3
 	msr	hcr_el2, x2
 	isb
 

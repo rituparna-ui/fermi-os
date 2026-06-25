@@ -58,4 +58,9 @@ extern char hyp_vector_table[];
  * EL1. Must run before the host timer is started (it uses no preemption). */
 void hyp_run_smoke_guest(void);
 
+/* Milestone 4 demo: run a spinning EL1 guest preempted by the EL2 physical
+ * timer (CNTHP, PPI 26) for a fixed number of slices, proving IRQ-driven
+ * exit + guest resume. No-op at EL1. Runs before the host timer starts. */
+void hyp_run_timeslice_demo(void);
+
 #endif /* HYP_HYP_H */

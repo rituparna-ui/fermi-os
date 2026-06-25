@@ -44,3 +44,18 @@ guest_stub_start:
 
 .global guest_stub_end
 guest_stub_end:
+
+// ---------------------------------------------------------------------------
+// Spinning EL1 guest (milestone 4 time-slice demo). Increments x10 forever and
+// never voluntarily exits, so the ONLY way control returns to the hypervisor is
+// an EL2-routed interrupt (HCR_EL2.IMO=1 + the EL2 physical timer). The host
+// reads x10 across slices to prove the guest both ran and resumed.
+.section .text.guest, "ax"
+.balign 16
+.global guest_spin_start
+guest_spin_start:
+	movz	x10, #0
+1:	add	x10, x10, #1
+	b	1b
+.global guest_spin_end
+guest_spin_end:

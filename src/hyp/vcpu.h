@@ -34,6 +34,8 @@ typedef struct vcpu {
   uint64_t esr;         /* +304 ESR_EL2 at exit                       */
   uint64_t far;         /* +312 FAR_EL2 at exit                       */
   uint64_t hpfar;       /* +320 HPFAR_EL2 at exit                     */
+  uint64_t hcr_extra;   /* +328 extra HCR_EL2 bits OR'd in on entry   */
+                        /*      (e.g. IMO for interrupt time-slicing) */
 
   /* ---- bookkeeping (not touched by asm) ---- */
   uint32_t vmid;

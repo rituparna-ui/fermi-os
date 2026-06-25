@@ -79,6 +79,9 @@ typedef struct hyp_trap_frame {
                                           *   x1 = op, x2 = target vCPU id,
                                           *   x3 = arg/buffer IPA (op-specific).
                                           *   ret in x0. */
+#define HVC_FERMI_LOG      0xFE110003ULL /* PV console: x1 = buf IPA, x2 = len.
+                                          * Hyp prints it tagged with VM name.
+                                          * Any VM may call (non-privileged). */
 
 /* VMCTL operations (in x1). Results return in registers — no shared buffer, so
  * no IPA translation is needed. */

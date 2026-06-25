@@ -215,6 +215,17 @@ all HVC (management calls), and the event-driven IPC consumer is WFx-heavy with
 *zero* IRQ exits — its doorbells are hardware-delivered via List Registers and
 never trap to EL2, which is exactly what an exit counter should (not) record.
 
+### Paravirtualized console (PV log)
+
+A guest can emit a log line through the hypervisor instead of poking the raw
+UART: `HVC x0=0xFE110003` with a buffer IPA in x1 and length in x2
+(`HVC_FERMI_LOG`). The hypervisor translates the guest IPA to a host PA —
+**bounds-checked** against that VM's private RAM window (`vcpu_ipa_to_pa`), so a
+malicious/buggy guest cannot make the hyp read arbitrary host memory — prints
+the bytes tagged with the VM name (`[guest2] ...`), and returns the count. This
+is the virtio-console / Xen-console paravirtualised-device pattern: the host
+multiplexes and attributes guest output. VM2's heartbeats use it.
+
 ### VM lifecycle (PSCI)
 
 The hypervisor emulates a per-VM PSCI interface (the guest's `hvc`/`smc`):

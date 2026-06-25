@@ -27,9 +27,14 @@ _g2_start:
 	ldr	x21, =0x40210000
 	str	xzr, [x21]
 
-1:	// Heartbeat loop
-	adr	x19, g2_beat
-	bl	g2_puts
+1:	// Heartbeat loop — emit via the PV console (HVC_FERMI_LOG) so the
+	// hypervisor prints it tagged "[guest2]". x1 = buffer IPA, x2 = length.
+	adr	x1, g2_beat
+	mov	x2, #(g2_beat_end - g2_beat)
+	mov	x0, #0
+	movk	x0, #0xFE11, lsl #16	// x0 = 0xFE110003 = HVC_FERMI_LOG
+	movk	x0, #0x0003
+	hvc	#0
 
 	// After 5 heartbeats, request a PSCI SYSTEM_RESET. The hypervisor warm-
 	// resets THIS VM only: it reloads our image and restarts us from _g2_start,
@@ -74,7 +79,10 @@ g2_puts:
 .section .rodata.g2
 g2_banner:
 	.asciz "\r\n[VM2] hello from guest 2 (EL1, isolated stage-2)\r\n"
+	// PV-console heartbeat: the hyp prepends "[guest2] ", so the body is just
+	// the text. g2_beat_end marks the length for HVC_FERMI_LOG.
 g2_beat:
-	.asciz "[VM2] heartbeat\r\n"
+	.ascii "heartbeat (via PV console)\r\n"
+g2_beat_end:
 g2_reset_msg:
 	.asciz "[VM2] 5 beats -> PSCI SYSTEM_RESET (warm restart)\r\n"

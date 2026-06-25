@@ -190,10 +190,12 @@ void hyp_main(void) {
    * VM1 uses FermiOS's own boot.S stack math (SP set by guest); VM2 sets its
    * own SP in _g2_start, so sp_el1_override is 0 for both. The image triples
    * let the hypervisor warm-reset a guest on PSCI SYSTEM_RESET. */
-  vcpu_alloc("FermiOS", GUEST_ENTRY_IPA, s2_make_vttbr(vm1_l1, 1), 0,
+  vcpu_t *vm1 = vcpu_alloc("FermiOS", GUEST_ENTRY_IPA, s2_make_vttbr(vm1_l1, 1), 0,
              __guest_blob_start, GUEST_ENTRY_IPA, vm1_size);
-  vcpu_alloc("guest2", GUEST_ENTRY_IPA, s2_make_vttbr(vm2_l1, 2), 0,
+  vm1->ram_size = 0x200000000ULL; /* 8 GiB */
+  vcpu_t *vm2 = vcpu_alloc("guest2", GUEST_ENTRY_IPA, s2_make_vttbr(vm2_l1, 2), 0,
              __guest2_blob_start, VM2_HOST_RAM_BASE, vm2_size);
+  vm2->ram_size = VM2_RAM_SIZE;
 
   /* The two IPC VMs run the same image; x0 selects the role (2=producer,
    * 3=consumer). Set x0_init AND the live gp.x[0] (the first boot's GP state
@@ -203,11 +205,13 @@ void hyp_main(void) {
                             __ipc_blob_start, IPCP_HOST_RAM_BASE, ipc_size);
   prod->x0_init = 2;
   prod->gp.x[0] = 2;
+  prod->ram_size = IPC_RAM_SIZE;
   vcpu_t *cons = vcpu_alloc("ipc-cons", GUEST_ENTRY_IPA,
                             s2_make_vttbr(ipcc_l1, 4), 0,
                             __ipc_blob_start, IPCC_HOST_RAM_BASE, ipc_size);
   cons->x0_init = 3;
   cons->gp.x[0] = 3;
+  cons->ram_size = IPC_RAM_SIZE;
 
   /* Wire the doorbell: producer notifies consumer (and vice-versa, so an
    * event-driven consumer can ACK back if it wants). */
@@ -219,6 +223,7 @@ void hyp_main(void) {
   vcpu_t *dom0 = vcpu_alloc("dom0", GUEST_ENTRY_IPA, s2_make_vttbr(dom0_l1, 5), 0,
                             __dom0_blob_start, DOM0_HOST_RAM_BASE, dom0_size);
   dom0->privileged = 1;
+  dom0->ram_size = DOM0_RAM_SIZE;
 
   hyp_puts("[HYP] 5 vCPUs created (incl. privileged dom0). Starting scheduler.\n");
   hyp_puts("--------------------------------------------------\n\n");

@@ -116,9 +116,10 @@ typedef struct vcpu {
    * PA backing the guest's load IPA), then re-initialises register state and
    * re-enters at entry_ipa. */
   const uint8_t *img_src;
-  uint64_t       img_dst_pa;
+  uint64_t       img_dst_pa;  /* host PA backing the guest's RAM base IPA */
   uint64_t       img_size;
-  uint64_t       entry_ipa;
+  uint64_t       ram_size;    /* size of the guest's private RAM window  */
+  uint64_t       entry_ipa;   /* guest RAM base IPA == entry == 0x40000000 */
   uint64_t       sp_el1_init;
   uint64_t       x0_init;   /* value placed in guest x0 at (re)start — used to
                              * pass a role/arg to the guest (e.g. IPC producer
@@ -179,6 +180,16 @@ int64_t vcpu_vmctl(uint64_t op, uint64_t target, uint64_t arg,
 
 /* Total number of vCPUs. */
 int vcpu_count(void);
+
+/* Translate a guest RAM IPA to its host PA for the given vCPU, bounds-checked
+ * against [entry_ipa, entry_ipa+ram_size). Returns 0 if out of range. (Only
+ * the linear private-RAM window; device/shared regions are not translated.) */
+uint64_t vcpu_ipa_to_pa(const vcpu_t *v, uint64_t ipa, uint64_t len);
+
+/* PV console: print [buf_ipa, buf_ipa+len) from the CURRENT guest's RAM to the
+ * host console, tagged with the VM name. Returns bytes printed, or -1 on a bad
+ * pointer/length. len is clamped to a sane max. */
+int64_t vcpu_pv_log(uint64_t buf_ipa, uint64_t len);
 
 /* True once a vCPU has been powered off (never runs again). */
 int vcpu_is_dead(const vcpu_t *v);

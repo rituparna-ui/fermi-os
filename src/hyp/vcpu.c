@@ -87,6 +87,36 @@ vcpu_t *vcpu_by_id(int id) {
 
 int vcpu_count(void) { return nr_vcpus; }
 
+uint64_t vcpu_ipa_to_pa(const vcpu_t *v, uint64_t ipa, uint64_t len) {
+  uint64_t base = v->entry_ipa;
+  uint64_t end = base + v->ram_size;
+  if (ipa < base || ipa >= end || len == 0 || ipa + len > end) {
+    return 0; /* outside this VM's private RAM window */
+  }
+  return v->img_dst_pa + (ipa - base);
+}
+
+#define PV_LOG_MAX 256
+
+int64_t vcpu_pv_log(uint64_t buf_ipa, uint64_t len) {
+  if (len > PV_LOG_MAX) {
+    len = PV_LOG_MAX;
+  }
+  uint64_t pa = vcpu_ipa_to_pa(cur_vcpu, buf_ipa, len);
+  if (!pa) {
+    return -1; /* bad guest pointer — reject (do not read arbitrary host PA) */
+  }
+  /* Tag with the VM name so multiplexed guest logs are attributable. */
+  hyp_puts("[");
+  hyp_puts(cur_vcpu->name);
+  hyp_puts("] ");
+  const char *p = (const char *)(uintptr_t)pa;
+  for (uint64_t i = 0; i < len; i++) {
+    hyp_putc(p[i]);
+  }
+  return (int64_t)len;
+}
+
 int64_t vcpu_vmctl(uint64_t op, uint64_t target, uint64_t arg,
                    hyp_trap_frame_t *f) {
   /* Only the designated control domain may manage other VMs. */

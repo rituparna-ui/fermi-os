@@ -246,6 +246,28 @@ fn cmd_cp(src: &str, dst_name: &str) {
             let n = vfs::fd_read(t, fd, &mut chunk);
             if n <= 0 { break; }
             data.extend_from_slice(&chunk[..n as usize]);
+}
+}
+}
+fn cmd_blkdump(sector: u64) {
+    let t = vfs::fd_table_create();
+    let fd = vfs::fd_open(t, "/dev/blk");
+    if fd >= 0 {
+        vfs::fd_seek(t, fd, (sector * 512) as i64, vfs::SEEK_SET);
+        let mut b = alloc::vec![0u8; 512];
+        if vfs::fd_read(t, fd, &mut b) == 512 {
+            for row in 0..4 {
+                kprint!("{:08x}  ", sector * 512 + row * 16);
+                for i in 0..16 { kprint!("{:02x} ", b[row as usize * 16 + i]); }
+                kprint!(" |");
+                for i in 0..16 {
+                    let c = b[row as usize * 16 + i];
+                    uart::putc(if (0x20..0x7f).contains(&c) { c } else { b'.' });
+                }
+                kprintln!("|");
+            }
+        } else {
+            kprintln!("blkdump: read failed");
         }
         vfs::fd_close(t, fd);
     }
@@ -304,6 +326,21 @@ fn cmd_sysinfo() {
     }
     kprintln!("  tasks   :");
     kprint!("{}", sched::render_tasks());
+}
+
+fn cmd_blkwrite(sector: u64, text: &str) {
+    let mut b = alloc::vec![0u8; 512];
+    let n = core::cmp::min(text.len(), 511);
+    b[..n].copy_from_slice(&text.as_bytes()[..n]);
+    let t = vfs::fd_table_create();
+    let fd = vfs::fd_open(t, "/dev/blk");
+    if fd >= 0 {
+        vfs::fd_seek(t, fd, (sector * 512) as i64, vfs::SEEK_SET);
+        let ok = vfs::fd_write(t, fd, &b) == 512;
+        kprintln!("blkwrite sector {}: {}", sector, if ok { "ok" } else { "failed" });
+        vfs::fd_close(t, fd);
+    }
+    vfs::fd_table_destroy(t);
 }
 
 fn dispatch(line: &str) {
@@ -404,6 +441,16 @@ fn dispatch(line: &str) {
                 kprintln!("usage: cp <src-path> <dst-name.ext>");
             } else {
                 cmd_cp(arg1, dst);
+}
+}
+        "blkdump" => {
+            match parse_u64(arg1) { Some(s) => cmd_blkdump(s), None => kprintln!("usage: blkdump <sector>") }
+        }
+        "blkwrite" => {
+            let rest: Vec<&str> = line.splitn(3, ' ').collect();
+            match (rest.get(1).and_then(|x| parse_u64(x)), rest.get(2)) {
+                (Some(sec), Some(txt)) => cmd_blkwrite(sec, txt),
+                _ => kprintln!("usage: blkwrite <sector> <text>"),
             }
         }
         "cat" => {

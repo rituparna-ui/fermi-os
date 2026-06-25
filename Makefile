@@ -20,7 +20,7 @@ C_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.c" -p
 
 # The HYPERVISOR image sources (EL2). Exclude the standalone guest subdirs —
 # those are built separately to flat blobs, not linked into the hyp.
-HYP_GUEST_DIRS := $(HYP_DIR)/guest2 $(HYP_DIR)/ipc $(HYP_DIR)/dom0 $(HYP_DIR)/vmtgt $(HYP_DIR)/crasher $(HYP_DIR)/hangguest $(HYP_DIR)/rngclient
+HYP_GUEST_DIRS := $(HYP_DIR)/guest2 $(HYP_DIR)/ipc $(HYP_DIR)/dom0 $(HYP_DIR)/vmtgt $(HYP_DIR)/crasher $(HYP_DIR)/hangguest $(HYP_DIR)/rngclient $(HYP_DIR)/blkclient
 HYP_PRUNE := $(foreach d,$(HYP_GUEST_DIRS),-path "$(d)" -o)
 HYP_S_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.S" -print)
 HYP_C_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.c" -print)
@@ -209,6 +209,18 @@ $(RNG_BIN): $(HYP_DIR)/rngclient/rngclient.S $(HYP_DIR)/rngclient/linker_rng.ld
 	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/rngclient.elf $@
 
 $(BUILD_DIR)/hyp/rngclient_blob.o: $(RNG_BIN)
+
+# blkclient: drives the emulated virtio-mmio block device.
+BLK_BIN := $(BUILD_DIR)/blkclient.bin
+$(BLK_BIN): $(HYP_DIR)/blkclient/blkclient.S $(HYP_DIR)/blkclient/linker_blk.ld
+	@echo "BLKCLIENT $@"
+	@mkdir -p $(dir $@)
+	@$(CC) -ffreestanding -nostdlib -nostartfiles -fno-pic \
+		-Wl,-T,$(HYP_DIR)/blkclient/linker_blk.ld -Wl,--build-id=none \
+		-o $(BUILD_DIR)/blkclient.elf $(HYP_DIR)/blkclient/blkclient.S
+	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/blkclient.elf $@
+
+$(BUILD_DIR)/hyp/blkclient_blob.o: $(BLK_BIN)
 
 # Hypervisor (EL2) — separate image, its own linker script.
 $(HYP_TARGET): $(HYP_OBJECTS)

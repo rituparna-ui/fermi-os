@@ -250,6 +250,21 @@ Design-verified hazards that are load-bearing here:
 - **16-bit free-running `avail.idx`/`used.idx`** handled with wrapping
   subtraction; ring indexed `% N`; descriptor chains bounded to `N` (DoS guard).
 
+### virtio-mmio block device
+
+A second virtio-mmio device (`virtio/virtio_blk.c`, DeviceID 2) at its own IPA
+window (`0x0A001000`), exercising the full virtio request shape the RNG device
+does not: a **3-descriptor chain** `[ RO header {type, sector} ][ data ][ WO
+1-byte status ]` and **bidirectional** transfer — `VIRTIO_BLK_T_IN` copies the
+RAM-backed disk → the guest's (WRITE) buffer, `VIRTIO_BLK_T_OUT` copies the
+guest's buffer → disk — plus a device-config region exposing the capacity. The
+"disk" is a 32 KiB region carved from the hyp pool (persistent across guest
+reboots). The `blkclient/` guest writes an incrementing pattern to sector 1,
+reads it back, and verifies the round-trip each iteration. The descriptor
+direction is honoured per-descriptor (`F_WRITE` ⇒ device writes the buffer), and
+the same cache-coherence discipline (invalidate before read, clean after write)
+applies in both transfer directions.
+
 ### Paravirtualized console (PV log)
 
 A guest can emit a log line through the hypervisor instead of poking the raw

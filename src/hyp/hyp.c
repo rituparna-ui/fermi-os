@@ -3,6 +3,7 @@
 #include "hyp_gic.h"
 #include "hyp_sysregs.h"
 #include "snapshot.h"
+#include "virtio/virtio_blk.h"
 #include "stage2.h"
 #include "timer/vtimer.h"
 #include "vcpu.h"
@@ -104,6 +105,8 @@ extern const uint8_t __hang_blob_start[];
 extern const uint8_t __hang_blob_end[];
 extern const uint8_t __rng_blob_start[];
 extern const uint8_t __rng_blob_end[];
+extern const uint8_t __blk_blob_start[];
+extern const uint8_t __blk_blob_end[];
 
 /* Guest RAM regions in the top reserved GiB (hyp is at 0x250000000, its pool
  * grows up from ~0x250100000). Each region is 2 MiB-aligned and well clear of
@@ -124,6 +127,8 @@ extern const uint8_t __rng_blob_end[];
 #define HANG_RAM_SIZE       0x01000000ULL
 #define RNG_HOST_RAM_BASE   0x272000000ULL /* virtio-mmio rngclient 16 MiB */
 #define RNG_RAM_SIZE        0x01000000ULL
+#define BLK_HOST_RAM_BASE   0x273000000ULL /* virtio-mmio blkclient 16 MiB */
+#define BLK_RAM_SIZE        0x01000000ULL
 
 /* Copy a flat blob to a host physical destination (EL2 MMU off) and make it
  * coherent for guest instruction fetch. Used at boot and on warm reset. */
@@ -174,6 +179,8 @@ void hyp_main(void) {
   hyp_copy_image(HANG_HOST_RAM_BASE, __hang_blob_start, hang_size);
   uint64_t rng_size = (uint64_t)(__rng_blob_end - __rng_blob_start);
   hyp_copy_image(RNG_HOST_RAM_BASE, __rng_blob_start, rng_size);
+  uint64_t blk_size = (uint64_t)(__blk_blob_end - __blk_blob_start);
+  hyp_copy_image(BLK_HOST_RAM_BASE, __blk_blob_start, blk_size);
   /* Zero the shared IPC page (its seqno starts at 0). */
   for (volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)IPC_SHARED_PA;
        p < (volatile uint64_t *)(uintptr_t)(IPC_SHARED_PA + 0x1000); p++) {
@@ -196,6 +203,7 @@ void hyp_main(void) {
   uint64_t crash_l1 = s2_build_vm2(CRASH_HOST_RAM_BASE, CRASH_RAM_SIZE);
   uint64_t hang_l1 = s2_build_vm2(HANG_HOST_RAM_BASE, HANG_RAM_SIZE);
   uint64_t rng_l1 = s2_build_vm2(RNG_HOST_RAM_BASE, RNG_RAM_SIZE);
+  uint64_t blk_l1 = s2_build_vm2(BLK_HOST_RAM_BASE, BLK_RAM_SIZE);
 
   /* GIC + timer virtualization. */
   hyp_gic_init();
@@ -278,10 +286,16 @@ void hyp_main(void) {
                             __rng_blob_start, RNG_HOST_RAM_BASE, rng_size);
   rngc->ram_size = RNG_RAM_SIZE;
 
-  hyp_puts("[HYP] 9 vCPUs created (incl. dom0, vmtgt, crasher, hangguest, rngclient). Starting scheduler.\n");
+  /* blkclient (id 9, VMID 10): drives the emulated virtio-mmio block device. */
+  vcpu_t *blkc = vcpu_alloc("blkclient", GUEST_ENTRY_IPA, s2_make_vttbr(blk_l1, 10), 0,
+                            __blk_blob_start, BLK_HOST_RAM_BASE, blk_size);
+  blkc->ram_size = BLK_RAM_SIZE;
+
+  hyp_puts("[HYP] 10 vCPUs created (incl. dom0, vmtgt, crasher, hangguest, rng/blk clients). Starting scheduler.\n");
   hyp_puts("--------------------------------------------------\n\n");
 
   snapshot_init();    /* reserve the VM snapshot slot */
+  virtio_blk_init();  /* reserve the virtio-blk backing disk */
   vcpu_sched_init();  /* arm CNTHV scheduler tick */
   vcpu_run_first();   /* enter VM1 — does not return */
 }

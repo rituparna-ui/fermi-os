@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-smoke-test:
+    name: build + clippy + QEMU boot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (aarch64-unknown-none + clippy + llvm-tools)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-unknown-none
+          rustup component add clippy llvm-tools-preview
+
+      - name: Install QEMU + FAT tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm mtools dosfstools
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --target aarch64-unknown-none -- -D warnings
+
+      - name: Build (debug)
+        run: cargo build
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: QEMU boot smoke-test (debug)
+        run: ./ci/smoke-test.sh target/aarch64-unknown-none/debug/kernel
+
+      - name: QEMU boot smoke-test (release)
+        run: ./ci/smoke-test.sh target/aarch64-unknown-none/release/kernel

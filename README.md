@@ -102,6 +102,20 @@ The QEMU invocation lives in `run.sh` (wired up as the Cargo `runner`).
 
 To exit QEMU: `Ctrl-A` then `X`
 
+## Testing
+
+A headless boot smoke-test builds a FAT32 disk, boots the kernel under QEMU,
+and asserts the key subsystem milestones (MMU/heap self-tests, VirtIO devices,
+DHCP lease, ICMP ping, FAT32 read) appear and nothing panics:
+
+```bash
+cargo build
+./ci/smoke-test.sh
+```
+
+CI (`.github/workflows/ci.yml`) runs `clippy -D warnings`, builds debug +
+release, and runs the smoke-test against both on every push/PR.
+
 ## Debugging
 
 Run QEMU paused with a GDB stub on `:1234`:

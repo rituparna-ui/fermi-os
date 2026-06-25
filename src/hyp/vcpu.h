@@ -131,7 +131,12 @@ typedef struct vcpu {
   int            paused;     /* 1 = administratively paused (VMCTL_STOP); the
                               * scheduler skips it and does NOT auto-resume it
                               * on a timer wake (distinct from WFI-blocked). */
+  uint32_t       weight;     /* proportional CPU share (Xen-credit / cgroup
+                              * cpu.weight style). Slice length scales with it;
+                              * default 1. Set via VMCTL_WEIGHT. */
   uint64_t       run_count;  /* times this vCPU has been scheduled in */
+  uint64_t       cpu_ticks;  /* total CNTPCT ticks this vCPU has run (for
+                              * proportional-share accounting / VMCTL_CPUTIME) */
 } vcpu_t;
 
 /* The currently-running vCPU (set by the scheduler before each guest entry).

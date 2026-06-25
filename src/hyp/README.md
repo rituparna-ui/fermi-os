@@ -156,6 +156,14 @@ outgoing guest's context and restores the incoming guest's. Each guest uses a
 different host PA — true memory isolation (except for explicitly shared pages,
 see above).
 
+**Weighted proportional share.** Each vCPU has a `weight` (default 1); its time
+slice is `base_slice * weight` (base 10 ms, weight clamped to 16), so a
+weight-W VM receives ~W/(Σweights) of the CPU — the Xen-credit / cgroup
+`cpu.weight` model. dom0 sets weights live via `VMCTL_WEIGHT` and reads
+consumed CPU time via `VMCTL_CPUTIME` (per-VM CNTPCT ticks, accumulated on each
+switch-out). The dom0 demo gives the IPC producer 8× the consumer's weight and
+shows it accruing the dominant CPU share.
+
 **Fair scheduling (block-on-WFI).** When a guest executes `WFI` (idle, awaiting
 its next interrupt) the hypervisor marks its vCPU *blocked* and world-switches
 to another runnable VM, instead of letting it busy-trap `WFI` for the rest of

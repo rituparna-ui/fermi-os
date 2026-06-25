@@ -27,6 +27,8 @@
 .equ VMCTL_STOP,  4
 .equ VMCTL_START, 5
 .equ VMCTL_STAT,  6
+.equ VMCTL_WEIGHT, 7
+.equ VMCTL_CPUTIME, 8
 
 .section .text.boot.dom0
 .global _dom0_start
@@ -138,10 +140,53 @@ _dom0_start:
 	add	x21, x21, #1
 	b	15b
 16:
+	// --- 8. weighted scheduling demo: give the IPC producer (vm 2) 8x the CPU
+	// share of the consumer (vm 3); idle a while; then read each VM's CPU time
+	// and show the producer accrued much more (proportional share). ---
+	adr	x19, m_wset
+	bl	d_puts
+	mov	x1, #VMCTL_WEIGHT
+	mov	x2, #2                    // vm 2 = ipc-prod
+	mov	x3, #8                    // weight 8
+	bl	vmctl
+	mov	x1, #VMCTL_WEIGHT
+	mov	x2, #3                    // vm 3 = ipc-cons
+	mov	x3, #1                    // weight 1
+	bl	vmctl
+
+	// idle ~4s so the weighted slices accumulate a clear difference.
+	mov	x20, #80
+20:	bl	d_yield
+	subs	x20, x20, #1
+	b.ne	20b
+
+	// dump per-VM cpu time (high byte = coarse magnitude).
+	adr	x19, m_cpu
+	bl	d_puts
+	mov	x21, #0
+21:	cmp	x21, x22
+	b.ge	22f
+	adr	x19, m_svm
+	bl	d_puts
+	mov	w23, w21
+	bl	d_puthex2
+	adr	x19, m_colon
+	bl	d_puts
+	mov	x1, #VMCTL_CPUTIME
+	mov	x2, x21
+	bl	vmctl
+	// print bits[31:24] of the tick count (coarse, fits 2 hex digits).
+	lsr	x23, x0, #24
+	bl	d_puthex2
+	adr	x19, m_nl
+	bl	d_puts
+	add	x21, x21, #1
+	b	21b
+22:
 	adr	x19, m_done
 	bl	d_puts
 
-	// --- 8. idle forever ---
+	// --- 9. idle forever ---
 9:	bl	d_yield
 	b	9b
 
@@ -223,6 +268,8 @@ m_start: .asciz "[dom0] VMCTL_START vm 1 (resume)\r\n"
 m_reset: .asciz "[dom0] VMCTL_RESET vm 2 (warm-restart IPC producer)\r\n"
 m_done:  .asciz "[dom0] management script complete; idling\r\n"
 m_stats: .asciz "[dom0] exit stats per vm (hvc dabt sysreg wfx irq):\r\n"
+m_wset:  .asciz "[dom0] VMCTL_WEIGHT: vm 2 = 8, vm 3 = 1 (proportional share)\r\n"
+m_cpu:   .asciz "[dom0] cpu time per vm (cntpct bits[31:24]):\r\n"
 m_svm:   .asciz "[dom0]  vm 0x"
 m_colon: .asciz ": "
 m_nl:    .asciz "\r\n"

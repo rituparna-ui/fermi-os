@@ -92,6 +92,8 @@ typedef struct hyp_trap_frame {
 #define VMCTL_STOP    4  /* x2=id; pause that VM (mark not-runnable)           */
 #define VMCTL_START   5  /* x2=id; resume that VM (mark runnable)              */
 #define VMCTL_STAT    6  /* x2=id, x3=stat index; -> x0 = that exit counter    */
+#define VMCTL_WEIGHT  7  /* x2=id, x3=weight; set proportional CPU share        */
+#define VMCTL_CPUTIME 8  /* x2=id; -> x0 = CPU ticks consumed (CNTPCT)          */
 
 /* VMCTL_STAT indices (x3). */
 #define VMSTAT_HVC        0

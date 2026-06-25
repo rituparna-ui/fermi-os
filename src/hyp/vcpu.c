@@ -150,6 +150,12 @@ int64_t vcpu_vmctl(uint64_t op, uint64_t target, uint64_t arg,
     case VMSTAT_IRQ:        return (int64_t)t->stats.irq;
     default:                return VMCTL_EINVAL;
     }
+  case VMCTL_WEIGHT:
+    if (arg < 1) return VMCTL_EINVAL;
+    t->weight = (uint32_t)arg;
+    return VMCTL_OK;
+  case VMCTL_CPUTIME:
+    return (int64_t)t->cpu_ticks;
   case VMCTL_RESET:
     if (t->dead) return VMCTL_EINVAL;
     /* Reset is in-place if it targets the caller; here the control VM never
@@ -201,6 +207,7 @@ vcpu_t *vcpu_alloc(const char *name, uint64_t entry_ipa, uint64_t vttbr,
   v->img_dst_pa = img_dst_pa;
   v->img_size = img_size;
   v->doorbell_target = -1; /* no peer unless wired up after alloc */
+  v->weight = 1;           /* equal share by default (VMCTL_WEIGHT changes it) */
 
   vcpu_init_state(v);
 
@@ -234,9 +241,28 @@ void vcpu_reset(vcpu_t *v, hyp_trap_frame_t *f) {
   }
 }
 
+/* CNTPCT timestamp when the current vCPU was last loaded — used to accumulate
+ * per-VM CPU time on each switch-out. */
+static uint64_t cur_load_tsc;
+
+static uint64_t read_cntpct(void) {
+  uint64_t t;
+  __asm__ __volatile__("mrs %0, cntpct_el0" : "=r"(t));
+  return t;
+}
+
+/* Credit the outgoing current vCPU with the wall-time it just ran. */
+static void account_cpu_time(void) {
+  if (cur_vcpu) {
+    uint64_t now = read_cntpct();
+    cur_vcpu->cpu_ticks += now - cur_load_tsc;
+  }
+}
+
 /* Restore the full guest context for `v` into the hardware. */
 static void vcpu_load(vcpu_t *v) {
   cur_vcpu = v;
+  cur_load_tsc = read_cntpct();
   v->run_count++;
   vcpu_restore_sysregs(&v->sys);
   vcpu_restore_fp(&v->fp);
@@ -287,16 +313,24 @@ void hyp_cnthp_arm(void) {
 
 uint64_t hyp_sched_deadline(void) { return sched_deadline; }
 
-static void sched_arm_slice(void) {
+/* Arm the next scheduler slice, sized by `v`'s weight (proportional share):
+ * a weight-W VM gets W base slices before it is preempted, so over time it
+ * receives ~W/(sum of weights) of the CPU. Weight is clamped so one VM can't
+ * monopolise or starve. */
+#define SCHED_WEIGHT_MAX 16
+static void sched_arm_slice_for(const vcpu_t *v) {
+  uint32_t w = v ? v->weight : 1;
+  if (w < 1) w = 1;
+  if (w > SCHED_WEIGHT_MAX) w = SCHED_WEIGHT_MAX;
   uint64_t now;
   __asm__ __volatile__("mrs %0, cntpct_el0" : "=r"(now));
-  sched_deadline = now + SCHED_SLICE_TICKS;
+  sched_deadline = now + SCHED_SLICE_TICKS * w;
   hyp_cnthp_arm();
 }
 
 void vcpu_sched_init(void) {
-  sched_arm_slice();
-  hyp_puts("[SCHED] EL2 scheduler armed (CNTHP PPI 26, ~50ms slice)\n");
+  sched_arm_slice_for(cur_vcpu);
+  hyp_puts("[SCHED] EL2 weighted scheduler armed (CNTHP PPI 26, 10ms base slice)\n");
 }
 
 /* Pick the next runnable (non-dead) vCPU round-robin after `cur`. Returns `cur`
@@ -317,6 +351,7 @@ static void switch_to(vcpu_t *next, hyp_trap_frame_t *f) {
   if (next == prev) {
     return;
   }
+  account_cpu_time(); /* credit prev with the time it just ran */
   static uint64_t nswitch;
   if ((nswitch++ % 200) == 0) {
     hyp_puts("[SCHED] world switches: ");
@@ -370,10 +405,11 @@ int vcpu_wake_expired(void) {
 }
 
 /* Periodic scheduler tick (CNTHP slice elapsed): round-robin to the next
- * runnable guest. */
+ * runnable guest and size the new slice by THAT guest's weight. */
 void vcpu_sched_tick(hyp_trap_frame_t *f) {
-  sched_arm_slice(); /* schedule the next slice (also re-arms CNTHP) */
-  switch_to(pick_next(cur_vcpu), f);
+  vcpu_t *next = pick_next(cur_vcpu);
+  sched_arm_slice_for(next); /* weighted slice for whoever runs next */
+  switch_to(next, f);
 }
 
 /* Current guest did WFI/WFE — block it and switch to another runnable guest.
@@ -389,7 +425,8 @@ void vcpu_block_current(hyp_trap_frame_t *f) {
     cur_vcpu->runnable = 1;
     return;
   }
-  /* Make sure CNTHP is armed to wake the blocking guest on its own deadline. */
-  hyp_cnthp_arm();
+  /* Give the VM we switch to its own weighted slice (also re-arms CNTHP, which
+   * folds in the blocking guest's vtimer deadline so it still wakes on time). */
+  sched_arm_slice_for(next);
   switch_to(next, f);
 }

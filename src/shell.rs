@@ -127,7 +127,7 @@ fn dispatch(line: &str) {
             kprintln!("builtins: help uptime version ps free meminfo ifconfig irqs");
             kprintln!("          cat <path> ping sleep <ms> kill <pid> echo <text>");
             kprintln!("          balloon <inflate|deflate|status> [n] vlog <text> clear");
-            kprintln!("          ls [path] run <elf-path> cpuinfo reboot");
+            kprintln!("          ls [path] run <elf> rand [n] cpuinfo reboot");
         }
         "uptime" => kprintln!("up {} ms ({} s)", timer::uptime_ms(), timer::uptime_seconds()),
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
@@ -187,6 +187,14 @@ fn dispatch(line: &str) {
                     kprintln!("balloon: actual {} pages, host_target {}", a, t);
                 }
             }
+        }
+        "rand" => {
+            let n = parse_u64(arg1).unwrap_or(16).clamp(1, 64) as usize;
+            let mut b = [0u8; 64];
+            let got = virtio::rng::read(&mut b[..n]);
+            kprint!("{} random bytes:", got);
+            for &x in &b[..got] { kprint!(" {:02x}", x); }
+            kprintln!();
         }
         "vlog" => {
             let rest: Vec<&str> = line.splitn(2, ' ').collect();

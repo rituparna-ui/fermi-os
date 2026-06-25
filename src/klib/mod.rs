@@ -5,4 +5,5 @@
 #![allow(dead_code)]
 
 pub mod mmio;
+pub mod sync;
 pub mod uart;

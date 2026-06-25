@@ -10,6 +10,7 @@
 mod klib;
 #[macro_use]
 mod arch;
+mod mm;
 mod panic;
 
 use core::arch::global_asm;
@@ -31,8 +32,22 @@ pub extern "C" fn kmain() -> ! {
     klib::uart::Uart.println("Fermi OS (Rust) - Booting Up...");
     arch::cpu::print_current_el();
 
-    // Echo received bytes, mirroring the original early kernel loop.
+    // Physical memory manager (pre-MMU, identity mapped).
+    mm::pmm::init(mm::pmm::MEM_START, mm::pmm::MEM_SIZE);
+    mm::pmm::print_info();
+
+    // Quick sanity check: allocate, then free, a single page.
+    let p = mm::pmm::allocate_page();
     let uart = klib::uart::Uart;
+    uart.puts("[PMM][TEST] allocated page at ");
+    uart.puthex(p);
+    uart.putc(b'\n');
+    mm::pmm::free_page(p);
+    uart.puts("[PMM][TEST] freed; free pages now ");
+    uart.putdec(mm::pmm::free_pages_count());
+    uart.putc(b'\n');
+
+    // Echo received bytes, mirroring the original early kernel loop.
     loop {
         let c = uart.getc();
         uart.putc(c);

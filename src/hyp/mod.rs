@@ -15,6 +15,8 @@
 //! materializes an absolute upper-half VA (no `kprintln!`/`core::fmt`); it logs
 //! through a self-contained PL011 writer and formats hex by hand.
 
+pub mod hypercall;
+
 use crate::mm::consts::{SIZE_1G, SIZE_512G};
 use crate::mm::pmm;
 use crate::mrs;
@@ -40,6 +42,7 @@ const S2_MEM_DEVICE: u64 = 0x0 << 2; // MemAttr = Device-nGnRnE
 
 // --- HCR_EL2 bits ------------------------------------------------------------
 const HCR_VM: u64 = 1 << 0; // Enable stage-2 translation for EL1&0
+const HCR_TID3: u64 = 1 << 18; // Trap ID group 3 (ID_AA64*) reads to EL2
 const HCR_RW: u64 = 1 << 31; // EL1 execution state is AArch64
 
 // --- CNTHCTL_EL2 bits (non-VHE): let EL1/EL0 reach the physical counter/timer
@@ -49,6 +52,7 @@ const CNTHCTL_EL1PCEN: u64 = 1 << 1;
 // --- Exception-class values in ESR_EL2[31:26] --------------------------------
 const ESR_EC_SHIFT: u64 = 26;
 const ESR_EC_MASK: u64 = 0x3F;
+const EC_SYSREG: u64 = 0x18; // Trapped MSR/MRS/system instruction (AArch64)
 const EC_HVC64: u64 = 0x16; // HVC instruction execution in AArch64 state
 const EC_DABT_LOWER: u64 = 0x24; // Data abort from a lower EL (stage-2 fault)
 const EC_IABT_LOWER: u64 = 0x20; // Instruction abort from a lower EL
@@ -87,10 +91,69 @@ static S2_L1_LOW: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 
 #[link_section = ".hyp_tables"]
 static S2_L1_HIGH: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512])); // 512G..1 TiB
 
+/// Per-vCPU control block. For Milestone 2 the single guest is co-resident at
+/// EL1, so this mostly tracks statistics and holds the slots a real world-switch
+/// (M5) will save/restore. Lives in hypervisor-private memory (`.hyp_tables`) so
+/// the guest cannot see or zero it.
+#[repr(C)]
+struct Vcpu {
+    id: u64,
+    hvc_count: u64,
+    sysreg_traps: u64,
+    abort_count: u64,
+    // Reserved for M5 world-switch context (guest EL1 sysregs).
+    sp_el1: u64,
+    elr_el1: u64,
+    spsr_el1: u64,
+    sctlr_el1: u64,
+    ttbr0_el1: u64,
+    ttbr1_el1: u64,
+    tcr_el1: u64,
+    mair_el1: u64,
+    vbar_el1: u64,
+}
+
+#[link_section = ".hyp_tables"]
+static G_VCPU: SyncUnsafeCell<Vcpu> = SyncUnsafeCell::new(Vcpu {
+    id: 0,
+    hvc_count: 0,
+    sysreg_traps: 0,
+    abort_count: 0,
+    sp_el1: 0,
+    elr_el1: 0,
+    spsr_el1: 0,
+    sctlr_el1: 0,
+    ttbr0_el1: 0,
+    ttbr1_el1: 0,
+    tcr_el1: 0,
+    mair_el1: 0,
+    vbar_el1: 0,
+});
+
 /// One-shot guard so an unexpected lower-EL abort dumps context once and then
 /// parks, instead of an endless re-fault spam loop. Lives in `.bss` (zeroed by
 /// `zero_bss` on the EL1 path, which always runs before any guest can fault).
 static DUMPED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the kernel was launched at EL2 (a hypervisor is active beneath the
+/// EL1 guest). `boot.S` carries the EL2-vs-EL1 entry decision in a callee-saved
+/// register across the eret and zero_bss, and `early_init` records it here via
+/// [`set_booted_via_el2`] — so this is set *after* zero_bss and survives. This
+/// gates guest-side `hvc_call`: on a bare EL1 boot (the host-QEMU CI path, no
+/// `virtualization=on`) an `HVC` would trap as UNDEFINED, so callers must check.
+static BOOTED_VIA_EL2: AtomicBool = AtomicBool::new(false);
+
+/// Record whether boot entered at EL2. Called once from `early_init` with the
+/// indicator `boot.S` threaded through from the entry-EL check.
+pub fn set_booted_via_el2(yes: bool) {
+    BOOTED_VIA_EL2.store(yes, Ordering::Relaxed);
+}
+
+/// Whether the kernel was launched at EL2 (a hypervisor is active beneath the
+/// EL1 guest). Guards guest-side `hvc_call` use.
+pub fn booted_via_el2() -> bool {
+    BOOTED_VIA_EL2.load(Ordering::Relaxed)
+}
 
 // --- self-contained PL011 output (no driver state, safe pre-uart_init) -------
 // EL2 runs MMU-off; the PL011 is reached at its physical base directly, with no
@@ -202,6 +265,16 @@ pub extern "C" fn hyp_init() {
 
     hyp_puts("\n[HYP] Fermi hypervisor online at EL2\n");
 
+    // Initialise the guest vCPU control block (NOLOAD memory => not zeroed).
+    // SAFETY (single-core, pre-guest): exclusive access during boot.
+    unsafe {
+        let v = G_VCPU.get();
+        (*v).id = 0;
+        (*v).hvc_count = 0;
+        (*v).sysreg_traps = 0;
+        (*v).abort_count = 0;
+    }
+
     // Sanity: confirm we really are at EL2.
     let el = (mrs!("CurrentEL") >> 2) & 0x3;
     hyp_puts("[HYP] CurrentEL = ");
@@ -243,9 +316,9 @@ pub extern "C" fn hyp_init() {
         msr!("vbar_el2", vbar);
         core::arch::asm!("isb");
 
-        // Enable stage-2 and pin EL1 to AArch64. From here the EL1 guest's
-        // physical accesses are IPA->PA translated by the tables above.
-        msr!("hcr_el2", HCR_RW | HCR_VM);
+        // Enable stage-2, pin EL1 to AArch64, and trap guest ID-register reads
+        // (HCR_EL2.TID3) so we can emulate the CPU feature view.
+        msr!("hcr_el2", HCR_RW | HCR_VM | HCR_TID3);
         core::arch::asm!("isb");
     }
 
@@ -270,78 +343,196 @@ pub struct El2Frame {
 fn ec_name(ec: u64) -> &'static str {
     match ec {
         EC_HVC64 => "HVC (hypercall)",
+        EC_SYSREG => "trapped MSR/MRS",
         EC_DABT_LOWER => "data abort (stage-2)",
         EC_IABT_LOWER => "instruction abort (stage-2)",
         _ => "other",
     }
 }
 
-/// C dispatcher for EL2 exceptions. `index` is the vector slot (0..15); 8 = sync
-/// from a lower EL (AArch64), which is where guest HVC/aborts land.
-#[no_mangle]
-pub extern "C" fn el2_dispatch(index: u64, _frame: *mut El2Frame) {
-    let esr = mrs!("esr_el2");
-    let elr = mrs!("elr_el2");
-    let ec = (esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
+/// Read the GP-register slot `i` (x0..x30) of the EL2 trap frame.
+#[inline]
+fn frame_x(frame: *mut El2Frame, i: usize) -> u64 {
+    // SAFETY: `frame` points at the 256-byte stub frame; i is in 0..31.
+    unsafe { (*frame).x[i] }
+}
 
-    hyp_puts("\n[HYP] *** EL2 trap *** vector=");
+/// Write the GP-register slot `i` (x0..x30) of the EL2 trap frame.
+#[inline]
+fn set_frame_x(frame: *mut El2Frame, i: usize, v: u64) {
+    // SAFETY: as `frame_x`.
+    unsafe { (*frame).x[i] = v };
+}
+
+/// HVC hypercall: function ID in x0, args in x1..x3, result back in x0. ELR_EL2
+/// already points past the HVC, so no PC adjustment is needed.
+fn hyp_handle_hvc(frame: *mut El2Frame) {
+    use hypercall::*;
+    let fn_id = frame_x(frame, 0);
+    let a1 = frame_x(frame, 1);
+
+    // SAFETY (single-core, pre-guest-concurrency): the vCPU block is touched
+    // only from EL2 trap context, which cannot reenter on a single core.
+    let vcpu = G_VCPU.get();
+    unsafe { (*vcpu).hvc_count += 1 };
+
+    let ret = match fn_id {
+        HVC_VERSION => HYP_ABI_VERSION,
+        HVC_PUTC => {
+            hyp_putc(a1 as u8);
+            0
+        }
+        HVC_PING => a1 + 1,
+        HVC_VM_INFO => unsafe { (*vcpu).hvc_count },
+        // Cooperative yield is a no-op until the M5 world-switch scheduler.
+        HVC_YIELD => 0,
+        _ => {
+            hyp_puts("[HYP] unknown hypercall fn=");
+            hyp_puthex(fn_id);
+            hyp_puts("\n");
+            HVC_ERR_BADCALL
+        }
+    };
+
+    set_frame_x(frame, 0, ret);
+}
+
+/// Trapped system-register access (EC=0x18), produced here by HCR_EL2.TID3 for
+/// guest reads of the ID_AA64* feature registers. We emulate by returning the
+/// real value, then step ELR past the trapped instruction (unlike HVC, ELR
+/// points *at* it).
+///
+/// ISS layout for MSR/MRS: Op0[21:20] Op2[19:17] Op1[16:14] CRn[13:10]
+/// Rt[9:5] CRm[4:1] Direction[0] (1 = read/MRS).
+fn hyp_handle_sysreg(frame: *mut El2Frame) {
+    let esr = mrs!("esr_el2");
+    let iss = esr & 0x1FF_FFFF;
+    let op0 = (iss >> 20) & 0x3;
+    let op2 = (iss >> 17) & 0x7;
+    let op1 = (iss >> 14) & 0x7;
+    let crn = (iss >> 10) & 0xF;
+    let rt = ((iss >> 5) & 0x1F) as usize;
+    let crm = (iss >> 1) & 0xF;
+    let is_read = iss & 0x1;
+
+    // SAFETY (single-core): see hyp_handle_hvc.
+    unsafe { (*G_VCPU.get()).sysreg_traps += 1 };
+
+    // Decode by (op0,op1,crn,crm,op2). Pass real values through for the ID
+    // registers Fermi actually consumes; any other ID register under TID3 is
+    // architecturally RES0, so returning 0 is safe.
+    let val = if op0 == 3 && op1 == 0 && crn == 0 && crm == 4 && op2 == 0 {
+        let v = mrs!("id_aa64pfr0_el1");
+        hyp_puts("[HYP] emulated guest MRS ID_AA64PFR0_EL1 -> ");
+        hyp_puthex(v);
+        hyp_puts("\n");
+        v
+    } else if op0 == 3 && op1 == 0 && crn == 0 && crm == 6 && op2 == 0 {
+        mrs!("id_aa64isar0_el1")
+    } else if op0 == 3 && op1 == 0 && crn == 0 && crm == 7 && op2 == 0 {
+        mrs!("id_aa64mmfr0_el1")
+    } else {
+        0 // unhandled ID register: RES0
+    };
+
+    if is_read != 0 && rt != 31 {
+        set_frame_x(frame, rt, val);
+    }
+
+    // Skip the trapped instruction.
+    // SAFETY: advancing ELR_EL2 past the emulated MRS; EL2 register, no memory.
+    unsafe {
+        msr!("elr_el2", mrs!("elr_el2") + 4);
+    }
+}
+
+/// Lower-EL abort. Real per-guest stage-2 management and isolation arrive in M3;
+/// for now dump the fault context once and park, so we never spin in a silent
+/// re-fault loop.
+fn hyp_handle_abort(index: u64) -> ! {
+    // SAFETY (single-core): see hyp_handle_hvc.
+    unsafe { (*G_VCPU.get()).abort_count += 1 };
+
+    let esr = mrs!("esr_el2");
+    let hpfar = mrs!("hpfar_el2");
+    let ipa = (hpfar >> 4) << 12; // HPFAR[43:4] = IPA[51:12]
+
+    hyp_puts("\n[HYP] *** unexpected lower-EL abort *** vector=");
     hyp_puthex(index);
     hyp_puts(" EC=");
-    hyp_puthex(ec);
-    hyp_puts(" (");
-    hyp_puts(ec_name(ec));
-    hyp_puts(")\n      ESR_EL2=");
+    hyp_puthex((esr >> ESR_EC_SHIFT) & ESR_EC_MASK);
+    hyp_puts("\n      ESR_EL2=");
     hyp_puthex(esr);
     hyp_puts(" ELR_EL2=");
-    hyp_puthex(elr);
-    hyp_puts("\n");
+    hyp_puthex(mrs!("elr_el2"));
+    hyp_puts("\n      FAR_EL2=");
+    hyp_puthex(mrs!("far_el2"));
+    hyp_puts(" faulting IPA=");
+    hyp_puthex(ipa);
+    hyp_puts("\n[HYP] parking CPU for inspection.\n");
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
 
-    if ec == EC_HVC64 {
-        // HVC #imm: the 16-bit immediate is in ESR_EL2[15:0]. ELR_EL2 already
-        // points to the instruction *after* the HVC, so a plain eret resumes
-        // the guest correctly. This is the Milestone-1 proof that guest->EL2
-        // world transitions work.
-        hyp_puts("      hypercall imm=");
-        hyp_puthex(esr & 0xFFFF);
-        hyp_puts(", returning to guest\n\n");
+/// Dispatcher for EL2 exceptions. `index` is the vector slot (0..15); 8 = sync
+/// from a lower EL (AArch64), which is where guest HVC/aborts land.
+#[no_mangle]
+pub extern "C" fn el2_dispatch(index: u64, frame: *mut El2Frame) {
+    let ec = (mrs!("esr_el2") >> ESR_EC_SHIFT) & ESR_EC_MASK;
+
+    match ec {
+        EC_HVC64 => hyp_handle_hvc(frame),
+        EC_SYSREG => hyp_handle_sysreg(frame),
+        EC_DABT_LOWER | EC_IABT_LOWER => {
+            // Dump once then park (the helper diverges). The DUMPED guard keeps
+            // a re-fault from spamming, matching the M1 behavior.
+            if !DUMPED.swap(true, Ordering::Relaxed) {
+                hyp_handle_abort(index);
+            }
+            hyp_puts("[HYP] unhandled EL2 exception (continuing)\n\n");
+        }
+        _ => {
+            hyp_puts("\n[HYP] unhandled EL2 exception: vector=");
+            hyp_puthex(index);
+            hyp_puts(" EC=");
+            hyp_puthex(ec);
+            hyp_puts(" (");
+            hyp_puts(ec_name(ec));
+            hyp_puts(") ELR_EL2=");
+            hyp_puthex(mrs!("elr_el2"));
+            hyp_puts("\n");
+        }
+    }
+}
+
+/// Guest-side hypercall probe (runs at EL1). Exercises the ABI so M2 is
+/// observable from a boot log. Gated on [`booted_via_el2`]: on a bare EL1 boot
+/// an `HVC` would trap as UNDEFINED.
+pub fn guest_probe() {
+    use crate::{kprint, kprintln};
+    use hypercall::*;
+
+    if !booted_via_el2() {
         return;
     }
 
-    // Any other trap at this milestone is unexpected. For a lower-EL abort, dump
-    // the full stage-2 context ONCE then park the CPU, so the log is readable
-    // instead of an endless re-fault spam loop.
-    if !DUMPED.swap(true, Ordering::Relaxed) {
-        let far = mrs!("far_el2");
-        let hpfar = mrs!("hpfar_el2");
-        let ipa = (hpfar >> 4) << 12; // HPFAR[43:4] = IPA[51:12]
-        hyp_puts("      FAR_EL2=");
-        hyp_puthex(far);
-        hyp_puts(" HPFAR_EL2=");
-        hyp_puthex(hpfar);
-        hyp_puts("\n      faulting IPA=");
-        hyp_puthex(ipa);
-        hyp_puts("\n      VTTBR_EL2=");
-        hyp_puthex(mrs!("vttbr_el2"));
-        hyp_puts(" VTCR_EL2=");
-        hyp_puthex(mrs!("vtcr_el2"));
-        hyp_puts("\n      HCR_EL2=");
-        hyp_puthex(mrs!("hcr_el2"));
-        // SAFETY (single-core): inspecting hypervisor-private tables for the
-        // crash dump; no concurrent writer once we have faulted.
-        unsafe {
-            hyp_puts("\n      &s2_l0=");
-            hyp_puthex(phys_of(S2_L0.get()));
-            hyp_puts(" s2_l0[0]=");
-            hyp_puthex((*S2_L0.get()).0[0]);
-            hyp_puts("\n      &s2_l1_low=");
-            hyp_puthex(phys_of(S2_L1_LOW.get()));
-            hyp_puts(" s2_l1_low[1]=");
-            hyp_puthex((*S2_L1_LOW.get()).0[1]);
-        }
-        hyp_puts("\n[HYP] parking CPU for inspection.\n");
-        loop {
-            unsafe { core::arch::asm!("wfi") };
-        }
+    kprintln!("[BOOT] testing hypervisor calls...");
+    // SAFETY: gated on booted_via_el2(), so a hypervisor is present at EL2.
+    unsafe {
+        kprintln!(
+            "[BOOT]   HVC_VERSION  -> {:#x}",
+            hvc_call(HVC_VERSION, 0, 0, 0)
+        );
+        kprintln!("[BOOT]   HVC_PING(41) -> {}", hvc_call(HVC_PING, 41, 0, 0));
+        kprint!("[BOOT]   HVC_PUTC ->");
+        hvc_call(HVC_PUTC, b' ' as u64, 0, 0);
+        hvc_call(HVC_PUTC, b'h' as u64, 0, 0);
+        hvc_call(HVC_PUTC, b'i' as u64, 0, 0);
+        hvc_call(HVC_PUTC, b'\n' as u64, 0, 0);
+        kprintln!(
+            "[BOOT]   HVC_VM_INFO  -> {} hypercalls served",
+            hvc_call(HVC_VM_INFO, 0, 0, 0)
+        );
     }
-    hyp_puts("[HYP] unhandled EL2 exception (continuing)\n\n");
 }

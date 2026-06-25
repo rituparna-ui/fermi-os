@@ -15,6 +15,11 @@
 .global _start
 
 _start:
+	// x28 carries "did we enter at EL2" across hyp_init (callee-saved, so the
+	// C ABI preserves it), the eret to EL1, and zero_bss (which only touches
+	// x0-x2). early_init reads it to record whether a hypervisor is present.
+	mov		x28, #0
+
 	// Park all secondary CPUs: only the primary (MPIDR Aff0 == 0) proceeds.
 	// MPIDR_EL1 is readable at both EL1 and EL2, so this is valid either way.
 	mrs		x1, mpidr_el1
@@ -41,6 +46,7 @@ _start:
 	// --- EL2: configure stage-2, vtimer, VBAR_EL2, HCR_EL2.VM ---
 	// hyp_init runs on the current (boot) stack; nothing else is live yet. It
 	// is PC-relative (bl), so it reaches physical hyp_init with the MMU off.
+	mov		x28, #1				// remember: we booted via EL2
 	bl		hyp_init
 
 	// Repoint SP_EL2 at a dedicated EL2 stack so future guest->EL2 traps don't
@@ -87,6 +93,8 @@ bss_done:
 
 	// early_init runs physically (PC-relative bl). It enables the MMU so that
 	// TTBR1 maps the upper half and TTBR0 identity-maps the lower half.
+	// Pass the EL2-entry indicator (x28) as its first argument.
+	mov		x0, x28
 	bl		early_init
 
 	// MMU is on. Switch to the upper-half stack and branch to the upper-half

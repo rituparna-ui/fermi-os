@@ -47,7 +47,12 @@ global_asm!(include_str!("arch/boot.S"));
 /// All logging here uses the UART's aligned helpers: RAM is Device memory until
 /// the MMU maps it Normal, so `core::fmt` would fault.
 #[no_mangle]
-pub extern "C" fn early_init() {
+pub extern "C" fn early_init(booted_via_el2: u64) {
+    // Record whether boot entered at EL2 (a hypervisor is active beneath us).
+    // boot.S threaded this through x28 across the eret and zero_bss; storing it
+    // now (post-zero_bss) makes it durable for the guest-side HVC probe below.
+    hyp::set_booted_via_el2(booted_via_el2 != 0);
+
     // Rust uses SIMD (incl. in core::fmt); enable it before anything formats.
     arch::cpu::enable_fp_simd();
 
@@ -70,6 +75,11 @@ pub extern "C" fn early_init() {
 
     // MMU is on now — absolute-VA data resolves via TTBR1 even at physical PC.
     arch::cpu::print_current_el();
+
+    // Hypervisor probe: if we booted via EL2, exercise the hypercall ABI from
+    // the EL1 guest. Skipped entirely on a bare EL1 boot (no `virtualization=on`)
+    // where an HVC would trap as UNDEFINED.
+    hyp::guest_probe();
 
     // Install the exception vector table (VBAR_EL1).
     exception::init();

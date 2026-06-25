@@ -26,6 +26,7 @@
 .equ VMCTL_RESET, 3
 .equ VMCTL_STOP,  4
 .equ VMCTL_START, 5
+.equ VMCTL_STAT,  6
 
 .section .text.boot.dom0
 .global _dom0_start
@@ -101,12 +102,57 @@ _dom0_start:
 	mov	x2, #2
 	bl	vmctl
 
+	// --- 7. idle a bit so the other VMs accumulate exits, then dump stats ---
+	mov	x20, #40
+14:	bl	d_yield
+	subs	x20, x20, #1
+	b.ne	14b
+
+	adr	x19, m_stats
+	bl	d_puts
+	mov	x21, #0                   // vm id
+15:	cmp	x21, x22
+	b.ge	16f
+	adr	x19, m_svm
+	bl	d_puts
+	mov	w23, w21
+	bl	d_puthex2                 // id
+	adr	x19, m_colon
+	bl	d_puts
+	// 5 stat counters (hvc,dabt,sysreg,wfx,irq) — print low byte of each.
+	mov	x24, #0                   // stat index
+17:	cmp	x24, #5
+	b.ge	18f
+	mov	x1, #VMCTL_STAT
+	mov	x2, x21
+	mov	x3, x24
+	bl	vmctl
+	mov	w23, w0
+	bl	d_puthex2
+	mov	w0, #' '
+	bl	d_putc
+	add	x24, x24, #1
+	b	17b
+18:	adr	x19, m_nl
+	bl	d_puts
+	add	x21, x21, #1
+	b	15b
+16:
 	adr	x19, m_done
 	bl	d_puts
 
-	// --- 7. idle forever ---
+	// --- 8. idle forever ---
 9:	bl	d_yield
 	b	9b
+
+// print one char in w0. clobbers x9,x10,x12.
+d_putc:
+	ldr	x9, =UART_DR
+	ldr	x10, =UART_FR
+19:	ldr	w12, [x10]
+	tbnz	w12, #5, 19b
+	str	w0, [x9]
+	ret
 
 // ---- helpers ----
 // vmctl: x1=op, x2=target -> x0 result. Clobbers x0.
@@ -176,4 +222,7 @@ m_stop:  .asciz "[dom0] VMCTL_STOP vm 1 (pause heartbeat guest)\r\n"
 m_start: .asciz "[dom0] VMCTL_START vm 1 (resume)\r\n"
 m_reset: .asciz "[dom0] VMCTL_RESET vm 2 (warm-restart IPC producer)\r\n"
 m_done:  .asciz "[dom0] management script complete; idling\r\n"
+m_stats: .asciz "[dom0] exit stats per vm (hvc dabt sysreg wfx irq):\r\n"
+m_svm:   .asciz "[dom0]  vm 0x"
+m_colon: .asciz ": "
 m_nl:    .asciz "\r\n"

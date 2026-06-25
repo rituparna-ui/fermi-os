@@ -89,7 +89,6 @@ int vcpu_count(void) { return nr_vcpus; }
 
 int64_t vcpu_vmctl(uint64_t op, uint64_t target, uint64_t arg,
                    hyp_trap_frame_t *f) {
-  (void)arg;
   /* Only the designated control domain may manage other VMs. */
   if (!cur_vcpu->privileged) {
     return VMCTL_EPERM;
@@ -112,6 +111,15 @@ int64_t vcpu_vmctl(uint64_t op, uint64_t target, uint64_t arg,
   }
   case VMCTL_RUNS:
     return (int64_t)t->run_count;
+  case VMCTL_STAT:
+    switch (arg) {
+    case VMSTAT_HVC:        return (int64_t)t->stats.hvc;
+    case VMSTAT_DATA_ABORT: return (int64_t)t->stats.data_abort;
+    case VMSTAT_SYSREG:     return (int64_t)t->stats.sysreg;
+    case VMSTAT_WFX:        return (int64_t)t->stats.wfx;
+    case VMSTAT_IRQ:        return (int64_t)t->stats.irq;
+    default:                return VMCTL_EINVAL;
+    }
   case VMCTL_RESET:
     if (t->dead) return VMCTL_EINVAL;
     /* Reset is in-place if it targets the caller; here the control VM never

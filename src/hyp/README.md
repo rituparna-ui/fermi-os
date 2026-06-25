@@ -206,6 +206,15 @@ The dom0 guest runs a one-shot script: enumerate all VMs + print their state and
 run-count, then pause the heartbeat guest, resume it, and warm-reset the IPC
 producer — demonstrating live VM management. (`vcpu_vmctl` in vcpu.c.)
 
+**Exit accounting (xentop-style).** The EL2 dispatcher tallies per-VM exit
+counts by reason — HVC, data abort (stage-2/MMIO), trapped sysreg, WFx, and
+physical IRQ (`vcpu_stats_t`, bumped in `account_exit`). dom0 reads them via
+`VMCTL_STAT` and prints a per-VM table. The profiles fingerprint each VM's
+behaviour: FermiOS is sysreg/IRQ-heavy (timer arms + ticks), dom0 is almost
+all HVC (management calls), and the event-driven IPC consumer is WFx-heavy with
+*zero* IRQ exits — its doorbells are hardware-delivered via List Registers and
+never trap to EL2, which is exactly what an exit counter should (not) record.
+
 ### VM lifecycle (PSCI)
 
 The hypervisor emulates a per-VM PSCI interface (the guest's `hvc`/`smc`):

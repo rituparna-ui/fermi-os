@@ -88,6 +88,15 @@ typedef struct hyp_trap_frame {
 #define VMCTL_RESET   3  /* x2=id; warm-reset that VM (reload image, restart)  */
 #define VMCTL_STOP    4  /* x2=id; pause that VM (mark not-runnable)           */
 #define VMCTL_START   5  /* x2=id; resume that VM (mark runnable)              */
+#define VMCTL_STAT    6  /* x2=id, x3=stat index; -> x0 = that exit counter    */
+
+/* VMCTL_STAT indices (x3). */
+#define VMSTAT_HVC        0
+#define VMSTAT_DATA_ABORT 1
+#define VMSTAT_SYSREG     2
+#define VMSTAT_WFX        3
+#define VMSTAT_IRQ        4
+#define VMSTAT_NR         5
 
 /* VMCTL_STATE packed result in x0: bit0 runnable, bit1 dead, bits[15:8] vmid. */
 #define VMCTL_ST_RUNNABLE 0x1ULL

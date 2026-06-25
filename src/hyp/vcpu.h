@@ -77,6 +77,16 @@ typedef struct vcpu_vgic {
   uint32_t gicr_isenabler0;
 } vcpu_vgic_t;
 
+/* Per-vCPU exit statistics (xentop-style observability). Bumped by the EL2
+ * trap dispatcher; surfaced to dom0 via VMCTL_STAT. */
+typedef struct {
+  uint64_t hvc;        /* hypercalls (yield/doorbell/vmctl/PSCI) */
+  uint64_t data_abort; /* stage-2 / MMIO data aborts            */
+  uint64_t sysreg;     /* trapped CNTP_* sysreg accesses        */
+  uint64_t wfx;        /* WFI/WFE traps                         */
+  uint64_t irq;        /* physical IRQs taken at EL2 for this VM */
+} vcpu_stats_t;
+
 /* Virtual timer per-vCPU state. */
 typedef struct {
   uint64_t cval;    /* shadow CNTP_CVAL_EL0 */
@@ -92,6 +102,7 @@ typedef struct vcpu {
   vcpu_fp_t      fp;
   vcpu_vgic_t    vgic;
   vcpu_vtimer_t  vtimer;
+  vcpu_stats_t   stats;
 
   uint64_t vttbr_el2; /* stage-2 base | (VMID << 48) — per-VM address space */
   uint32_t vmid;

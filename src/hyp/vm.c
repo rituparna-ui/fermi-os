@@ -220,7 +220,30 @@ static void handle_irq(hyp_trap_frame_t *f) {
   hyp_gic_eoi(intid);
 }
 
+/* Account a trap to the CURRENT vCPU's stats BEFORE handling it — a handler may
+ * world-switch (changing cur_vcpu), and we want to credit the VM that trapped. */
+static void account_exit(uint64_t type, hyp_trap_frame_t *f) {
+  vcpu_stats_t *s = &cur_vcpu->stats;
+  if (type == HYP_EXC_IRQ) {
+    s->irq++;
+    return;
+  }
+  if (type != HYP_EXC_SYNC) {
+    return;
+  }
+  switch (ESR_EC(f->esr)) {
+  case EC_HVC_AARCH64:
+  case EC_SMC_AARCH64:    s->hvc++; break;
+  case EC_TRAPPED_SYSREG: s->sysreg++; break;
+  case EC_WF_TRAPPED:     s->wfx++; break;
+  case EC_DATA_ABORT_LO:
+  case EC_INST_ABORT_LO:  s->data_abort++; break;
+  default: break;
+  }
+}
+
 void hyp_dispatch(uint64_t type, hyp_trap_frame_t *f) {
+  account_exit(type, f);
   switch (type) {
   case HYP_EXC_SYNC:
     handle_sync(type, f);

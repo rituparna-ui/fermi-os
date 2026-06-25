@@ -225,7 +225,7 @@ pub extern "C" fn kernel_main() -> ! {
             }
             fs::vfs::fd_close(t, fd);
             kprintln!("[boot] loaded /mnt/fat32/HELLO.ELF ({} bytes)", data.len());
-            sched::spawn_elf("hello", &data);
+            sched::spawn_elf("hello", &data, &[]);
         }
         fs::vfs::fd_table_destroy(t);
     }

@@ -272,8 +272,49 @@ pub fn create_user_task(name: &str) -> i64 {
     pid as i64
 }
 
+/// Lay out the aarch64 process-startup stack (argc, argv[], NULL, envp NULL,
+/// auxv AT_NULL) into the user stack. Strings live at the top; the array sits
+/// below them. Returns the user-VA SP (16-aligned) pointing at argc.
+fn build_argv_stack(kbase: u64, ubase: u64, size: u64, name: &str, args: &[&str]) -> u64 {
+    let k_top = kbase + size;
+    let u_top = ubase + size;
+    // argv[0] = name, then args (cap total at 8).
+    let mut argv: [&str; 8] = [""; 8];
+    let mut n = 0usize;
+    argv[n] = name; n += 1;
+    for a in args {
+        if n >= 8 { break; }
+        argv[n] = a; n += 1;
+    }
+    let mut k = k_top;
+    let mut uvas = [0u64; 8];
+    for i in (0..n).rev() {
+        let b = argv[i].as_bytes();
+        k -= b.len() as u64 + 1;
+        unsafe {
+            core::ptr::copy_nonoverlapping(b.as_ptr(), k as *mut u8, b.len());
+            *((k + b.len() as u64) as *mut u8) = 0;
+        }
+        uvas[i] = u_top - (k_top - k);
+    }
+    k &= !0xF;
+    let slots = 1 + n + 1 + 1 + 2; // argc + argv + NULL + envp NULL + auxv(0,0)
+    let mut sp_k = k - slots as u64 * 8;
+    sp_k &= !0xF;
+    unsafe {
+        let mut p = sp_k as *mut u64;
+        *p = n as u64; p = p.add(1);
+        for i in 0..n { *p = uvas[i]; p = p.add(1); }
+        *p = 0; p = p.add(1); // argv end
+        *p = 0; p = p.add(1); // envp end
+        *p = 0; p = p.add(1); // auxv type AT_NULL
+        *p = 0;               // auxv val
+    }
+    u_top - (k_top - sp_k)
+}
+
 /// Create an EL0 task by loading an ELF image into a fresh address space.
-pub fn spawn_elf(name: &str, elf_bytes: &[u8]) -> i64 {
+pub fn spawn_elf(name: &str, elf_bytes: &[u8], args: &[&str]) -> i64 {
     let s = unsafe { SCHED.get() };
     let t = kmalloc(core::mem::size_of::<Task>()) as *mut Task;
     if t.is_null() {
@@ -305,25 +346,27 @@ pub fn spawn_elf(name: &str, elf_bytes: &[u8]) -> i64 {
         }
     };
 
-    // User stack.
+    // User stack + argv layout (argv[0] = name, then args).
     let ustack_phys = pmm::allocate_pages(mmu::USER_STACK_PAGES);
     let ustack_size = mmu::USER_STACK_PAGES * PAGE_SIZE;
     let ustack_base = mmu::USER_STACK_TOP - ustack_size;
     mmu::map_user_range(l0, ustack_base, ustack_phys, mmu::USER_STACK_PAGES,
         mmu::PTE_AP_RW_EL0 | mmu::PTE_UXN | mmu::PTE_PXN | mmu::pte_attridx(1));
+    let kbase = phys_to_virt(ustack_phys);
+    let user_sp = build_argv_stack(kbase, ustack_base, ustack_size, name, args);
 
     let frame = (kstack_top - 160) as *mut u64;
     let pid = s.next_pid;
     unsafe {
-        *frame.add(0) = img.entry;            // x19 = ELF entry
-        *frame.add(1) = mmu::USER_STACK_TOP;  // x20 = user SP
+        *frame.add(0) = img.entry;   // x19 = ELF entry
+        *frame.add(1) = user_sp;     // x20 = user SP (argc/argv)
         *frame.add(11) = user_trampoline as usize as u64;
         (*t).sp = frame as u64;
         (*t).ttbr0 = mmu::ttbr_pack(l0, pid as u16);
         (*t).pid = pid;
         (*t).state = TASK_READY;
         (*t).stack_phys = kstack_phys;
-        (*t).user_sp = mmu::USER_STACK_TOP;
+        (*t).user_sp = user_sp;
         (*t).ustack_phys = ustack_phys;
         (*t).user_l0 = l0;
         (*t).fds = crate::fs::vfs::fd_table_create() as u64;

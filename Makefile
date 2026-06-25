@@ -25,13 +25,19 @@ build/hello.elf: user/hello.S
 	clang --target=aarch64-unknown-none -c user/hello.S -o build/hello.o
 	ld.lld -e _start --image-base=0x400000 -z max-page-size=0x1000 --no-rosegment build/hello.o -o build/hello.elf
 
-$(DISK): build/hello.elf
+build/echo.elf: user/echo.S
+	@mkdir -p build
+	clang --target=aarch64-unknown-none -c user/echo.S -o build/echo.o
+	ld.lld -e _start --image-base=0x400000 -z max-page-size=0x1000 --no-rosegment build/echo.o -o build/echo.elf
+
+$(DISK): build/hello.elf build/echo.elf
 	@mkdir -p build
 	dd if=/dev/zero of=$(DISK) bs=1M count=16 status=none
 	mkfs.fat -F 32 -n FERMI $(DISK)
 	printf 'Hello from FAT32 on Fermi OS (Rust)!\nThis file was read through the VFS.\n' > build/HELLO.TXT
 	mcopy -o -i $(DISK) build/HELLO.TXT ::HELLO.TXT
 	mcopy -o -i $(DISK) build/hello.elf ::HELLO.ELF
+	mcopy -o -i $(DISK) build/echo.elf ::ECHO.ELF
 
 clean:
 	cargo clean

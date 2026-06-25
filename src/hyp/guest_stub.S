@@ -379,3 +379,75 @@ hvc_loop:
 	b	hvc_loop
 .global guest_hvc_end
 guest_hvc_end:
+
+// ---------------------------------------------------------------------------
+// Paravirt block-device demo guest (milestone 19). Uses the BLK hypercalls to
+// read sector 0 of the real host disk into a guest RAM buffer, then prints the
+// first 8 bytes as hex via PUTC (host-mediated console) so we can confirm the
+// guest sees actual on-disk data. Buffer is at guest IPA 0x40010000 (inside the
+// guest's mapped RAM); the hypervisor stage-2-translates it before the DMA.
+.equ BLK_BUF_IPA, 0x40010000
+.equ HVC_PUTC2,   0xC6000001
+.equ HVC_BLK_INFO,0xC6000005
+.equ HVC_BLK_RW,  0xC6000006
+
+.section .text.guest, "ax"
+.balign 16
+.global guest_blk_start
+guest_blk_start:
+	// Read sector 0 into BLK_BUF_IPA.
+	movz	x0, #0x0006
+	movk	x0, #0xC600, lsl #16	// HVC_BLK_RW
+	mov	x1, #0			// sector 0
+	movz	x2, #0x0000
+	movk	x2, #0x4001, lsl #16	// buf IPA 0x40010000
+	mov	x3, #0			// read
+	hvc	#0
+	// x0 = 0 on success; if nonzero, print 'E' and stop.
+	cbz	x0, blk_ok
+	movz	x0, #0x0001
+	movk	x0, #0xC600, lsl #16
+	mov	x1, #'E'
+	hvc	#0
+	b	blk_done
+blk_ok:
+	// Print first 8 bytes of the buffer as hex nibbles.
+	movz	x19, #0x0000
+	movk	x19, #0x4001, lsl #16	// buffer base
+	mov	x20, #0			// byte index
+blk_print:
+	cmp	x20, #8
+	b.ge	blk_done
+	ldrb	w21, [x19, x20]
+	// high nibble
+	lsr	w22, w21, #4
+	bl	blk_puthex_nib
+	// low nibble
+	and	w22, w21, #0xF
+	bl	blk_puthex_nib
+	add	x20, x20, #1
+	b	blk_print
+blk_done:
+	movz	x0, #0x0001
+	movk	x0, #0xC600, lsl #16
+	mov	x1, #'\n'
+	hvc	#0
+1:	hvc	#0			// yield forever
+	b	1b
+
+// w22 = nibble (0..15) -> PUTC its hex digit. clobbers x0,x1; x30 saved by caller? use x23.
+blk_puthex_nib:
+	mov	x23, x30		// preserve return (no stack)
+	cmp	w22, #10
+	b.lt	2f
+	add	w22, w22, #('a' - 10)
+	b	3f
+2:	add	w22, w22, #'0'
+3:	movz	x0, #0x0001
+	movk	x0, #0xC600, lsl #16	// HVC_PUTC
+	mov	x1, x22
+	hvc	#0
+	mov	x30, x23
+	ret
+.global guest_blk_end
+guest_blk_end:

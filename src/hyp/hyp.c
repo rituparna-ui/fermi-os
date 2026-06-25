@@ -6,6 +6,8 @@
 #include "psci/psci.h"
 #include "hvc/hvc.h"
 #include "gic/gic.h" /* gic_enable_irq, gic_ack_irq, gic_end_irq */
+#include "blk/blk.h" /* blk_read/blk_write/capacity (host virtio-blk) */
+#include "utils/utils.h" /* ESUCCESS */
 #include "mm/pmm/pmm.h"
 #include "mm/mmu/mmu.h" /* PHYS_TO_VIRT */
 #include "mmio/mmio.h"  /* mmio_read32 (host UART RX poll) */
@@ -1567,4 +1569,113 @@ void hyp_run_hvc_abi(void) {
   for (int i = 0; i < HVC_COUNT; i++) {
     pmm_free_pages(ram[i], HVC_RAM_SIZE / 0x1000);
   }
+}
+
+/* ---- Milestone 19: paravirtualized block device over hypercalls ---- */
+
+extern char guest_blk_start[];
+extern char guest_blk_end[];
+
+#define PV_RAM_SIZE  0x00200000ULL
+
+/* Service a BLK hypercall against the running guest `s2`. The guest buffer is
+ * named by an IPA which we stage-2-translate (so the guest can only ever target
+ * memory it actually owns), bounce through a host-side buffer, and drive the
+ * real virtio-blk device. Returns the value to put in the guest's x0. */
+static uint64_t pv_blk_service(vcpu_t *v, stage2_t *s2) {
+  static uint8_t bounce[VIRTIO_BLK_SECTOR_SIZE] __attribute__((aligned(16)));
+  uint64_t fn = v->x[0];
+
+  if (fn == HVC_FN_BLK_INFO) {
+    extern struct virtio_blk blk_dev;
+    return blk_dev.capacity_sectors;
+  }
+
+  /* HVC_FN_BLK_RW: x1=sector, x2=guest buffer IPA, x3=write? */
+  uint64_t sector = v->x[1];
+  uint64_t buf_ipa = v->x[2];
+  int is_write = (int)(v->x[3] & 1);
+
+  /* Translate + bounds-check the guest buffer: the whole 512-byte sector must
+   * lie within one mapped guest page (no straddling / unmapped access). */
+  uint64_t buf_pa = stage2_translate(s2, buf_ipa);
+  if (!buf_pa || (buf_ipa & 0xFFF) + VIRTIO_BLK_SECTOR_SIZE > 0x1000) {
+    return (uint64_t)-1; /* unmapped or straddles a page -> reject */
+  }
+  uint8_t *buf_kva = (uint8_t *)PHYS_TO_VIRT(buf_pa);
+
+  if (is_write) {
+    for (int i = 0; i < VIRTIO_BLK_SECTOR_SIZE; i++) bounce[i] = buf_kva[i];
+    return (blk_write(sector, bounce) == ESUCCESS) ? 0 : (uint64_t)-1;
+  }
+  if (blk_read(sector, bounce) != ESUCCESS) {
+    return (uint64_t)-1;
+  }
+  for (int i = 0; i < VIRTIO_BLK_SECTOR_SIZE; i++) buf_kva[i] = bounce[i];
+  __asm__ __volatile__("dsb ish" ::: "memory");
+  return 0;
+}
+
+void hyp_run_blk_pv(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M19: paravirt block device (guest reads real disk via HVC)");
+
+  uintptr_t ram = pmm_allocate_pages(PV_RAM_SIZE / 0x1000);
+  static stage2_t s2;
+  if (!ram || !stage2_create(&s2, /*vmid=*/1)) {
+    return;
+  }
+  stage2_map(&s2, GUEST_ENTRY_IPA, (uint64_t)ram, PV_RAM_SIZE, 0);
+
+  uint64_t len = (uint64_t)(guest_blk_end - guest_blk_start);
+  uint64_t kva = PHYS_TO_VIRT((uint64_t)ram);
+  for (uint64_t b = 0; b < len; b++) {
+    ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)guest_blk_start)[b];
+  }
+  guest_sync_icache(kva, (len + 0xFFF) & ~0xFFFULL);
+
+  static vcpu_t v;
+  for (int i = 0; i < 31; i++) v.x[i] = 0;
+  v.pc = GUEST_ENTRY_IPA;
+  v.pstate = 0x3C5;
+  v.sp_el1 = GUEST_ENTRY_IPA + PV_RAM_SIZE;
+  v.vttbr = stage2_vttbr(&s2);
+  v.vmid = 1;
+  v.name = "blkvm";
+  vuart_init(&v.vuart, "blkvm");
+
+  uint64_t host_daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(host_daif));
+  __asm__ __volatile__("msr daifset, #3");
+
+  uart_puts("[HYP] guest read of sector 0 (first 8 bytes): ");
+
+  long guard = 100000;
+  int done = 0;
+  while (!done && guard-- > 0) {
+    vcpu_enter(&v);
+    if (v.exit_reason == HYP_EXC_SYNC && ESR_EC_OF(v.esr) == 0x16) {
+      uint64_t fn = v.x[0];
+      if (fn == HVC_FN_BLK_INFO || fn == HVC_FN_BLK_RW) {
+        v.x[0] = pv_blk_service(&v, &s2);
+      } else if (fn == HVC_FN_PUTC) {
+        vuart_emulate(&v.vuart, 0x09000000ULL, /*is_write=*/1, &v.x[1], 1);
+        v.x[0] = 0;
+      } else {
+        /* plain yield HVC: the guest has finished its read+print loop. */
+        done = 1;
+      }
+    } else if (!df_service_exit(&v)) {
+      done = 1;
+    }
+  }
+
+  vuart_flush(&v.vuart);
+  __asm__ __volatile__("msr daif, %0" ::"r"(host_daif));
+  uart_println("[HYP] M19: done (bytes above are real on-disk data via stage-2-translated DMA)");
+
+  pmm_free_pages(ram, PV_RAM_SIZE / 0x1000);
 }

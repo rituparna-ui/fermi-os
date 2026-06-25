@@ -26,6 +26,8 @@
 #define HVC_FN_VM_INFO    (HVC_VENDOR_BASE + 0x02) /* -> x0=vmid, x1=vm_count   */
 #define HVC_FN_YIELD      (HVC_VENDOR_BASE + 0x03) /* cooperatively end slice    */
 #define HVC_FN_DOORBELL   (HVC_VENDOR_BASE + 0x04) /* signal the peer VM (SPI)   */
+#define HVC_FN_BLK_INFO   (HVC_VENDOR_BASE + 0x05) /* -> x0 = disk capacity (sectors) */
+#define HVC_FN_BLK_RW     (HVC_VENDOR_BASE + 0x06) /* x1=sector x2=buf IPA x3=write?  */
 
 #define HVC_ABI_VERSION   0x00010000ULL            /* v1.0 */
 #define HVC_RET_NOT_SUPP  ((uint64_t)-1)

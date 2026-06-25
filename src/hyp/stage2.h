@@ -74,4 +74,11 @@ void stage2_map(stage2_t *s2, uint64_t ipa, uint64_t pa, uint64_t size, int devi
 /* VTTBR_EL2 value (root_phys | VMID<<48) for this address space. */
 uint64_t stage2_vttbr(const stage2_t *s2);
 
+/* Translate a guest IPA to its host physical address by walking THIS guest's
+ * stage-2 tables. Returns the host PA on success, or 0 if the IPA is not mapped
+ * in this guest (the isolation check). This is the safe primitive for the
+ * hypervisor to touch a guest-supplied buffer: a guest can only ever name
+ * memory the hypervisor already granted it. */
+uint64_t stage2_translate(const stage2_t *s2, uint64_t ipa);
+
 #endif /* HYP_STAGE2_H */

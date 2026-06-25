@@ -114,4 +114,11 @@ void hyp_run_doorbell_irq(void);
  * host timer. */
 void hyp_run_hvc_abi(void);
 
+/* Milestone 19: paravirtualized block device. A guest reads a real host-disk
+ * sector via the BLK hypercalls; the hypervisor stage-2-translates the guest's
+ * buffer IPA to a host PA and drives the physical virtio-blk device. Proves
+ * safe guest-buffer (DMA-equivalent) access. No-op at EL1; runs before the
+ * host timer. */
+void hyp_run_blk_pv(void);
+
 #endif /* HYP_HYP_H */

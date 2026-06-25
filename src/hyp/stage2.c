@@ -126,3 +126,34 @@ int stage2_create(stage2_t *s2, uint32_t vmid) {
 uint64_t stage2_vttbr(const stage2_t *s2) {
   return (s2->root_phys & ~0x1FFFULL) | ((uint64_t)s2->vmid << 48);
 }
+
+uint64_t stage2_translate(const stage2_t *s2, uint64_t ipa) {
+  /* L1: concatenated 1024-entry table (1 GiB per entry). */
+  uint64_t e = s2->l1_virt[S2_L1_INDEX(ipa)];
+  if (!(e & S2_PTE_VALID)) {
+    return 0;
+  }
+  if (!(e & S2_PTE_TABLE)) {
+    /* 1 GiB block leaf. */
+    return (e & S2_ADDR_MASK & ~(S2_1GB - 1)) | (ipa & (S2_1GB - 1));
+  }
+
+  /* L2: 512 entries (2 MiB per entry). */
+  uint64_t *l2 = (uint64_t *)PHYS_TO_VIRT(e & S2_ADDR_MASK);
+  e = l2[S2_L2_INDEX(ipa)];
+  if (!(e & S2_PTE_VALID)) {
+    return 0;
+  }
+  if (!(e & S2_PTE_TABLE)) {
+    /* 2 MiB block leaf. */
+    return (e & S2_ADDR_MASK & ~(S2_2MB - 1)) | (ipa & (S2_2MB - 1));
+  }
+
+  /* L3: 512 entries (4 KiB pages). A valid L3 leaf has the table/page bit set. */
+  uint64_t *l3 = (uint64_t *)PHYS_TO_VIRT(e & S2_ADDR_MASK);
+  e = l3[S2_L3_INDEX(ipa)];
+  if (!(e & S2_PTE_VALID)) {
+    return 0;
+  }
+  return (e & S2_ADDR_MASK) | (ipa & (S2_PAGE - 1));
+}

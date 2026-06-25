@@ -116,6 +116,14 @@ cargo build
 CI (`.github/workflows/ci.yml`) runs `clippy -D warnings`, builds debug +
 release, and runs the smoke-test against both on every push/PR.
 
+## Documentation
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — subsystem map, boot flow,
+  memory layout, the frozen ABI contracts (trap frame, syscall numbers, PTE
+  format), the concurrency model, and the test matrix.
+- [`docs/PORT-NOTES.md`](docs/PORT-NOTES.md) — the C→Rust port plan, build order,
+  and risk register.
+
 ## Debugging
 
 Run QEMU paused with a GDB stub on `:1234`:

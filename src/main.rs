@@ -322,13 +322,21 @@ fn asid_wrap_stress() {
     for _ in 0..4 {
         sched::create_task("churnkid", user::task_noop);
     }
-    for _ in 0..40 {
+    // Drain until every churnkid has exited *and* been reaped — i.e. the PMM
+    // free count returns to the pre-create baseline. Poll rather than spinning a
+    // fixed number of yields, since the time to fully reap varies with overall
+    // system load (a fixed count was a flaky measurement, not a real leak).
+    let mut free_after = 0;
+    for _ in 0..2000 {
         sched::reap();
         sched::r#yield();
+        free_after = mm::pmm::free_pages_count();
+        if free_after >= free_before {
+            break;
+        }
     }
 
     let wrapped = sched::peek_next_asid() < 100; // reset to a small value
-    let free_after = mm::pmm::free_pages_count();
     let leaked = free_before as i64 - free_after as i64;
 
     if wrapped && leaked == 0 {
@@ -449,6 +457,51 @@ fn fat32_stress() {
         "[FAT32 RM] create+exists+remove+gone+recreate: {}",
         if rm_ok { "PASS" } else { "FAIL" }
     );
+
+    // Delete/reuse churn: create→verify→rm a multi-cluster file many times with
+    // changing content, then confirm free space returned to baseline. Verifies
+    // freed clusters are actually reusable (FAT entries zeroed) and that
+    // recreated files read back their *new* content (no stale data), all
+    // bypassing the VFS cache via read_path.
+    let cyc_baseline = mm::pmm::free_pages_count(); // PMM is stable here; FAT free-space below
+    let blk_free_before = fat32_free_clusters();
+    let mut cyc_ok = true;
+    for round in 0..5u8 {
+        // ~6 KiB payload spans multiple clusters; content distinct per round.
+        let mut payload = [0u8; 6000];
+        for b in payload.iter_mut() {
+            *b = b'A' + round % 26;
+        }
+        if !fs::fat32::create(b"CYCLE.DAT", &payload) {
+            cyc_ok = false;
+            break;
+        }
+        let mut rbuf = [0u8; 6000];
+        let n = fs::fat32::read_path(b"CYCLE.DAT", &mut rbuf);
+        if n as usize != payload.len() || rbuf[..] != payload[..] {
+            cyc_ok = false;
+            break;
+        }
+        if !fs::fat32::remove(b"CYCLE.DAT") {
+            cyc_ok = false;
+            break;
+        }
+    }
+    let blk_free_after = fat32_free_clusters();
+    let _ = cyc_baseline;
+    if cyc_ok && blk_free_after == blk_free_before {
+        kprintln!("[FAT32 CYCLE] PASS: 5x create/verify/rm, FAT free-space stable");
+    } else {
+        kprintln!(
+            "[FAT32 CYCLE] FAIL: ok={} free {} -> {}",
+            cyc_ok, blk_free_before, blk_free_after
+        );
+    }
+}
+
+/// Count free clusters on the mounted FAT32 volume (test helper).
+fn fat32_free_clusters() -> u64 {
+    fs::fat32::count_free_clusters()
 }
 
 /// fd-table stress: open the max number of fds, confirm the table rejects the

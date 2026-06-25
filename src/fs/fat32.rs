@@ -329,6 +329,36 @@ fn fat_alloc_cluster(v: &Volume) -> u32 {
     }
 }
 
+/// Count free clusters (FAT entries == 0) across the FAT. O(volume) — intended
+/// for tests / diagnostics, not the hot path.
+pub fn count_free_clusters() -> u64 {
+    let v = vol();
+    if !v.mounted {
+        return 0;
+    }
+    let mut buf = [0u8; SECTOR];
+    let mut free = 0u64;
+    let mut c = 2u32;
+    loop {
+        let fat_offset = c * 4;
+        let sector = v.fat_start_sector + fat_offset / SECTOR as u32;
+        if sector >= v.data_start_sector {
+            break;
+        }
+        let offset = (fat_offset % SECTOR as u32) as usize;
+        if !blk::read(sector as u64, &mut buf) {
+            break;
+        }
+        let val = u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
+            & 0x0FFF_FFFF;
+        if val == 0 {
+            free += 1;
+        }
+        c += 1;
+    }
+    free
+}
+
 /// Find a free directory entry slot in `dir_cluster` and write `entry` (32 B).
 fn dir_add_entry(v: &Volume, dir_cluster: u32, entry: &[u8; DIR_ENTRY_SIZE]) -> bool {
     let mut cluster = dir_cluster;
@@ -625,6 +655,25 @@ pub fn exists(path: &[u8]) -> bool {
     match resolve_parent(&v, path) {
         Some((dir, name83)) => dir_lookup(&v, dir, &name83).is_some(),
         None => false,
+    }
+}
+
+/// Read a file's contents by path, bypassing the VFS vnode cache (resolve the
+/// parent + dir entry fresh from disk, then read the chain). Returns bytes read
+/// or -1. Useful for verifying create/remove churn where the cache would hold
+/// stale vnodes for a repeatedly recreated name.
+pub fn read_path(path: &[u8], buf: &mut [u8]) -> i64 {
+    let v = vol();
+    if !v.mounted {
+        return -1;
+    }
+    let (dir, name83) = match resolve_parent(&v, path) {
+        Some(p) => p,
+        None => return -1,
+    };
+    match dir_lookup(&v, dir, &name83) {
+        Some((first_cluster, size, _attr)) => read_file(first_cluster, size, buf),
+        None => -1,
     }
 }
 

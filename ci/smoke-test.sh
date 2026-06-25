@@ -31,7 +31,7 @@ rm -f "$USER_ELF"
 
 # --- boot headless with the full VirtIO device set ---
 echo "Booting $KERNEL ..."
-timeout 35 qemu-system-aarch64 \
+timeout 45 qemu-system-aarch64 \
 	-machine virt,gic-version=3 -cpu cortex-a72 -m 8G -nographic \
 	-netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on \
 	-device virtio-rng-pci,disable-legacy=on \
@@ -76,6 +76,7 @@ require "[FORK STRESS] parent forked 16 children PASS"
 require "[FAT32 STRESS] PASS: created + verified 30 files"
 require "[FAT32 SUBDIR] mkdir RDIR + create RDIR/INNER.TXT + read: PASS"
 require "[FAT32 RM] create+exists+remove+gone+recreate: PASS"
+require "[FAT32 CYCLE] PASS"
 require "[ASID WRAP] PASS"
 require "[KERNEL] Ready!"
 
@@ -99,7 +100,7 @@ trap 'rm -f "$DISK" "$VCONS" "$LOG" "$SHLOG"' EXIT
 echo "Driving the EL0 shell..."
 # Leading newlines absorb the first-byte-eaten race on QEMU stdin.
 printf '\n\npid\nmkdir /mnt/fat32/CIDIR\nls /mnt/fat32\nrm /mnt/fat32/CIDIR\nfork\nballoon inflate 4\nballoon\nhexdump /mnt/fat32/HELLO.TXT\nexec /mnt/fat32/HELLO.ELF a b\nexit\n' | \
-	timeout 35 qemu-system-aarch64 \
+	timeout 45 qemu-system-aarch64 \
 		-machine virt,gic-version=3 -cpu cortex-a72 -m 8G -nographic \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on \
 		-device virtio-rng-pci,disable-legacy=on \

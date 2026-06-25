@@ -5,6 +5,7 @@
 #include "vgic/vgic.h"
 #include "virtio/virtio_rng.h"
 #include "virtio/virtio_blk.h"
+#include "virtio/virtio_net.h"
 #include "vcpu.h"
 #include <stdint.h>
 
@@ -103,7 +104,8 @@ static void handle_data_abort(uint64_t type, hyp_trap_frame_t *f) {
   int is_vgic = vgic_mmio_is_target(ipa);
   int is_virtio = virtio_mmio_is_target(ipa);
   int is_vblk = virtio_blk_mmio_is_target(ipa);
-  if (!is_vgic && !is_virtio && !is_vblk) {
+  int is_vnet = virtio_net_mmio_is_target(ipa);
+  if (!is_vgic && !is_virtio && !is_vblk && !is_vnet) {
     hyp_puts("\n[HYP] stage-2 data abort outside emulated MMIO, IPA=");
     hyp_puthex(ipa);
     hyp_putc('\n');
@@ -133,11 +135,13 @@ static void handle_data_abort(uint64_t type, hyp_trap_frame_t *f) {
   if (is_write) {
     /* xzr (reg 31) reads as 0. */
     val = (srt == 31) ? 0 : f->regs[srt];
-    if (is_vblk)        virtio_blk_mmio_emulate(ipa, 1, &val, size_bytes);
+    if (is_vnet)        virtio_net_mmio_emulate(ipa, 1, &val, size_bytes);
+    else if (is_vblk)   virtio_blk_mmio_emulate(ipa, 1, &val, size_bytes);
     else if (is_virtio) virtio_mmio_emulate(ipa, 1, &val, size_bytes);
     else                vgic_mmio_emulate(ipa, 1, &val, size_bytes);
   } else {
-    if (is_vblk)        virtio_blk_mmio_emulate(ipa, 0, &val, size_bytes);
+    if (is_vnet)        virtio_net_mmio_emulate(ipa, 0, &val, size_bytes);
+    else if (is_vblk)   virtio_blk_mmio_emulate(ipa, 0, &val, size_bytes);
     else if (is_virtio) virtio_mmio_emulate(ipa, 0, &val, size_bytes);
     else                vgic_mmio_emulate(ipa, 0, &val, size_bytes);
     if (srt != 31) {

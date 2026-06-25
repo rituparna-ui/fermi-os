@@ -265,6 +265,19 @@ direction is honoured per-descriptor (`F_WRITE` ⇒ device writes the buffer), a
 the same cache-coherence discipline (invalidate before read, clean after write)
 applies in both transfer directions.
 
+### virtio-mmio network device (loopback NIC)
+
+A third virtio-mmio device (`virtio/virtio_net.c`, DeviceID 1) at `0x0A002000`,
+the meatiest: **two virtqueues** — RX (queue 0) and TX (queue 1), routed by
+`QueueSel` so each Queue* register write lands in the right per-queue state —
+and a 12-byte virtio-net header prepended to every packet, plus a device-config
+MAC. The hypervisor is a **loopback NIC**: a frame the guest transmits on TX is
+copied into a buffer the guest pre-posted on RX, both buffers are completed, and
+the RX interrupt (SPI 43) is injected — so a guest that sends a packet receives
+it back. The `netclient/` guest posts an RX buffer, transmits a tagged frame,
+and verifies the looped-back tag each iteration. Three virtio devices
+(entropy + block + net) now coexist on the shared transport.
+
 ### Paravirtualized console (PV log)
 
 A guest can emit a log line through the hypervisor instead of poking the raw

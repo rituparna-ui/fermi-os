@@ -107,6 +107,8 @@ extern const uint8_t __rng_blob_start[];
 extern const uint8_t __rng_blob_end[];
 extern const uint8_t __blk_blob_start[];
 extern const uint8_t __blk_blob_end[];
+extern const uint8_t __net_blob_start[];
+extern const uint8_t __net_blob_end[];
 
 /* Guest RAM regions in the top reserved GiB (hyp is at 0x250000000, its pool
  * grows up from ~0x250100000). Each region is 2 MiB-aligned and well clear of
@@ -129,6 +131,8 @@ extern const uint8_t __blk_blob_end[];
 #define RNG_RAM_SIZE        0x01000000ULL
 #define BLK_HOST_RAM_BASE   0x273000000ULL /* virtio-mmio blkclient 16 MiB */
 #define BLK_RAM_SIZE        0x01000000ULL
+#define NET_HOST_RAM_BASE   0x274000000ULL /* virtio-mmio netclient 16 MiB */
+#define NET_RAM_SIZE        0x01000000ULL
 
 /* Copy a flat blob to a host physical destination (EL2 MMU off) and make it
  * coherent for guest instruction fetch. Used at boot and on warm reset. */
@@ -181,6 +185,8 @@ void hyp_main(void) {
   hyp_copy_image(RNG_HOST_RAM_BASE, __rng_blob_start, rng_size);
   uint64_t blk_size = (uint64_t)(__blk_blob_end - __blk_blob_start);
   hyp_copy_image(BLK_HOST_RAM_BASE, __blk_blob_start, blk_size);
+  uint64_t net_size = (uint64_t)(__net_blob_end - __net_blob_start);
+  hyp_copy_image(NET_HOST_RAM_BASE, __net_blob_start, net_size);
   /* Zero the shared IPC page (its seqno starts at 0). */
   for (volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)IPC_SHARED_PA;
        p < (volatile uint64_t *)(uintptr_t)(IPC_SHARED_PA + 0x1000); p++) {
@@ -204,6 +210,7 @@ void hyp_main(void) {
   uint64_t hang_l1 = s2_build_vm2(HANG_HOST_RAM_BASE, HANG_RAM_SIZE);
   uint64_t rng_l1 = s2_build_vm2(RNG_HOST_RAM_BASE, RNG_RAM_SIZE);
   uint64_t blk_l1 = s2_build_vm2(BLK_HOST_RAM_BASE, BLK_RAM_SIZE);
+  uint64_t net_l1 = s2_build_vm2(NET_HOST_RAM_BASE, NET_RAM_SIZE);
 
   /* GIC + timer virtualization. */
   hyp_gic_init();
@@ -291,7 +298,12 @@ void hyp_main(void) {
                             __blk_blob_start, BLK_HOST_RAM_BASE, blk_size);
   blkc->ram_size = BLK_RAM_SIZE;
 
-  hyp_puts("[HYP] 10 vCPUs created (incl. dom0, vmtgt, crasher, hangguest, rng/blk clients). Starting scheduler.\n");
+  /* netclient (id 10, VMID 11): drives the emulated virtio-mmio net device. */
+  vcpu_t *netc = vcpu_alloc("netclient", GUEST_ENTRY_IPA, s2_make_vttbr(net_l1, 11), 0,
+                            __net_blob_start, NET_HOST_RAM_BASE, net_size);
+  netc->ram_size = NET_RAM_SIZE;
+
+  hyp_puts("[HYP] 11 vCPUs created (incl. dom0, vmtgt, crasher, hangguest, rng/blk/net clients). Starting scheduler.\n");
   hyp_puts("--------------------------------------------------\n\n");
 
   snapshot_init();    /* reserve the VM snapshot slot */

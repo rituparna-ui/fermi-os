@@ -95,6 +95,7 @@ timer `CNTHP` (PPI 26) instead.
 | M15 | Inter-VM shared memory + a doorbell hypercall (a para-virt primitive). |
 | M16 | Interrupt-driven doorbell: the hypercall injects a **virtual SPI** into the peer VM, whose EL1 IRQ handler services it. |
 | M17 | Unified **HVC hypercall ABI** (`hvc/`): SMCCC-style numbered services (VERSION/PUTC/VM_INFO/YIELD/DOORBELL) with PSCI folded in. |
+| M18 | **Guest→host security audit** (adversarially verified): fixed a guest-reachable vGIC NULL-deref host-DoS + an LR-count OOB; the rest of the trap surface verified sound. |
 
 The default hypervisor build runs **two** interactive FermiOS guests (M14);
 `Ctrl-X` cycles console focus. Build with `-DHYP_RUN_DEMOS` to run the

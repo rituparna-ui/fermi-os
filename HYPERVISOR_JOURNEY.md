@@ -299,11 +299,21 @@ qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on -m 8G \
   PSCI (delegated) plus FermiOS vendor services (VERSION, PUTC = host-mediated
   console, VM_INFO, YIELD, DOORBELL) returning a single action enum. Verified
   with a demo guest that prints `H<vmid>` via the PUTC hypercall and yields.
+- **M18 — guest→host security audit (done):** an adversarial review (parallel
+  reviewers per trust boundary, each finding verified against source) of the
+  whole trap-emulation surface. Verdict: the surface is sound — SRT register
+  index (31→xzr), syndrome/size decode, IPA routing (fixed windows), stage-2
+  index masks, hypercall args (constant GPR indices), and SPSR_EL2 restore were
+  all verified non-exploitable. Two issues fixed: a **guest-reachable vGIC
+  NULL-deref host-DoS** (`vgic_mmio_emulate` dereferenced a NULL `cur`; the M15
+  loop never set it) — fixed with a fail-safe NULL guard + restoring the
+  `vgic_set_current` invariant — and an LR-count OOB (`vgic_nr_lr` up to 32 vs a
+  16-entry shadow) clamped to 16.
 
 ## 10. What's next (not yet built)
 
-- Virtio passthrough (real guest disk/net), a non-FermiOS guest, dynamic VM
-  lifecycle, and a guest→host security audit.
+- Virtio passthrough (real guest disk/net), a non-FermiOS guest, and dynamic VM
+  lifecycle (create/destroy at runtime).
 
 ---
 

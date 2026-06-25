@@ -207,6 +207,15 @@ own registers and needs no context switch.
   `virtio-rng` (a module loaded from the initramfs) driver drives it, feeding
   the guest's entropy pool / `/dev/hwrng`. This exercises the complete virtio
   path and is the template for further virtio devices (e.g. virtio-blk).
+- **Emulated virtio-blk (virtio-mmio)**: a block device at IPA `0x0a000200`
+  (IRQ SPI 3 / INTID 35) backed by a 256 KiB in-hypervisor RAM disk, exposing
+  `/dev/vda`. The config space reports the capacity; on `QueueNotify` the
+  hypervisor walks each request's descriptor chain (16-byte out-header → data
+  buffer(s) → 1-byte status) and reads/writes the RAM disk, then completes the
+  request and injects the device SPI. The disk is seeded with a signature and a
+  minimal MBR, so Linux's `virtio_blk` driver (a module from the initramfs)
+  registers `/dev/vda` with the right size and its partition scan detects
+  `vda1` — confirming correct block reads.
 
 ---
 

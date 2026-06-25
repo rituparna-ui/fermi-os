@@ -88,4 +88,12 @@
 		reg = <0x0 0x0a000000 0x0 0x200>;
 		interrupts = <0 2 4>;
 	};
+
+	/* Emulated virtio-blk (virtio-mmio, device id 2) => /dev/vda. The device
+	 * interrupt is SPI 3 (INTID 35). */
+	virtio_blk@a000200 {
+		compatible = "virtio,mmio";
+		reg = <0x0 0x0a000200 0x0 0x200>;
+		interrupts = <0 3 4>;
+	};
 };

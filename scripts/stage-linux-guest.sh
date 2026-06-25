@@ -69,21 +69,25 @@ curl -fsSL -o "$WORK/mod.deb" "${KDIR}${MODDEB}"
 deb_extract "$WORK/mod.deb" "$WORK/mod"
 VRNG_KO="$(find "$WORK/mod" -name 'virtio-rng.ko' | head -1)"
 [ -n "$VRNG_KO" ] || { echo "[stage] ERROR: virtio-rng.ko not found" >&2; exit 1; }
+VBLK_KO="$(find "$WORK/mod" -name 'virtio_blk.ko' | head -1)"
+[ -n "$VBLK_KO" ] || { echo "[stage] ERROR: virtio_blk.ko not found" >&2; exit 1; }
 
 echo "[stage] building initramfs..."
 IR="$WORK/ir"
 mkdir -p "$IR/bin" "$IR/proc" "$IR/sys" "$IR/dev"
 cp "$BB" "$IR/bin/busybox"; chmod +x "$IR/bin/busybox"
 cp "$VRNG_KO" "$IR/virtio-rng.ko"
+cp "$VBLK_KO" "$IR/virtio_blk.ko"
 cat > "$IR/init" <<'INIT'
 #!/bin/busybox sh
 /bin/busybox mount -t proc proc /proc 2>/dev/null
 /bin/busybox mount -t sysfs sys /sys 2>/dev/null
 /bin/busybox mount -t devtmpfs dev /dev 2>/dev/null
-# Load the virtio-rng driver (CONFIG_HW_RANDOM_VIRTIO=m); virtio_mmio and the
-# rng core are built into the kernel, so a plain insmod is enough. It binds to
-# the hypervisor's emulated virtio-mmio RNG device.
+# Load the virtio drivers (CONFIG_HW_RANDOM_VIRTIO=m, CONFIG_VIRTIO_BLK=m);
+# virtio_mmio and the rng core are built into the kernel, so plain insmods are
+# enough. They bind to the hypervisor's emulated virtio-mmio devices.
 /bin/busybox insmod /virtio-rng.ko 2>/dev/null && echo "[init] loaded virtio-rng driver"
+/bin/busybox insmod /virtio_blk.ko 2>/dev/null && echo "[init] loaded virtio_blk driver"
 echo ""
 echo "==================================================="
 echo "  Linux userspace is ALIVE on the Fermi hypervisor!"

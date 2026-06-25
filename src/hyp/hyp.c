@@ -102,6 +102,12 @@ __attribute__((section(".hyp_tables"))) static uint64_t g_switch_count;
 __attribute__((section(".hyp_tables"))) static uint8_t g_lcon[LCON_SZ];
 __attribute__((section(".hyp_tables"))) static uint32_t g_lcon_len;
 
+/* virtio-blk RAM disk (declared early so hyp_init can seed it; the device
+ * model is defined further below). */
+#define VBLK_SECTORS 512               /* 256 KiB disk */
+#define VBLK_BYTES (VBLK_SECTORS * 512)
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint8_t g_vdisk[VBLK_BYTES];
+
 /* Emulated PL011 RX side (for interactive input to the Linux guest). Bytes
  * pushed via HVC_LCON_PUT land in this FIFO; when the guest has enabled the RX
  * interrupt (IMSC.RXIM) the hypervisor injects the UART SPI so Linux's pl011
@@ -232,6 +238,24 @@ void hyp_init(void) {
    * stage-2 tables and guest 1 payload are in place. */
   memset(vcpus, 0, sizeof(vcpus));
   current_vcpu = 0;
+
+  /* Seed the virtio-blk RAM disk: a recognizable signature at sector 0, plus a
+   * minimal MBR with one Linux partition. Linux's partition scan reads sector 0
+   * over the virtqueue and registers /dev/vda1 — proving block reads return the
+   * correct data, independent of the interactive shell. */
+  {
+    static const char sig[] = "VBLKOK_FERMI_HV\n";
+    memcpy(g_vdisk, sig, sizeof(sig));
+    uint8_t *p = &g_vdisk[446]; /* first MBR partition entry */
+    p[0] = 0x00;                /* not bootable                  */
+    p[1] = 0xFE; p[2] = 0xFF; p[3] = 0xFF; /* CHS first (dummy)   */
+    p[4] = 0x83;                /* type = Linux                  */
+    p[5] = 0xFE; p[6] = 0xFF; p[7] = 0xFF; /* CHS last (dummy)    */
+    p[8] = 1; p[9] = 0; p[10] = 0; p[11] = 0;        /* LBA start = 1   */
+    p[12] = 0xFE; p[13] = 1; p[14] = 0; p[15] = 0;   /* sectors = 510   */
+    g_vdisk[510] = 0x55;        /* MBR boot signature            */
+    g_vdisk[511] = 0xAA;
+  }
 
   /* Sanity: confirm we really are at EL2. */
   uint64_t el = (MRS(CurrentEL) >> 2) & 0x3;
@@ -736,6 +760,144 @@ static int hyp_emulate_virtio(uint64_t ipa, int is_write, uint64_t *val) {
   return 1;
 }
 
+/* ------------------------- emulated virtio-blk ----------------------------- */
+/* A minimal virtio-mmio (version 2) virtio-blk device backed by an in-
+ * hypervisor RAM disk. Exposes /dev/vda to the Linux guest. On QueueNotify the
+ * hypervisor walks each request's descriptor chain (16-byte out-header, one or
+ * more data buffers, a 1-byte status) and reads/writes the RAM disk. */
+#define VBLK_LO 0x0a000200ULL
+#define VBLK_HI 0x0a000400ULL
+#define VBLK_INTID 35 /* DT: virtio_blk interrupts = <0 3 4> => SPI 3 => 35 */
+#define VIRTIO_BLK_T_IN 0
+#define VIRTIO_BLK_T_OUT 1
+#define VQ_F_NEXT 1
+
+__attribute__((section(".hyp_tables"))) static struct {
+  uint32_t status;
+  uint32_t dev_feat_sel, drv_feat_sel;
+  uint32_t q_num, q_ready;
+  uint64_t q_desc, q_avail, q_used;
+  uint16_t last_avail;
+  uint32_t int_status;
+  uint32_t served;
+} g_vblk;
+
+static void hyp_vblk_process(void) {
+  if (!g_vblk.q_ready || !g_vblk.q_desc || !g_vblk.q_avail || !g_vblk.q_used)
+    return;
+  struct vq_desc *desc = lx_gpa(g_vblk.q_desc);
+  volatile uint16_t *avail = lx_gpa(g_vblk.q_avail);
+  volatile uint16_t *used16 = lx_gpa(g_vblk.q_used);
+  if (!desc || !avail || !used16 || g_vblk.q_num == 0)
+    return;
+
+  uint16_t avail_idx = avail[1];
+  int worked = 0;
+  while (g_vblk.last_avail != avail_idx) {
+    uint16_t head = avail[2 + (g_vblk.last_avail % g_vblk.q_num)];
+    if (head >= g_vblk.q_num)
+      break;
+
+    struct vq_desc *d = &desc[head];
+    uint8_t *hdr = lx_gpa(d->addr);
+    uint32_t type = 0;
+    uint64_t sector = 0;
+    if (hdr) {
+      type = *(volatile uint32_t *)(hdr + 0);
+      sector = *(volatile uint64_t *)(hdr + 8);
+    }
+    uint64_t off = sector * 512;
+    uint32_t total = 0;
+
+    if (d->flags & VQ_F_NEXT) {
+      uint16_t idx = d->next;
+      for (;;) {
+        if (idx >= g_vblk.q_num)
+          break;
+        struct vq_desc *dd = &desc[idx];
+        if (!(dd->flags & VQ_F_NEXT)) { /* status byte (device writes) */
+          uint8_t *st = lx_gpa(dd->addr);
+          if (st)
+            st[0] = 0; /* VIRTIO_BLK_S_OK */
+          total += 1;
+          break;
+        }
+        uint8_t *buf = lx_gpa(dd->addr);
+        uint32_t len = dd->len;
+        if (buf && off + len <= VBLK_BYTES) {
+          if (type == VIRTIO_BLK_T_IN)
+            memcpy(buf, g_vdisk + off, len);
+          else if (type == VIRTIO_BLK_T_OUT)
+            memcpy(g_vdisk + off, buf, len);
+        }
+        off += len;
+        total += len;
+        idx = dd->next;
+      }
+    }
+
+    volatile uint32_t *used_ring = (volatile uint32_t *)(used16 + 2);
+    uint16_t uidx = used16[1];
+    uint16_t uslot = uidx % g_vblk.q_num;
+    used_ring[uslot * 2 + 0] = head;
+    used_ring[uslot * 2 + 1] = total;
+    __asm__ __volatile__("dsb ish");
+    used16[1] = uidx + 1;
+
+    g_vblk.last_avail++;
+    worked = 1;
+  }
+  if (worked) {
+    __asm__ __volatile__("dsb ish");
+    g_vblk.int_status |= 1;
+    hyp_vgic_inject_ex(1 /* Linux */, VBLK_INTID, 0 /* SW */);
+    if (g_vblk.served < 3) {
+      g_vblk.served++;
+      hyp_puts("[HYP] virtio-blk: served guest request\n");
+    }
+  }
+}
+
+static int hyp_emulate_vblk(uint64_t ipa, int is_write, uint64_t *val) {
+  uint64_t off = ipa - VBLK_LO;
+  if (is_write) {
+    switch (off) {
+    case 0x014: g_vblk.dev_feat_sel = (uint32_t)*val; break;
+    case 0x024: g_vblk.drv_feat_sel = (uint32_t)*val; break;
+    case 0x030: break; /* QueueSel — single queue */
+    case 0x038: g_vblk.q_num = (uint32_t)*val; break;
+    case 0x044: g_vblk.q_ready = (uint32_t)*val; break;
+    case 0x050: hyp_vblk_process(); break; /* QueueNotify */
+    case 0x064: g_vblk.int_status &= ~(uint32_t)*val; break;
+    case 0x070: g_vblk.status = (uint32_t)*val; break;
+    case 0x080: g_vblk.q_desc = (g_vblk.q_desc & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x084: g_vblk.q_desc = (g_vblk.q_desc & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    case 0x090: g_vblk.q_avail = (g_vblk.q_avail & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x094: g_vblk.q_avail = (g_vblk.q_avail & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    case 0x0a0: g_vblk.q_used = (g_vblk.q_used & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x0a4: g_vblk.q_used = (g_vblk.q_used & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    default: break;
+    }
+    return 1;
+  }
+  switch (off) {
+  case 0x000: *val = 0x74726976; break;       /* Magic                       */
+  case 0x004: *val = 2; break;                /* Version 2                   */
+  case 0x008: *val = 2; break;                /* DeviceID 2 = block          */
+  case 0x00c: *val = 0x554d4551; break;       /* VendorID                    */
+  case 0x010: *val = (g_vblk.dev_feat_sel == 1) ? (1u << 0) : 0; break; /* VERSION_1 */
+  case 0x034: *val = 8; break;                /* QueueNumMax                 */
+  case 0x044: *val = g_vblk.q_ready; break;
+  case 0x060: *val = g_vblk.int_status; break;
+  case 0x070: *val = g_vblk.status; break;
+  case 0x0fc: *val = 0; break;                /* ConfigGeneration            */
+  case 0x100: *val = VBLK_SECTORS; break;     /* config: capacity[31:0]      */
+  case 0x104: *val = 0; break;                /* config: capacity[63:32]     */
+  default: *val = 0; break;
+  }
+  return 1;
+}
+
 /* ------------------------------- traps ------------------------------------ */
 
 static const char *ec_name(uint64_t ec) {
@@ -1104,9 +1266,11 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
   if (current_vcpu == 1 &&
       ((ipa >= GICD_LO && ipa < GICD_HI) || (ipa >= GICR_LO && ipa < GICR_HI) ||
        (ipa >= PL011_LO && ipa < PL011_HI) ||
-       (ipa >= VIRTIO_LO && ipa < VIRTIO_HI))) {
+       (ipa >= VIRTIO_LO && ipa < VIRTIO_HI) ||
+       (ipa >= VBLK_LO && ipa < VBLK_HI))) {
     int is_uart = (ipa >= PL011_LO && ipa < PL011_HI);
     int is_virtio = (ipa >= VIRTIO_LO && ipa < VIRTIO_HI);
+    int is_vblk = (ipa >= VBLK_LO && ipa < VBLK_HI);
     vcpus[current_vcpu].mmio_emulated++;
     uint64_t isv = (esr >> 24) & 1;
     uint64_t sas = (esr >> 22) & 3;
@@ -1120,6 +1284,8 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
           hyp_emulate_pl011(ipa, 1, &v);
         else if (is_virtio)
           hyp_emulate_virtio(ipa, 1, &v);
+        else if (is_vblk)
+          hyp_emulate_vblk(ipa, 1, &v);
         else
           hyp_emulate_gic(ipa, 1, &v);
       } else {
@@ -1127,6 +1293,8 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
           hyp_emulate_pl011(ipa, 0, &v);
         else if (is_virtio)
           hyp_emulate_virtio(ipa, 0, &v);
+        else if (is_vblk)
+          hyp_emulate_vblk(ipa, 0, &v);
         else
           hyp_emulate_gic(ipa, 0, &v);
         if (sas == 0)

@@ -1,6 +1,11 @@
 # Fermi OS
 
-Fermi OS is a bare-metal `aarch64 (ARMv8-A)` kernel built from scratch in `C` and assembly, targeting QEMU's `virt` machine with a Cortex-A72 processor.
+Fermi OS is a bare-metal `aarch64 (ARMv8-A)` kernel built from scratch in **pure Rust and assembly**, targeting QEMU's `virt` machine with a Cortex-A72 processor.
+
+> **Port in progress.** This branch (`fermi-claude-rs`) is a ground-up Rust
+> re-implementation of the original C kernel, rebuilt feature by feature
+> following the original commit history. The C sources remain available in git
+> history as the reference.
 
 
 ---
@@ -58,68 +63,49 @@ Fermi OS is a bare-metal `aarch64 (ARMv8-A)` kernel built from scratch in `C` an
 ---
 
 ## Prerequisites
-> Note: This project is being developed and tested on Mac M4 chip. There is a possibility that you might encounter environment setup errors on other platforms.
 
-Install [docker](https://www.docker.com) on your host machine.
+The build is **pure Rust** — no GCC or GNU binutils required. Assembly (`.S`
+files) is assembled by LLVM's integrated assembler, and linking uses the
+toolchain-bundled `rust-lld`.
 
 ```bash
-git clone https://github.com/rituparna-ui/fermi-os.git
-cd fermi-os
+# Rust toolchain + the bare-metal aarch64 target
+rustup target add aarch64-unknown-none
 
-docker run -d -it -v .:/root/fermi-os --name osdev ubuntu
-```
-
-Once the Docker container is up and running, start a shell in the container that was just created.
-```bash
-docker exec -it osdev bash
-```
-
-Inside the Docker container, install required dependencies.
-```bash
-apt update && apt upgrade
-
-apt install make qemu-system gcc-aarch64-linux-gnu gdb-multiarch tmux mtools dosfstools
-ln -sf aarch64-linux-gnu-as /usr/bin/as
+# QEMU for running the kernel
+#   macOS:  brew install qemu
+#   Debian: apt install qemu-system-arm
 ```
 
 ## Building & Running
 
 ```bash
 # Build the kernel ELF
-make
+cargo build
 
 # Build and run in QEMU (serial console)
-make run
+cargo run
 
-# Clean build artifacts
-make clean
+# Release build
+cargo build --release
 ```
+
+The QEMU invocation lives in `run.sh` (wired up as the Cargo `runner`).
 
 To exit QEMU: `Ctrl-A` then `X`
 
 ## Debugging
 
+Run QEMU paused with a GDB stub on `:1234`:
+
 ```bash
-# Launch QEMU paused + GDB in a tmux split
-make tmux
+qemu-system-aarch64 -machine virt,gic-version=3 -cpu cortex-a72 -m 8G \
+    -nographic -kernel target/aarch64-unknown-none/debug/kernel -s -S
 ```
 
-Or manually in two terminals:
+Then connect with a GDB that understands aarch64 (e.g. `gdb-multiarch`):
 
 ```bash
-# Terminal 1: QEMU waiting for debugger
-make debug
-
-# Terminal 2: GDB connecting to QEMU
-make gdb
-```
-
-### Other Utilities
-
-```bash
-# Generate compile_commands.json for clangd / IDE support
-make compile_commands.json
-
-# Dump QEMU device tree source (DTS)
-make dump_dts
+gdb-multiarch target/aarch64-unknown-none/debug/kernel \
+    -ex "target remote :1234" -ex "layout split"
 ```

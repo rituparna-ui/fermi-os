@@ -1,3 +1,8 @@
+# Rust / Cargo
+/target/
+Cargo.lock
+
+# Legacy C build artifacts (kept ignored during the port)
 build/
 compile_commands.json
 .cache/

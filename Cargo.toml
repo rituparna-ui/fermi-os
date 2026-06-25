@@ -1,0 +1,19 @@
+[package]
+name = "fermi"
+version = "0.1.0"
+edition = "2021"
+description = "Fermi OS — a bare-metal aarch64 kernel in pure Rust + assembly"
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+
+# Bare-metal: abort on panic (no unwinder), optimize for correctness/size.
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true

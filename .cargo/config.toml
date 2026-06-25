@@ -1,0 +1,14 @@
+# Pure-Rust bare-metal build: no GCC/binutils required. rustc compiles for the
+# aarch64-unknown-none target (precompiled `core` ships with the toolchain) and
+# links with the bundled rust-lld. Assembly lives in .S files pulled in via
+# global_asm!(include_str!(...)) — LLVM's integrated assembler handles them.
+[build]
+target = "aarch64-unknown-none"
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tlinker.ld",
+    # Build a position-dependent image; the kernel is linked at a fixed VA.
+    "-C", "relocation-model=static",
+]
+runner = "./run.sh"

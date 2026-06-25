@@ -115,6 +115,47 @@ fn cmd_run(path: &str) {
     vfs::fd_table_destroy(t);
 }
 
+fn cmd_write(name: &str, text: &str) {
+    // Create a root-level FAT32 file from a string (newline-terminated).
+    let mut data = alloc::vec::Vec::new();
+    data.extend_from_slice(text.as_bytes());
+    data.push(b'\n');
+    let ok = crate::fs::fat32::create(name.as_bytes(), &data);
+    kprintln!("write {}: {}", name, if ok { "ok" } else { "failed" });
+}
+
+fn cmd_hexdump(path: &str) {
+    let node = vfs::resolve(path);
+    if node.is_null() {
+        kprintln!("hexdump: {}: not found", path);
+        return;
+    }
+    let t = vfs::fd_table_create();
+    let fd = vfs::fd_open(t, path);
+    if fd >= 0 {
+        let mut buf = [0u8; 16];
+        let mut off = 0usize;
+        loop {
+            let n = vfs::fd_read(t, fd, &mut buf);
+            if n <= 0 { break; }
+            let n = n as usize;
+            kprint!("{:08x}  ", off);
+            for i in 0..16 {
+                if i < n { kprint!("{:02x} ", buf[i]); } else { kprint!("   "); }
+            }
+            kprint!(" |");
+            for i in 0..n {
+                let c = buf[i];
+                uart::putc(if (0x20..0x7f).contains(&c) { c } else { b'.' });
+            }
+            kprintln!("|");
+            off += n;
+        }
+        vfs::fd_close(t, fd);
+    }
+    vfs::fd_table_destroy(t);
+}
+
 fn dispatch(line: &str) {
     let mut parts = line.split_whitespace();
     let cmd = match parts.next() {
@@ -127,7 +168,7 @@ fn dispatch(line: &str) {
             kprintln!("builtins: help uptime version ps free meminfo ifconfig irqs");
             kprintln!("          cat <path> ping sleep <ms> kill <pid> echo <text>");
             kprintln!("          balloon <inflate|deflate|status> [n] vlog <text> clear");
-            kprintln!("          ls [path] run <elf-path> cpuinfo reboot");
+            kprintln!("          ls [path] write <name> <text> hexdump <path> run <elf> cpuinfo reboot");
         }
         "uptime" => kprintln!("up {} ms ({} s)", timer::uptime_ms(), timer::uptime_seconds()),
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
@@ -135,6 +176,17 @@ fn dispatch(line: &str) {
         "free" | "meminfo" => cmd_free(),
         "ifconfig" => kprint!("{}", net::render_info()),
         "irqs" => kprint!("{}", gic::render_interrupts()),
+        "write" => {
+            let rest: Vec<&str> = line.splitn(3, ' ').collect();
+            if rest.len() < 3 {
+                kprintln!("usage: write <name.ext> <text>");
+            } else {
+                cmd_write(rest[1], rest[2]);
+            }
+        }
+        "hexdump" => {
+            if arg1.is_empty() { kprintln!("usage: hexdump <path>"); } else { cmd_hexdump(arg1); }
+        }
         "ls" => {
             let path = if arg1.is_empty() { "/" } else { arg1 };
             kprint!("{}", vfs::list(path));

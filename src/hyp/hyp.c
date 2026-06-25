@@ -2,6 +2,7 @@
 #include "exception.h" /* ESR_EC, EC_HVC_AARCH64, ESR_ISS_* */
 #include "stage2.h"
 #include "vcpu.h"
+#include "vgic/vgic.h"
 #include "gic/gic.h" /* gic_enable_irq, gic_ack_irq, gic_end_irq */
 #include "mm/pmm/pmm.h"
 #include "mm/mmu/mmu.h" /* PHYS_TO_VIRT */
@@ -358,6 +359,9 @@ void hyp_boot_fermios_guest(void) {
   }
   guest_sync_icache(ram_kva, (blob_len + 0xFFF) & ~0xFFFULL);
 
+  /* Enable the virtual GIC interface (one-time). */
+  vgic_init();
+
   static vcpu_t v;
   for (int i = 0; i < 31; i++) {
     v.x[i] = 0;
@@ -366,7 +370,7 @@ void hyp_boot_fermios_guest(void) {
   v.pstate = 0x3C5;       /* EL1h, DAIF masked (guest's boot.S runs MMU-off) */
   v.sp_el1 = 0;           /* guest boot.S sets its own SP */
   v.vttbr = stage2_vttbr(&s2);
-  v.hcr_extra = 0;        /* no IRQ routing yet — observe to first trap */
+  v.hcr_extra = HCR_IMO;  /* route phys IRQ to EL2 + enable virtual interface */
   v.vmid = 1;
   v.id = 0;
   v.name = "fermios";
@@ -375,30 +379,81 @@ void hyp_boot_fermios_guest(void) {
               v.pc, v.vttbr);
   uart_println("[HYP] ---- guest output follows ----");
 
-  /* Run the guest, handling only the traps needed to OBSERVE how far it boots.
+  /* Run the guest, servicing GICD/GICR MMIO so its gic_init completes.
    * Bounded so a guest fault loop can't hang the host. */
-  int max_exits = 64;
+  long max_exits = 100000;
+  uint64_t mmio_count = 0;
   while (max_exits-- > 0) {
     vcpu_enter(&v);
     uint64_t ec = ESR_EC_OF(v.esr);
 
+    /* Stage-2 data abort: emulate if it targets the vGIC MMIO windows. */
+    if (v.exit_reason == HYP_EXC_SYNC && ec == 0x24) {
+      uint64_t ipa = ((v.hpfar >> 4) << 12) | (v.far & 0xFFF);
+      if (vgic_mmio_is_target(ipa)) {
+        uint64_t iss = v.esr & 0x1FFFFFFULL;
+        int isv = (int)((iss >> 24) & 1);
+        if (!isv) {
+          uart_printf("\n[HYP] vGIC MMIO with ISV=0 at IPA=%x — cannot decode\n",
+                      ipa);
+          break;
+        }
+        int is_write = (int)((iss >> 6) & 1);
+        int sas = (int)((iss >> 22) & 3);
+        int srt = (int)((iss >> 16) & 0x1F);
+        int sf = (int)((iss >> 15) & 1);
+        int size_bytes = 1 << sas;
+
+        uint64_t val = 0;
+        if (is_write) {
+          val = (srt == 31) ? 0 : v.x[srt];
+          vgic_mmio_emulate(ipa, 1, &val, size_bytes);
+        } else {
+          vgic_mmio_emulate(ipa, 0, &val, size_bytes);
+          if (srt != 31) {
+            v.x[srt] = sf ? val : (val & 0xFFFFFFFFULL);
+          }
+        }
+        v.pc += 4; /* advance past the trapped load/store */
+        mmio_count++;
+        continue;
+      }
+      /* A real stage-2 fault elsewhere — report and stop. */
+      uart_printf("\n[HYP] guest stage-2 data abort OUTSIDE vGIC: IPA=%x pc=%x ESR=%x\n",
+                  ipa, v.pc, v.esr);
+      break;
+    }
+
+    /* Physical IRQ routed to EL2 while the guest ran. The only one we expect
+     * here is the guest's own EL1 physical timer (PPI 30); ack it, inject the
+     * virtual INTID 30 into the guest, EOI, and resume. */
+    if (v.exit_reason == HYP_EXC_IRQ) {
+      uint64_t intid = gic_ack_irq();
+      if (intid != GIC_INTID_NO_PENDING) {
+        if (intid == 30) {
+          vgic_inject_ppi(30);
+        }
+        gic_end_irq(intid);
+      }
+      continue;
+    }
+
     if (v.exit_reason == HYP_EXC_SYNC && ec == 0x16) {
-      /* Guest HVC (e.g. PSCI reboot). Stop and report. */
       uart_printf("\n[HYP] guest HVC at pc=%x x0=%x — stopping observation\n",
                   v.pc, v.x[0]);
       break;
     }
 
-    /* Any abort / trap: report the first one richly — this defines what the
-     * next milestone (vGIC etc.) must emulate — and stop. */
+    /* Any other trap: report richly and stop (defines the next wall). */
     uint64_t ipa = ((v.hpfar >> 4) << 12) | (v.far & 0xFFF);
-    uart_printf("\n[HYP] guest TRAP: reason=%u EC=%x (%s)\n",
-                v.exit_reason, ec, hyp_ec_name(ec));
+    uart_printf("\n[HYP] guest TRAP: reason=%u EC=%x (%s) after %u vGIC MMIO ops\n",
+                v.exit_reason, ec, hyp_ec_name(ec), mmio_count);
     uart_printf("       guest_pc=%x ESR_EL2=%x FAR_EL2=%x HPFAR_EL2=%x faultIPA=%x\n",
                 v.pc, v.esr, v.far, v.hpfar, ipa);
     break;
   }
 
-  uart_println("[HYP] ---- end FermiOS guest observation ----");
+  uart_printf("[HYP] ---- end FermiOS guest observation (%u vGIC MMIO ops) ----\n",
+              mmio_count);
   pmm_free_pages(ram_phys, FERMI_GUEST_RAM / 0x1000);
 }

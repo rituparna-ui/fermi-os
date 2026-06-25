@@ -515,3 +515,107 @@ void hyp_boot_fermios_guest(void) {
               mmio_count);
   pmm_free_pages(ram_phys, FERMI_GUEST_RAM / 0x1000);
 }
+
+/* ---- Milestone 9: round-robin two heartbeat EL1 guests ---- */
+
+extern char guest_hb_start[];
+extern char guest_hb_end[];
+
+#define MG_COUNT      2
+#define MG_RAM_SIZE   0x00200000ULL  /* 2 MiB per guest */
+#define MG_ROUNDS     5              /* beats per guest */
+#define MG_MARKER_OFF 0x800          /* where the guest stores its counter */
+
+void hyp_run_multi_guest_demo(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M9: round-robin two heartbeat EL1 guests (A and B)");
+
+  static stage2_t s2[MG_COUNT];
+  static vcpu_t vc[MG_COUNT];
+  uintptr_t ram[MG_COUNT];
+  uint64_t hb_len = (uint64_t)(guest_hb_end - guest_hb_start);
+
+  for (int i = 0; i < MG_COUNT; i++) {
+    ram[i] = pmm_allocate_pages(MG_RAM_SIZE / 0x1000);
+    if (!ram[i]) {
+      uart_errorln("[HYP] M9: guest RAM alloc failed");
+      return;
+    }
+    if (!stage2_create(&s2[i], /*vmid=*/(uint32_t)(i + 1))) {
+      return;
+    }
+    /* Each guest's IPA 0x40000000 maps to a DIFFERENT host PA -> isolation. */
+    stage2_map(&s2[i], GUEST_ENTRY_IPA, (uint64_t)ram[i], MG_RAM_SIZE, 0);
+    stage2_map(&s2[i], UART_BASE, UART_BASE, 0x1000, /*device=*/1);
+
+    uint64_t kva = PHYS_TO_VIRT((uint64_t)ram[i]);
+    for (uint64_t b = 0; b < hb_len; b++) {
+      ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)guest_hb_start)[b];
+    }
+    *(volatile uint64_t *)(kva + MG_MARKER_OFF) = 0;
+    guest_sync_icache(kva, (hb_len + 0xFFF) & ~0xFFFULL);
+
+    for (int r = 0; r < 31; r++) {
+      vc[i].x[r] = 0;
+    }
+    vc[i].x[0] = (uint64_t)('A' + i); /* id char the heartbeat prints */
+    vc[i].pc = GUEST_ENTRY_IPA;
+    vc[i].pstate = 0x3C5;             /* EL1h, DAIF masked */
+    vc[i].sp_el1 = GUEST_ENTRY_IPA + MG_RAM_SIZE;
+    vc[i].vttbr = stage2_vttbr(&s2[i]);
+    vc[i].hcr_extra = 0;              /* voluntary HVC yields; no IRQ routing */
+    vc[i].vmid = (uint32_t)(i + 1);
+    vc[i].id = (uint32_t)i;
+    vc[i].name = (i == 0) ? "guestA" : "guestB";
+  }
+
+  uart_puts("[HYP] schedule (each char = one beat of that guest): ");
+
+  /* Round-robin: run a beat of each guest in turn. Each guest runs until its
+   * voluntary HVC yield, at which point we advance its PC past the hvc and move
+   * on. The world switch preserves each vCPU's full GP context (incl. its x10
+   * counter and x0 id) and swaps VTTBR_EL2 (VMID + stage-2). */
+  for (int round = 0; round < MG_ROUNDS; round++) {
+    for (int i = 0; i < MG_COUNT; i++) {
+      vcpu_enter(&vc[i]);
+      uint64_t ec = ESR_EC_OF(vc[i].esr);
+      /* HVC: ELR_EL2 already points past the hvc (at the `b 1b`), so the next
+       * entry resumes the loop. Do NOT advance pc. */
+      if (!(vc[i].exit_reason == HYP_EXC_SYNC && ec == 0x16)) {
+        uart_printf("\n[HYP] guest %s unexpected exit reason=%u EC=%x pc=%x\n",
+                    vc[i].name, vc[i].exit_reason, ec, vc[i].pc);
+        return;
+      }
+    }
+  }
+  uart_println("");
+
+  /* Verify per-vCPU isolation: each guest's counter (x10) should equal the
+   * number of rounds, and each guest's RAM marker should match its own x10 and
+   * the two RAM regions are physically distinct. */
+  int ok = 1;
+  for (int i = 0; i < MG_COUNT; i++) {
+    uint64_t kva = PHYS_TO_VIRT((uint64_t)ram[i]);
+    uint64_t marker = *(volatile uint64_t *)(kva + MG_MARKER_OFF);
+    uart_printf("[HYP] guest %s: x0(id)=%c x10(beats)=%u RAM@phys %x marker=%u\n",
+                vc[i].name, (uint64_t)vc[i].x[0], vc[i].x[10],
+                (uint64_t)ram[i], marker);
+    if (vc[i].x[10] != MG_ROUNDS || marker != (uint64_t)MG_ROUNDS ||
+        vc[i].x[0] != (uint64_t)('A' + i)) {
+      ok = 0;
+    }
+  }
+  if (ram[0] == ram[1]) {
+    ok = 0;
+  }
+
+  uart_println(ok ? "[HYP] M9 demo: PASS (two isolated guests round-robined)"
+                  : "[HYP] M9 demo: FAIL");
+
+  for (int i = 0; i < MG_COUNT; i++) {
+    pmm_free_pages(ram[i], MG_RAM_SIZE / 0x1000);
+  }
+}

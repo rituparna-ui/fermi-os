@@ -69,4 +69,10 @@ void hyp_run_timeslice_demo(void);
  * takes. No-op at EL1. Runs before the host timer starts. */
 void hyp_boot_fermios_guest(void);
 
+/* Milestone 9: round-robin TWO heartbeat EL1 guests, each with its own VMID,
+ * stage-2 address space and RAM, scheduled on the EL2 timer. Proves per-vCPU
+ * GP-context isolation + stage-2 isolation. No-op at EL1; runs before the host
+ * timer starts. */
+void hyp_run_multi_guest_demo(void);
+
 #endif /* HYP_HYP_H */

@@ -59,3 +59,31 @@ guest_spin_start:
 	b	1b
 .global guest_spin_end
 guest_spin_end:
+
+// ---------------------------------------------------------------------------
+// Heartbeat EL1 guest (milestone 9 multi-guest demo). Position-independent.
+// On entry the hypervisor seeds x0 = this guest's ASCII id char ('A','B',...).
+// Each "beat": increment a per-guest counter (x10, lives in the per-vCPU GP
+// context across world switches), write the id char to the PL011 UART data
+// register, store the counter to the guest's own RAM at 0x40000800, then HVC to
+// voluntarily yield back to the hypervisor scheduler. x0 (the id) is preserved
+// across the loop to prove per-vCPU register isolation.
+.section .text.guest, "ax"
+.balign 16
+.global guest_hb_start
+guest_hb_start:
+	// x9 = UART data register (IPA, straight-through mapped).
+	movz	x9, #0x0000
+	movk	x9, #0x0900, lsl #16	// x9 = 0x09000000
+	// x11 = counter store address (guest RAM base + 0x800).
+	movz	x11, #0x0000
+	movk	x11, #0x4000, lsl #16
+	add	x11, x11, #0x800
+	movz	x10, #0			// per-guest beat counter
+1:	add	x10, x10, #1
+	str	w0, [x9]		// print our id char
+	str	x10, [x11]		// record counter in our own RAM
+	hvc	#0			// yield to the hypervisor scheduler
+	b	1b
+.global guest_hb_end
+guest_hb_end:

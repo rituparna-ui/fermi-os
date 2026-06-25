@@ -840,8 +840,11 @@ void kernel_main() {
    * Also runs before the host timer so the two timers don't interleave yet. */
   hyp_run_timeslice_demo();
 
+  /* Milestone 9: round-robin two isolated heartbeat EL1 guests. */
+  hyp_run_multi_guest_demo();
+
   /* Milestone 8: boot the real (reduced-RAM) FermiOS as an EL1 guest and
-   * observe how far it gets / its first trap. */
+   * run it (it ticks indefinitely, so keep this last). */
   hyp_boot_fermios_guest();
 #endif
 

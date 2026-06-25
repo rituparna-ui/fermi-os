@@ -11,9 +11,12 @@ BUILD_DIR := build
 USER_DIR  := user
 TARGET := $(BUILD_DIR)/kernel.elf
 
-# File discovery - find all .c and .S files in src
-S_SOURCES := $(shell find $(SRC_DIR) -name "*.S")
-C_SOURCES := $(shell find $(SRC_DIR) -name "*.c")
+# File discovery - find all .c and .S files in src EXCEPT the standalone
+# miniguest (src/hyp/miniguest), which is a separate AArch64 image built on its
+# own and embedded as a flat blob — it must never link into the hypervisor or
+# the FermiOS guest.
+S_SOURCES := $(shell find $(SRC_DIR) -path "$(SRC_DIR)/hyp/miniguest" -prune -o -name "*.S" -print)
+C_SOURCES := $(shell find $(SRC_DIR) -path "$(SRC_DIR)/hyp/miniguest" -prune -o -name "*.c" -print)
 
 # Object File Mapping
 # src/boot.S      -> build/boot.o
@@ -42,6 +45,18 @@ GUEST_BIN := $(BUILD_DIR)/guest.bin
 # GUEST_BUILD compiles out the hypervisor hooks in kernel_main (the guest is
 # plain FermiOS at EL1 and links none of src/hyp).
 GUEST_CFLAGS := -DMEM_SIZE='$(GUEST_MEM_SIZE)' -DGUEST_BUILD
+
+# --- Foreign mini-guest (standalone, DTB-driven) -------------------------
+# A separate AArch64 EL1 image (src/hyp/miniguest) with its own linker script
+# and entry; shares NO code with FermiOS. Built to a flat blob and embedded
+# into the hypervisor by src/hyp/miniguest_blob.S.
+MINI_DIR     := $(SRC_DIR)/hyp/miniguest
+MINI_ELF     := $(BUILD_DIR)/miniguest.elf
+MINI_BIN     := $(BUILD_DIR)/miniguest.bin
+MINI_SOURCES := $(MINI_DIR)/start.S $(MINI_DIR)/main.c
+MINI_CFLAGS  := -ffreestanding -nostdlib -nostartfiles -fno-pic -mstrict-align \
+                -mgeneral-regs-only -O2 -Wall -Wextra
+
 DEPS    := $(OBJECTS:.o=.d)
 
 # User-space binaries packaged onto the FAT32 disk and exec()'d at runtime.
@@ -103,6 +118,8 @@ all: $(TARGET)
 # The hypervisor image embeds the guest blob (via src/hyp/guest_blob.S), so the
 # blob must exist before guest_blob.o is assembled and before the final link.
 $(BUILD_DIR)/hyp/guest_blob.o: $(GUEST_BIN)
+# Likewise the foreign mini-guest blob (src/hyp/miniguest_blob.S).
+$(BUILD_DIR)/hyp/miniguest_blob.o: $(MINI_BIN)
 
 # TARGET depends on all .o files
 $(TARGET): $(OBJECTS)
@@ -128,6 +145,17 @@ $(GUEST_ELF): $(GUEST_OBJECTS)
 
 $(GUEST_BIN): $(GUEST_ELF)
 	@echo "OBJCOPY $@ (flat guest image)"
+	@$(CROSS_COMPILE)objcopy -O binary $< $@
+
+# --- Foreign mini-guest build rules --------------------------------------
+$(MINI_ELF): $(MINI_SOURCES) $(MINI_DIR)/linker.ld
+	@echo "MINI LD  $@ (standalone foreign guest)"
+	@mkdir -p $(dir $@)
+	@$(CC) $(MINI_CFLAGS) -T $(MINI_DIR)/linker.ld -o $@ \
+		$(MINI_DIR)/start.S $(MINI_DIR)/main.c
+
+$(MINI_BIN): $(MINI_ELF)
+	@echo "OBJCOPY $@ (flat mini-guest image)"
 	@$(CROSS_COMPILE)objcopy -O binary $< $@
 
 # Compile all .c files

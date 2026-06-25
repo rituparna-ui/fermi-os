@@ -134,4 +134,10 @@ void hyp_run_net_pv(void);
  * EL1; runs before the host timer. */
 void hyp_run_vm_lifecycle(void);
 
+/* Milestone 22: boot a FOREIGN (non-FermiOS) guest via the standard AArch64
+ * boot protocol. The hypervisor builds a DTB into guest RAM, enters the
+ * standalone mini-guest with x0 = DTB IPA, and the guest discovers its UART +
+ * RAM by parsing the device tree. No-op at EL1; runs before the host timer. */
+void hyp_run_miniguest(void);
+
 #endif /* HYP_HYP_H */

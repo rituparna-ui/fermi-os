@@ -5,6 +5,7 @@
 #include "vgic/vgic.h"
 #include "psci/psci.h"
 #include "hvc/hvc.h"
+#include "fdt.h" /* fdt_build (foreign-guest device tree) */
 #include "gic/gic.h" /* gic_enable_irq, gic_ack_irq, gic_end_irq */
 #include "blk/blk.h" /* blk_read/blk_write/capacity (host virtio-blk) */
 #include "net/net.h" /* net_tx/net_rx_poll/net_get_mac/arp (host virtio-net) */
@@ -1896,4 +1897,106 @@ void hyp_run_vm_lifecycle(void) {
   uart_printf("[HYP] M21: %s (free pages %u, baseline %u after %u create/destroy cycles)\n",
               (ok && final == baseline) ? "PASS - no leak" : "FAIL - leak",
               final, baseline, (uint64_t)VM_CYCLES);
+}
+
+/* ---- Milestone 22: boot a foreign (non-FermiOS) guest via DTB ---- */
+
+extern char __miniguest_blob_start[];
+extern char __miniguest_blob_end[];
+
+#define MG_FOREIGN_RAM  0x00200000ULL  /* 2 MiB */
+#define MG_DTB_IPA      0x40100000ULL  /* DTB lives 1 MiB into guest RAM */
+
+void hyp_run_miniguest(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M22: booting a FOREIGN (non-FermiOS) guest via DTB");
+
+  uintptr_t ram = pmm_allocate_pages(MG_FOREIGN_RAM / 0x1000);
+  static stage2_t s2;
+  if (!ram || !stage2_create(&s2, /*vmid=*/1)) {
+    return;
+  }
+  /* RAM + a straight-through PL011 so the foreign guest's discovered UART
+   * writes reach the real console directly. */
+  stage2_map(&s2, GUEST_ENTRY_IPA, (uint64_t)ram, MG_FOREIGN_RAM, 0);
+  stage2_map(&s2, UART_BASE, UART_BASE, 0x1000, /*device=*/1);
+
+  uint64_t kva = PHYS_TO_VIRT((uint64_t)ram);
+
+  /* Copy the standalone foreign-guest blob to the RAM base (IPA 0x40000000). */
+  uint64_t blob_len = (uint64_t)(__miniguest_blob_end - __miniguest_blob_start);
+  for (uint64_t b = 0; b < blob_len; b++) {
+    ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)__miniguest_blob_start)[b];
+  }
+
+  /* Build a DTB into guest RAM at MG_DTB_IPA and self-check it. The guest sees
+   * its RAM as [0x40000000, +2 MiB) and a PL011 at the architected UART base. */
+  uint64_t dtb_kva = kva + (MG_DTB_IPA - GUEST_ENTRY_IPA);
+  uint32_t dtb_sz = fdt_build((void *)dtb_kva, 0x1000, GUEST_ENTRY_IPA,
+                              MG_FOREIGN_RAM, UART_BASE);
+  if (!dtb_sz || !fdt_check((void *)dtb_kva)) {
+    uart_errorln("[HYP] M22: DTB build failed");
+    stage2_destroy(&s2);
+    pmm_free_pages(ram, MG_FOREIGN_RAM / 0x1000);
+    return;
+  }
+  uart_printf("[HYP] built DTB (%u bytes) at guest IPA %x\n",
+              (uint64_t)dtb_sz, MG_DTB_IPA);
+  guest_sync_icache(kva, MG_FOREIGN_RAM);
+
+  static vcpu_t v;
+  for (int i = 0; i < 31; i++) v.x[i] = 0;
+  v.x[0] = MG_DTB_IPA;   /* AArch64 boot protocol: x0 = DTB address */
+  v.pc = GUEST_ENTRY_IPA;
+  v.pstate = 0x3C5;
+  v.sp_el1 = 0;          /* the foreign guest sets its own SP */
+  v.vttbr = stage2_vttbr(&s2);
+  v.hcr_extra = HCR_IMO; /* so CNTHP can preempt its final WFI */
+  v.vmid = 1;
+  v.name = "miniguest";
+
+  vgic_init();
+  vgic_vcpu_reset(&v.vgic);
+  vgic_set_current(&v.vgic);
+  gic_enable_irq(HYP_CNTHP_PPI);
+
+  uint64_t freq;
+  __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
+
+  uint64_t host_daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(host_daif));
+  __asm__ __volatile__("msr daifset, #3");
+
+  /* The foreign guest prints then WFIs; give it a few CNTHP-bounded slices to
+   * run to completion, then stop. */
+  for (int slice = 0; slice < 4; slice++) {
+    cnthp_arm(freq / 100); /* 10 ms */
+    int slice_done = 0;
+    long guard = 200000;
+    while (!slice_done && guard-- > 0) {
+      vcpu_enter(&v);
+      if (v.exit_reason == HYP_EXC_IRQ) {
+        uint64_t intid = gic_ack_irq();
+        if (intid == HYP_CNTHP_PPI) {
+          cnthp_disarm();
+          gic_end_irq(intid);
+          slice_done = 1;
+        } else if (intid != GIC_INTID_NO_PENDING) {
+          gic_end_irq(intid);
+        }
+      } else if (!df_service_exit(&v)) {
+        slice_done = 1;
+      }
+    }
+    cnthp_disarm();
+  }
+
+  __asm__ __volatile__("msr daif, %0" ::"r"(host_daif));
+  uart_println("[HYP] M22: done (a non-FermiOS guest booted + parsed our DTB)");
+
+  stage2_destroy(&s2);
+  pmm_free_pages(ram, MG_FOREIGN_RAM / 0x1000);
 }

@@ -851,6 +851,7 @@ void kernel_main() {
   hyp_run_blk_pv();           /* M19 */
   hyp_run_net_pv();           /* M20 */
   hyp_run_vm_lifecycle();     /* M21 */
+  hyp_run_miniguest();        /* M22 */
   hyp_run_dual_fermios();     /* M9c */
 #endif
 

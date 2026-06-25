@@ -7,13 +7,14 @@ scheduling:
 
 - **vCPU 0** — Fermi itself, running unmodified at EL1.
 - **vCPU 1** — an unmodified aarch64 **Linux** kernel, booted to a BusyBox
-  userspace shell (its console is captured; see §10).
-- **vCPU 2** — a tiny silent bare-metal payload demonstrating that the vCPU
-  table / scheduler / per-guest stage-2 generalise past two guests. Its
-  progress is visible via `/proc/vms`.
+  userspace shell (its console is captured; see §10). It is **SMP**: …
+- **vCPU 2** — …Linux's **second core**, brought online by the boot CPU via
+  PSCI `CPU_ON`. It shares vCPU 1's stage-2 (same VMID) but has its own MPIDR,
+  register/sysreg/vGIC context, and virtual timer. `nproc` in the guest reports
+  2. See §6 for the SGI/IPI emulation that makes cross-core IPIs work.
 
 The vCPU count is just `NUM_VCPUS`; the round-robin scheduler and per-guest
-stage-2 (one VMID each) scale to N.
+stage-2 (one VMID per VM; cores of one VM share it) scale to N.
 
 It targets QEMU's `virt` machine with `gic-version=3,virtualization=on` and a
 Cortex-A72 (ARMv8.0-A, **no VHE**). The code lives in `src/hyp/`.
@@ -183,9 +184,19 @@ own registers and needs no context switch.
   ID in `x0`, args in `x1`–`x3`, result in `x0`. Calls: `VERSION`, `PUTC`
   (paravirt console), `PING`, `YIELD`, `VM_INFO`, `HYP_BASE`, and introspection
   (`VM_COUNT`, `VM_STAT`).
-- **PSCI** (over `HVC`, function-ID space `0x8400_00xx`): `PSCI_VERSION`,
-  `SYSTEM_OFF`/`SYSTEM_RESET` (reap the calling vCPU). Linux's DT declares
-  `psci { method = "hvc"; }`, so its PSCI calls land here.
+- **PSCI** (over `HVC`, function-ID space `0x8400_00xx` / `0xC400_00xx`):
+  `PSCI_VERSION`, `SYSTEM_OFF`/`SYSTEM_RESET` (reap the calling vCPU), and for
+  SMP `CPU_ON` (start a secondary vCPU at a given entry point), `AFFINITY_INFO`,
+  `CPU_OFF`, and `FEATURES`. Linux's DT declares `psci { method = "hvc"; }`, so
+  its PSCI calls land here.
+- **SGIs / IPIs (SMP)**: with multiple vCPUs on one physical CPU, the guest's
+  inter-processor interrupts can't use physical SGIs (affinity wouldn't match).
+  `ICH_HCR_EL2.TC` traps the guest's "common" CPU-interface registers; a write
+  to `ICC_SGI1R_EL1` is decoded (SGI INTID + target affinity / IRM) and injected
+  as a virtual SGI into the target core's vGIC. `TC` also traps `ICC_PMR_EL1`
+  and `ICC_CTLR_EL1`, which are mirrored into `ICH_VMCR_EL2`. The hot
+  interrupt-acknowledge/EOI path (group-1, not under `TC`) stays on the hardware
+  virtual interface.
 - **System registers** (EC `0x18`): infrastructure to decode `ESR_EL2` ISS and
   emulate `MRS/MRS`, stepping `ELR_EL2` past the trapped instruction. (The M2
   `HCR_EL2.TID3` ID-trap demo is left disabled by default — guests read ID

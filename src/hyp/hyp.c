@@ -81,12 +81,6 @@ __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_dev
 #define GUEST2_PHYS_BASE 0x280000000ULL /* 10 GiB                              */
 #define GUEST2_IPA_BASE 0x40000000ULL   /* its own private IPA view            */
 #define GUEST2_RAM_SIZE _2MB
-__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g2_l0[512];
-__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g2_l1[512];
-__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t g2_l2[512];
-
-extern uint8_t guest2_payload[];
-extern uint8_t guest2_payload_end[];
 
 /* The vCPUs and the index of the one currently running. In .hyp_tables
  * (NOLOAD); initialised explicitly in hyp_init(). */
@@ -94,6 +88,7 @@ __attribute__((section(".hyp_tables"))) static vcpu_t vcpus[NUM_VCPUS];
 __attribute__((section(".hyp_tables"))) static int current_vcpu;
 __attribute__((section(".hyp_tables"))) static uint64_t g_switch_count;
 __attribute__((section(".hyp_tables"))) static uint64_t g_wfi_count;
+__attribute__((section(".hyp_tables"))) static uint64_t g_midr;
 
 /* Captured Linux-guest console. The Linux PL011 is left unmapped in its
  * stage-2, so its UART MMIO traps to EL2 and is emulated (hyp_emulate_pl011);
@@ -144,7 +139,7 @@ static void hyp_uart_rx_kick(void);
 __attribute__((section(".hyp_tables"))) static uint64_t g_quantum_ticks;
 
 static void hyp_create_linux_guest(void);
-static void hyp_create_guest2(void);
+static void hyp_create_linux_secondary(void);
 static void hyp_tick_init(void);
 static void hyp_vgic_inject_ex(int target, uint32_t intid, int hw);
 static void hyp_tick_start(void);
@@ -342,7 +337,7 @@ void hyp_init(void) {
     MSR(icc_ctlr_el1, ctlr);
   }
   MSR(icc_igrpen1_el1, 1ULL);                /* enable phys Group 1 at EL2   */
-  MSR(ich_hcr_el2, ICH_HCR_EN);              /* enable virtual CPU interface */
+  MSR(ich_hcr_el2, ICH_HCR_EN | ICH_HCR_TC); /* enable vCPU iface; trap SGIs */
   __asm__ __volatile__("isb");
 
   /* Enable stage-2, pin EL1 to AArch64, route physical IRQs to EL2 (IMO) so we
@@ -353,16 +348,27 @@ void hyp_init(void) {
   MSR(hcr_el2, HCR_RW | HCR_VM | HCR_IMO | HCR_TWI);
   __asm__ __volatile__("isb");
 
+  /* Virtualized CPU identity: the guest's MPIDR_EL1 / MIDR_EL1 reads come from
+   * VMPIDR_EL2 / VPIDR_EL2. Seed them so the primary guest sees a sane core id;
+   * each vCPU's MPIDR is then restored per world-switch (per-core for SMP). */
+  g_midr = MRS(midr_el1);
+  uint64_t real_mpidr = MRS(mpidr_el1);
+  MSR(vpidr_el2, g_midr);
+  MSR(vmpidr_el2, real_mpidr);
+  __asm__ __volatile__("isb");
+
   /* Register the primary guest (Fermi) as vCPU 0 — its full context is
-   * captured lazily on its first yield — and create the tiny guest 1. */
+   * captured lazily on its first yield — then create the Linux guest and its
+   * second core (an SMP secondary, parked until PSCI CPU_ON). */
   vcpus[0].id = 0;
   vcpus[0].state = VCPU_RUNNING;
+  vcpus[0].mpidr = real_mpidr;
   vcpus[0].vttbr = (uint64_t)s2_l0; /* VMID 0 */
   current_vcpu = 0;
   hyp_create_linux_guest();
   hyp_puts("[HYP] created Linux-slot guest (vCPU 1): 1 GiB @ IPA 0x40000000\n");
-  hyp_create_guest2();
-  hyp_puts("[HYP] created guest2 (vCPU 2): 2 MiB bare-metal payload\n");
+  hyp_create_linux_secondary();
+  hyp_puts("[HYP] prepared Linux SMP secondary (vCPU 2), parked for CPU_ON\n");
 
   /* Start the preemptive scheduling tick (CNTHP / PPI 26). */
   hyp_tick_init();
@@ -394,6 +400,8 @@ static void hyp_save_el1(vcpu_t *v) {
   v->esr_el1 = MRS(esr_el1);
   v->far_el1 = MRS(far_el1);
   v->par_el1 = MRS(par_el1);
+  v->cntv_ctl = MRS(cntv_ctl_el0);
+  v->cntv_cval = MRS(cntv_cval_el0);
 }
 
 static void hyp_restore_el1(vcpu_t *v) {
@@ -416,6 +424,10 @@ static void hyp_restore_el1(vcpu_t *v) {
   MSR(esr_el1, v->esr_el1);
   MSR(far_el1, v->far_el1);
   MSR(par_el1, v->par_el1);
+  MSR(cntv_ctl_el0, v->cntv_ctl);
+  MSR(cntv_cval_el0, v->cntv_cval);
+  MSR(vmpidr_el2, v->mpidr); /* the core identity the guest reads as MPIDR_EL1 */
+  MSR(vpidr_el2, g_midr);
   __asm__ __volatile__("isb");
 }
 
@@ -568,6 +580,7 @@ static void hyp_create_linux_guest(void) {
   memset(v, 0, sizeof(*v));
   v->id = 1;
   v->state = VCPU_READY;
+  v->mpidr = 0x80000000ULL;                     /* core 0 (aff0=0, bit31 RES1) */
   v->pc = LINUX_IPA_BASE + 0x200000;            /* Image entry (IPA)         */
   v->regs[0] = LINUX_IPA_BASE + 0x8000000;      /* x0 = DTB (IPA 0x48000000) */
   v->pstate = 0x3c5;                            /* EL1h, DAIF masked         */
@@ -575,39 +588,17 @@ static void hyp_create_linux_guest(void) {
   /* sctlr_el1 = 0 => stage-1 MMU off, as Linux's early entry expects. */
 }
 
-/* Third guest: map only its 2 MiB slice (IPA GUEST2_IPA_BASE -> high RAM) as a
- * single stage-2 2 MiB block; everything else is unmapped (sandboxed). */
-static void hyp_create_guest2(void) {
-  for (int i = 0; i < 512; i++) {
-    g2_l0[i] = 0;
-    g2_l1[i] = 0;
-    g2_l2[i] = 0;
-  }
-  uint64_t gb = GUEST2_IPA_BASE / _1GB;          /* 1 GiB region index        */
-  uint64_t mb = (GUEST2_IPA_BASE % _1GB) / _2MB; /* 2 MiB block within region */
-  g2_l0[0] = ((uint64_t)g2_l1) | S2_TABLE | S2_VALID;
-  g2_l1[gb] = ((uint64_t)g2_l2) | S2_TABLE | S2_VALID;
-  g2_l2[mb] = GUEST2_PHYS_BASE | S2_VALID | S2_AF | S2_SH_INNER | S2_AP_RW |
-              S2_MEM_NORMAL;
-  __asm__ __volatile__("dsb ish");
-
-  /* Isolate guest2's RAM from the primary guest (its 1 GiB block in Fermi's
-   * stage-2). */
-  s2_l1_low[GUEST2_PHYS_BASE / _1GB] = 0;
-  __asm__ __volatile__("dsb ish");
-
-  /* Copy the payload into guest2's RAM (physical, MMU off). */
-  uint64_t len = (uint64_t)(guest2_payload_end - guest2_payload);
-  memcpy((void *)GUEST2_PHYS_BASE, guest2_payload, len);
-
+/* Linux SMP secondary (vCPU 2, core 1). It shares the primary Linux guest's
+ * stage-2 (same VTTBR / VMID 1), so it sees the same RAM and devices. It starts
+ * UNUSED (parked); Linux's boot CPU brings it online via PSCI CPU_ON, which
+ * fills in its entry PC and marks it READY. */
+static void hyp_create_linux_secondary(void) {
   vcpu_t *v = &vcpus[2];
   memset(v, 0, sizeof(*v));
   v->id = 2;
-  v->state = VCPU_READY;
-  v->pc = GUEST2_IPA_BASE;                       /* entry (IPA)               */
-  v->pstate = 0x3c5;                             /* EL1h, DAIF masked         */
-  v->sp_el1 = GUEST2_IPA_BASE + GUEST2_RAM_SIZE;
-  v->vttbr = ((uint64_t)g2_l0) | (2ULL << 48);   /* VMID 2                    */
+  v->state = VCPU_UNUSED;                        /* parked until CPU_ON       */
+  v->mpidr = 0x80000001ULL;                      /* core 1 (aff0=1)           */
+  v->vttbr = ((uint64_t)lx_l0) | (1ULL << 48);   /* shares Linux VMID 1       */
 }
 
 /* Bring up just enough of the physical GIC for the hypervisor's own timer
@@ -1214,8 +1205,13 @@ static void hyp_world_switch(el2_frame_t *f);
 
 /* PSCI function IDs (SMC Calling Convention, 32-bit space). */
 #define PSCI_VERSION_FN 0x84000000
+#define PSCI_CPU_OFF 0x84000002
+#define PSCI_MIGRATE_INFO_TYPE 0x84000006
 #define PSCI_SYSTEM_OFF 0x84000008
 #define PSCI_SYSTEM_RESET 0x84000009
+#define PSCI_FEATURES 0x8400000A
+#define PSCI_CPU_ON_64 0xC4000003
+#define PSCI_AFFINITY_INFO_64 0xC4000004
 
 /* Reap the running vCPU and switch to the next runnable one without saving
  * the dying vCPU's state. If none remain, halt. */
@@ -1249,13 +1245,70 @@ static void hyp_vcpu_exit(el2_frame_t *f) {
   hyp_restore_fp(nv);
 }
 
-/* Minimal PSCI: report a version, and treat SYSTEM_OFF / SYSTEM_RESET from a
- * guest as "this VM is done" — reap it. Returns nonzero if handled. */
+/* Minimal PSCI: report a version, boot/inspect SMP secondaries, and treat
+ * SYSTEM_OFF / SYSTEM_RESET from a guest as "this VM is done" — reap it.
+ * Returns nonzero if handled. */
 static int hyp_handle_psci(el2_frame_t *f, uint64_t fn) {
   switch (fn) {
   case PSCI_VERSION_FN:
     f->x[0] = 0x00010001; /* PSCI v1.1 */
     return 1;
+  case PSCI_FEATURES: {
+    uint64_t qfn = f->x[1];
+    /* Advertise the calls we implement (0 = present); else NOT_SUPPORTED. */
+    if (qfn == PSCI_CPU_ON_64 || qfn == PSCI_AFFINITY_INFO_64 ||
+        qfn == PSCI_CPU_OFF || qfn == PSCI_SYSTEM_OFF ||
+        qfn == PSCI_SYSTEM_RESET || qfn == PSCI_VERSION_FN)
+      f->x[0] = 0;
+    else
+      f->x[0] = (uint64_t)-1;
+    return 1;
+  }
+  case PSCI_MIGRATE_INFO_TYPE:
+    f->x[0] = 2; /* Trusted OS not present / migration not required */
+    return 1;
+  case PSCI_CPU_ON_64: {
+    uint64_t target = f->x[1] & 0xFFFFFFULL; /* affinity bits of MPIDR */
+    uint64_t entry = f->x[2];
+    uint64_t ctx = f->x[3];
+    for (int i = 0; i < NUM_VCPUS; i++) {
+      if ((vcpus[i].mpidr & 0xFFFFFFULL) != target)
+        continue;
+      if (vcpus[i].state != VCPU_UNUSED) {
+        f->x[0] = (uint64_t)-4; /* ALREADY_ON */
+        return 1;
+      }
+      vcpu_t *v = &vcpus[i];
+      uint64_t saved_mpidr = v->mpidr, saved_vttbr = v->vttbr, saved_id = v->id;
+      memset(v, 0, sizeof(*v));
+      v->id = saved_id;
+      v->mpidr = saved_mpidr;
+      v->vttbr = saved_vttbr; /* shares the Linux VM's stage-2 */
+      v->pc = entry;          /* PSCI entry point (IPA), MMU off */
+      v->regs[0] = ctx;       /* context_id passed in x0 */
+      v->pstate = 0x3c5;      /* EL1h, DAIF masked */
+      __asm__ __volatile__("dsb ish");
+      v->state = VCPU_READY;  /* scheduler will run it on the next tick */
+      hyp_puts("[HYP] PSCI CPU_ON: started vCPU ");
+      hyp_puthex((uint64_t)i);
+      hyp_puts(" @ entry ");
+      hyp_puthex(entry);
+      hyp_puts("\n");
+      f->x[0] = 0; /* SUCCESS */
+      return 1;
+    }
+    f->x[0] = (uint64_t)-2; /* INVALID_PARAMETERS */
+    return 1;
+  }
+  case PSCI_AFFINITY_INFO_64: {
+    uint64_t target = f->x[1] & 0xFFFFFFULL;
+    f->x[0] = 1; /* default OFF */
+    for (int i = 0; i < NUM_VCPUS; i++)
+      if ((vcpus[i].mpidr & 0xFFFFFFULL) == target)
+        f->x[0] = (vcpus[i].state == VCPU_UNUSED) ? 1 : 0; /* 0 = ON */
+    return 1;
+  }
+  case PSCI_CPU_OFF:
   case PSCI_SYSTEM_OFF:
   case PSCI_SYSTEM_RESET:
     hyp_vcpu_exit(f); /* does not return to the caller's vCPU */
@@ -1384,6 +1437,71 @@ static void hyp_handle_sysreg(el2_frame_t *f) {
 
   vcpus[current_vcpu].sysreg_traps++;
 
+  /* GICv3 CPU-interface "common" registers trapped via ICH_HCR_EL2.TC. The hot
+   * interrupt path (IAR/EOIR/BPR/IGRPEN, all group-1) is NOT trapped and stays
+   * on the hardware virtual interface; only these init/SGI registers trap. */
+  if (op0 == 3 && op1 == 0 && crn == 12 &&
+      ((crm == 11 && (op2 == 5 || op2 == 6 || op2 == 7)) || /* SGI1R/ASGI1R/SGI0R */
+       (crm == 11 && (op2 == 1 || op2 == 3)) ||             /* DIR / RPR          */
+       (crm == 12 && op2 == 4))) {                          /* CTLR               */
+    uint64_t wval = (rt == 31) ? 0 : f->x[rt];
+    if (crm == 11 && op2 == 5 && !is_read) {
+      /* ICC_SGI1R_EL1 write => generate an SGI. Inject a virtual SGI into the
+       * targeted Linux core(s). Only Linux (vCPU 1/2) participates in SMP. */
+      uint32_t intid = (uint32_t)((wval >> 24) & 0xF);
+      int irm = (int)((wval >> 40) & 1);
+      if (current_vcpu == 1 || current_vcpu == 2) {
+        for (int aff0 = 0; aff0 < 2; aff0++) {
+          int vc = 1 + aff0; /* aff0 0 => core0=vCPU1, aff0 1 => core1=vCPU2 */
+          int hit = irm ? (vc != current_vcpu) : (int)((wval >> aff0) & 1);
+          if (hit)
+            hyp_vgic_inject_ex(vc, intid, 0 /* software SGI */);
+        }
+      }
+    } else if (crm == 12 && op2 == 4) {
+      /* ICC_CTLR_EL1: map CBPR/EOImode to ICH_VMCR_EL2; synthesize ID fields
+       * (PRIbits/IDbits/A3V) from ICH_VTR_EL2 on read. */
+      uint64_t vmcr = MRS(ich_vmcr_el2);
+      if (is_read) {
+        uint64_t vtr = MRS(ich_vtr_el2);
+        uint64_t pribits = (vtr >> 29) & 0x7;
+        uint64_t idbits = (vtr >> 23) & 0x7;
+        uint64_t a3v = (vtr >> 21) & 0x1;
+        uint64_t cbpr = (vmcr >> 4) & 1;
+        uint64_t eoim = (vmcr >> 9) & 1;
+        val = cbpr | (eoim << 1) | (pribits << 8) | (idbits << 11) | (a3v << 15);
+      } else {
+        vmcr &= ~((1ULL << 4) | (1ULL << 9));
+        if (wval & 1) vmcr |= (1ULL << 4);  /* CBPR -> VCBPR */
+        if (wval & 2) vmcr |= (1ULL << 9);  /* EOImode -> VEOIM */
+        MSR(ich_vmcr_el2, vmcr);
+      }
+    }
+    /* DIR/RPR/SGI0R/ASGI1R: writes ignored, reads return 0 (val stays 0). */
+    if (is_read && rt != 31)
+      f->x[rt] = val;
+    MSR(elr_el2, MRS(elr_el2) + 4);
+    return;
+  }
+
+  /* ICC_PMR_EL1 (priority mask) is also trapped by TC. Mirror it into the
+   * virtual interface's VPMR field (ICH_VMCR_EL2[31:24]); a wrong VPMR would
+   * block all vIRQ delivery, so this must be exact. */
+  if (op0 == 3 && op1 == 0 && crn == 4 && crm == 6 && op2 == 0) {
+    uint64_t vmcr = MRS(ich_vmcr_el2);
+    if (is_read) {
+      val = (vmcr >> 24) & 0xFF;
+      if (rt != 31)
+        f->x[rt] = val;
+    } else {
+      uint64_t wval = (rt == 31) ? 0 : f->x[rt];
+      vmcr = (vmcr & ~(0xFFULL << 24)) | ((wval & 0xFF) << 24);
+      MSR(ich_vmcr_el2, vmcr);
+    }
+    MSR(elr_el2, MRS(elr_el2) + 4);
+    return;
+  }
+
   /* Decode by (op0,op1,crn,crm,op2). Pass real values through for the ID
    * registers Fermi actually consumes; any other ID register under TID3 is
    * architecturally RES0, so returning 0 is safe. */
@@ -1417,7 +1535,7 @@ static void hyp_handle_sysreg(el2_frame_t *f) {
 #define GICD_LO 0x08000000ULL
 #define GICD_HI 0x08010000ULL
 #define GICR_LO 0x080A0000ULL
-#define GICR_HI 0x080C0000ULL
+#define GICR_HI 0x080E0000ULL /* 2 redistributor frames (0x20000 each) for SMP */
 
 __attribute__((section(".hyp_tables"))) static struct {
   uint32_t gicd_ctlr;
@@ -1459,7 +1577,7 @@ static int hyp_emulate_pl011(uint64_t ipa, int is_write, uint64_t *val) {
              * virtio-blk signature, then bring up eth0 and ping the
              * hypervisor-emulated host (10.0.0.1) over virtio-net. */
             lrx_push_str(
-                "head -c 16 /dev/vda; ifconfig eth0 10.0.0.2 up; "
+                "nproc; head -c 16 /dev/vda; ifconfig eth0 10.0.0.2 up; "
                 "ping -c 2 10.0.0.1; echo NETDONE\n");
           }
           hyp_uart_rx_kick();
@@ -1528,17 +1646,25 @@ static int hyp_emulate_gic(uint64_t ipa, int is_write, uint64_t *val) {
     return 1;
   }
   if (ipa >= GICR_LO && ipa < GICR_HI) {
-    uint64_t off = ipa - GICR_LO; /* RD frame at 0, SGI frame at 0x10000 */
+    uint64_t rel = ipa - GICR_LO;
+    uint32_t core = (uint32_t)(rel / 0x20000); /* redistributor frame index   */
+    uint64_t off = rel % 0x20000; /* RD frame at 0, SGI frame at 0x10000      */
     if (is_write) {
       if (off == 0x000)
         g_vgic.gicr_ctlr = (uint32_t)*val;
       /* WAKER and per-PPI config: accepted and ignored */
     } else {
       switch (off) {
-      case 0x0000: *val = g_vgic.gicr_ctlr; break;         /* GICR_CTLR     */
-      case 0x0008: *val = (1ULL << 4); break;              /* TYPER: Last=1, aff=0 */
-      case 0x0014: *val = 0; break;                        /* WAKER: not asleep */
-      case 0xFFE8: *val = 0x30; break;                     /* PIDR2 => GICv3 */
+      case 0x0000: *val = g_vgic.gicr_ctlr; break;        /* GICR_CTLR      */
+      case 0x0008: /* GICR_TYPER low: ProcessorNumber[23:8], Last[4]; the      */
+        /* high word (affinity, read at +0x0C or as part of a 64-bit read)     */
+        /* identifies the core. core 1 is the last redistributor.             */
+        *val = ((uint64_t)core << 32) | ((uint64_t)core << 8) |
+               ((core == 1) ? (1ULL << 4) : 0); /* core 1 = last redistributor */
+        break;
+      case 0x000C: *val = core; break;                    /* TYPER high (aff) */
+      case 0x0014: *val = 0; break;                       /* WAKER: awake     */
+      case 0xFFE8: *val = 0x30; break;                    /* PIDR2 => GICv3   */
       default: *val = 0; break;
       }
     }
@@ -1580,8 +1706,8 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
     return;
   }
 
-  /* Linux guest: emulate trapped GIC / PL011 / virtio-mmio accesses. */
-  if (current_vcpu == 1 &&
+  /* Linux guest (either core): emulate trapped GIC / PL011 / virtio-mmio. */
+  if ((current_vcpu == 1 || current_vcpu == 2) &&
       ((ipa >= GICD_LO && ipa < GICD_HI) || (ipa >= GICR_LO && ipa < GICR_HI) ||
        (ipa >= PL011_LO && ipa < PL011_HI) ||
        (ipa >= VIRTIO_LO && ipa < VIRTIO_HI) ||
@@ -1637,7 +1763,7 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
 
   /* Linux guest hit an unhandled fault: reap it (keeping the primary guest
    * and hypervisor alive), logging where it died. */
-  if (current_vcpu == 1) {
+  if (current_vcpu == 1 || current_vcpu == 2) {
     vcpus[current_vcpu].abort_count++;
     hyp_puts("\n[HYP] Linux guest unhandled abort: IPA=");
     hyp_puthex(ipa);
@@ -1680,10 +1806,11 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
  * the device/timer interrupts it programmed; extend this map as guests gain
  * their own interrupt sources. */
 static int hyp_intid_owner(uint32_t intid) {
-  /* CNTV (PPI 27) is the Linux guest's virtual timer; everything else
-   * (notably the primary guest's CNTP, INTID 30) belongs to vCPU 0. */
+  /* CNTV (PPI 27) is per-CPU: it fires for whichever Linux core is running
+   * (its CNTV_CVAL is loaded), so inject it into the current vCPU. Everything
+   * else (notably the primary guest's CNTP, INTID 30) belongs to vCPU 0. */
   if (intid == 27)
-    return 1;
+    return current_vcpu;
   return 0;
 }
 

@@ -295,6 +295,40 @@ the initramfs. *Verified, first try:* `ifconfig eth0 10.0.0.2 up; ping -c 2
 with `ttl=64` (the value the hypervisor stamps), exercising the complete
 two-queue TX+RX path. No anomalies.
 
+### SMP guest — a 2-core Linux
+*Why:* the most "real hypervisor" milestone — give Linux more than one vCPU.
+This touched many subsystems at once:
+- **Per-vCPU identity**: added `mpidr` to the vCPU and set `VMPIDR_EL2` /
+  `VPIDR_EL2` on every world-switch, so each core reads a distinct `MPIDR_EL1`
+  (core0 aff0=0, core1 aff0=1) and a valid `MIDR`.
+- **A second Linux vCPU** (vCPU2) sharing the primary's stage-2 (same
+  VTTBR/VMID 1) — it replaced the old silent payload guest. Parked `UNUSED`
+  until the boot CPU starts it.
+- **PSCI `CPU_ON`/`AFFINITY_INFO`/`CPU_OFF`/`FEATURES`**: the boot CPU's
+  `CPU_ON(mpidr, entry, ctx)` fills in the secondary's entry PC + context and
+  marks it `READY`; the scheduler then runs it.
+- **2-redistributor emulated GICR**: the GICR window holds two 0x20000 frames
+  with per-core `GICR_TYPER` affinity and the `Last` bit on core1, so each core
+  finds its own redistributor.
+- **Per-vCPU virtual timer**: save/restore `CNTV_CTL/CVAL_EL0` and route the
+  CNTV PPI to the *running* core.
+- **The hard part — IPIs.** `SMP: Total of 2 processors activated` printed, but
+  Linux then hung in `on_each_cpu` (an IPI). Cross-core IPIs are GICv3 SGIs;
+  with one physical CPU they must be trapped and re-injected as virtual SGIs.
+  Set `ICH_HCR_EL2.TC` to trap the guest's "common" CPU-interface registers,
+  decode `ICC_SGI1R_EL1` writes (INTID + target affinity / IRM) and inject the
+  SGI into the target core's vGIC. `TC` also traps `ICC_PMR_EL1` / `ICC_CTLR_EL1`,
+  so those are mirrored into `ICH_VMCR_EL2` (a wrong VPMR would block *all*
+  interrupt delivery — including the primary guest's, since `TC` is global —
+  so this had to be exact). The hot IAR/EOIR path is group-1 (not under `TC`)
+  and stays on the hardware virtual interface.
+*Verified:* `nproc` returns **2**, `CPU1: Booted secondary processor` and
+`SMP: Total of 2 processors activated` appear, and Linux runs all the way to
+userspace (the IPI-driven `on_each_cpu` now completes — proving the secondary
+receives SGIs, runs the work, and acks) with `/dev/vda` read and `ping` working
+concurrently. The primary guest (Fermi) is unaffected by the new `TC` trapping.
+No anomalies.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)
@@ -329,7 +363,8 @@ under preemptive scheduling**:
   console** (`/proc/linux_console`), an emulated **virtio-rng**, an emulated
   **virtio-blk `/dev/vda`** (partition `vda1` detected), and an emulated
   **virtio-net `eth0`** (can `ping` the hypervisor host `10.0.0.1`).
-- **vCPU 2:** a tiny isolated bare-metal payload (visible via `/proc/vms`).
+- **vCPU 2:** Linux's **second core** (SMP secondary), brought online by the boot
+  CPU via PSCI `CPU_ON`; `nproc` reports 2.
 
 Full per-guest context is switched: GP regs, PC/PSTATE, the EL1 system-register
 bank (including `SP_EL0`), vGIC state, and FP/SIMD. Memory is mutually isolated

@@ -42,6 +42,7 @@
 #define ICC_SRE_ENABLE (1ULL << 3) /* allow lower-EL ICC_SRE access (no trap) */
 #define ICC_CTLR_EOIMODE (1ULL << 1) /* EOIR1 = priority drop only (no deact) */
 #define ICH_HCR_EN (1ULL << 0)       /* enable the virtual CPU interface       */
+#define ICH_HCR_TC (1ULL << 10)      /* trap EL1 common ICC regs (SGI1R, PMR…) */
 /* ICH_LR<n>_EL2 list-register fields */
 #define ICH_LR_GROUP1 (1ULL << 60)
 #define ICH_LR_HW (1ULL << 61)
@@ -79,6 +80,7 @@
 typedef struct {
   uint64_t id;
   int state;
+  uint64_t mpidr; /* value the guest reads as MPIDR_EL1 (VMPIDR_EL2)          */
 
   /* Statistics. */
   uint64_t hvc_count;
@@ -100,6 +102,7 @@ typedef struct {
   uint64_t vbar_el1, contextidr_el1;
   uint64_t tpidr_el1, tpidrro_el0, tpidr_el0;
   uint64_t esr_el1, far_el1, par_el1;
+  uint64_t cntv_ctl, cntv_cval; /* per-vCPU virtual timer (EL0)              */
 
   /* Per-guest vGIC (virtual CPU interface) state. */
   uint64_t ich_lr[2];   /* list registers 0..1 (pending/active vIRQs)        */

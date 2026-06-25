@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU + FAT tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm clang lld dosfstools mtools
+
+      - name: Install Rust bare-metal target
+        run: rustup target add aarch64-unknown-none
+
+      - name: Build kernel
+        run: cargo build
+
+      - name: Build FAT32 disk image
+        run: make disk
+
+      - name: Boot smoke test (QEMU)
+        run: |
+          set -euo pipefail
+          OUT=$(timeout 25 qemu-system-aarch64 \
+            -machine virt,gic-version=3 -cpu cortex-a72 -m 8G -nographic \
+            -device virtio-rng-pci,disable-legacy=on \
+            -drive file=build/disk.img,if=none,id=hd0,format=raw \
+            -device virtio-blk-pci,drive=hd0,disable-legacy=on \
+            -netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on \
+            -chardev file,id=vc,path=build/vcons.txt \
+            -device virtio-serial-pci,disable-legacy=on -device virtconsole,chardev=vc \
+            -device virtio-balloon-pci,disable-legacy=on \
+            -kernel target/aarch64-unknown-none/debug/kernel 2>&1 || true)
+          echo "$OUT" | tail -60
+          # Assert the kernel reached key milestones.
+          echo "$OUT" | grep -q "MMU TEST] TTBR1 Upper Half: PASS"
+          echo "$OUT" | grep -q "DRIVER_OK"
+          echo "$OUT" | grep -q "PING reply from"
+          echo "$OUT" | grep -q "hello from a loaded ELF64 binary"
+          echo "$OUT" | grep -q "fermi>"
+          echo "CI boot smoke test passed."

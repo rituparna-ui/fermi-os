@@ -28,6 +28,10 @@
 #define HVC_FN_DOORBELL   (HVC_VENDOR_BASE + 0x04) /* signal the peer VM (SPI)   */
 #define HVC_FN_BLK_INFO   (HVC_VENDOR_BASE + 0x05) /* -> x0 = disk capacity (sectors) */
 #define HVC_FN_BLK_RW     (HVC_VENDOR_BASE + 0x06) /* x1=sector x2=buf IPA x3=write?  */
+#define HVC_FN_NET_MAC    (HVC_VENDOR_BASE + 0x07) /* -> x0 = device MAC (6 bytes LE)  */
+#define HVC_FN_NET_TX     (HVC_VENDOR_BASE + 0x08) /* x1=frame IPA x2=len -> x0=ok     */
+#define HVC_FN_NET_RX     (HVC_VENDOR_BASE + 0x09) /* x1=buf IPA x2=max  -> x0=rx len  */
+#define HVC_FN_NET_ARP    (HVC_VENDOR_BASE + 0x0A) /* send ARP probe (gateway) -> x0=ok */
 
 #define HVC_ABI_VERSION   0x00010000ULL            /* v1.0 */
 #define HVC_RET_NOT_SUPP  ((uint64_t)-1)

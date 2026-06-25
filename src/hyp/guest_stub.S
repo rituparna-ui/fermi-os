@@ -451,3 +451,94 @@ blk_puthex_nib:
 	ret
 .global guest_blk_end
 guest_blk_end:
+
+// ---------------------------------------------------------------------------
+// Paravirt network demo guest (milestone 20). Queries the device MAC, asks the
+// hypervisor to send an ARP probe to the slirp gateway, then polls NET_RX into
+// a guest buffer and prints the received frame length (hex) — proving a real
+// NIC round-trip driven by the guest through hypercalls. Buffer at IPA
+// 0x40010000 (inside guest RAM); the hypervisor stage-2-translates it.
+.equ NB_BUF_IPA,   0x40010000
+
+.section .text.guest, "ax"
+.balign 16
+.global guest_net_start
+guest_net_start:
+	// MAC -> x0 (6 bytes); print low byte hex as a liveness marker 'M'<hex>.
+	movz	x0, #0x0007
+	movk	x0, #0xC600, lsl #16	// HVC_FN_NET_MAC
+	hvc	#0
+	mov	x19, x0			// save MAC
+	movz	x0, #0x0001
+	movk	x0, #0xC600, lsl #16	// PUTC
+	mov	x1, #'M'
+	hvc	#0
+	and	w22, w19, #0xF
+	bl	nb_puthex_nib
+
+	// Ask the hypervisor to send an ARP probe for the gateway.
+	movz	x0, #0x000A
+	movk	x0, #0xC600, lsl #16	// HVC_FN_NET_ARP
+	hvc	#0
+
+	// Poll RX up to 200000 times for a reply into NB_BUF_IPA.
+	mov	x24, #0			// spin counter
+nb_rx_loop:
+	movz	x0, #0x0009
+	movk	x0, #0xC600, lsl #16	// HVC_FN_NET_RX
+	movz	x1, #0x0000
+	movk	x1, #0x4001, lsl #16	// buf IPA 0x40010000
+	mov	x2, #1600		// max len
+	hvc	#0
+	cbnz	x0, nb_got		// x0 = received length (>0 => got a frame)
+	add	x24, x24, #1
+	movz	x25, #0x0d40		// 200000 = 0x30D40
+	movk	x25, #0x0003, lsl #16
+	cmp	x24, x25
+	b.lt	nb_rx_loop
+	// timeout: print 'T'
+	movz	x0, #0x0001
+	movk	x0, #0xC600, lsl #16
+	mov	x1, #'T'
+	hvc	#0
+	b	nb_done
+nb_got:
+	// print 'R'<len-hex-4-nibbles>
+	mov	x26, x0			// length
+	movz	x0, #0x0001
+	movk	x0, #0xC600, lsl #16
+	mov	x1, #'R'
+	hvc	#0
+	lsr	w22, w26, #12
+	bl	nb_puthex_nib
+	lsr	w22, w26, #8
+	bl	nb_puthex_nib
+	lsr	w22, w26, #4
+	bl	nb_puthex_nib
+	mov	w22, w26
+	bl	nb_puthex_nib
+nb_done:
+	movz	x0, #0x0001
+	movk	x0, #0xC600, lsl #16
+	mov	x1, #'\n'
+	hvc	#0
+1:	hvc	#0			// yield forever
+	b	1b
+
+// w22 = nibble -> PUTC hex digit. preserves x30 in x23 (no stack).
+nb_puthex_nib:
+	mov	x23, x30
+	and	w22, w22, #0xF
+	cmp	w22, #10
+	b.lt	2f
+	add	w22, w22, #('a' - 10)
+	b	3f
+2:	add	w22, w22, #'0'
+3:	movz	x0, #0x0001
+	movk	x0, #0xC600, lsl #16
+	mov	x1, x22
+	hvc	#0
+	mov	x30, x23
+	ret
+.global guest_net_end
+guest_net_end:

@@ -7,6 +7,7 @@
 #include "hvc/hvc.h"
 #include "gic/gic.h" /* gic_enable_irq, gic_ack_irq, gic_end_irq */
 #include "blk/blk.h" /* blk_read/blk_write/capacity (host virtio-blk) */
+#include "net/net.h" /* net_tx/net_rx_poll/net_get_mac/arp (host virtio-net) */
 #include "utils/utils.h" /* ESUCCESS */
 #include "mm/pmm/pmm.h"
 #include "mm/mmu/mmu.h" /* PHYS_TO_VIRT */
@@ -1676,6 +1677,141 @@ void hyp_run_blk_pv(void) {
   vuart_flush(&v.vuart);
   __asm__ __volatile__("msr daif, %0" ::"r"(host_daif));
   uart_println("[HYP] M19: done (bytes above are real on-disk data via stage-2-translated DMA)");
+
+  pmm_free_pages(ram, PV_RAM_SIZE / 0x1000);
+}
+
+/* ---- Milestone 20: paravirtualized network device over hypercalls ---- */
+
+extern char guest_net_start[];
+extern char guest_net_end[];
+
+#define NET_FRAME_MAX 1600
+
+/* Service a NET hypercall against the running guest `s2`. Guest frame buffers
+ * are named by IPA and stage-2-translated (the same isolation check as block).
+ * Returns the value for the guest's x0. */
+static uint64_t pv_net_service(vcpu_t *v, stage2_t *s2) {
+  static uint8_t bounce[NET_FRAME_MAX] __attribute__((aligned(16)));
+  uint64_t fn = v->x[0];
+
+  if (fn == HVC_FN_NET_MAC) {
+    uint8_t mac[6] = {0};
+    if (!net_get_mac(mac)) {
+      return (uint64_t)-1;
+    }
+    uint64_t packed = 0;
+    for (int i = 0; i < 6; i++) {
+      packed |= (uint64_t)mac[i] << (8 * i);
+    }
+    return packed;
+  }
+
+  if (fn == HVC_FN_NET_ARP) {
+    /* The hypervisor builds + sends the ARP probe on the guest's behalf. */
+    return (net_send_arp_probe() > 0) ? 0 : (uint64_t)-1;
+  }
+
+  if (fn == HVC_FN_NET_TX) {
+    uint64_t ipa = v->x[1];
+    uint64_t fl = v->x[2];
+    if (fl == 0 || fl > NET_FRAME_MAX) {
+      return (uint64_t)-1;
+    }
+    uint64_t pa = stage2_translate(s2, ipa);
+    if (!pa || (ipa & 0xFFF) + fl > 0x1000) {
+      return (uint64_t)-1; /* unmapped or page-straddling */
+    }
+    uint8_t *kva = (uint8_t *)PHYS_TO_VIRT(pa);
+    for (uint64_t i = 0; i < fl; i++) bounce[i] = kva[i];
+    return (net_tx(bounce, (uint32_t)fl) > 0) ? 0 : (uint64_t)-1;
+  }
+
+  if (fn == HVC_FN_NET_RX) {
+    uint64_t ipa = v->x[1];
+    uint64_t maxlen = v->x[2];
+    if (maxlen == 0) {
+      return 0;
+    }
+    if (maxlen > NET_FRAME_MAX) {
+      maxlen = NET_FRAME_MAX;
+    }
+    uint64_t pa = stage2_translate(s2, ipa);
+    if (!pa || (ipa & 0xFFF) + maxlen > 0x1000) {
+      return (uint64_t)-1;
+    }
+    int n = net_rx_poll(bounce, (uint32_t)maxlen);
+    if (n <= 0) {
+      return 0; /* nothing received */
+    }
+    uint8_t *kva = (uint8_t *)PHYS_TO_VIRT(pa);
+    for (int i = 0; i < n; i++) kva[i] = bounce[i];
+    __asm__ __volatile__("dsb ish" ::: "memory");
+    return (uint64_t)n;
+  }
+
+  return (uint64_t)-1;
+}
+
+void hyp_run_net_pv(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M20: paravirt network (guest does an ARP round-trip via HVC)");
+
+  uintptr_t ram = pmm_allocate_pages(PV_RAM_SIZE / 0x1000);
+  static stage2_t s2;
+  if (!ram || !stage2_create(&s2, /*vmid=*/1)) {
+    return;
+  }
+  stage2_map(&s2, GUEST_ENTRY_IPA, (uint64_t)ram, PV_RAM_SIZE, 0);
+
+  uint64_t len = (uint64_t)(guest_net_end - guest_net_start);
+  uint64_t kva = PHYS_TO_VIRT((uint64_t)ram);
+  for (uint64_t b = 0; b < len; b++) {
+    ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)guest_net_start)[b];
+  }
+  guest_sync_icache(kva, (len + 0xFFF) & ~0xFFFULL);
+
+  static vcpu_t v;
+  for (int i = 0; i < 31; i++) v.x[i] = 0;
+  v.pc = GUEST_ENTRY_IPA;
+  v.pstate = 0x3C5;
+  v.sp_el1 = GUEST_ENTRY_IPA + PV_RAM_SIZE;
+  v.vttbr = stage2_vttbr(&s2);
+  v.vmid = 1;
+  v.name = "netvm";
+  vuart_init(&v.vuart, "netvm");
+
+  uint64_t host_daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(host_daif));
+  __asm__ __volatile__("msr daifset, #3");
+
+  uart_puts("[HYP] guest net result (M<mac> then R<rxlen> or T=timeout): ");
+
+  long guard = 4000000; /* the guest spins polling RX; allow generous budget */
+  int done = 0;
+  while (!done && guard-- > 0) {
+    vcpu_enter(&v);
+    if (v.exit_reason == HYP_EXC_SYNC && ESR_EC_OF(v.esr) == 0x16) {
+      uint64_t fn = v.x[0];
+      if (fn >= HVC_FN_NET_MAC && fn <= HVC_FN_NET_ARP) {
+        v.x[0] = pv_net_service(&v, &s2);
+      } else if (fn == HVC_FN_PUTC) {
+        vuart_emulate(&v.vuart, 0x09000000ULL, /*is_write=*/1, &v.x[1], 1);
+        v.x[0] = 0;
+      } else {
+        done = 1; /* plain yield: guest finished */
+      }
+    } else if (!df_service_exit(&v)) {
+      done = 1;
+    }
+  }
+
+  vuart_flush(&v.vuart);
+  __asm__ __volatile__("msr daif, %0" ::"r"(host_daif));
+  uart_println("[HYP] M20: done (guest drove the real NIC: MAC query + ARP TX + RX poll)");
 
   pmm_free_pages(ram, PV_RAM_SIZE / 0x1000);
 }

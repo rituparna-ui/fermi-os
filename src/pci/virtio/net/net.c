@@ -39,6 +39,16 @@ uint8_t  g_dhcp_acquired  = 0;
  * synchronous (poll-completed) so re-use is safe. */
 static struct virtio_net_hdr tx_hdr __attribute__((aligned(16)));
 
+int net_get_mac(uint8_t out[6]) {
+  if (!net_dev.rx_vq.desc && !net_dev.tx_vq.desc) {
+    return 0; /* device never initialised */
+  }
+  for (int i = 0; i < 6; i++) {
+    out[i] = net_dev.mac[i];
+  }
+  return 1;
+}
+
 int net_tx(const void *frame, uint32_t len) {
   if (!frame || len == 0) {
     return -1;

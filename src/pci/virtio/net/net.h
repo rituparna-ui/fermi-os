@@ -64,6 +64,10 @@ void pci_virtio_net_init(void);
  * via the used ring. */
 int net_tx(const void *frame, uint32_t len);
 
+/* Copy the device's 6-byte MAC into `out`. Returns 1 if the device is present
+ * (MAC valid), 0 otherwise. */
+int net_get_mac(uint8_t out[6]);
+
 /* Hand-crafted ARP request to QEMU's slirp gateway (10.0.2.2). Used as a
  * smoke test that the TX path is actually reaching the device. Once V3
  * lands, the ARP reply will be observable on the RX queue. */

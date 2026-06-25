@@ -121,4 +121,11 @@ void hyp_run_hvc_abi(void);
  * host timer. */
 void hyp_run_blk_pv(void);
 
+/* Milestone 20: paravirtualized network device. A guest queries the NIC MAC,
+ * sends an ARP probe and polls for the reply via the NET hypercalls; the
+ * hypervisor stage-2-translates the guest's frame buffer and drives the real
+ * virtio-net. Proves guest-driven NIC I/O. No-op at EL1; runs before the host
+ * timer. */
+void hyp_run_net_pv(void);
+
 #endif /* HYP_HYP_H */

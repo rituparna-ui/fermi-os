@@ -187,6 +187,31 @@ fn cmd_top() {
     kprintln!("cp {} -> {} ({} bytes): {}", src, dst_name, data.len(),
               if ok { "ok" } else { "failed" });
 }
+fn cmd_memtest(kb: u64) {
+    use alloc::vec::Vec;
+    let n = (kb as usize) * 1024;
+    let before = heap::free_bytes();
+    let mut v: Vec<u8> = Vec::with_capacity(n);
+    for i in 0..n {
+        v.push((i & 0xff) as u8);
+    }
+    let mut ok = true;
+    for i in 0..n {
+        if v[i] != (i & 0xff) as u8 {
+            ok = false;
+            break;
+        }
+    }
+    let during = heap::free_bytes();
+    drop(v);
+    let after = heap::free_bytes();
+    kprintln!(
+        "memtest {} KiB: {} | free {} -> {} -> {} bytes",
+        kb,
+        if ok { "PASS" } else { "FAIL" },
+        before, during, after
+    );
+}
 
 fn dispatch(line: &str) {
     let mut parts = line.split_whitespace();
@@ -233,6 +258,7 @@ fn dispatch(line: &str) {
         "ps" => kprint!("{}", sched::render_tasks()),
         "top" => cmd_top(),
         "free" | "meminfo" => cmd_free(),
+        "memtest" => cmd_memtest(parse_u64(arg1).unwrap_or(64).clamp(1, 512)),
         "ifconfig" => kprint!("{}", net::render_info()),
         "irqs" => kprint!("{}", gic::render_interrupts()),
         "write" => {

@@ -6,9 +6,10 @@
 #![no_std]
 #![no_main]
 
-mod arch;
 #[macro_use]
 mod klib;
+#[macro_use]
+mod arch;
 mod panic;
 
 use core::arch::global_asm;
@@ -23,7 +24,12 @@ global_asm!(include_str!("arch/boot.S"));
 pub extern "C" fn kmain() -> ! {
     klib::uart::init();
 
-    kprintln!("Fermi OS (Rust) - Booting Up...");
+    // Pre-MMU: RAM is Device memory, so avoid core::fmt (it emits unaligned
+    // accesses that fault with no vectors installed). Plain string output via
+    // the UART is safe. Once the MMU maps RAM as Normal memory, kprintln! is
+    // usable everywhere.
+    klib::uart::Uart.println("Fermi OS (Rust) - Booting Up...");
+    arch::cpu::print_current_el();
 
     // Echo received bytes, mirroring the original early kernel loop.
     let uart = klib::uart::Uart;

@@ -310,10 +310,17 @@ qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on -m 8G \
   `vgic_set_current` invariant — and an LR-count OOB (`vgic_nr_lr` up to 32 vs a
   16-entry shadow) clamped to 16.
 
-## 10. What's next (not yet built)
+- **M19 — paravirtualized block device (done):** a guest reads the real host
+  disk via block hypercalls (`HVC_FN_BLK_INFO`/`BLK_RW`). The hypervisor
+  stage-2-translates the guest's buffer IPA to a host PA (`stage2_translate` —
+  validating the guest owns that page; the DMA-isolation check), bounces through
+  a host buffer, and drives the physical virtio-blk. Verified: the guest read
+  sector 0 and printed `eb58906d6b66732e` — the real FAT32 boot sector.
 
-- Virtio passthrough (real guest disk/net), a non-FermiOS guest, and dynamic VM
-  lifecycle (create/destroy at runtime).
+## 11. What's next (not yet built)
+
+- Paravirt net/console (same hypercall pattern as M19 block), a non-FermiOS
+  guest, and dynamic VM lifecycle (create/destroy at runtime).
 
 ---
 

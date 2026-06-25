@@ -120,6 +120,7 @@ pub extern "C" fn kernel_main() -> ! {
             kprintln!("[boot] blk sector0[0..16] = {:?}", marker);
         }
     }
+    virtio::net::init();
 
     // Scheduler + a couple of preemptive EL1 demo tasks.
     sched::init();

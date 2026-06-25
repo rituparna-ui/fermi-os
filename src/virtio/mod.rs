@@ -5,6 +5,7 @@
 pub mod virtqueue;
 pub mod rng;
 pub mod blk;
+pub mod net;
 
 use crate::kprintln;
 use crate::pci::{self, PciDevice};

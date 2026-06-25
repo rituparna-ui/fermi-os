@@ -73,6 +73,13 @@ uint64_t s2_build_vm1(void);
  * 0x40000000. Returns the L1 root host PA. */
 uint64_t s2_build_vm2(uint64_t host_ram_base, uint64_t ram_size);
 
+/* Build a stage-2 for an inter-VM IPC guest: private RAM IPA 0x40000000 ->
+ * host_ram_base (isolated per VM), the UART (straight-through), AND a SHARED
+ * page at IPA 0x50000000 -> shared_pa (the SAME host PA for every IPC VM, so
+ * they can communicate). Returns the L1 root host PA. */
+uint64_t s2_build_ipc(uint64_t host_ram_base, uint64_t ram_size,
+                      uint64_t shared_pa);
+
 /* Map [ipa, ipa+size) -> [pa, pa+size) into the stage-2 table rooted at l1.
  *   device != 0 : Device-nGnRE + execute-never; else Normal-WB + executable. */
 void s2_map_range_in(uint64_t *l1, uint64_t ipa, uint64_t pa, uint64_t size,

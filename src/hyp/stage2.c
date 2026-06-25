@@ -167,3 +167,24 @@ uint64_t s2_build_vm2(uint64_t host_ram_base, uint64_t ram_size) {
   s2_clean_tables();
   return (uint64_t)(uintptr_t)l1;
 }
+
+uint64_t s2_build_ipc(uint64_t host_ram_base, uint64_t ram_size,
+                      uint64_t shared_pa) {
+  hyp_puts("[S2] building IPC VM: RAM IPA 0x40000000 -> host PA ");
+  hyp_puthex(host_ram_base);
+  hyp_puts(", shared IPA 0x50000000 -> ");
+  hyp_puthex(shared_pa);
+  hyp_putc('\n');
+  uint64_t *l1 = s2_alloc_l1();
+
+  /* Private RAM (isolated per VM). */
+  s2_map_range_in(l1, 0x40000000ULL, host_ram_base, ram_size, 0);
+  /* UART (straight-through Device). */
+  s2_map_range_in(l1, 0x09000000ULL, 0x09000000ULL, S2_PAGE, 1);
+  /* SHARED page at IPA 0x50000000 -> the common host PA. Normal-WB so ordinary
+   * loads/stores between the two VMs are coherent (single inner-shareable PE). */
+  s2_map_range_in(l1, 0x50000000ULL, shared_pa, S2_PAGE, 0);
+
+  s2_clean_tables();
+  return (uint64_t)(uintptr_t)l1;
+}

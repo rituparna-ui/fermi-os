@@ -1,8 +1,9 @@
 # Fermi Hypervisor (EL2)
 
 A minimal **type-1 (bare-metal) hypervisor** for AArch64 that runs the existing
-FermiOS kernel — unmodified — as an EL1/EL0 guest, and can run a second guest
-alongside it with preemptive round-robin scheduling.
+FermiOS kernel — unmodified — as an EL1/EL0 guest, and runs several smaller
+guests alongside it (4 VMs total) with preemptive round-robin scheduling,
+per-VM stage-2 isolation, inter-VM shared memory, and per-VM PSCI lifecycle.
 
 The hypervisor is a separate image from the guest. QEMU loads it via `-kernel`
 and enters it at **EL2**; it sets up virtualization and `eret`s down into the
@@ -38,8 +39,10 @@ QEMU is launched with `-m 9G`, so RAM spans `0x40000000 .. 0x280000000`.
 | Region | Host PA | Notes |
 |---|---|---|
 | VM1 (FermiOS) RAM | `0x40000000 .. 0x240000000` (8 GiB) | the guest's hardcoded `MEM_SIZE` |
-| VM2 RAM | `0x260000000 .. 0x264000000` (64 MiB) | tiny second guest |
 | Hypervisor image + pool | `0x250000000 .. ` | text/data/stack + bump allocator |
+| VM2 RAM | `0x260000000 .. 0x264000000` (64 MiB) | heartbeat guest |
+| IPC producer RAM | `0x264000000` (16 MiB) | + shared page @ `0x266000000` |
+| IPC consumer RAM | `0x265000000` (16 MiB) | shares the same page |
 
 The hypervisor links at `0x250000000` — **above** the guest's 8 GiB — so it
 never collides with pages the guest's PMM hands out, even with stage-2 off.
@@ -69,8 +72,9 @@ never collides with pages the guest's PMM hands out, even with stage-2 off.
 | `hyp_gic.c` / `.h` | EL2-side physical GIC bring-up (receive CNTHP PPI 26) |
 | `hyp_alloc.c` / `.h` | Hypervisor-private bump allocator (above guest RAM) |
 | `vcpu.c` / `.h` / `vcpu_switch.S` | Per-vCPU context + EL2 round-robin scheduler |
-| `guest2/` | Tiny standalone EL1 second guest (heartbeat printer) |
-| `guest_blob.S`, `guest2_blob.S` | Embed the flat guest images into the hyp |
+| `guest2/` | Tiny standalone EL1 guest (heartbeat printer; self-resets via PSCI) |
+| `ipc/` | EL1 guest run by 2 VMs (producer/consumer) for inter-VM shared memory |
+| `guest_blob.S`, `guest2_blob.S`, `ipc_blob.S` | Embed the flat guest images into the hyp |
 
 ## How key subsystems work
 
@@ -117,6 +121,17 @@ assume), and injects interrupts by writing a free `ICH_LR<n>_EL2`. GICD/GICR
 **MMIO** faults to EL2 and is serviced by a small software model (`GICD_CTLR`,
 `GICR_WAKER`, `ISENABLER`, etc.).
 
+### Inter-VM shared memory
+
+Isolation is the default (each VM's IPA `0x40000000` maps to a *different* host
+PA), but the hypervisor can also *grant* sharing: it maps one host page into two
+VMs' stage-2 spaces at a common IPA (`0x50000000`). The two `ipc` VMs (a
+producer and a consumer running the same image, role chosen by `x0`) demonstrate
+it — the producer increments a sequence number in the shared page and the
+consumer reads back the identical value, while their private RAM stays isolated.
+This is the Xen-grant-table / KVM-ivshmem model: same-IPA→same-PA for sharing,
+same-IPA→different-PA for isolation. (`s2_build_ipc` in stage2.c.)
+
 ### Multi-VM world switch
 
 Each guest has a `struct vcpu` with the full context (GPRs, EL1 sysregs, FP,
@@ -124,9 +139,10 @@ per-VM vGIC, per-VM vtimer, per-VM stage-2 `VTTBR`). The EL2 scheduler preempts
 on the **CNTHP** timer (~10 ms slice). CNTHP is armed to the soonest of {the
 scheduler slice, **every** vCPU's vtimer deadline} — so a blocked guest is woken
 precisely on its own timer even while another VM runs. On a tick it saves the
-outgoing guest's context and restores the incoming guest's. The two guests use
-**separate stage-2 roots**, so both run at IPA `0x40000000` but map to different
-host PA — true memory isolation.
+outgoing guest's context and restores the incoming guest's. Each guest uses a
+**separate stage-2 root**, so they all run at IPA `0x40000000` but map to
+different host PA — true memory isolation (except for explicitly shared pages,
+see above).
 
 **Fair scheduling (block-on-WFI).** When a guest executes `WFI` (idle, awaiting
 its next interrupt) the hypervisor marks its vCPU *blocked* and world-switches

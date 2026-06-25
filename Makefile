@@ -18,10 +18,10 @@ HYP_TARGET := $(BUILD_DIR)/hyp.elf       # the HYPERVISOR (runs at EL2)
 S_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.S" -print)
 C_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.c" -print)
 
-# The HYPERVISOR image sources (EL2). Exclude the guest2/ subdir — VM2 is a
-# standalone guest built separately to a flat blob, not linked into the hyp.
-HYP_S_SOURCES := $(shell find $(HYP_DIR) -path "$(HYP_DIR)/guest2" -prune -o -name "*.S" -print)
-HYP_C_SOURCES := $(shell find $(HYP_DIR) -path "$(HYP_DIR)/guest2" -prune -o -name "*.c" -print)
+# The HYPERVISOR image sources (EL2). Exclude the guest2/ and ipc/ subdirs —
+# those are standalone guests built separately to flat blobs, not linked in.
+HYP_S_SOURCES := $(shell find $(HYP_DIR) \( -path "$(HYP_DIR)/guest2" -o -path "$(HYP_DIR)/ipc" \) -prune -o -name "*.S" -print)
+HYP_C_SOURCES := $(shell find $(HYP_DIR) \( -path "$(HYP_DIR)/guest2" -o -path "$(HYP_DIR)/ipc" \) -prune -o -name "*.c" -print)
 
 # Object File Mapping
 # src/boot.S      -> build/boot.o
@@ -133,6 +133,19 @@ $(GUEST2_BIN): $(HYP_DIR)/guest2/guest2.S $(HYP_DIR)/guest2/linker_g2.ld
 	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/guest2.elf $@
 
 $(BUILD_DIR)/hyp/guest2_blob.o: $(GUEST2_BIN)
+
+# IPC demo guest: one standalone EL1 image run by TWO VMs (producer + consumer)
+# to demonstrate inter-VM shared memory. Built flat, embedded via ipc_blob.S.
+IPC_BIN := $(BUILD_DIR)/ipc.bin
+$(IPC_BIN): $(HYP_DIR)/ipc/ipc.S $(HYP_DIR)/ipc/linker_ipc.ld
+	@echo "IPCGUEST $@"
+	@mkdir -p $(dir $@)
+	@$(CC) -ffreestanding -nostdlib -nostartfiles -fno-pic \
+		-Wl,-T,$(HYP_DIR)/ipc/linker_ipc.ld -Wl,--build-id=none \
+		-o $(BUILD_DIR)/ipc.elf $(HYP_DIR)/ipc/ipc.S
+	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/ipc.elf $@
+
+$(BUILD_DIR)/hyp/ipc_blob.o: $(IPC_BIN)
 
 # Hypervisor (EL2) — separate image, its own linker script.
 $(HYP_TARGET): $(HYP_OBJECTS)

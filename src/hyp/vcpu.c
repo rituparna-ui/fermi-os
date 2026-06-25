@@ -16,7 +16,7 @@
  * so the same guest IPA maps to different host PAs — true memory isolation.
  * ------------------------------------------------------------------------- */
 
-#define MAX_VCPUS 2
+#define MAX_VCPUS 4
 
 static vcpu_t vcpus[MAX_VCPUS];
 static int    nr_vcpus;
@@ -38,8 +38,11 @@ static void capture_reset_baseline(vcpu_sysregs_t *s) { vcpu_save_sysregs(s); }
  * boot values: GP/PC/PSTATE, EL1 sysregs (from the captured QEMU-reset
  * baseline), FP, vGIC, vtimer. Shared by vcpu_alloc and vcpu_reset. */
 static void vcpu_init_state(vcpu_t *v) {
-  /* GP: enter the guest at its IPA in EL1h with DAIF masked (guest unmasks). */
+  /* GP: enter the guest at its IPA in EL1h with DAIF masked (guest unmasks).
+   * x0 carries an optional role/arg (IPC producer vs consumer); the other
+   * guests leave x0_init = 0, matching a clean reset. */
   for (int i = 0; i < 31; i++) v->gp.x[i] = 0;
+  v->gp.x[0] = v->x0_init;
   v->gp.elr_el2 = v->entry_ipa;
   v->gp.spsr_el2 = SPSR_EL2_GUEST_ENTRY;
 

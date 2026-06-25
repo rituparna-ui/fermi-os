@@ -108,6 +108,9 @@ typedef struct vcpu {
   uint64_t       img_size;
   uint64_t       entry_ipa;
   uint64_t       sp_el1_init;
+  uint64_t       x0_init;   /* value placed in guest x0 at (re)start — used to
+                             * pass a role/arg to the guest (e.g. IPC producer
+                             * vs consumer). */
 } vcpu_t;
 
 /* The currently-running vCPU (set by the scheduler before each guest entry).

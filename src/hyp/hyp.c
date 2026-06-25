@@ -88,16 +88,21 @@ __attribute__((noreturn)) void hyp_panic(const char *msg) {
 extern const uint8_t __guest_blob_start[];
 extern const uint8_t __guest_blob_end[];
 
-/* VM2's flat image, embedded in the hyp (guest2_blob.S). */
+/* VM2 + IPC guest flat images, embedded in the hyp. */
 extern const uint8_t __guest2_blob_start[];
 extern const uint8_t __guest2_blob_end[];
+extern const uint8_t __ipc_blob_start[];
+extern const uint8_t __ipc_blob_end[];
 
-/* VM2's RAM lives above the hypervisor image, in the top reserved GiB. The hyp
- * is at 0x250000000; place VM2's RAM at 0x260000000 (well clear of the hyp's
- * own pool which grows up from ~0x250100000). 64 MiB is ample for the tiny
- * guest and keeps the stage-2 map to whole 2 MiB blocks. */
-#define VM2_HOST_RAM_BASE 0x260000000ULL
-#define VM2_RAM_SIZE      0x04000000ULL /* 64 MiB */
+/* Guest RAM regions in the top reserved GiB (hyp is at 0x250000000, its pool
+ * grows up from ~0x250100000). Each region is 2 MiB-aligned and well clear of
+ * the others and the hyp pool. */
+#define VM2_HOST_RAM_BASE 0x260000000ULL /* VM2 (heartbeat)     64 MiB */
+#define VM2_RAM_SIZE      0x04000000ULL
+#define IPCP_HOST_RAM_BASE 0x264000000ULL /* IPC producer       16 MiB */
+#define IPCC_HOST_RAM_BASE 0x265000000ULL /* IPC consumer       16 MiB */
+#define IPC_RAM_SIZE       0x01000000ULL
+#define IPC_SHARED_PA      0x266000000ULL /* shared page (both IPC VMs)  */
 
 /* Copy a flat blob to a host physical destination (EL2 MMU off) and make it
  * coherent for guest instruction fetch. Used at boot and on warm reset. */
@@ -129,21 +134,32 @@ void hyp_main(void) {
   hyp_puthex(cptr);
   hyp_putc('\n');
 
-  /* Place both guest images at their host PAs.
-   *   VM1 (FermiOS) -> host PA 0x40000000 (== its IPA 0x40000000)
-   *   VM2 (tiny)    -> host PA VM2_HOST_RAM_BASE (its IPA 0x40000000 maps here) */
+  /* Place each guest image at its host PA. The IPC producer + consumer run the
+   * SAME image (role chosen by x0) but at separate private host RAM regions. */
   uint64_t vm1_size = (uint64_t)(__guest_blob_end - __guest_blob_start);
   uint64_t vm2_size = (uint64_t)(__guest2_blob_end - __guest2_blob_start);
+  uint64_t ipc_size = (uint64_t)(__ipc_blob_end - __ipc_blob_start);
   hyp_copy_image(GUEST_ENTRY_IPA, __guest_blob_start, vm1_size);
   hyp_copy_image(VM2_HOST_RAM_BASE, __guest2_blob_start, vm2_size);
-  hyp_puts("[HYP] guest images placed (VM1 @ 0x40000000, VM2 @ ");
-  hyp_puthex(VM2_HOST_RAM_BASE);
-  hyp_puts(")\n");
+  hyp_copy_image(IPCP_HOST_RAM_BASE, __ipc_blob_start, ipc_size);
+  hyp_copy_image(IPCC_HOST_RAM_BASE, __ipc_blob_start, ipc_size);
+  /* Zero the shared IPC page (its seqno starts at 0). */
+  for (volatile uint64_t *p = (volatile uint64_t *)(uintptr_t)IPC_SHARED_PA;
+       p < (volatile uint64_t *)(uintptr_t)(IPC_SHARED_PA + 0x1000); p++) {
+    *p = 0;
+  }
+  hyp_dcache_clean_range(IPC_SHARED_PA, 0x1000);
+  hyp_puts("[HYP] 4 guest images placed; IPC shared page @ ");
+  hyp_puthex(IPC_SHARED_PA);
+  hyp_putc('\n');
 
-  /* Stage-2: one VTCR (shared geometry), two L1 roots (isolated spaces). */
+  /* Stage-2: one VTCR (shared geometry), one L1 root per VM (isolated spaces).
+   * The two IPC VMs additionally share one page at IPA 0x50000000. */
   s2_init_vtcr();
   uint64_t vm1_l1 = s2_build_vm1();
   uint64_t vm2_l1 = s2_build_vm2(VM2_HOST_RAM_BASE, VM2_RAM_SIZE);
+  uint64_t ipcp_l1 = s2_build_ipc(IPCP_HOST_RAM_BASE, IPC_RAM_SIZE, IPC_SHARED_PA);
+  uint64_t ipcc_l1 = s2_build_ipc(IPCC_HOST_RAM_BASE, IPC_RAM_SIZE, IPC_SHARED_PA);
 
   /* GIC + timer virtualization. */
   hyp_gic_init();
@@ -171,7 +187,22 @@ void hyp_main(void) {
              __guest_blob_start, GUEST_ENTRY_IPA, vm1_size);
   vcpu_alloc("guest2", GUEST_ENTRY_IPA, s2_make_vttbr(vm2_l1, 2), 0,
              __guest2_blob_start, VM2_HOST_RAM_BASE, vm2_size);
-  hyp_puts("[HYP] 2 vCPUs created. Starting EL2 scheduler.\n");
+
+  /* The two IPC VMs run the same image; x0 selects the role (2=producer,
+   * 3=consumer). Set x0_init AND the live gp.x[0] (the first boot's GP state
+   * was already initialised by vcpu_alloc). */
+  vcpu_t *prod = vcpu_alloc("ipc-prod", GUEST_ENTRY_IPA,
+                            s2_make_vttbr(ipcp_l1, 3), 0,
+                            __ipc_blob_start, IPCP_HOST_RAM_BASE, ipc_size);
+  prod->x0_init = 2;
+  prod->gp.x[0] = 2;
+  vcpu_t *cons = vcpu_alloc("ipc-cons", GUEST_ENTRY_IPA,
+                            s2_make_vttbr(ipcc_l1, 4), 0,
+                            __ipc_blob_start, IPCC_HOST_RAM_BASE, ipc_size);
+  cons->x0_init = 3;
+  cons->gp.x[0] = 3;
+
+  hyp_puts("[HYP] 4 vCPUs created. Starting EL2 scheduler.\n");
   hyp_puts("--------------------------------------------------\n\n");
 
   vcpu_sched_init();  /* arm CNTHV scheduler tick */

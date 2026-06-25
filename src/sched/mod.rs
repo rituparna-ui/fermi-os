@@ -114,13 +114,8 @@ static mut DEAD_LIST: *mut Task = ptr::null_mut();
 static mut NEXT_ASID: u16 = 1;
 
 fn copy_name(dst: &mut [u8; 16], src: &str) {
-    let mut i = 0;
-    for b in src.bytes() {
-        if i >= 15 {
-            break;
-        }
+    for (i, b) in src.bytes().take(15).enumerate() {
         dst[i] = b;
-        i += 1;
     }
 }
 

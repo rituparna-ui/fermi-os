@@ -45,10 +45,12 @@ pub fn user_buf_ok(ptr: u64, len: u64) -> bool {
     if len == 0 {
         return true;
     }
-    if ptr + len < ptr {
-        return false; // overflow
+    // checked_add rejects the overflow case (a hostile ptr+len that wraps);
+    // a C-style `ptr+len < ptr` guard would panic on overflow in a debug build.
+    match ptr.checked_add(len) {
+        Some(end) => end <= USER_STACK_TOP,
+        None => false,
     }
-    ptr + len <= USER_STACK_TOP
 }
 
 /// Validate a NUL-terminated user string; returns its length or -1.

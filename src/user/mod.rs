@@ -279,6 +279,9 @@ pub extern "C" fn task_shell() {
             print(b"(top finished)\n");
         } else if streq(cmd, b"fork") {
             let r = sys_fork();
+            // fork's three branches (child / error / parent) read more clearly
+            // as a comparison chain than a match on a signed value.
+            #[allow(clippy::comparison_chain)]
             if r == 0 {
                 print(b"[fork-child] hello from the child!\n");
                 print_uint(b"[fork-child] my pid=", sys_getpid() as u64, b"\n");

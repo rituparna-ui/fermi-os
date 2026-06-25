@@ -210,15 +210,18 @@ pub fn load(buf: &[u8], user_l0: u64) -> Result<ElfImage, ()> {
             free_regions(&mut img);
             return Err(());
         }
-        if p_offset + p_filesz > buf.len() as u64 || p_offset + p_filesz < p_offset {
-            uart.errorln("[ELF] PT_LOAD: file slice outside buffer");
-            free_regions(&mut img);
-            return Err(());
+        // checked_add catches the overflow case directly (a C `a+b < a` guard
+        // would instead panic in a debug build before the comparison runs).
+        match p_offset.checked_add(p_filesz) {
+            Some(end) if end <= buf.len() as u64 => {}
+            _ => {
+                uart.errorln("[ELF] PT_LOAD: file slice outside buffer");
+                free_regions(&mut img);
+                return Err(());
+            }
         }
-        if p_vaddr >= USER_STACK_TOP
-            || p_vaddr + p_memsz > USER_STACK_TOP
-            || p_vaddr + p_memsz < p_vaddr
-        {
+        let vaddr_end = p_vaddr.checked_add(p_memsz);
+        if p_vaddr >= USER_STACK_TOP || !matches!(vaddr_end, Some(e) if e <= USER_STACK_TOP) {
             uart.errorln("[ELF] PT_LOAD: vaddr range outside user half");
             free_regions(&mut img);
             return Err(());

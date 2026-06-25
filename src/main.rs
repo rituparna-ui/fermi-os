@@ -5,6 +5,17 @@
 
 #![no_std]
 #![no_main]
+// Clippy lints we intentionally accept: register/offset definitions keep
+// `+ 0x00` and `<< 0` for symmetry with the hardware spec; some ABI structs
+// have many fields; writeln-style newline endings are deliberate in the kernel
+// log format. Real correctness lints stay on.
+#![allow(clippy::identity_op)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::write_with_newline)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::manual_div_ceil)]
+#![allow(clippy::unnecessary_cast)]
 
 extern crate alloc;
 

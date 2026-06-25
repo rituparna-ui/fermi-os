@@ -96,7 +96,9 @@ int stage2_create(stage2_t *s2, uint32_t vmid) {
   /* Concatenated 1024-entry L1 = two contiguous 4 KiB pages, 8 KiB aligned so
    * VTTBR_EL2.BADDR alignment holds. pmm_allocate_pages is page-granular; ask
    * for 2 and rely on the bitmap allocator's natural alignment, then assert. */
-  uintptr_t root = pmm_allocate_pages(2);
+  uintptr_t alloc_base = pmm_allocate_pages(2);
+  uint32_t alloc_n = 2;
+  uintptr_t root = alloc_base;
   if (!root || (root & 0x1FFF)) {
     /* Need 8 KiB alignment; if the 2-page run isn't aligned, grab 3 and use the
      * aligned 8 KiB window inside it. */
@@ -108,6 +110,8 @@ int stage2_create(stage2_t *s2, uint32_t vmid) {
       uart_errorln("[S2] failed to allocate L1 root");
       return 0;
     }
+    alloc_base = wide;
+    alloc_n = 3;
     root = (wide + 0x1FFF) & ~0x1FFFULL;
   }
 
@@ -118,9 +122,45 @@ int stage2_create(stage2_t *s2, uint32_t vmid) {
 
   s2->l1_virt = v;
   s2->root_phys = (uint64_t)root;
+  s2->l1_alloc_pa = (uint64_t)alloc_base;
+  s2->l1_alloc_n = alloc_n;
   s2->vmid = vmid;
   __asm__ __volatile__("dsb ish" ::: "memory");
   return 1;
+}
+
+void stage2_destroy(stage2_t *s2) {
+  if (!s2 || !s2->l1_virt) {
+    return;
+  }
+  /* Walk the L1 (1024 concatenated entries). Each valid TABLE entry points at
+   * an L2; each valid L2 TABLE entry points at an L3. Free every L3, then every
+   * L2, then the L1 root. Block entries (no TABLE bit) own no sub-table. */
+  for (int i = 0; i < 1024; i++) {
+    uint64_t l1e = s2->l1_virt[i];
+    if (!(l1e & S2_PTE_VALID) || !(l1e & S2_PTE_TABLE)) {
+      continue;
+    }
+    uint64_t l2_pa = l1e & S2_ADDR_MASK;
+    uint64_t *l2 = (uint64_t *)PHYS_TO_VIRT(l2_pa);
+    for (int j = 0; j < 512; j++) {
+      uint64_t l2e = l2[j];
+      if ((l2e & S2_PTE_VALID) && (l2e & S2_PTE_TABLE)) {
+        pmm_free_page((uintptr_t)(l2e & S2_ADDR_MASK)); /* free the L3 page */
+      }
+    }
+    pmm_free_page((uintptr_t)l2_pa); /* free the L2 page */
+  }
+
+  /* Invalidate this VMID's stage-1+2 TLB entries before reusing the VMID. */
+  uint64_t vttbr = stage2_vttbr(s2);
+  __asm__ __volatile__("msr vttbr_el2, %0\n\tisb\n\t"
+                       "tlbi vmalls12e1is\n\tdsb ish\n\tisb" ::"r"(vttbr)
+                       : "memory");
+
+  pmm_free_pages((uintptr_t)s2->l1_alloc_pa, s2->l1_alloc_n);
+  s2->l1_virt = 0;
+  s2->root_phys = 0;
 }
 
 uint64_t stage2_vttbr(const stage2_t *s2) {

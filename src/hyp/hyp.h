@@ -128,4 +128,10 @@ void hyp_run_blk_pv(void);
  * timer. */
 void hyp_run_net_pv(void);
 
+/* Milestone 21: dynamic VM lifecycle. Repeatedly create, run, and destroy a
+ * guest VM, verifying that stage-2 teardown + RAM/VMID release return the PMM
+ * free-page count to baseline (no leak across create/destroy cycles). No-op at
+ * EL1; runs before the host timer. */
+void hyp_run_vm_lifecycle(void);
+
 #endif /* HYP_HYP_H */

@@ -59,13 +59,20 @@
 /* An opaque stage-2 address space. Built with pmm pages; root_phys is what
  * goes into VTTBR_EL2 (with the VMID in [55:48]). */
 typedef struct stage2 {
-  uint64_t *l1_virt;   /* PHYS_TO_VIRT(root_phys) — used to edit tables */
-  uint64_t  root_phys; /* physical base for VTTBR_EL2 (8 KiB aligned)   */
+  uint64_t *l1_virt;     /* PHYS_TO_VIRT(root_phys) — used to edit tables   */
+  uint64_t  root_phys;   /* physical base for VTTBR_EL2 (8 KiB aligned)     */
+  uint64_t  l1_alloc_pa; /* real PMM base of the L1 root allocation (to free)*/
+  uint32_t  l1_alloc_n;  /* page count of that allocation                   */
   uint32_t  vmid;
 } stage2_t;
 
 /* Initialise an empty stage-2 (allocates the concatenated L1). */
 int stage2_create(stage2_t *s2, uint32_t vmid);
+
+/* Free every page-table page this address space allocated (L2/L3 tables + the
+ * L1 root) and invalidate its stage-2 TLB entries. Does NOT free guest RAM —
+ * the caller owns that. After this the stage2_t must not be used. */
+void stage2_destroy(stage2_t *s2);
 
 /* Map [ipa,ipa+size) -> [pa,pa+size). device!=0 => Device-nGnRE + XN; else
  * Normal-WB + executable. ipa/pa/size must be 4 KiB aligned. */

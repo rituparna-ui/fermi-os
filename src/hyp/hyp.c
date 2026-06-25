@@ -1815,3 +1815,85 @@ void hyp_run_net_pv(void) {
 
   pmm_free_pages(ram, PV_RAM_SIZE / 0x1000);
 }
+
+/* ---- Milestone 21: dynamic VM lifecycle (create / run / destroy) ---- */
+
+#define VM_RAM_SIZE   0x00200000ULL  /* 2 MiB per VM */
+#define VM_CYCLES     4
+#define VM_BEATS      3
+
+/* Create + run + destroy one heartbeat VM with the given VMID. Returns 1 on a
+ * clean lifecycle. All resources (stage-2 tables, RAM, VMID) are released. */
+static int vm_run_one(uint32_t vmid) {
+  uintptr_t ram = pmm_allocate_pages(VM_RAM_SIZE / 0x1000);
+  if (!ram) {
+    return 0;
+  }
+  stage2_t s2;
+  if (!stage2_create(&s2, vmid)) {
+    pmm_free_pages(ram, VM_RAM_SIZE / 0x1000);
+    return 0;
+  }
+  /* Map RAM + a straight-through UART, and force an L2+L3 table to exist (a
+   * 4 KiB mapping) so teardown has real sub-tables to free. */
+  stage2_map(&s2, GUEST_ENTRY_IPA, (uint64_t)ram, VM_RAM_SIZE, 0);
+  stage2_map(&s2, UART_BASE, UART_BASE, 0x1000, /*device=*/1);
+
+  uint64_t hb_len = (uint64_t)(guest_hb_end - guest_hb_start);
+  uint64_t kva = PHYS_TO_VIRT((uint64_t)ram);
+  for (uint64_t b = 0; b < hb_len; b++) {
+    ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)guest_hb_start)[b];
+  }
+  guest_sync_icache(kva, (hb_len + 0xFFF) & ~0xFFFULL);
+
+  vcpu_t v;
+  for (int i = 0; i < 31; i++) v.x[i] = 0;
+  v.x[0] = (uint64_t)('0' + (vmid % 10)); /* heartbeat prints this id char */
+  v.pc = GUEST_ENTRY_IPA;
+  v.pstate = 0x3C5;
+  v.sp_el1 = GUEST_ENTRY_IPA + VM_RAM_SIZE;
+  v.vttbr = stage2_vttbr(&s2);
+  v.hcr_extra = 0;
+  v.vmid = vmid;
+  v.name = "vm";
+
+  for (int beat = 0; beat < VM_BEATS; beat++) {
+    vcpu_enter(&v);
+    if (!(v.exit_reason == HYP_EXC_SYNC && ESR_EC_OF(v.esr) == 0x16)) {
+      break; /* unexpected exit — still tear down cleanly below */
+    }
+  }
+
+  /* Tear down: free the stage-2 page tables (+ TLBI), then the guest RAM. */
+  stage2_destroy(&s2);
+  pmm_free_pages(ram, VM_RAM_SIZE / 0x1000);
+  return 1;
+}
+
+void hyp_run_vm_lifecycle(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M21: dynamic VM lifecycle (create/run/destroy, leak check)");
+
+  uint64_t baseline = pmm_get_free_pages();
+  int ok = 1;
+  for (int c = 0; c < VM_CYCLES; c++) {
+    if (!vm_run_one(/*vmid=*/(uint32_t)(c + 1))) {
+      ok = 0;
+      break;
+    }
+    uint64_t now = pmm_get_free_pages();
+    uart_printf("[HYP]  cycle %u: free pages %u (baseline %u)\n",
+                (uint64_t)(c + 1), now, baseline);
+    if (now != baseline) {
+      ok = 0; /* leaked (or, implausibly, gained) pages */
+    }
+  }
+
+  uint64_t final = pmm_get_free_pages();
+  uart_printf("[HYP] M21: %s (free pages %u, baseline %u after %u create/destroy cycles)\n",
+              (ok && final == baseline) ? "PASS - no leak" : "FAIL - leak",
+              final, baseline, (uint64_t)VM_CYCLES);
+}

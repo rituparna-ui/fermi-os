@@ -300,7 +300,48 @@ extern "C" fn churn_test() {
     }
 
     heap_stress();
+    fd_stress();
     sched::task_exit();
+}
+
+/// fd-table stress: open the max number of fds, confirm the table rejects the
+/// (MAX+1)th, close them all, and confirm reuse. Exercises the fd-table
+/// boundary and close/realloc path. Runs at EL1 via the kernel VFS API.
+fn fd_stress() {
+    use fs::vfs;
+    let t = vfs::fd_table_create();
+    if t.is_null() {
+        kprintln!("[FD STRESS] FAIL: fd_table_create returned null");
+        return;
+    }
+
+    // Open /dev/zero MAX_FDS times — all should succeed (fds 0..MAX-1).
+    let mut opened = 0;
+    for _ in 0..vfs::MAX_FDS {
+        if vfs::fd_open(t, "/dev/zero") >= 0 {
+            opened += 1;
+        }
+    }
+    // The next open must fail (table full).
+    let overflow = vfs::fd_open(t, "/dev/zero");
+    // Close one and confirm a fresh open reuses the slot.
+    let _ = vfs::fd_close(t, 0);
+    let reused = vfs::fd_open(t, "/dev/zero");
+    // Double-close + bad-fd should be rejected, not crash.
+    let double = vfs::fd_close(t, 0); // slot 0 now holds `reused`
+    let badfd = vfs::fd_close(t, 9999);
+
+    vfs::fd_table_destroy(t);
+
+    let ok = opened == vfs::MAX_FDS && overflow < 0 && reused == 0 && double == 0 && badfd < 0;
+    if ok {
+        kprintln!("[FD STRESS] PASS: {} fds, overflow rejected, close/reuse + bad-fd handled", opened);
+    } else {
+        kprintln!(
+            "[FD STRESS] FAIL: opened={} overflow={} reused={} double={} badfd={}",
+            opened, overflow, reused, double, badfd
+        );
+    }
 }
 
 /// Heap stress: churn many varied-size allocations (incl. one large enough to

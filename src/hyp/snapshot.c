@@ -110,52 +110,36 @@ int64_t snapshot_save(int id) {
   return VMCTL_OK;
 }
 
-int64_t snapshot_restore(int id) {
-  vcpu_t *t = vcpu_by_id(id);
-  if (!t || t == cur_vcpu) {
-    return VMCTL_EINVAL;
-  }
-  /* Hard precondition: a valid snapshot for THIS exact target must exist —
-   * else we'd splat a zero/garbage buffer over a live guest's RAM. */
-  if (!slot.valid || slot.id != id || slot.vmid != t->vmid ||
-      slot.ram_size != t->ram_size) {
-    return VMCTL_EINVAL;
-  }
-  if (t->dead) {
-    return VMCTL_EINVAL; /* never resurrect a powered-off VM */
-  }
-
-  /* Quiesce the target so the scheduler can't select it mid-restore. (Single
-   * CPU + IRQs masked in the EL2 HVC handler means no true concurrency, but
-   * this is the correct discipline.) */
+/* Apply the snapshot slot's captured state onto vcpu `t`. Shared by restore
+ * (t == the snapshot's origin VM) and clone/migrate (t is a DIFFERENT VM with
+ * the same ram_size). t must NOT be the current vCPU and must not be dead;
+ * t->ram_size must equal the snapshot's. The guest state is host-PA- and
+ * VMID-agnostic (it references IPAs + virtual INTIDs), so it transplants into
+ * t's own stage-2 (t->vttbr_el2 / t->img_dst_pa) unchanged. */
+static void apply_snapshot_to(vcpu_t *t) {
   int was_paused = t->paused;
-  t->runnable = 0;
+  t->runnable = 0; /* quiesce: scheduler must not pick t mid-apply */
 
-  /* Restore RAM first, then make it coherent for data + instruction fetch
-   * (the guest may have self-modified .text). Same sequence as hyp_copy_image. */
+  /* Restore RAM into t's OWN backing store, then make it coherent for data +
+   * instruction fetch (the guest may have self-modified .text). */
   mem_copy64(t->img_dst_pa, (uint64_t)(uintptr_t)slot.ram, t->ram_size);
   hyp_dcache_clean_range(t->img_dst_pa, t->ram_size);
   __asm__ __volatile__("ic ialluis\n\tdsb ish\n\tisb" ::: "memory");
 
-  /* Flush the TARGET VMID's stage-2+combined TLB. s2_tlb_flush_all() would
-   * flush the CALLER's (dom0's) VMID — wrong. Temporarily point VTTBR_EL2 at
-   * the target, flush its VMID, then restore the caller's VTTBR_EL2. */
+  /* Flush t's OWN VMID's stage-2+combined TLB (NOT the caller dom0's). */
   uint64_t saved_vttbr;
   __asm__ __volatile__("mrs %0, vttbr_el2" : "=r"(saved_vttbr));
   __asm__ __volatile__("msr vttbr_el2, %0\n\tisb" ::"r"(t->vttbr_el2));
   __asm__ __volatile__("dsb ish\n\ttlbi vmalls12e1is\n\tdsb ish\n\tisb" ::: "memory");
   __asm__ __volatile__("msr vttbr_el2, %0\n\tisb" ::"r"(saved_vttbr));
 
-  /* Restore execution state (memory-only; takes effect on the next vcpu_load
-   * when the scheduler world-switches in). */
+  /* Execution state (memory-only; loaded into HW on the next vcpu_load). */
   t->gp   = slot.gp;
   t->sys  = slot.sys;
   t->fp   = slot.fp;
   t->vgic = slot.vgic;
 
-  /* Re-base the vtimer deadline to now + captured delta. If it wasn't an armed
-   * future deadline at capture, force it DISABLED so a stale cval=0 is never
-   * treated as an already-expired live deadline (which would storm). */
+  /* Re-base the absolute vtimer deadline to now + captured delta. */
   uint64_t now = snap_cntpct();
   if (slot.vt_armed) {
     t->vtimer.ctl = slot.vt_ctl;
@@ -168,21 +152,64 @@ int64_t snapshot_restore(int id) {
   }
 
   /* Identity + accounting fields (vmid, vttbr, img_x, run_count, cpu_ticks,
-   * stats, weight, doorbell_target, privileged) are left untouched. */
+   * stats, weight, doorbell_target, privileged) are left untouched — for clone
+   * this is exactly what keeps the destination's own container identity. */
 
-  /* Resume policy: do not resurrect dead, do not silently un-pause an admin
-   * pause; otherwise make it runnable so it resumes from the restored PC. */
   t->dead = 0;
   t->paused = was_paused;
   if (!was_paused) {
     t->runnable = 1;
   }
-
-  /* Fold the (possibly newly-near) target deadline into the shared CNTHP. */
   hyp_cnthp_arm();
+}
 
+int64_t snapshot_restore(int id) {
+  vcpu_t *t = vcpu_by_id(id);
+  if (!t || t == cur_vcpu) {
+    return VMCTL_EINVAL;
+  }
+  /* Restore goes back onto the SAME VM the snapshot came from: require an exact
+   * id+vmid+ram_size match so we never splat one VM's image onto another here. */
+  if (!slot.valid || slot.id != id || slot.vmid != t->vmid ||
+      slot.ram_size != t->ram_size) {
+    return VMCTL_EINVAL;
+  }
+  if (t->dead) {
+    return VMCTL_EINVAL; /* never resurrect a powered-off VM */
+  }
+
+  apply_snapshot_to(t);
   hyp_puts("[SNAP] restored VM '");
   hyp_puts(t->name);
   hyp_puts("' from snapshot\n");
+  return VMCTL_OK;
+}
+
+int64_t snapshot_clone(int dst_id) {
+  vcpu_t *t = vcpu_by_id(dst_id);
+  if (!t || t == cur_vcpu) {
+    return VMCTL_EINVAL;
+  }
+  /* Clone/migrate: transplant the snapshot into a DIFFERENT VM. We do NOT
+   * require id/vmid to match (that is the whole point) — only that a valid
+   * snapshot exists, the destination is large enough (same ram_size), and the
+   * destination is not the snapshot's own origin (use RESTORE for that) and not
+   * dead. The captured state is IPA/VMID-agnostic, so it runs in t's stage-2. */
+  if (!slot.valid || slot.ram_size != t->ram_size) {
+    return VMCTL_EINVAL;
+  }
+  if (slot.id == dst_id) {
+    return VMCTL_EINVAL; /* same VM — that's RESTORE, not clone */
+  }
+  if (t->dead) {
+    return VMCTL_EINVAL;
+  }
+
+  apply_snapshot_to(t);
+  hyp_puts("[SNAP] cloned snapshot of vcpu ");
+  hyp_puthex((uint64_t)slot.id);
+  hyp_puts(" into VM '");
+  hyp_puts(t->name);
+  hyp_puts("' (live migration)\n");
   return VMCTL_OK;
 }

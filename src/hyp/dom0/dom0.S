@@ -31,6 +31,7 @@
 .equ VMCTL_CPUTIME, 8
 .equ VMCTL_SNAPSHOT, 9
 .equ VMCTL_RESTORE, 10
+.equ VMCTL_MIGRATE, 11
 
 .section .text.boot.dom0
 .global _dom0_start
@@ -219,10 +220,28 @@ _dom0_start:
 	adr	x19, m_nl
 	bl	d_puts
 
+	// --- 10. LIVE MIGRATION: clone guest2's snapshot (still in the slot) into
+	// vm 5 (the idle migration target). vm5 then resumes executing guest2's
+	// code — printing beats — in its OWN slot (different host PA + VMID). ---
+	mov	x20, #20
+25:	bl	d_yield
+	subs	x20, x20, #1
+	b.ne	25b
+
+	adr	x19, m_mig
+	bl	d_puts
+	mov	x1, #VMCTL_MIGRATE
+	mov	x2, #5                    // dst = vm 5 (vmtgt)
+	bl	vmctl
+	mov	w23, w0
+	bl	d_puthex2
+	adr	x19, m_nl
+	bl	d_puts
+
 	adr	x19, m_done
 	bl	d_puts
 
-	// --- 10. idle forever ---
+	// --- 11. idle forever ---
 9:	bl	d_yield
 	b	9b
 
@@ -308,6 +327,7 @@ m_wset:  .asciz "[dom0] VMCTL_WEIGHT: vm 2 = 8, vm 3 = 1 (proportional share)\r\
 m_cpu:   .asciz "[dom0] cpu time per vm (cntpct bits[31:24]):\r\n"
 m_snap:  .asciz "[dom0] VMCTL_SNAPSHOT vm 1 -> rc=0x"
 m_rest:  .asciz "[dom0] VMCTL_RESTORE vm 1 (rollback) -> rc=0x"
+m_mig:   .asciz "[dom0] VMCTL_MIGRATE guest2 -> vm 5 (live clone) -> rc=0x"
 m_svm:   .asciz "[dom0]  vm 0x"
 m_colon: .asciz ": "
 m_nl:    .asciz "\r\n"

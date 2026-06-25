@@ -17,7 +17,7 @@
  * so the same guest IPA maps to different host PAs — true memory isolation.
  * ------------------------------------------------------------------------- */
 
-#define MAX_VCPUS 5
+#define MAX_VCPUS 6
 
 static vcpu_t vcpus[MAX_VCPUS];
 static int    nr_vcpus;
@@ -161,6 +161,8 @@ int64_t vcpu_vmctl(uint64_t op, uint64_t target, uint64_t arg,
     return snapshot_save((int)target);
   case VMCTL_RESTORE:
     return snapshot_restore((int)target);
+  case VMCTL_MIGRATE:
+    return snapshot_clone((int)target);
   case VMCTL_RESET:
     if (t->dead) return VMCTL_EINVAL;
     /* Reset is in-place if it targets the caller; here the control VM never

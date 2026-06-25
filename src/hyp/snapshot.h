@@ -39,4 +39,10 @@ int64_t snapshot_save(int id);
  * Rejects: no valid snapshot, id/vmid/ram_size mismatch, a dead target. */
 int64_t snapshot_restore(int id);
 
+/* Clone (live-migrate) the snapshot into a DIFFERENT vcpu `dst_id` whose
+ * ram_size matches. The captured guest state is IPA/VMID-agnostic, so it runs
+ * in the destination's own stage-2. Rejects: no valid snapshot, ram_size
+ * mismatch, dst == the snapshot's origin (use restore), or a dead destination. */
+int64_t snapshot_clone(int dst_id);
+
 #endif /* HYP_SNAPSHOT_H */

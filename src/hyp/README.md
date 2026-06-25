@@ -259,6 +259,21 @@ The design was adversarially reviewed; the load-bearing correctness points:
   `VMCTL_EINVAL`). A `valid` + id/vmid/ram_size stamp guards against restoring a
   stale or mismatched snapshot over a live guest. (`src/hyp/snapshot.c`.)
 
+### Live migration (clone)
+
+`VMCTL_MIGRATE` transplants a snapshot into a *different* VM slot: the captured
+guest resumes executing in the destination's own stage-2 (different host PA +
+VMID). This works because guest execution state is **host-PA / VMID agnostic** —
+it references IPAs and *virtual* INTIDs, never host physical addresses — so the
+same state runs unchanged under a different container. The demo migrates the
+heartbeat guest into an idle "migration target" VM, which then resumes printing
+beats from the migrated counter (two beat streams now run, the original and its
+clone, each on its own RAM). Shares `apply_snapshot_to()` with restore; the only
+difference is the precondition (clone requires a *matching ram_size* but a
+*different* id, vs restore's exact id/vmid match). This is the in-box core of
+live migration — a cross-machine version would add a transfer of the same
+captured blob.
+
 ### VM lifecycle (PSCI)
 
 The hypervisor emulates a per-VM PSCI interface (the guest's `hvc`/`smc`):

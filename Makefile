@@ -20,7 +20,7 @@ C_SOURCES := $(shell find $(SRC_DIR) -path "$(HYP_DIR)" -prune -o -name "*.c" -p
 
 # The HYPERVISOR image sources (EL2). Exclude the standalone guest subdirs —
 # those are built separately to flat blobs, not linked into the hyp.
-HYP_GUEST_DIRS := $(HYP_DIR)/guest2 $(HYP_DIR)/ipc $(HYP_DIR)/dom0
+HYP_GUEST_DIRS := $(HYP_DIR)/guest2 $(HYP_DIR)/ipc $(HYP_DIR)/dom0 $(HYP_DIR)/vmtgt
 HYP_PRUNE := $(foreach d,$(HYP_GUEST_DIRS),-path "$(d)" -o)
 HYP_S_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.S" -print)
 HYP_C_SOURCES := $(shell find $(HYP_DIR) \( $(HYP_PRUNE) -false \) -prune -o -name "*.c" -print)
@@ -161,6 +161,18 @@ $(DOM0_BIN): $(HYP_DIR)/dom0/dom0.S $(HYP_DIR)/dom0/linker_dom0.ld
 	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/dom0.elf $@
 
 $(BUILD_DIR)/hyp/dom0_blob.o: $(DOM0_BIN)
+
+# Migration-target guest: idle stub that a live migration clones a snapshot into.
+VMTGT_BIN := $(BUILD_DIR)/vmtgt.bin
+$(VMTGT_BIN): $(HYP_DIR)/vmtgt/vmtgt.S $(HYP_DIR)/vmtgt/linker_vmtgt.ld
+	@echo "VMTGT $@"
+	@mkdir -p $(dir $@)
+	@$(CC) -ffreestanding -nostdlib -nostartfiles -fno-pic \
+		-Wl,-T,$(HYP_DIR)/vmtgt/linker_vmtgt.ld -Wl,--build-id=none \
+		-o $(BUILD_DIR)/vmtgt.elf $(HYP_DIR)/vmtgt/vmtgt.S
+	@$(CROSS_COMPILE)objcopy -O binary $(BUILD_DIR)/vmtgt.elf $@
+
+$(BUILD_DIR)/hyp/vmtgt_blob.o: $(VMTGT_BIN)
 
 # Hypervisor (EL2) — separate image, its own linker script.
 $(HYP_TARGET): $(HYP_OBJECTS)

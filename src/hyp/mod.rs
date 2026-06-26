@@ -27,9 +27,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 // EL2 exception vector table + el2_common save/restore trampoline.
 global_asm!(include_str!("vector_el2.S"));
-// The M10 bring-up stub (linux_stub.S) is retained in the tree as a stand-in
-// the slot can run when no real Image is staged, but from M11 the guest enters
-// a real Linux Image staged by QEMU's loader, so it is not linked in here.
+// The M10 bring-up stub: the Linux slot runs it as a stand-in when no real Image
+// is staged (see hyp_create_linux_guest), so the multi-guest demo works out of
+// the box; with a real Image present the slot boots that instead.
+global_asm!(include_str!("linux_stub.S"));
 
 // --- Stage-2 (VMSAv8-64) descriptor bits ------------------------------------
 // These differ from stage-1: no MAIR indirection (MemAttr[5:2] encodes the type
@@ -296,6 +297,17 @@ fn gic_write32(addr: usize, val: u32) {
 const LINUX_PHYS_BASE: u64 = 0x2_4000_0000; // 9 GiB: past Fermi's 8 GiB view
 const LINUX_IPA_BASE: u64 = 0x4000_0000; // arm64 RAM base the guest sees
 const LINUX_RAM_SIZE: u64 = 1024 * 1024 * 1024;
+// Offset of the arm64 Linux Image entry within the slot (the loader stages the
+// Image here). The 64-byte Image header begins with a branch then carries the
+// little-endian magic "ARM\x64" = 0x644d_5241 at byte +56.
+const LINUX_IMAGE_OFF: u64 = 0x20_0000; // Image @ IPA 0x40200000
+const LINUX_DTB_OFF: u64 = 0x800_0000; // DTB   @ IPA 0x48000000
+const ARM64_IMAGE_MAGIC: u32 = 0x644d_5241;
+
+extern "C" {
+    static linux_stub: u8;
+    static linux_stub_end: u8;
+}
 #[link_section = ".hyp_tables"]
 static LX_L0: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
 #[link_section = ".hyp_tables"]
@@ -874,26 +886,39 @@ fn hyp_build_linux_stage2() {
 fn hyp_create_linux_guest() {
     hyp_build_linux_stage2();
 
-    // The Linux Image and DTB are staged into the guest's high RAM by QEMU's
-    // generic loader (see Makefile), at IPAs 0x40200000 and 0x48000000. We just
-    // enter per the arm64 boot protocol: PC = Image base, x0 = DTB, EL1h, MMU
-    // off, x1..x3 = 0.
-    //
-    // When no real Image is loaded (the default in this tree — no guest/Image
-    // asset is committed), the slot's RAM is whatever QEMU left there; the guest
-    // faults on its first instruction and is reaped by hyp_handle_abort's
-    // current_vcpu==1 path, leaving the hypervisor and primary guest unharmed.
-    // SAFETY (single-core, pre-guest): exclusive access during boot.
+    // A real arm64 Linux Image + DTB may be staged into the slot's high RAM by
+    // QEMU's generic loader (Image @ IPA 0x40200000, DTB @ 0x48000000 — see the
+    // README / PORT-NOTES). Detect it by the Image header magic ("ARM\x64" at
+    // byte +56). If present, enter per the arm64 boot protocol (PC = Image base,
+    // x0 = DTB, EL1h, stage-1 MMU off). If absent — the default in this tree, no
+    // Image is committed — fall back to the self-contained M10 stub so the
+    // multi-guest demo still runs (the stub writes 'L' from the slice through
+    // its stage-2 UART mapping) instead of faulting on garbage RAM.
+    // SAFETY (single-core, pre-guest): exclusive access during boot; the slot's
+    // physical RAM is reachable directly (EL2 MMU off, IPA == phys here).
     unsafe {
+        let magic = read_volatile((LINUX_PHYS_BASE + LINUX_IMAGE_OFF + 56) as *const u32);
         let v = &mut (*VCPUS.get())[1];
         *v = Vcpu::zeroed();
         v.id = 1;
         v.state = VCPU_READY;
-        v.pc = LINUX_IPA_BASE + 0x20_0000; // Image entry (IPA)
-        v.regs[0] = LINUX_IPA_BASE + 0x800_0000; // x0 = DTB (IPA 0x48000000)
         v.pstate = 0x3c5; // EL1h, DAIF masked
         v.vttbr = phys_of(LX_L0.get()) | (1 << 48); // VMID 1
-                                                    // sctlr_el1 left 0 => stage-1 MMU off, as Linux's early entry expects.
+                                                    // sctlr_el1 left 0 => stage-1 MMU off, as the stub / Linux early entry expect.
+
+        if magic == ARM64_IMAGE_MAGIC {
+            hyp_puts("[HYP] Linux Image detected in slot; entering per arm64 boot protocol\n");
+            v.pc = LINUX_IPA_BASE + LINUX_IMAGE_OFF; // Image entry (IPA)
+            v.regs[0] = LINUX_IPA_BASE + LINUX_DTB_OFF; // x0 = DTB (IPA)
+        } else {
+            hyp_puts("[HYP] no Linux Image staged; running bring-up stub in the slot\n");
+            let stub = core::ptr::addr_of!(linux_stub) as *const u8;
+            let stub_end = core::ptr::addr_of!(linux_stub_end) as *const u8;
+            let len = stub_end as usize - stub as usize;
+            core::ptr::copy_nonoverlapping(stub, LINUX_PHYS_BASE as *mut u8, len);
+            v.pc = LINUX_IPA_BASE; // stub entry at the slot base (IPA == phys)
+            v.sp_el1 = LINUX_IPA_BASE + LINUX_RAM_SIZE;
+        }
     }
 }
 

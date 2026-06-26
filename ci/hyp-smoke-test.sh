@@ -117,20 +117,23 @@ else
 	echo "  ok: no EL2 traps / panics / FAILs"
 fi
 
-# From M11 the Linux slot enters a real Image staged by QEMU's loader. No Image
-# is committed in this tree, so the guest faults on its first fetch and the
-# hypervisor reaps it ("Linux guest unhandled abort") while keeping the primary
-# guest + hypervisor alive. Seeing the reap AND Fermi reaching Ready proves the
-# graceful-degradation path; an *** unexpected lower-EL abort *** (host-side)
-# would instead mean the hypervisor itself faulted, already caught above.
+# The Linux slot detects a staged arm64 Image by its header magic. No Image is
+# committed in this tree, so the hypervisor falls back to the self-contained M10
+# stub, which runs from the slot's high RAM and writes 'L' through its stage-2
+# UART mapping. Seeing the fallback log + the stub output proves the slot's
+# stage-2 (RAM + device) and the preemptive scheduling of guest 1 all work.
 #
-# To boot a real guest: stage guest/Image + guest/initramfs.cpio.gz + a built
-# guest.dtb via QEMU -device loader at the IPAs in src/hyp/mod.rs, then this
-# becomes a full Linux-to-userspace boot. See docs/PORT-NOTES.md.
-if grep -qaF '[HYP] Linux guest unhandled abort' "$LOG"; then
-	echo "  ok: Linux slot faulted w/o Image and was reaped; Fermi survived (M11-13 path)"
+# To boot a real guest instead: stage guest/Image + guest/initramfs.cpio.gz + a
+# built guest.dtb via QEMU -device loader at the IPAs in src/hyp/mod.rs; the
+# detector then enters the Image per the arm64 boot protocol with no code change.
+# See docs/PORT-NOTES.md §6.
+if grep -qaF '[HYP] no Linux Image staged; running bring-up stub' "$LOG" && grep -qaE '^L' "$LOG"; then
+	echo "  ok: no Image staged -> slot ran the bring-up stub (emitted 'L'); Fermi survived"
+elif grep -qaF '[HYP] Linux Image detected in slot' "$LOG"; then
+	echo "  ok: a real Linux Image was detected and entered"
 else
-	echo "  note: no Linux-guest reap seen (a real Image may have booted, or the slot didn't run)"
+	echo "  MISSING: Linux slot neither ran the stub nor detected an Image"
+	fail=1
 fi
 
 if [ "$fail" -ne 0 ]; then

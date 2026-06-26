@@ -388,8 +388,13 @@ userspace needs an external `guest/Image` (arm64 Linux kernel) + an initramfs +
 a built `guest.dtb`, staged into the slot via QEMU's `-device loader` at the
 IPAs in `src/hyp/mod.rs` (Image @ IPA 0x40200000, DTB @ 0x48000000). None of
 these binaries exist in git history (only `guest.dts` does), so M11–M13's code
-is ported and exercised on every path EXCEPT a successful Linux boot: with no
-Image staged, the Linux slot faults on its first fetch and the hypervisor reaps
-it gracefully (`[HYP] Linux guest unhandled abort`), leaving Fermi running —
-which the hyp smoke test asserts. Supplying the three assets turns this into a
-full Linux-to-shell boot with no code changes.
+is ported and exercised on every path EXCEPT a successful Linux boot.
+
+`hyp_create_linux_guest` **auto-detects** a staged Image by its arm64 header
+magic (`0x644d5241` = "ARM\\x64" at Image byte +56). If present, it enters the
+Image per the boot protocol (PC = Image base, x0 = DTB); if absent — the default
+in this tree — it falls back to the self-contained M10 bring-up stub
+(`linux_stub.S`), which runs from the slot's high RAM and writes `L` through the
+guest's stage-2 UART mapping. So out of the box the slot is a working second
+guest (the hyp smoke test asserts the stub output), and supplying the three
+assets turns it into a full Linux-to-shell boot with no code changes.

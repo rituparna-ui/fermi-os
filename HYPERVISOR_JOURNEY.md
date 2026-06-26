@@ -391,6 +391,31 @@ qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on -m 8G \
   PPI 26 armed after `hyp_run_linux` returned, storming its post-return IRQ
   path; `gic_disable_irq` + `cnthp_disarm` on exit drop the storm to zero.)
 
+- **M30 — Linux reaches USERSPACE (done):** the final step from "boots the
+  kernel" to "runs a program." A **built-in, uncompressed initramfs**
+  (`CONFIG_INITRAMFS_SOURCE`, so no host `cpio`/`xz` needed — the build
+  container has neither) carries `/dev/console` and a **freestanding static
+  `/init`** (no libc: raw `svc #0` syscalls, a custom `_start` that must never
+  return). Linux unpacks it, exec's `/init` as PID 1, and `/init` prints from
+  userspace then calls `reboot(POWER_OFF)` → with PSCI firmware that becomes a
+  PSCI `SYSTEM_OFF` HVC, which our run-loop catches ("Linux issued PSCI
+  shutdown/reset") and reaps the VM. Three things had to be right, and the plan
+  was adversarially verified against the on-disk kernel source *before*
+  building, which caught two of them: (1) `tinyconfig` leaves
+  **`CONFIG_BINFMT_ELF` OFF**, so the ELF `/init` was unexecutable → must enable
+  it (this was the silent boot-blocker); (2) `build-linux.sh` regenerates
+  `.config` every run, so the config edits live in its heredoc, not a stray
+  `.config`; (3) the first userspace run printed nothing — "unable to open an
+  initial console" — because our hand-built DTB declared the PL011 as a bare
+  `arm,pl011` node, so the **AMBA bus never bound it** and `ttyAMA0` never
+  registered. Fix: make it a real **AMBA PrimeCell** (`compatible` includes
+  `arm,primecell`, plus a `fixed-clock` node and `clocks`/`clock-names =
+  uartclk, apb_pclk` — the AMBA bus aborts probe without `apb_pclk`), matching
+  QEMU virt's own binding. Console TX is polled, so no UART-IRQ routing is
+  needed. Result: `[init] Hello from PID 1 - USERSPACE is ALIVE under the
+  FermiOS hyp` → clean PSCI power-off. 69 exits (7 hvc, 45 mmio, 17 irq, 0
+  fault).
+
 ## 14. Status
 
 The hypervisor is feature-complete for a small multi-tenant Type-1 design:
@@ -401,12 +426,14 @@ paravirt disk + network with safe IPA translation; leak-free dynamic VM
 lifecycle; a generic DTB-booted foreign guest with an OS-grade device tree; SMP
 (multi-vCPU) guests; runtime fault isolation (a bad guest is contained); per-VM
 exit observability; and — the capstone — **a real mainline Linux 6.6 kernel that
-boots fully**, bringing up its GICv3 + arch timer and exec'ing init (M28/M29). A
-single regression script (`src/hyp/run-demos.sh`, M26) boots the whole M1-M25
-suite in one QEMU run and asserts every milestone passes ("ALL MILESTONES PASS").
-Further work would be breadth (an initramfs/rootfs so Linux reaches a userspace
-shell, PSCI CPU_ON for the Linux guest's secondary cores, more emulated devices)
-rather than missing fundamentals.
+boots to userspace**: it brings up GICv3 + arch timer, unpacks a built-in
+initramfs, runs a userspace PID 1, and powers off via PSCI, which the hypervisor
+catches and reaps (M28→M30). A single regression script (`src/hyp/run-demos.sh`,
+M26) boots the whole M1-M25 suite in one QEMU run and asserts every milestone
+passes ("ALL MILESTONES PASS"). Further work would be breadth (a fuller rootfs
+— busybox + a shell — and UART-IRQ routing for interactive Linux input; PSCI
+CPU_ON for the Linux guest's secondary cores; more emulated devices) rather than
+missing fundamentals.
 
 ---
 

@@ -108,6 +108,7 @@ timer `CNTHP` (PPI 26) instead.
 | M27 | **Per-VM observability:** every guest exit is accounted by class (hvc/mmio/irq/fault) for a virsh-style introspection summary. |
 | M28 | **Real Linux guest:** a full mainline Linux 6.6 boots as an EL1 guest via `x0=DTB`; it parses our device tree (memory/cmdline/cpus/PSCI/GIC). |
 | M29 | **Fuller vGIC → Linux boots to init:** with a real GICD/GICR register model, Linux brings up its GICv3 + arch timer, switches clocksource, calibrates BogoMIPS, and execs `/sbin/init` (panics only for lack of a rootfs). |
+| M30 | **Linux reaches USERSPACE:** a built-in initramfs carries a freestanding static `/init`; Linux unpacks it, opens `/dev/console` (PL011 now bound as an AMBA PrimeCell → `ttyAMA0`), and runs PID 1, which prints from userspace then powers the VM off via PSCI `SYSTEM_OFF` — the hypervisor catches it and reaps the guest. |
 
 The default hypervisor build runs **two** interactive FermiOS guests (M14);
 `Ctrl-X` cycles console focus. Build with `-DHYP_RUN_DEMOS` to run the
@@ -158,10 +159,15 @@ so config reads return "no device" without trapping.
   come up, but it is still not a complete GICv3 (no SPI routing to guests, no
   ITS/LPIs, single redistributor). A FermiOS or Linux guest boots and takes its
   timer IRQ; richer interrupt topologies are future work.
-- Real Linux boots to the point of exec'ing init (M29) but has **no rootfs**
-  (kernel built with no initramfs), so it panics with "No working init found" —
-  the correct end of a kernel-only boot. Adding an initramfs would reach a
-  shell.
+- Real Linux now reaches **userspace** (M30): a built-in initramfs carries a
+  freestanding static `/init` that prints from PID 1 and powers off via PSCI.
+  There is no shell/busybox and no writable disk rootfs — `/init` is a single
+  self-contained program, not a general userland. A fuller rootfs (busybox +
+  a shell) is future breadth.
+- The PL011 console is **TX-only** for the Linux guest: the hypervisor does
+  not route the UART's SPI into the guest, so `ttyAMA0` console output works
+  (it is polled) but interactive input to Linux userspace does not. Routing
+  the UART interrupt into the vGIC would add input.
 - Guest *virtio* is not passed through (PCI config space is emulated as "no
   device"); real device access is via paravirt hypercalls instead (M19 block,
   M20 net), which translate guest buffer IPAs safely.

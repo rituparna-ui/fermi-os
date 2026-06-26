@@ -163,6 +163,9 @@ smoke-test on every push/PR.
 
 ## Documentation
 
+- [`docs/BUILD-SUMMARY.md`](docs/BUILD-SUMMARY.md) — what was built on this
+  branch (kernel + hypervisor), the commit-by-commit map, module layout, and how
+  this branch relates to the other branches/worktrees in the repo.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — subsystem map, boot flow,
   memory layout, the frozen ABI contracts (trap frame, syscall numbers, PTE
   format), the concurrency model, and the test matrix.

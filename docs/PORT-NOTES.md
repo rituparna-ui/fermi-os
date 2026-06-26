@@ -398,3 +398,14 @@ in this tree — it falls back to the self-contained M10 bring-up stub
 guest's stage-2 UART mapping. So out of the box the slot is a working second
 guest (the hyp smoke test asserts the stub output), and supplying the three
 assets turns it into a full Linux-to-shell boot with no code changes.
+
+To exercise the **detect + boot-protocol-entry** path without downloading a real
+kernel, the tree ships a **synthetic arm64 Image** (`guest/synthimage.rs` +
+`guest/build-synthimage.sh`): a valid 64-byte arm64 boot header (magic at +56)
+followed by code that writes a banner to the guest UART and spins.
+`STAGE_SYNTH_IMAGE=1 ci/hyp-smoke-test.sh` builds it (pure Rust →
+`llvm-objcopy -O binary`), stages it at the slot via `-device loader`, and
+asserts the hypervisor detects it, enters it per the boot protocol, and that it
+runs from the slot (`SYNTH-LINUX: …` banner). CI runs both the stub-fallback and
+staged-Image modes. This validates the *same* code path a real Linux Image takes
+(identical header check, entry, and stage-2/timer plumbing).

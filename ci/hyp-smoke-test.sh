@@ -34,10 +34,25 @@ mkfs.fat -F 32 -n FERMI "$DISK" >/dev/null
 printf 'Hello from Fermi OS FAT32!\nThis is HELLO.TXT.\n' \
 	| MTOOLS_SKIP_CHECK=1 mcopy -i "$DISK" - ::/HELLO.TXT
 
+# Optionally stage a guest Image into the Linux slot (physical 0x240200000 ==
+# guest IPA 0x40200000). With STAGE_SYNTH_IMAGE=1 we build the in-tree synthetic
+# arm64 Image (guest/build-synthimage.sh) and load it, so the hypervisor's
+# Image-detection + boot-protocol entry path is exercised end-to-end. The loader
+# path differs between the direct and Docker runners (host vs /image).
+SYNTH_IMAGE=""
+if [ "${STAGE_SYNTH_IMAGE:-0}" = "1" ]; then
+	SYNTH_IMAGE="$(mktemp /tmp/fermi-synth-Image.XXXXXX)"
+	./guest/build-synthimage.sh "$SYNTH_IMAGE" >/dev/null
+	trap 'rm -f "$DISK" "$LOG" "${SHLOG:-}" "$SYNTH_IMAGE"' EXIT
+fi
+
 # QEMU args shared by both the direct and Docker paths. virtualization=on is the
-# whole point: it makes QEMU enter the image at EL2.
+# whole point: it makes QEMU enter the image at EL2. $1=kernel, $2=disk,
+# $3=optional synth-Image path (already visible to the runner).
 qemu_args() {
-	local kernel="$1" disk="$2"
+	local kernel="$1" disk="$2" image="${3:-}"
+	local loader=""
+	[ -n "$image" ] && loader="-device loader,file=$image,addr=0x240200000,force-raw=on"
 	# -m 10G: the Linux-slot guest's RAM lives at physical 9 GiB, past Fermi's
 	# 8 GiB PMM view, so the machine must expose at least 9 GiB + the slice.
 	echo "-machine virt,gic-version=3,virtualization=on -cpu cortex-a72 -m 10G -nographic \
@@ -46,6 +61,7 @@ qemu_args() {
 		-drive file=$disk,if=none,format=raw,id=d0 \
 		-device virtio-blk-pci,drive=d0,disable-legacy=on \
 		-device virtio-balloon-pci,disable-legacy=on \
+		$loader \
 		-kernel $kernel"
 }
 
@@ -56,19 +72,27 @@ host_qemu_major() {
 }
 
 echo "Booting $KERNEL under virtualization=on ..."
+[ -n "$SYNTH_IMAGE" ] && echo "  staging synthetic arm64 Image into the Linux slot"
 if [ -n "${HYP_QEMU:-}" ]; then
 	echo "  runner: \$HYP_QEMU = $HYP_QEMU"
 	# shellcheck disable=SC2046
-	timeout 45 "$HYP_QEMU" $(qemu_args "$KERNEL" "$DISK") < /dev/null > "$LOG" 2>&1 || true
+	timeout 45 "$HYP_QEMU" $(qemu_args "$KERNEL" "$DISK" "$SYNTH_IMAGE") < /dev/null > "$LOG" 2>&1 || true
 elif [ "$(host_qemu_major)" -ge 8 ]; then
 	echo "  runner: host qemu-system-aarch64 ($(qemu-system-aarch64 --version | head -1))"
 	# shellcheck disable=SC2046
-	timeout 45 qemu-system-aarch64 $(qemu_args "$KERNEL" "$DISK") < /dev/null > "$LOG" 2>&1 || true
+	timeout 45 qemu-system-aarch64 $(qemu_args "$KERNEL" "$DISK" "$SYNTH_IMAGE") < /dev/null > "$LOG" 2>&1 || true
 elif command -v docker >/dev/null 2>&1; then
 	echo "  runner: docker $DOCKER_IMG (host qemu too old for stage-2)"
+	# Mount the synth Image (if any) into the container at a fixed path.
+	img_mount=""
+	img_path=""
+	if [ -n "$SYNTH_IMAGE" ]; then
+		img_mount="-v $SYNTH_IMAGE:/synth-Image"
+		img_path="/synth-Image"
+	fi
 	# shellcheck disable=SC2046
-	timeout 90 docker run --rm -v "$PWD":/work -v "$DISK":/disk.img -w /work "$DOCKER_IMG" \
-		timeout 45 qemu-system-aarch64 $(qemu_args "$KERNEL" /disk.img) < /dev/null > "$LOG" 2>&1 || true
+	timeout 90 docker run --rm -v "$PWD":/work -v "$DISK":/disk.img $img_mount -w /work "$DOCKER_IMG" \
+		timeout 45 qemu-system-aarch64 $(qemu_args "$KERNEL" /disk.img "$img_path") < /dev/null > "$LOG" 2>&1 || true
 else
 	echo "SKIP: no QEMU >= 8 and no docker; cannot exercise stage-2 translation."
 	echo "      (EL2 bring-up itself works on any QEMU; set HYP_QEMU or install docker to test the full guest boot.)"
@@ -117,17 +141,24 @@ else
 	echo "  ok: no EL2 traps / panics / FAILs"
 fi
 
-# The Linux slot detects a staged arm64 Image by its header magic. No Image is
-# committed in this tree, so the hypervisor falls back to the self-contained M10
-# stub, which runs from the slot's high RAM and writes 'L' through its stage-2
-# UART mapping. Seeing the fallback log + the stub output proves the slot's
-# stage-2 (RAM + device) and the preemptive scheduling of guest 1 all work.
+# The Linux slot detects a staged arm64 Image by its header magic and enters it
+# per the boot protocol; with no Image it falls back to the self-contained M10
+# stub. Which path we assert depends on whether this run staged the synthetic
+# Image (STAGE_SYNTH_IMAGE=1). Either way it proves the slot's stage-2 (RAM +
+# device) and the preemptive scheduling of guest 1 work.
 #
-# To boot a real guest instead: stage guest/Image + guest/initramfs.cpio.gz + a
-# built guest.dtb via QEMU -device loader at the IPAs in src/hyp/mod.rs; the
-# detector then enters the Image per the arm64 boot protocol with no code change.
-# See docs/PORT-NOTES.md §6.
-if grep -qaF '[HYP] no Linux Image staged; running bring-up stub' "$LOG" && grep -qaE '^L' "$LOG"; then
+# To boot real Linux instead: stage guest/Image + initramfs + a built guest.dtb
+# via QEMU -device loader at the IPAs in src/hyp/mod.rs; the detector then enters
+# it with no code change. See docs/PORT-NOTES.md §6.
+if [ "${STAGE_SYNTH_IMAGE:-0}" = "1" ]; then
+	if grep -qaF '[HYP] Linux Image detected in slot' "$LOG" \
+		&& grep -qaF 'SYNTH-LINUX: arm64 Image booted by Fermi hyp' "$LOG"; then
+		echo "  ok: staged Image detected + entered; it ran from the slot (SYNTH banner)"
+	else
+		echo "  MISSING: synthetic Image was staged but not detected/entered"
+		fail=1
+	fi
+elif grep -qaF '[HYP] no Linux Image staged; running bring-up stub' "$LOG" && grep -qaE '^L' "$LOG"; then
 	echo "  ok: no Image staged -> slot ran the bring-up stub (emitted 'L'); Fermi survived"
 elif grep -qaF '[HYP] Linux Image detected in slot' "$LOG"; then
 	echo "  ok: a real Linux Image was detected and entered"

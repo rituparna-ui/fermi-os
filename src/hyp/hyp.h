@@ -37,6 +37,12 @@ void hyp_putc(char c);
 void hyp_puts(const char *s);
 void hyp_puthex(uint64_t v);
 
+/* SMP: bracket a multi-call log line (several hyp_puts/hyp_puthex that form one
+ * line) so it prints atomically w.r.t. other physical cores. The console lock is
+ * recursive per owning pCPU, so the inner calls are safe. Always pair them. */
+void hyp_con_begin(void);
+void hyp_con_end(void);
+
 /* Fatal EL2 error: print a message + spin. Reached from the EL2 vector stubs
  * and on impossible boot conditions (e.g. not actually at EL2). */
 __attribute__((noreturn)) void hyp_panic(const char *msg);

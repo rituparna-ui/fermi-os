@@ -22,6 +22,7 @@
 // secure=on, and an EL3 register access from EL2 would be UNDEFINED.
 
 #include "hyp_sysregs.h"
+#include "pcpu.h"
 
 .section .text.boot.hyp
 .global _hyp_start
@@ -97,6 +98,12 @@ _hyp_start:
 	dsb	sy
 	isb
 
+	// --- 8b. SMP: TPIDR_EL2 = &hyp_pcpus[0] so this_pcpu() works on pCPU0
+	// before hyp_main touches cur_vcpu / sched_deadline (both per-pCPU macros). ---
+	ldr	x0, =hyp_pcpus
+	msr	tpidr_el2, x0
+	isb
+
 	// --- 9. C entry at EL2. hyp_main sets up both VMs + the scheduler and
 	// enters the first guest via vcpu_run_first(); it does NOT return. ---
 	bl	hyp_main
@@ -104,3 +111,63 @@ _hyp_start:
 	// hyp_main should never return; if it does, spin.
 2:	wfe
 	b	2b
+
+// ===========================================================================
+// SMP secondary entry. PSCI CPU_ON (issued by pCPU0) resets a powered-off core
+// HERE at EL2 with x0 = context_id = cpu_id (1..3). We set up THIS core's EL2
+// register block (MMU still off), its TPIDR_EL2 + SP, then call the noreturn C
+// entry which enables the EL2 MMU as its first act and then idles/schedules.
+// (Deliberately self-contained — does not share pCPU0's path, so pCPU0 stays
+// byte-identical.)
+// ===========================================================================
+.global _hyp_secondary_start
+_hyp_secondary_start:
+	mov	x19, x0			// x19 = cpu_id (callee-stable across the msr block)
+
+	// VBAR_EL2 + SCTLR_EL2 (MMU off) + CPTR + MDCR + VPIDR/VMPIDR + timer + HCR.
+	ldr	x0, =hyp_vector_table
+	msr	vbar_el2, x0
+	ldr	x0, =SCTLR_EL2_RES1_OFF
+	msr	sctlr_el2, x0
+	isb
+	ldr	x0, =CPTR_EL2_M1
+	msr	cptr_el2, x0
+	mrs	x1, pmcr_el0
+	ubfx	x1, x1, #11, #5
+	and	x1, x1, #MDCR_EL2_HPMN_MASK
+	msr	mdcr_el2, x1
+	mrs	x0, midr_el1
+	msr	vpidr_el2, x0
+	mrs	x0, mpidr_el1
+	msr	vmpidr_el2, x0
+	mov	x0, #CNTHCTL_EL2_M1
+	msr	cnthctl_el2, x0
+	msr	cntvoff_el2, xzr
+	// HCR: stage-2 + IRQ-to-EL2 regime (HCR_EL2_M3) — this core will run guests.
+	ldr	x0, =HCR_EL2_M3
+	msr	hcr_el2, x0
+	isb
+	tlbi	alle2
+	dsb	sy
+	ic	iallu
+	dsb	sy
+	isb
+
+	// TPIDR_EL2 = &hyp_pcpus[cpu_id]; SP = that pCPU's stack top.
+	ldr	x0, =hyp_pcpus
+	mov	x1, #PCPU_STRUCT_SIZE
+	madd	x0, x19, x1, x0		// x0 = &hyp_pcpus[cpu_id]
+	msr	tpidr_el2, x0
+	isb
+	ldr	x2, =__hyp_stacks_base
+	ldr	x3, =HYP_STACK_STRIDE
+	madd	x2, x19, x3, x2		// x2 = stacks_base + cpu_id*stride
+	ldr	x4, =HYP_STACK_SIZE
+	add	x2, x2, x4		// + 64 KiB => stack top
+	mov	sp, x2
+
+	// C entry (noreturn): enables EL2 MMU first, then per-core init + idle.
+	mov	x0, x19
+	bl	hyp_secondary_main
+3:	wfe
+	b	3b

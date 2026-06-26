@@ -78,7 +78,9 @@ DISK_SIZE := 1G
 # the hyp image at PA 0x250000000 lives ABOVE the guest's 8 GiB (0x40000000..
 # 0x240000000) — no hyp/guest collision even with stage-2 off.
 QEMU_CPU := max
-QEMU_MACHINE := virt,gic-version=3,virtualization=on -m 9G
+# -smp 4: the hypervisor is now multicore. QEMU parks secondaries powered-off
+# (PSCI enable-method); the hyp brings them up itself via PSCI CPU_ON from EL2.
+QEMU_MACHINE := virt,gic-version=3,virtualization=on -m 9G -smp 4
 QEMU_DEVICES := -netdev user,id=n0 \
 	-device virtio-net-pci,netdev=n0,disable-legacy=on \
 	-device virtio-rng-pci,disable-legacy=on \

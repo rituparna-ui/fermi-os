@@ -33,6 +33,11 @@ struct vcpu_vgic;
  * enable, read VPL). Per-vCPU state is set up by vgic_vcpu_reset. */
 void vgic_init(void);
 
+/* SMP: per-core vGIC interface init for a secondary pCPU (ICC_SRE_EL2, clear
+ * this core's List Registers + APRs, assert ICH_VTR_EL2 matches the global LR
+ * count). Call once on each secondary at bring-up. */
+void vgic_percpu_init(void);
+
 /* Number of implemented List Registers (VPL), read from ICH_VTR_EL2. */
 uint32_t vgic_num_lr(void);
 

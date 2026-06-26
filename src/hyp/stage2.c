@@ -104,12 +104,20 @@ void s2_tlb_flush_all(void) {
 }
 
 void s2_init_vtcr(void) {
-  /* One-time: program VTCR_EL2 (shared IPA geometry for every VM). */
+  /* Program VTCR_EL2 (the per-PE register holding the shared IPA geometry). Run
+   * on every pCPU (it is UNKNOWN on secondaries at reset), but only pCPU0 prints
+   * — secondaries' values are identical and would race the console. */
   uint64_t vtcr = 0x80023558ULL; /* T0SZ=24,SL0=1,WBWA,IS,4K,PS=40b,VS=8b,RES1 */
   __asm__ __volatile__("msr vtcr_el2, %0\n\tisb" ::"r"(vtcr));
-  hyp_puts("[S2] VTCR_EL2=");
-  hyp_puthex(vtcr);
-  hyp_putc('\n');
+  uint64_t mpidr;
+  __asm__ __volatile__("mrs %0, mpidr_el1" : "=r"(mpidr));
+  if ((mpidr & 0xFF) == 0) {
+    hyp_con_begin();
+    hyp_puts("[S2] VTCR_EL2=");
+    hyp_puthex(vtcr);
+    hyp_putc('\n');
+    hyp_con_end();
+  }
 }
 
 uint64_t s2_make_vttbr(uint64_t l1_root, uint32_t vmid) {

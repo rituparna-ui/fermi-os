@@ -21,7 +21,11 @@
 
 static vcpu_t vcpus[MAX_VCPUS];
 static int    nr_vcpus;
-vcpu_t       *cur_vcpu;
+/* cur_vcpu is now a per-pCPU macro (this_pcpu()->current) from vcpu.h.
+ * cur_load_tsc / sched_deadline likewise live in the per-pCPU block, so each
+ * physical core tracks its own CPU-time stamp and slice deadline. */
+#define cur_load_tsc   (this_pcpu()->cur_load_tsc)
+#define sched_deadline (this_pcpu()->sched_deadline)
 
 /* Implemented in vcpu_switch.S — load gp->x[]/elr/spsr and eret (no return). */
 extern void vcpu_first_entry(vcpu_gp_t *gp) __attribute__((noreturn));
@@ -476,9 +480,8 @@ void vcpu_reset(vcpu_t *v, hyp_trap_frame_t *f) {
   }
 }
 
-/* CNTPCT timestamp when the current vCPU was last loaded — used to accumulate
- * per-VM CPU time on each switch-out. */
-static uint64_t cur_load_tsc;
+/* cur_load_tsc (the CNTPCT timestamp when this pCPU's current vCPU was loaded)
+ * is a per-pCPU macro defined at the top of this file. */
 
 static uint64_t read_cntpct(void) {
   uint64_t t;
@@ -527,7 +530,8 @@ __attribute__((noreturn)) void vcpu_run_first(void) {
  * deadline(s) elapsed. A coarse slice (~50 ms) keeps the round-robin visible. */
 #define SCHED_SLICE_TICKS (62500000ULL / 100) /* ~10 ms at 62.5 MHz */
 
-static uint64_t sched_deadline; /* absolute CNTPCT of the next scheduler slice */
+/* sched_deadline (absolute CNTPCT of THIS pCPU's next scheduler slice) is a
+ * per-pCPU macro defined at the top of this file. */
 
 /* True if vCPU v has a live (armed, unmasked, not-yet-fired) vtimer deadline. */
 static int vtimer_armed(const vcpu_t *v) {

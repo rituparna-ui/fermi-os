@@ -110,6 +110,29 @@ void vgic_init(void) {
   hyp_puts(" (virtual CPU interface ready)\n");
 }
 
+/* SMP: per-core vGIC interface init for a secondary pCPU. ICC_SRE_EL2 and the
+ * ICH_LR/APR registers are PER-CORE hardware, so every core must enable its own
+ * virtual interface and clear its own list registers. vgic_nr_lr is read once
+ * globally by vgic_init (uniform -cpu max); re-read here and assert it matches so
+ * a heterogeneous config is rejected rather than silently mis-served. */
+void vgic_percpu_init(void) {
+  uint64_t sre = ICC_SRE_EL2_VAL;
+  __asm__ __volatile__("msr icc_sre_el2, %0\n\tisb" ::"r"(sre));
+
+  uint64_t vtr;
+  __asm__ __volatile__("mrs %0, ich_vtr_el2" : "=r"(vtr));
+  uint32_t nr = (uint32_t)((vtr & 0x1F) + 1);
+  if (nr != vgic_nr_lr) {
+    hyp_panic("vgic_percpu_init: ICH_VTR_EL2 List-Reg count differs across cores");
+  }
+
+  for (uint32_t i = 0; i < vgic_nr_lr; i++) {
+    lr_write(i, 0);
+  }
+  __asm__ __volatile__("msr ich_ap0r0_el2, %0" ::"r"(0ULL));
+  __asm__ __volatile__("msr ich_ap1r0_el2, %0" ::"r"(0ULL));
+}
+
 uint32_t vgic_num_lr(void) { return vgic_nr_lr; }
 
 /* Seed a fresh per-vCPU vGIC state: virtual interface enabled, Group1 + PMR

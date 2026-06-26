@@ -49,9 +49,15 @@ SECTIONS
 		__hyp_bss_end = .;
 	} :data
 
+	/* Per-pCPU EL2 stacks: 4 x (64 KiB stack + 4 KiB guard page). pCPU n's stack
+	 * TOP = __hyp_stacks_base + n*0x11000 + 0x10000. The guard page is slack so a
+	 * small overflow corrupts the guard rather than a neighbour's stack. pCPU0's
+	 * stack top keeps the same offset as the old single stack. */
 	. = ALIGN(4096);
-	. = . + 0x10000;		/* 64 KiB EL2 stack */
-	__hyp_stack_top = .;
+	__hyp_stacks_base = .;
+	. = . + 0x11000 * 4;		/* HYP_MAX_PCPUS=4 x (64 KiB + 4 KiB guard) */
+	__hyp_stacks_end = .;
+	__hyp_stack_top = __hyp_stacks_base + 0x10000;	/* pCPU0 stack top */
 
 	. = ALIGN(4096);
 	__hyp_end = .;

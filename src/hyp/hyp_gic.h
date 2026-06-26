@@ -21,8 +21,17 @@
 #define HYP_GICR_SGI_BASE (HYP_GICR_BASE + 0x10000ULL)
 
 /* Bring up the EL2 physical CPU interface (ICC_SRE_EL2 is done by vgic_init;
- * here we set PMR/IGRPEN1 at EL2 and enable + route the CNTHP PPI 26). */
+ * here we set PMR/IGRPEN1 at EL2 and enable + route the CNTHP PPI 26). On the
+ * uniprocessor this did everything; under SMP it is the GLOBAL distributor part
+ * + pCPU0's own per-core part. */
 void hyp_gic_init(void);
+
+/* SMP: per-core EL2 GIC bring-up for a secondary pCPU. Discovers this core's
+ * redistributor frame (GICR_TYPER affinity match), wakes it, marks SGIs/PPIs
+ * Group1, sets ICC_PMR/IGRPEN1 at EL2. `enable_cnthp` gates PPI 26 (CNTHP) — a
+ * secondary that does not yet schedule (Phase A/B idle) MUST leave it masked, or
+ * it would take a CNTHP with no current vCPU. Returns the discovered GICR base. */
+uint64_t hyp_gic_percpu_init(int enable_cnthp);
 
 /* Acknowledge / EOI a physical IRQ at the EL2 host interface. */
 uint32_t hyp_gic_ack(void);

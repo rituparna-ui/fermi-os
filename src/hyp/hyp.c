@@ -1,6 +1,8 @@
 #include "hyp.h"
 #include "hyp_alloc.h"
 #include "hyp_mmu_el2.h"
+#include "pcpu.h"
+#include "lock.h"
 #include "hyp_gic.h"
 #include "hyp_sysregs.h"
 #include "snapshot.h"
@@ -35,30 +37,80 @@ static inline uint32_t mmio_r32(uint64_t addr) {
   return *(volatile uint32_t *)addr;
 }
 
+/* SMP: serialize console output so concurrent writers (pCPU0 + secondaries)
+ * don't interleave mid-line. The lock word is in the cacheable EL2 arena.
+ *
+ * A whole log line is usually several calls (hyp_puts + hyp_puthex + ...). To
+ * keep the LINE atomic (not just each call), the lock is RECURSIVE per owning
+ * pCPU: hyp_con_lock()/hyp_con_unlock() bracket a full line, and the inner
+ * hyp_puts/hyp_puthex re-enter harmlessly (depth counter). A panicking core
+ * bypasses the lock entirely (it may hold it, and the box is dying). */
+static hyp_spinlock_t uart_lock = HYP_SPINLOCK_INIT;
+static volatile int hyp_panicking;
+static int uart_owner = -1; /* pCPU id currently holding the console, -1 = free */
+static int uart_depth;      /* recursion depth for the owning pCPU */
+static uint64_t uart_daif;  /* saved DAIF of the outermost acquire */
+
+static void hyp_con_lock(void) {
+  if (hyp_panicking) {
+    return;
+  }
+  int me = (int)this_pcpu()->cpu_id;
+  /* Fast recursive path: already mine. Reads of uart_owner are safe — only this
+   * core ever sets it to `me`, and any other value just means "take the lock". */
+  if (uart_owner == me) {
+    uart_depth++;
+    return;
+  }
+  uint64_t f = hyp_lock_irqsave(&uart_lock);
+  uart_owner = me;
+  uart_depth = 1;
+  uart_daif = f;
+}
+
+static void hyp_con_unlock(void) {
+  if (hyp_panicking) {
+    return;
+  }
+  if (--uart_depth == 0) {
+    uint64_t f = uart_daif;
+    uart_owner = -1;
+    hyp_unlock_irqrestore(&uart_lock, f);
+  }
+}
+
 void hyp_putc(char c) {
-  /* Spin while the TX FIFO is full, then push the byte. */
+  /* Raw primitive: spin while the TX FIFO is full, then push the byte. */
   while (mmio_r32(HYP_UART_FR) & HYP_UART_FR_TXFF) {
   }
   mmio_w32(HYP_UART_DR, (uint32_t)(unsigned char)c);
 }
 
 void hyp_puts(const char *s) {
+  hyp_con_lock();
   for (; *s; s++) {
     if (*s == '\n') {
       hyp_putc('\r');
     }
     hyp_putc(*s);
   }
+  hyp_con_unlock();
 }
 
 void hyp_puthex(uint64_t v) {
   static const char digits[] = "0123456789ABCDEF";
+  hyp_con_lock();
   hyp_putc('0');
   hyp_putc('x');
   for (int shift = 60; shift >= 0; shift -= 4) {
     hyp_putc(digits[(v >> shift) & 0xF]);
   }
+  hyp_con_unlock();
 }
+
+/* Bracket a multi-call log line so it prints atomically (see hyp.h). */
+void hyp_con_begin(void) { hyp_con_lock(); }
+void hyp_con_end(void) { hyp_con_unlock(); }
 
 /* Called from the EL2 vector stubs (hyp_vectors.S). At Milestone 1 no vector
  * should ever fire, so reaching here means something unexpected trapped to
@@ -78,6 +130,7 @@ __attribute__((noreturn)) void hyp_vector_report(uint64_t index, uint64_t esr,
 }
 
 __attribute__((noreturn)) void hyp_panic(const char *msg) {
+  hyp_panicking = 1; /* console writers now bypass uart_lock (best-effort) */
   hyp_puts("\n[HYP][PANIC] ");
   if (msg) {
     hyp_puts(msg);
@@ -161,6 +214,96 @@ void hyp_copy_image(uint64_t dst_pa, const uint8_t *src, uint64_t size) {
   __asm__ __volatile__("ic ialluis\n\tdsb ish\n\tisb" ::: "memory");
 }
 
+/* Per-pCPU EL2 stack region (from linker_hyp.ld). */
+extern uint8_t __hyp_stacks_base[];
+
+/* Set to 1 by pCPU0 once all one-time-global init is published; secondaries
+ * spin on it before doing anything that reads shared state. In the cacheable
+ * arena (EL2 MMU on) so the release/acquire is genuinely visible cross-core. */
+static volatile uint32_t smp_global_ready;
+
+/* SMP secondary C entry (called from _hyp_secondary_start with x0 = cpu_id).
+ * Phase A: enable this core's EL2 MMU, wait for pCPU0's global init, do per-core
+ * GIC/VTCR/vgic init with the scheduler IRQ (CNTHP) MASKED, mark online, then
+ * idle forever in WFI. It does NOT schedule yet (that is Phase C). */
+__attribute__((noreturn)) void hyp_secondary_main(uint64_t cpu_id) {
+  /* FIRST: enable this core's EL2 stage-1 MMU so its RAM accesses are
+   * cacheable-IS and coherent with pCPU0 (the L1 table was built by pCPU0). */
+  hyp_mmu_el2_enable();
+
+  hyp_pcpu_t *pc = &hyp_pcpus[cpu_id];
+  uint64_t mpidr;
+  __asm__ __volatile__("mrs %0, mpidr_el1" : "=r"(mpidr));
+  pc->cpu_id = (uint32_t)cpu_id;
+  pc->mpidr = mpidr;
+  pc->current = (void *)0;
+  pc->cur_load_tsc = 0;
+  pc->sched_deadline = 0;
+  pc->stack_top = (uint64_t)(uintptr_t)__hyp_stacks_base + cpu_id * HYP_STACK_STRIDE + HYP_STACK_SIZE;
+
+  /* Wait until pCPU0 has published all global init (stage-2, vcpus[], devices). */
+  while (__atomic_load_n(&smp_global_ready, __ATOMIC_ACQUIRE) == 0) {
+    __asm__ __volatile__("wfe");
+  }
+
+  /* Per-core stage-2 control + vGIC interface + EL2 GIC (CNTHP MASKED: this core
+   * does not schedule in Phase A, so it must never take a CNTHP IRQ). */
+  s2_init_vtcr();
+  vgic_percpu_init();
+  pc->gicr_base = hyp_gic_percpu_init(/*enable_cnthp=*/0);
+
+  __atomic_store_n(&pc->online, 1, __ATOMIC_RELEASE);
+  hyp_con_begin(); /* keep this multi-call line atomic vs other cores */
+  hyp_puts("[SMP] CPU ");
+  hyp_puthex(cpu_id);
+  hyp_puts(" online (MPIDR=");
+  hyp_puthex(mpidr);
+  hyp_puts(" gicr=");
+  hyp_puthex(pc->gicr_base);
+  hyp_puts(")\n");
+  hyp_con_end();
+
+  /* Phase A: idle. IRQs stay masked (we enabled no PPI); just park. */
+  for (;;) {
+    __asm__ __volatile__("wfi");
+  }
+}
+
+/* PSCI CPU_ON (SMC conduit) a secondary physical core into _hyp_secondary_start.
+ * Verified empirically that this works from EL2 with no EL3 on QEMU virt. */
+static int64_t psci_cpu_on(uint64_t target_aff, uint64_t entry, uint64_t ctx) {
+  register uint64_t x0 __asm__("x0") = 0xC4000003ULL; /* PSCI_CPU_ON (SMC64) */
+  register uint64_t x1 __asm__("x1") = target_aff;
+  register uint64_t x2 __asm__("x2") = entry;
+  register uint64_t x3 __asm__("x3") = ctx;
+  __asm__ __volatile__("smc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
+  return (int64_t)x0;
+}
+
+/* Bring up the 3 secondary physical cores (Phase A: to an idle WFI loop). Called
+ * by pCPU0 after publishing global init. */
+static void hyp_smp_bringup(void) {
+  extern void _hyp_secondary_start(void);
+  uint64_t entry = (uint64_t)(uintptr_t)&_hyp_secondary_start;
+
+  /* Publish: ensure all prior global writes are visible before the secondaries
+   * (which CPU_ON resets with clean caches) read shared state. */
+  __asm__ __volatile__("dsb ish" ::: "memory");
+  __atomic_store_n(&smp_global_ready, 1, __ATOMIC_RELEASE);
+  __asm__ __volatile__("sev" ::: "memory"); /* wake any secondary already in wfe */
+
+  for (uint64_t cpu = 1; cpu < HYP_MAX_PCPUS; cpu++) {
+    int64_t r = psci_cpu_on(/*aff0=*/cpu, entry, /*ctx=*/cpu);
+    hyp_con_begin();
+    hyp_puts("[SMP] CPU_ON cpu ");
+    hyp_puthex(cpu);
+    hyp_puts(" -> ");
+    hyp_puthex((uint64_t)r);
+    hyp_putc('\n');
+    hyp_con_end();
+  }
+}
+
 /* Called from hyp_boot.S after the EL2 register context is established. Sets up
  * stage-2 for both VMs, the GIC/timer virtualization, both vCPUs, the EL2
  * scheduler, and enters VM1. Does NOT return (vcpu_run_first erets). */
@@ -168,6 +311,21 @@ void hyp_main(void) {
   uint64_t current_el, cptr;
   __asm__ __volatile__("mrs %0, CurrentEL" : "=r"(current_el));
   __asm__ __volatile__("mrs %0, cptr_el2" : "=r"(cptr));
+
+  /* SMP: initialise pCPU0's control block (TPIDR_EL2 already points at it, set
+   * in hyp_boot.S). this_pcpu()->current/sched_deadline are used below. */
+  {
+    hyp_pcpu_t *pc0 = &hyp_pcpus[0];
+    uint64_t mpidr;
+    __asm__ __volatile__("mrs %0, mpidr_el1" : "=r"(mpidr));
+    pc0->cpu_id = 0;
+    pc0->mpidr = mpidr;
+    pc0->current = (void *)0;
+    pc0->cur_load_tsc = 0;
+    pc0->sched_deadline = 0;
+    pc0->stack_top = (uint64_t)(uintptr_t)__hyp_stacks_base + HYP_STACK_SIZE;
+    pc0->online = 1;
+  }
 
   hyp_puts("\n==================================================\n");
   hyp_puts("  Fermi Hypervisor (EL2) - multi-VM\n");
@@ -383,6 +541,11 @@ void hyp_main(void) {
   snapshot_init();      /* reserve the VM snapshot slot */
   virtio_blk_init();    /* reserve the virtio-blk backing disk */
   virtio_balloon_init();/* init the memory-balloon device */
-  vcpu_sched_init();  /* arm CNTHV scheduler tick */
-  vcpu_run_first();   /* enter VM1 — does not return */
+
+  /* SMP Phase A: bring up the 3 secondary physical cores (to an idle WFI loop;
+   * they do not schedule yet). All global init above is now done and published. */
+  hyp_smp_bringup();
+
+  vcpu_sched_init();  /* arm CNTHP scheduler tick (pCPU0) */
+  vcpu_run_first();   /* enter VM1 on pCPU0 — does not return */
 }

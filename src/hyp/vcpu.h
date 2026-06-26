@@ -165,9 +165,13 @@ typedef struct vcpu {
  * spin the hypervisor forever). */
 #define VCPU_FAULT_MAX 3
 
-/* The currently-running vCPU (set by the scheduler before each guest entry).
- * vtimer / vgic emulation use this to find their per-VM state. */
-extern vcpu_t *cur_vcpu;
+/* The currently-running vCPU on the CALLING physical core (set by the scheduler
+ * before each guest entry). vtimer / vgic / device emulation use this to find
+ * the per-VM state of the VM that trapped on THIS pCPU. On the uniprocessor this
+ * was a single global; under SMP it is per-pCPU (this_pcpu()->current). The
+ * macro is a valid lvalue, so vcpu_load's `cur_vcpu = v` still works. */
+#include "pcpu.h"
+#define cur_vcpu (this_pcpu()->current)
 
 /* Save the outgoing guest's EL1 sysregs + FP into `v`; restore the incoming
  * guest's into the CPU. Implemented in vcpu_switch.S. */

@@ -681,6 +681,15 @@ fn dispatch(line: &str) {
                 cmd_grep(arg1, arg2);
             }
         }
+        "mkdir" => {
+            if arg1.is_empty() {
+                kprintln!("usage: mkdir <name>  (root-level)");
+            } else {
+                let name = arg1.rsplit('/').next().unwrap_or(arg1);
+                let ok = crate::fs::fat32::mkdir(name.as_bytes());
+                kprintln!("mkdir {}: {}", name, if ok { "ok" } else { "failed (exists?)" });
+            }
+        }
         "rm" => {
             if arg1.is_empty() {
                 kprintln!("usage: rm <path>");

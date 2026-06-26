@@ -531,6 +531,53 @@ pub fn rename(old: &[u8], new: &[u8]) -> bool {
     blk::write(sector as u64, sec())
 }
 
+/// Create an empty root-level subdirectory. Allocates a cluster, initializes it
+/// with `.` and `..` entries (rest zeroed), and adds an ATTR_DIRECTORY entry in
+/// the root. Fails if the name already exists or no space.
+pub fn mkdir(name: &[u8]) -> bool {
+    let v = unsafe { VOL.get() };
+    if !v.mounted {
+        return false;
+    }
+    let t83 = to_83(name);
+    if dir_find_loc(v.root_cluster, &t83).is_some() {
+        return false; // already exists
+    }
+    let c = fat_alloc_cluster();
+    if c == 0 {
+        return false;
+    }
+    let base = cluster_to_sector(c);
+    // Zero every sector of the new directory cluster.
+    for srel in 0..v.sectors_per_cluster {
+        let b = sec();
+        for x in b.iter_mut() { *x = 0; }
+        if srel == 0 {
+            // "." -> this cluster ; ".." -> root cluster.
+            build_dir_entry(&mut b[0..32], b".          ", c);
+            build_dir_entry(&mut b[32..64], b"..         ", v.root_cluster);
+        }
+        if !blk::write((base + srel) as u64, sec()) {
+            return false;
+        }
+    }
+    // Add the directory entry in the root.
+    let mut e = [0u8; 32];
+    e[..11].copy_from_slice(&t83);
+    e[11] = ATTR_DIRECTORY;
+    e[20..22].copy_from_slice(&((c >> 16) as u16).to_le_bytes());
+    e[26..28].copy_from_slice(&(c as u16).to_le_bytes());
+    // size = 0 for directories
+    dir_add_entry(v.root_cluster, &e)
+}
+
+fn build_dir_entry(dst: &mut [u8], name11: &[u8; 11], cluster: u32) {
+    dst[..11].copy_from_slice(name11);
+    dst[11] = ATTR_DIRECTORY;
+    dst[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+    dst[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
+}
+
 /// Attach the mounted FAT32 root to an existing empty VFS directory.
 pub fn vfs_mount(path: &str) {
     let v = unsafe { VOL.get() };

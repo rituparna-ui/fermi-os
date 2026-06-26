@@ -2000,3 +2000,91 @@ void hyp_run_miniguest(void) {
   stage2_destroy(&s2);
   pmm_free_pages(ram, MG_FOREIGN_RAM / 0x1000);
 }
+
+/* ---- Milestone 23: SMP guest — two vCPUs in one VM via PSCI CPU_ON ---- */
+
+extern char guest_smp_start[];
+extern char guest_smp_end[];
+
+#define SMP_VCPUS    2
+#define SMP_RAM_SIZE 0x00200000ULL
+
+void hyp_run_smp_guest(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M23: SMP guest — boot vCPU brings up a 2nd via PSCI CPU_ON");
+
+  uintptr_t ram = pmm_allocate_pages(SMP_RAM_SIZE / 0x1000);
+  static stage2_t s2;
+  if (!ram || !stage2_create(&s2, /*vmid=*/1)) {
+    return;
+  }
+  /* ONE address space shared by both vCPUs (true SMP) + straight-through UART. */
+  stage2_map(&s2, GUEST_ENTRY_IPA, (uint64_t)ram, SMP_RAM_SIZE, 0);
+  stage2_map(&s2, UART_BASE, UART_BASE, 0x1000, /*device=*/1);
+
+  uint64_t len = (uint64_t)(guest_smp_end - guest_smp_start);
+  uint64_t kva = PHYS_TO_VIRT((uint64_t)ram);
+  for (uint64_t b = 0; b < len; b++) {
+    ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)guest_smp_start)[b];
+  }
+  guest_sync_icache(kva, (len + 0xFFF) & ~0xFFFULL);
+
+  uint64_t vttbr = stage2_vttbr(&s2);
+  static vcpu_t vc[SMP_VCPUS];
+  int runnable[SMP_VCPUS] = {1, 0}; /* only the boot vCPU runs initially */
+  for (int i = 0; i < SMP_VCPUS; i++) {
+    for (int r = 0; r < 31; r++) vc[i].x[r] = 0;
+    vc[i].pstate = 0x3C5;
+    vc[i].sp_el1 = GUEST_ENTRY_IPA + SMP_RAM_SIZE - (uint64_t)i * 0x1000;
+    vc[i].vttbr = vttbr;      /* shared address space */
+    vc[i].vmid = 1;
+    vc[i].mpidr = (uint64_t)i; /* distinct affinity per vCPU */
+    vc[i].hcr_extra = 0;
+    vc[i].id = (uint32_t)i;
+    vc[i].name = (i == 0) ? "cpu0" : "cpu1";
+  }
+  vc[0].pc = GUEST_ENTRY_IPA; /* boot vCPU enters at guest_smp_start */
+
+  uint64_t host_daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(host_daif));
+  __asm__ __volatile__("msr daifset, #3");
+
+  /* Cooperative round-robin over the runnable vCPUs (they yield via HVC). */
+  int both_printed_guard = 40;
+  while (both_printed_guard-- > 0) {
+    for (int i = 0; i < SMP_VCPUS; i++) {
+      if (!runnable[i]) {
+        continue;
+      }
+      vcpu_enter(&vc[i]);
+      if (vc[i].exit_reason == HYP_EXC_SYNC && ESR_EC_OF(vc[i].esr) == 0x16) {
+        if (psci_handle(&vc[i]) == PSCI_ACT_CPU_ON) {
+          /* x1=target, x2=entry, x3=ctx. Activate the secondary vCPU. */
+          uint64_t entry = vc[i].x[2];
+          uint64_t ctx = vc[i].x[3];
+          if (!runnable[1]) {
+            vc[1].pc = entry;
+            vc[1].x[0] = ctx; /* AArch64 PSCI passes context_id in x0 */
+            runnable[1] = 1;
+            vc[i].x[0] = 0;   /* PSCI SUCCESS */
+            uart_println("[HYP] PSCI CPU_ON: secondary vCPU activated");
+          } else {
+            vc[i].x[0] = (uint64_t)-4; /* ALREADY_ON */
+          }
+        }
+        /* plain yield HVC otherwise: just move on. */
+      } else if (!df_service_exit(&vc[i])) {
+        runnable[i] = 0;
+      }
+    }
+  }
+
+  __asm__ __volatile__("msr daif, %0" ::"r"(host_daif));
+  uart_println("[HYP] M23: done (two vCPUs ran in one VM with distinct MPIDR affinity)");
+
+  stage2_destroy(&s2);
+  pmm_free_pages(ram, SMP_RAM_SIZE / 0x1000);
+}

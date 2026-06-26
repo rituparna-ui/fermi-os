@@ -30,6 +30,7 @@
 .equ VCPU_FAR,         312
 .equ VCPU_HPFAR,       320
 .equ VCPU_HCR_EXTRA,   328
+.equ VCPU_MPIDR,       336
 
 // Host frame built on the EL2 stack by vcpu_enter (160 bytes, 16-aligned):
 //   [sp+0]  x19,x20  [sp+16] x21,x22  [sp+32] x23,x24  [sp+48] x25,x26
@@ -101,6 +102,12 @@ vcpu_enter:
 	ldr	x3, [x0, #VCPU_HCR_EXTRA]
 	orr	x2, x2, x3
 	msr	hcr_el2, x2
+	isb
+
+	// Per-vCPU virtual MPIDR: the guest's MPIDR_EL1 reads return this, so each
+	// vCPU of an SMP guest sees a distinct affinity / core id.
+	ldr	x1, [x0, #VCPU_MPIDR]
+	msr	vmpidr_el2, x1
 	isb
 
 	// Guest return state.

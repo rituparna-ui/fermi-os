@@ -542,3 +542,58 @@ nb_puthex_nib:
 	ret
 .global guest_net_end
 guest_net_end:
+
+// ---------------------------------------------------------------------------
+// SMP demo guest (milestone 23). One VM with TWO vCPUs sharing one address
+// space. The boot vCPU (entered at guest_smp_start) reads its MPIDR affinity,
+// prints 'A'<aff>, then issues PSCI CPU_ON to bring up the secondary vCPU at
+// guest_smp_sec, passing the secondary's entry as an IPA. The secondary reads
+// its own (distinct) MPIDR and prints 'A'<aff>. Both then yield-loop. This
+// proves per-vCPU VMPIDR + PSCI CPU_ON secondary bring-up.
+//
+// Secondary entry IPA is built with movz/movk so it is position-correct at the
+// guest's fixed load base (0x40000000). guest_smp_sec is at a known small
+// offset; rather than hardcode it, the boot CPU computes it via adr and passes
+// the resulting IPA. (adr yields the runtime IPA since we run at our link addr.)
+.section .text.guest, "ax"
+.balign 16
+.global guest_smp_start
+guest_smp_start:
+	mrs	x9, mpidr_el1
+	and	x9, x9, #0xFF		// affinity low byte
+	movz	x10, #0x0000
+	movk	x10, #0x0900, lsl #16	// UART
+	mov	w11, #'A'
+	str	w11, [x10]
+	add	w11, w9, #'0'
+	str	w11, [x10]		// print 'A'<boot-aff>
+	mov	w11, #'\n'
+	str	w11, [x10]
+
+	// PSCI CPU_ON(target=1, entry=&guest_smp_sec, ctx=0).
+	movz	x0, #0x0003
+	movk	x0, #0xC400, lsl #16	// 0xC4000003 = PSCI_CPU_ON (64-bit)
+	mov	x1, #1			// target affinity / cpu 1
+	adr	x2, guest_smp_sec	// secondary entry (runtime IPA)
+	mov	x3, #0			// context id
+	hvc	#0
+
+1:	hvc	#0			// yield-loop (boot CPU)
+	b	1b
+
+.balign 16
+guest_smp_sec:
+	mrs	x9, mpidr_el1
+	and	x9, x9, #0xFF
+	movz	x10, #0x0000
+	movk	x10, #0x0900, lsl #16
+	mov	w11, #'A'
+	str	w11, [x10]
+	add	w11, w9, #'0'
+	str	w11, [x10]		// print 'A'<secondary-aff>
+	mov	w11, #'\n'
+	str	w11, [x10]
+2:	hvc	#0			// yield-loop (secondary CPU)
+	b	2b
+.global guest_smp_end
+guest_smp_end:

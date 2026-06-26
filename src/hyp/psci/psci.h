@@ -32,6 +32,7 @@ typedef enum {
   PSCI_ACT_NONE = 0,   /* handled in place (x0 set); resume the guest */
   PSCI_ACT_RESET,      /* warm-reset this guest                       */
   PSCI_ACT_OFF,        /* power off this guest (stop scheduling it)   */
+  PSCI_ACT_CPU_ON,     /* bring up a secondary vCPU (SMP)             */
 } psci_action_t;
 
 /* Decode the PSCI call in v->x[0..]. Writes the return value into v->x[0] for

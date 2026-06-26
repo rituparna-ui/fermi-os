@@ -140,4 +140,10 @@ void hyp_run_vm_lifecycle(void);
  * RAM by parsing the device tree. No-op at EL1; runs before the host timer. */
 void hyp_run_miniguest(void);
 
+/* Milestone 23: SMP guest. One VM with TWO vCPUs sharing a single stage-2
+ * address space and distinct VMPIDRs. The boot vCPU brings up the secondary via
+ * PSCI CPU_ON; both run and print their distinct MPIDR affinity. No-op at EL1;
+ * runs before the host timer. */
+void hyp_run_smp_guest(void);
+
 #endif /* HYP_HYP_H */

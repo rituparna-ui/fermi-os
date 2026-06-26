@@ -12,13 +12,19 @@ psci_action_t psci_handle(vcpu_t *v) {
     uint64_t q = v->x[1];
     /* Report the state-changing calls we implement as available (0). */
     if (q == PSCI_SYSTEM_RESET_FN || q == PSCI_SYSTEM_OFF_FN ||
-        q == PSCI_CPU_OFF_FN || q == PSCI_VERSION_FN) {
+        q == PSCI_CPU_OFF_FN || q == PSCI_VERSION_FN ||
+        q == PSCI_CPU_ON_FN64) {
       v->x[0] = PSCI_RET_SUCCESS;
     } else {
       v->x[0] = (uint64_t)PSCI_RET_NOT_SUPPORTED;
     }
     return PSCI_ACT_NONE;
   }
+
+  case PSCI_CPU_ON_FN64:
+    /* x1=target affinity, x2=entry point, x3=context id. The run-loop activates
+     * the secondary vCPU; it sets x0 (SUCCESS / ALREADY_ON / error). */
+    return PSCI_ACT_CPU_ON;
 
   case PSCI_SYSTEM_RESET_FN:
     return PSCI_ACT_RESET;

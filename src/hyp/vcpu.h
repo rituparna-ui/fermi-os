@@ -65,6 +65,7 @@ typedef struct vcpu {
   uint64_t far;         /* +312 FAR_EL2 at exit                       */
   uint64_t hpfar;       /* +320 HPFAR_EL2 at exit                     */
   uint64_t hcr_extra;   /* +328 extra HCR_EL2 bits OR'd in on entry   */
+  uint64_t mpidr;       /* +336 VMPIDR_EL2 — this vCPU's virtual MPIDR */
 
   /* ---- extended per-vCPU state (M9; not referenced by world_switch.S) ---- */
   vcpu_el1_t  el1;   /* guest EL1 sysreg bank (via _EL12)             */

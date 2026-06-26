@@ -89,12 +89,26 @@ static void handle_psci(hyp_trap_frame_t *f) {
      * vCPU's x0, not the caller's. */
     f->regs[0] = (uint64_t)vcpu_psci_cpu_on(f->regs[1], f->regs[2], f->regs[3]);
     break;
+  case PSCI_CPU_OFF_FN: {
+    /* No target argument — operates on cur_vcpu (a secondary powering itself
+     * down). LOAD-BEARING: unlike every other PSCI case, do NOT unconditionally
+     * write f->regs[0]. On SUCCESS vcpu_psci_cpu_off has ALREADY switched away
+     * and `f` is the NEXT vCPU's frame — writing f->regs[0] would clobber its
+     * x0. Only the DENIED path (caller still running) returns a value. */
+    int64_t r = vcpu_psci_cpu_off(f);
+    if (r != PSCI_SUCCESS) {
+      f->regs[0] = (uint64_t)r;
+    }
+    break;
+  }
   case PSCI_AFFINITY_INFO_FN64:
     f->regs[0] = (uint64_t)vcpu_psci_affinity_info(f->regs[1]);
     break;
   case PSCI_FEATURES_FN:
-    /* Advertise CPU_ON / AFFINITY_INFO as implemented (0), else not supported. */
-    if (f->regs[1] == PSCI_CPU_ON_FN64 || f->regs[1] == PSCI_AFFINITY_INFO_FN64)
+    /* Advertise CPU_ON / AFFINITY_INFO / CPU_OFF as implemented (0), else not
+     * supported. */
+    if (f->regs[1] == PSCI_CPU_ON_FN64 || f->regs[1] == PSCI_AFFINITY_INFO_FN64 ||
+        f->regs[1] == PSCI_CPU_OFF_FN)
       f->regs[0] = 0;
     else
       f->regs[0] = (uint64_t)PSCI_NOT_SUPPORTED;

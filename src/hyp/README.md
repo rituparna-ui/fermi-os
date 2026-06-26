@@ -450,6 +450,22 @@ CPUs, not that the host has them.
   `INVALID_PARAMETERS`. A secondary starts `online=0` and is **never scheduled**
   until `CPU_ON` (enforced in `pick_next` and `vcpu_wake_expired`).
   `AFFINITY_INFO` (`0xC4000004`) reports ON/OFF.
+- **`PSCI CPU_OFF` (`0x84000002`) — CPU hotplug.** A secondary can power *itself*
+  down: the hyp sets its `online=0` (but **not** `dead` — it stays resurrectable)
+  and switches away, exactly like `SYSTEM_OFF` but reversible. A later `CPU_ON`
+  re-onlines it (re-seeding its vGIC/vtimer), giving the full online→offline→
+  online hotplug cycle. Restricted to SMP secondaries (`Aff0 != 0`); a primary or
+  single-vCPU VM is `DENIED` and must use `SYSTEM_OFF` (so a VM can never strand
+  itself with no online sibling to `CPU_ON` it back, matching Linux never
+  offlining CPU0). One control-flow subtlety: PSCI `CPU_OFF` returns *nothing* on
+  success, so once `vcpu_psci_cpu_off` has switched away, the trap frame belongs
+  to the **next** vCPU — `handle_psci` must **not** write `x0` then (it would
+  clobber the next vCPU's register); only the `DENIED` failure path returns a
+  value. Every vCPU-iterating site (`pick_next`, `vcpu_wake_expired`,
+  `hyp_cnthp_arm`, `vcpu_check_watchdogs`) gates on `online`; the
+  `hyp_cnthp_arm` gate is load-bearing — without it an offlined secondary's
+  stale-armed vtimer would pull `CNTHP` to a past deadline in a tight re-fire
+  livelock.
 - **Inter-processor SGIs.** The HW virtual interface only delivers to the
   *resident* vCPU, so a guest `ICC_SGI1R_EL1` write that targets a sibling must
   be routed in software. We enable `ICH_HCR_EL2.TC` (Trap Common) **per-vCPU, for
@@ -465,7 +481,10 @@ CPUs, not that the host has them.
 
 `smpguest` demonstrates the whole path: the primary `CPU_ON`s the secondary, then
 the two ping-pong an SGI (the hyp routing it across the time-sliced siblings each
-bounce) while incrementing a counter in their shared RAM.
+bounce) while incrementing a counter in their shared RAM. After a few pings the
+secondary `CPU_OFF`s itself; the primary polls `AFFINITY_INFO`, sees it go OFF,
+counts a hotplug cycle, `CPU_ON`s it again, and the cycle repeats forever — a
+self-sustaining online→offline→online hotplug loop.
 
 ## Known limitations / future work
 

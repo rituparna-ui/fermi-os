@@ -234,6 +234,13 @@ int64_t vcpu_psci_cpu_on(uint64_t target_mpidr, uint64_t entry_ipa,
  * target_mpidr; INVALID_PARAMETERS if none. */
 int64_t vcpu_psci_affinity_info(uint64_t target_mpidr);
 
+/* PSCI CPU_OFF: the CURRENT vCPU powers itself down (no target arg). Allowed
+ * only for SMP secondaries (Aff0 != 0); a primary / single-vCPU VM must use
+ * SYSTEM_OFF. On PSCI_SUCCESS it has switched away and `f` now belongs to the
+ * NEXT vCPU — the caller MUST NOT write f->regs[0]. On failure returns
+ * PSCI_DENIED to the still-running caller. */
+int64_t vcpu_psci_cpu_off(hyp_trap_frame_t *f);
+
 /* Route a guest SGI (decoded from ICC_SGI1R_EL1) to its in-group target
  * sibling(s): inject `intid` (an SGI 0..15) into each, waking blocked ones. */
 void vcpu_sgi_route(uint64_t sgi1r);

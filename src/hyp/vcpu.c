@@ -129,9 +129,11 @@ void vcpu_check_watchdogs(hyp_trap_frame_t *f) {
   uint64_t now = read_cntpct();
   for (int i = 0; i < nr_vcpus; i++) {
     vcpu_t *v = &vcpus[i];
-    /* Only armed, live, non-paused VMs are watched. A paused VM legitimately
-     * isn't petting; a dead one is gone. */
-    if (v->wdog_period == 0 || v->dead || v->paused) {
+    /* Only armed, live, non-paused, ONLINE VMs are watched. A paused VM
+     * legitimately isn't petting; a dead one is gone; an OFF (CPU_OFF'd)
+     * secondary isn't running so it can't pet — and rebooting it would flush
+     * the live primary sibling's shared-VMID TLB and re-copy the image. */
+    if (v->wdog_period == 0 || v->dead || v->paused || !v->online) {
       continue;
     }
     if (now < v->wdog_deadline) {
@@ -222,6 +224,49 @@ int64_t vcpu_psci_affinity_info(uint64_t target_mpidr) {
     return PSCI_INVALID_PARAMETERS;
   }
   return (t->online && !t->dead) ? 0 /*ON*/ : 1 /*OFF*/;
+}
+
+/* PSCI CPU_OFF: the CURRENT vCPU powers ITSELF down. Unlike SYSTEM_OFF it is
+ * NOT marked dead — a sibling can CPU_ON it again (real CPU hotplug). Restricted
+ * to SMP secondaries (Aff0 != 0); a primary or single-vCPU VM must use SYSTEM_OFF
+ * instead, so we never strand a VM with no online sibling to re-CPU_ON it.
+ *
+ * CONTRACT: on PSCI_SUCCESS this has ALREADY switched away — switch_to() has
+ * overwritten the entire trap frame `f` with the NEXT vCPU's context, so the
+ * caller (handle_psci) MUST NOT write f->regs[0] afterwards (it would clobber
+ * the next vCPU's x0). Only the failure path (PSCI_DENIED) returns a value to
+ * the still-running caller. */
+int64_t vcpu_psci_cpu_off(hyp_trap_frame_t *f) {
+  if (!cur_vcpu->is_smp || (cur_vcpu->mpidr & 0xFFULL) == 0) {
+    return PSCI_DENIED; /* primary / UP VM: use SYSTEM_OFF, not CPU_OFF */
+  }
+
+  hyp_puts("[SMP] CPU_OFF: '");
+  hyp_puts(cur_vcpu->name);
+  hyp_puts("' offlining (Aff0=");
+  hyp_puthex(cur_vcpu->mpidr & 0xFF);
+  hyp_puts(")\n");
+
+  cur_vcpu->online = 0;
+  cur_vcpu->runnable = 0;
+  /* Defensive: drop any armed vtimer deadline so no vCPU-iterating site can fold
+   * a stale cval (vcpu_init_state re-clears these on the next CPU_ON anyway). */
+  cur_vcpu->vtimer.ctl = 0;
+  cur_vcpu->vtimer.pending = 0;
+
+  vcpu_t *next = pick_next(cur_vcpu);
+  if (next == cur_vcpu) {
+    /* Unreachable in this design (the primary sibling + other VMs stay
+     * runnable), but switching to self would re-run the vCPU we just offlined.
+     * Re-online and refuse rather than corrupt state. */
+    cur_vcpu->online = 1;
+    cur_vcpu->runnable = 1;
+    return PSCI_DENIED;
+  }
+  /* account_cpu_time() inside switch_to credits the offlining vCPU (cur_vcpu is
+   * still it until vcpu_load) — do not reorder. */
+  switch_to(next, f); /* rewrites f; the vector exit erets into `next` */
+  return PSCI_SUCCESS; /* MUST NOT be written into f — the frame is now next's */
 }
 
 void vcpu_sgi_route(uint64_t sgi1r) {
@@ -496,8 +541,12 @@ static int vtimer_armed(const vcpu_t *v) {
 void hyp_cnthp_arm(void) {
   uint64_t deadline = sched_deadline;
   for (int i = 0; i < nr_vcpus; i++) {
-    if (!vcpus[i].dead && !vcpus[i].paused && vtimer_armed(&vcpus[i]) &&
-        vcpus[i].vtimer.cval < deadline) {
+    /* online gate is MANDATORY: an OFF (CPU_OFF'd) secondary with a stale armed
+     * vtimer would otherwise pull CNTHP to a past deadline, which fires ->
+     * vcpu_wake_expired skips it (!online) -> re-arm to the same past deadline
+     * -> a tight CNTHP re-fire livelock. */
+    if (vcpus[i].online && !vcpus[i].dead && !vcpus[i].paused &&
+        vtimer_armed(&vcpus[i]) && vcpus[i].vtimer.cval < deadline) {
       deadline = vcpus[i].vtimer.cval;
     }
   }
@@ -595,7 +644,9 @@ int vcpu_wake_expired(void) {
 
   if (!cur_vcpu->runnable) {
     for (int i = 0; i < nr_vcpus; i++) {
-      if (vcpus[i].runnable) return 1; /* someone else can run */
+      /* online gate: an OFF vCPU must not count as "someone else can run" even
+       * if a stale runnable flag lingers. */
+      if (vcpus[i].runnable && vcpus[i].online) return 1;
     }
   }
   return 0;

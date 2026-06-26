@@ -1,21 +1,27 @@
-// smpguest: a 2-vCPU SMP guest. The primary (Aff0=0) brings up the secondary
-// (Aff0=1) via PSCI CPU_ON, then the two ping-pong a GICv3 SGI (inter-processor
-// interrupt) that the hypervisor traps (ICH_HCR_EL2.TC) and software-routes to
+// smpguest: a 2-vCPU SMP guest demonstrating GICv3 inter-processor SGIs AND
+// full PSCI CPU hotplug (online -> offline -> online). The primary (Aff0=0)
+// brings up the secondary (Aff0=1) via PSCI CPU_ON, then the two ping-pong a
+// GICv3 SGI that the hypervisor traps (ICH_HCR_EL2.TC) and software-routes to
 // the sibling vCPU. Both vCPUs run the SAME image at IPA 0x40000000 on a SHARED
 // stage-2 (same VTTBR/VMID); MPIDR_EL1 (= per-vCPU VMPIDR_EL2) distinguishes
 // them. They are time-sliced onto the one physical CPU by the EL2 scheduler, so
 // each bounce of the ping-pong forces a world switch between the siblings.
 //
-// Flow:
+// Flow (a self-sustaining hotplug cycle):
 //   primary (entered at reset, Aff0=0):
 //     set SP, banner, set up EL1 IRQ vector + GICv3 CPU interface, enable SGI 0,
-//     PSCI CPU_ON(target aff=1, entry=_secondary_entry, ctx=0x5EC0), unmask IRQ,
-//     send the FIRST SGI 0 to CPU1, then idle in WFI.
-//   secondary (entered by the hyp at _secondary_entry, x0=context_id):
-//     verify MPIDR Aff0=1, print Aff0 + ctx, set up GIC iface, unmask IRQ, idle.
+//     PSCI CPU_ON(aff=1, entry=_secondary_entry, ctx=0x5EC0), unmask IRQ, send
+//     the FIRST SGI 0 to CPU1, then run super_loop: poll PSCI AFFINITY_INFO(CPU1)
+//     (wfi-throttled, woken by inbound ping SGIs); when CPU1 reads OFF, count a
+//     hotplug cycle, CPU_ON it again, and re-kick the ping-pong.
+//   secondary (entered by the hyp at _secondary_entry, x0=context_id; re-entered
+//     here on every re-CPU_ON): verify MPIDR Aff0=1, print Aff0 + ctx, reset the
+//     per-online ping counter, set up GIC iface, unmask IRQ, idle.
 //   shared IRQ handler (both CPUs): ack the SGI, print "CPUn got IPI #k", bump a
-//     SHARED counter (the siblings share RAM), throttle, then SGI the OTHER CPU
-//     back — an endless ping-pong proving both routing directions + shared mem.
+//     shared display counter. The PRIMARY then SGIs CPU1 back. The SECONDARY
+//     bumps its per-online counter and, after OFF_AT pings, calls PSCI CPU_OFF
+//     to power ITSELF down (it does not return; a later CPU_ON re-enters
+//     _secondary_entry) — otherwise it SGIs CPU0 back.
 //
 // _smp_start MUST be the first byte of the image: the hyp erets to IPA
 // 0x40000000. Links flat at 0x40000000; embedded via smpguest_blob.S.
@@ -39,6 +45,7 @@
 .equ SGI_INTID, 0
 .equ AP_AFF,    1              // secondary Aff0
 .equ CTX_ID,    0x5EC0
+.equ OFF_AT,    3              // secondary offlines after this many pings/online window
 
 .section .text.boot.smp
 .global _smp_start
@@ -73,8 +80,44 @@ primary:
 	mov	x0,#(1<<AP_AFF)
 	msr	ICC_SGI1R_EL1, x0
 	isb
-1:	wfi
-	b	1b
+
+// primary supervisor: poll PSCI AFFINITY_INFO(CPU1) on a throttle, yielding the
+// CPU between polls (HVC_FERMI_YIELD) so other VMs run and we stay live. We do
+// NOT wfi here: CPU1 stops sending ping SGIs on the very ping where it offlines,
+// so a wfi waiting for that SGI would never wake. When CPU1 reports OFF, count a
+// hotplug cycle, CPU_ON it again, and re-kick the ping-pong — a self-sustaining
+// online->offline->online cycle. Ping-pong IRQs are still serviced concurrently
+// (IRQs stay unmasked), the handler's throttle keeps them human-visible.
+super_loop:
+20:	mov	x0,#0
+	movk	x0,#0xC400,lsl #16 ; movk x0,#0x0004   // x0 = 0xC4000004 AFFINITY_INFO
+	mov	x1,#AP_AFF                              // target Aff0 = 1
+	hvc	#0
+	cbnz	x0, off_seen                           // x0==1 (OFF) -> re-online it
+	// throttle, then yield to other VMs and poll again
+	mov	x20,#0x800000
+21:	subs x20,x20,#1 ; b.ne 21b
+	mov	x0,#0 ; movk x0,#0xFE11,lsl #16          // HVC_FERMI_YIELD
+	hvc	#0
+	b	20b
+
+off_seen:
+	adr	x19,m_off ; bl s_puts
+	ldr	x11,=cycle_count ; ldr w23,[x11] ; add w23,w23,#1 ; str w23,[x11]
+	adr	x19,m_cyc ; bl s_puts ; bl s_hex2 ; adr x19,m_nl ; bl s_puts
+	// CPU_ON the secondary again (same entry/ctx as boot)
+	mov	x0,#0
+	movk	x0,#0xC400,lsl #16 ; movk x0,#0x0003   // CPU_ON
+	mov	x1,#AP_AFF
+	ldr	x2,=_secondary_entry
+	ldr	x3,=CTX_ID
+	hvc	#0
+	adr	x19,m_reon ; bl s_puts ; mov w23,w0 ; bl s_hex2 ; adr x19,m_nl ; bl s_puts
+	// re-kick the ping-pong with a fresh SGI to CPU1
+	mov	x0,#(1<<AP_AFF)
+	msr	ICC_SGI1R_EL1, x0
+	isb
+	b	super_loop
 
 // ---------------- secondary (CPU1), entered by the hyp via PSCI CPU_ON -------
 .global _secondary_entry
@@ -86,6 +129,7 @@ _secondary_entry:
 	adr	x19,m_ctx ; bl s_puts
 	mov	w23,w21 ; bl s_hex2       // context_id low byte (expect C0)
 	adr	x19,m_nl ; bl s_puts
+	ldr	x11,=pings_since_on ; str wzr,[x11]   // fresh per-online window
 	bl	gic_setup_and_vectors
 	msr	daifclr,#2                // unmask IRQs; the rest is IRQ-driven
 2:	wfi
@@ -114,6 +158,25 @@ sgi_irq_handler:
 	mov	w23,w25 ; bl s_hex2_irq    // shared ping count
 	adr	x19,m_nl ; bl s_puts_irq
 
+	// The PRIMARY (Aff0=0) always just bounces the ping back. The SECONDARY
+	// (Aff0!=0) bumps its per-online counter and, after OFF_AT pings, powers
+	// ITSELF down via PSCI CPU_OFF.
+	cbz	w24, do_pingback           // primary -> just pong
+	ldr	x11,=pings_since_on ; ldr w26,[x11] ; add w26,w26,#1 ; str w26,[x11]
+	cmp	w26,#OFF_AT
+	b.lt	do_pingback
+	// --- secondary offlines itself via PSCI CPU_OFF ---
+	msr	ICC_EOIR1_EL1, x18         // EOI the in-flight SGI (we won't reach 9:)
+	adr	x19,m_soff ; bl s_puts_irq
+	mov	x0,#0
+	movk	x0,#0x8400,lsl #16 ; movk x0,#0x0002   // x0 = 0x84000002 CPU_OFF
+	hvc	#0
+	// Returns ONLY on failure (DENIED). On success the hyp switched away and a
+	// later CPU_ON re-enters _secondary_entry, not here.
+	adr	x19,m_odn ; bl s_puts_irq
+	b	do_pingback                // DENIED -> rejoin the ping-pong
+
+do_pingback:
 	// throttle so the bounce is human-visible, then poke the OTHER CPU.
 	mov	x12,#0x400000
 3:	subs x12,x12,#1 ; b.ne 3b
@@ -180,7 +243,9 @@ smp_vectors:
 
 .section .data.smp
 .balign 8
-ping_count: .word 0
+ping_count:     .word 0      // total pings (display only)
+pings_since_on: .word 0      // reset at _secondary_entry; drives the CPU_OFF trigger
+cycle_count:    .word 0      // completed offline->online hotplug cycles
 
 .section .rodata.smp
 m_pbanner: .asciz "\r\n[smpguest] primary (CPU0) up, bringing up CPU1 via PSCI CPU_ON\r\n"
@@ -189,4 +254,9 @@ m_sbanner: .asciz "[smpguest] secondary (CPU1) running, Aff0=0x"
 m_ctx:     .asciz " ctx=0x"
 m_cpu:     .asciz "[smpguest] CPU"
 m_ipi:     .asciz " got IPI, ping #0x"
+m_soff:    .asciz "[smpguest] CPU1 calling PSCI CPU_OFF\r\n"
+m_off:     .asciz "[smpguest] primary observed CPU1 OFF via AFFINITY_INFO\r\n"
+m_reon:    .asciz "[smpguest] primary re-CPU_ON CPU1, ret=0x"
+m_cyc:     .asciz "[smpguest] === hotplug cycle 0x"
+m_odn:     .asciz "[smpguest] CPU_OFF DENIED, rejoining ping-pong\r\n"
 m_nl:      .asciz "\r\n"

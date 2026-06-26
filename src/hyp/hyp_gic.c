@@ -39,10 +39,10 @@ void hyp_gic_init(void) {
   /* Mark all SGIs/PPIs Group1-NS. */
   gicr_w32(HYP_GICR_SGI_BASE, GICR_SGI_IGROUPR0, 0xFFFFFFFFU);
 
-  /* Enable PPI 26 (EL2 physical-timer / CNTHP — per-guest vtimer) and PPI 28
-   * (EL2 virtual-timer / CNTHV — the hypervisor's own scheduler tick) in the
-   * redistributor. */
-  gicr_w32(HYP_GICR_SGI_BASE, GICR_SGI_ISENABLER0, (1U << 26) | (1U << 28));
+  /* Enable PPI 26 (EL2 physical-timer / CNTHP), PPI 28 (EL2 virtual-timer /
+   * CNTHV), and SGI 0 (the inter-core reschedule IPI, so pCPU0 can be poked by a
+   * secondary) in the redistributor. */
+  gicr_w32(HYP_GICR_SGI_BASE, GICR_SGI_ISENABLER0, (1U << 26) | (1U << 28) | (1U << 0));
 
   /* EL2 host CPU interface: accept all priorities, enable Group1. */
   __asm__ __volatile__("msr icc_pmr_el1, %0" ::"r"(0xFFULL));
@@ -98,7 +98,9 @@ uint64_t hyp_gic_percpu_init(int enable_cnthp) {
 
   gicr_w32(sgi, GICR_SGI_IGROUPR0, 0xFFFFFFFFU); /* SGIs/PPIs Group1-NS */
   if (enable_cnthp) {
-    gicr_w32(sgi, GICR_SGI_ISENABLER0, (1U << 26)); /* CNTHP only if scheduling */
+    /* Scheduling core: enable PPI 26 (CNTHP slice/vtimer) + SGI 0 (the
+     * inter-core reschedule IPI hyp_send_resched_sgi targets). */
+    gicr_w32(sgi, GICR_SGI_ISENABLER0, (1U << 26) | (1U << 0));
   }
 
   /* EL2 host CPU interface: accept all priorities, enable Group1. */

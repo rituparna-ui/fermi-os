@@ -37,18 +37,19 @@ static inline uint32_t mmio_r32(uint64_t addr) {
   return *(volatile uint32_t *)addr;
 }
 
-/* SMP: serialize console output so concurrent writers (pCPU0 + secondaries)
- * don't interleave mid-line. The lock word is in the cacheable EL2 arena.
- *
- * A whole log line is usually several calls (hyp_puts + hyp_puthex + ...). To
- * keep the LINE atomic (not just each call), the lock is RECURSIVE per owning
- * pCPU: hyp_con_lock()/hyp_con_unlock() bracket a full line, and the inner
- * hyp_puts/hyp_puthex re-enter harmlessly (depth counter). A panicking core
- * bypasses the lock entirely (it may hold it, and the box is dying). */
+/* SMP: serialize console output so concurrent cores don't interleave mid-line.
+ * The console lock is LINE-ORIENTED: a log line is built from many putc/puts/
+ * puthex calls, so a per-pCPU "mid-line" flag holds the lock from the first
+ * character of a line until its terminating '\n'. Any sequence of console calls
+ * forming one line is thus atomic with no per-site bracketing. The lock is also
+ * RECURSIVE per owning pCPU (depth counter) so an explicit hyp_con_begin/end can
+ * group SEVERAL lines (used where output must not be split even across newlines).
+ * A panicking core bypasses the lock entirely (it may hold it; the box is dying).
+ * The lock word lives in the cacheable EL2 arena. */
 static hyp_spinlock_t uart_lock = HYP_SPINLOCK_INIT;
 static volatile int hyp_panicking;
 static int uart_owner = -1; /* pCPU id currently holding the console, -1 = free */
-static int uart_depth;      /* recursion depth for the owning pCPU */
+static int uart_depth;      /* nesting depth for the owning pCPU */
 static uint64_t uart_daif;  /* saved DAIF of the outermost acquire */
 
 static void hyp_con_lock(void) {
@@ -56,8 +57,6 @@ static void hyp_con_lock(void) {
     return;
   }
   int me = (int)this_pcpu()->cpu_id;
-  /* Fast recursive path: already mine. Reads of uart_owner are safe — only this
-   * core ever sets it to `me`, and any other value just means "take the lock". */
   if (uart_owner == me) {
     uart_depth++;
     return;
@@ -79,20 +78,35 @@ static void hyp_con_unlock(void) {
   }
 }
 
-void hyp_putc(char c) {
-  /* Raw primitive: spin while the TX FIFO is full, then push the byte. */
+/* Raw byte to the PL011, no locking. */
+static void uart_raw(char c) {
   while (mmio_r32(HYP_UART_FR) & HYP_UART_FR_TXFF) {
   }
   mmio_w32(HYP_UART_DR, (uint32_t)(unsigned char)c);
+}
+
+/* Each console call is individually atomic (takes + releases the recursive
+ * console lock). This is deadlock-free (the lock is never held across a return
+ * to guest execution). A multi-CALL log line (e.g. puts; puthex; puts) is kept
+ * whole by wrapping it in hyp_con_begin()/hyp_con_end(), which hold the
+ * recursive ref across the inner calls. Without a bracket, two cores' lines may
+ * interleave only at call boundaries (never mid-token) — cosmetic. */
+void hyp_putc(char c) {
+  hyp_con_lock();
+  if (c == '\n') {
+    uart_raw('\r');
+  }
+  uart_raw(c);
+  hyp_con_unlock();
 }
 
 void hyp_puts(const char *s) {
   hyp_con_lock();
   for (; *s; s++) {
     if (*s == '\n') {
-      hyp_putc('\r');
+      uart_raw('\r');
     }
-    hyp_putc(*s);
+    uart_raw(*s);
   }
   hyp_con_unlock();
 }
@@ -100,15 +114,15 @@ void hyp_puts(const char *s) {
 void hyp_puthex(uint64_t v) {
   static const char digits[] = "0123456789ABCDEF";
   hyp_con_lock();
-  hyp_putc('0');
-  hyp_putc('x');
+  uart_raw('0');
+  uart_raw('x');
   for (int shift = 60; shift >= 0; shift -= 4) {
-    hyp_putc(digits[(v >> shift) & 0xF]);
+    uart_raw(digits[(v >> shift) & 0xF]);
   }
   hyp_con_unlock();
 }
 
-/* Bracket a multi-call log line so it prints atomically (see hyp.h). */
+/* Bracket a multi-call log line/region so it prints atomically (recursive). */
 void hyp_con_begin(void) { hyp_con_lock(); }
 void hyp_con_end(void) { hyp_con_unlock(); }
 
@@ -246,11 +260,11 @@ __attribute__((noreturn)) void hyp_secondary_main(uint64_t cpu_id) {
     __asm__ __volatile__("wfe");
   }
 
-  /* Per-core stage-2 control + vGIC interface + EL2 GIC (CNTHP MASKED: this core
-   * does not schedule in Phase A, so it must never take a CNTHP IRQ). */
+  /* Per-core stage-2 control + vGIC interface + EL2 GIC. Phase C: this core
+   * SCHEDULES, so enable CNTHP (PPI 26, slice/vtimer) + the reschedule SGI. */
   s2_init_vtcr();
   vgic_percpu_init();
-  pc->gicr_base = hyp_gic_percpu_init(/*enable_cnthp=*/0);
+  pc->gicr_base = hyp_gic_percpu_init(/*enable_cnthp=*/1);
 
   __atomic_store_n(&pc->online, 1, __ATOMIC_RELEASE);
   hyp_con_begin(); /* keep this multi-call line atomic vs other cores */
@@ -260,13 +274,14 @@ __attribute__((noreturn)) void hyp_secondary_main(uint64_t cpu_id) {
   hyp_puthex(mpidr);
   hyp_puts(" gicr=");
   hyp_puthex(pc->gicr_base);
-  hyp_puts(")\n");
+  hyp_puts(") -> scheduler\n");
   hyp_con_end();
 
-  /* Phase A: idle. IRQs stay masked (we enabled no PPI); just park. */
-  for (;;) {
-    __asm__ __volatile__("wfi");
-  }
+  /* Unmask IRQs and enter the scheduler: claim a runnable vCPU, arm this core's
+   * slice, and eret into it. Does not return. From here this pCPU world-switches
+   * on its own CNTHP exactly like pCPU0. */
+  __asm__ __volatile__("msr daifclr, #2" ::: "memory");
+  vcpu_run_first();
 }
 
 /* PSCI CPU_ON (SMC conduit) a secondary physical core into _hyp_secondary_start.
@@ -526,7 +541,11 @@ void hyp_main(void) {
                             __smp_blob_start, SMP_HOST_RAM_BASE, smp_size);
   smp0->ram_size = SMP_RAM_SIZE;
   vcpu_t *smp1 = vcpu_alloc_secondary(smp0, "smp-cpu1", 0x80000001ULL);
-  (void)smp1; /* brought online by the primary's PSCI CPU_ON, not run yet */
+  /* SMP Phase C: PIN both sibling vCPUs to pCPU0 so the guest-internal SGI
+   * ping-pong is still software-routed on one physical core (not yet cross-pCPU).
+   * Phase D unpins them so they run genuinely in parallel on two pCPUs. */
+  smp0->pin_pcpu = 0;
+  smp1->pin_pcpu = 0;
 
   /* balloonclient (id 14, VMID 14): drives the emulated virtio-mmio memory-
    * balloon device — inflate (donate+zero pages) and deflate, self-driven by

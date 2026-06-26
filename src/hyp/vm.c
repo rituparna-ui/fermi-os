@@ -50,6 +50,7 @@ static const char *ec_name(uint64_t ec) {
  * bugs and still panic — see the current-EL vector stubs / handle_irq.) */
 static void hyp_fatal_trap(uint64_t type, hyp_trap_frame_t *f) {
   uint64_t ec = ESR_EC(f->esr);
+  hyp_con_begin(); /* SMP: keep the whole multi-line trap report atomic */
   hyp_puts("\n[HYP][TRAP] guest '");
   hyp_puts(cur_vcpu->name);
   hyp_puts("' type=");
@@ -67,6 +68,7 @@ static void hyp_fatal_trap(uint64_t type, hyp_trap_frame_t *f) {
   hyp_puts(" HPFAR_EL2=");
   hyp_puthex(f->hpfar);
   hyp_putc('\n');
+  hyp_con_end();
   vcpu_fault_isolate(f); /* reboot/kill just this VM; machine stays up */
 }
 
@@ -313,6 +315,16 @@ static void handle_irq(hyp_trap_frame_t *f) {
   if (intid == 1023) {
     return; /* spurious */
   }
+  if (intid == HYP_RESCHED_SGI) {
+    /* SMP: another core asked us to re-evaluate. If we have a current vCPU,
+     * drain its pending vIRQ bitmap into our live LRs (a cross-core inject
+     * targeted it while resident here). If idle, the wfi already broke and the
+     * IRQ-return path runs schedule(). Do NOT force a switch here (that would
+     * thrash/double-run); CNTHP drives actual rescheduling. */
+    vcpu_drain_current_pending();
+    hyp_gic_eoi(intid);
+    return;
+  }
   if (intid == HYP_CNTHP_PPI) {
     /* CNTHP is the soonest of: the scheduler slice and EVERY vCPU's vtimer
      * deadline. First inject timer IRQs into (and wake) any vCPU whose deadline
@@ -343,6 +355,9 @@ static void handle_irq(hyp_trap_frame_t *f) {
 /* Account a trap to the CURRENT vCPU's stats BEFORE handling it — a handler may
  * world-switch (changing cur_vcpu), and we want to credit the VM that trapped. */
 static void account_exit(uint64_t type, hyp_trap_frame_t *f) {
+  if (!cur_vcpu) {
+    return; /* SMP: an idle pCPU (no resident vCPU) took an IRQ — nothing to bill */
+  }
   vcpu_stats_t *s = &cur_vcpu->stats;
   if (type == HYP_EXC_IRQ) {
     s->irq++;

@@ -38,9 +38,8 @@ static hyp_spinlock_t sched_lock = HYP_SPINLOCK_INIT;
 /* Bit n set = pCPU n is idle (no runnable vCPU); used to wake an idle core when
  * a vCPU becomes runnable. Written under sched_lock. */
 static volatile uint32_t pcpu_idle_mask;
-/* Physical SGI INTID the hyp sends core-to-core to force a reschedule / pending
- * drain. SGI 0 in the EL2 (physical) GIC. */
-#define HYP_RESCHED_SGI 0
+/* HYP_RESCHED_SGI (the core-to-core reschedule IPI INTID) is in vcpu.h so vm.c's
+ * handle_irq can match it. */
 
 /* Implemented in vcpu_switch.S — load gp->x[]/elr/spsr and eret (no return). */
 extern void vcpu_first_entry(vcpu_gp_t *gp) __attribute__((noreturn));
@@ -121,9 +120,11 @@ void vcpu_fault_isolate(hyp_trap_frame_t *f) {
    * guest that faults immediately on every restart can't spin the hypervisor.
    * Also power off if there is no pristine image to reboot from. */
   if (v->fault_count > VCPU_FAULT_MAX || !v->img_src || !v->img_size) {
+    hyp_con_begin();
     hyp_puts("[FAULT] VM '");
     hyp_puts(v->name);
     hyp_puts("' exceeded fault budget — powering it off\n");
+    hyp_con_end();
     vcpu_poweroff_current(f); /* marks dead + switches away (does not return) */
     return;
   }
@@ -131,6 +132,7 @@ void vcpu_fault_isolate(hyp_trap_frame_t *f) {
   /* Reboot just this VM (warm-reset in place: reloads its pristine image,
    * re-inits state, and rewrites the live trap frame `f` so the vector exit
    * erets into the fresh guest). The other VMs are untouched. */
+  hyp_con_begin();
   hyp_puts("[FAULT] rebooting faulted VM '");
   hyp_puts(v->name);
   hyp_puts("' (fault ");
@@ -138,6 +140,7 @@ void vcpu_fault_isolate(hyp_trap_frame_t *f) {
   hyp_puts(" of ");
   hyp_puthex(VCPU_FAULT_MAX);
   hyp_puts(")\n");
+  hyp_con_end();
   vcpu_reset(v, f);
 }
 
@@ -169,9 +172,11 @@ void vcpu_check_watchdogs(hyp_trap_frame_t *f) {
     v->wdog_expiries++;
     v->wdog_period = 0;
     v->wdog_deadline = 0;
+    hyp_con_begin();
     hyp_puts("[WDOG] VM '");
     hyp_puts(v->name);
     hyp_puts("' watchdog expired (hung) — rebooting\n");
+    hyp_con_end();
     vcpu_reset(v, (v == cur_vcpu) ? f : (hyp_trap_frame_t *)0);
   }
 }
@@ -233,13 +238,27 @@ int64_t vcpu_psci_cpu_on(uint64_t target_mpidr, uint64_t entry_ipa,
   t->entry_ipa = entry_ipa;
   t->x0_init = context_id;
   vcpu_init_state(t);   /* sets gp.elr=entry, gp.x[0]=context_id, EL1h, online=1 */
+  /* Publish online/runnable under sched_lock (a remote pCPU may be scanning the
+   * run-queue). The target was online=0 so no core can be running it; once
+   * marked runnable an idle core may claim it — kick one so it starts promptly. */
+  uint64_t sl = hyp_lock_irqsave(&sched_lock);
   t->online = 1;
   t->runnable = 1;
+  t->on_pcpu = -1; /* not yet resident; a pCPU will claim it */
+  int idle = -1;
+  for (int c = 0; c < HYP_MAX_PCPUS; c++) {
+    if (pcpu_idle_mask & (1u << c)) { idle = c; break; }
+  }
+  hyp_unlock_irqrestore(&sched_lock, sl);
+  if (idle >= 0) {
+    hyp_send_resched_sgi(idle); /* wake an idle core to pick up the new vCPU */
+  }
   hyp_puts("[SMP] CPU_ON: '");
   hyp_puts(t->name);
   hyp_puts("' online at entry ");
   hyp_puthex(entry_ipa);
   hyp_putc('\n');
+  hyp_con_end();
   return PSCI_SUCCESS;
 }
 
@@ -345,7 +364,9 @@ int64_t vcpu_pv_log(uint64_t buf_ipa, uint64_t len) {
   if (!pa) {
     return -1; /* bad guest pointer — reject (do not read arbitrary host PA) */
   }
-  /* Tag with the VM name so multiplexed guest logs are attributable. */
+  /* Tag with the VM name so multiplexed guest logs are attributable. Bracket the
+   * whole tagged line so a concurrent core's output can't interleave into it. */
+  hyp_con_begin();
   hyp_puts("[");
   hyp_puts(cur_vcpu->name);
   hyp_puts("] ");
@@ -353,6 +374,7 @@ int64_t vcpu_pv_log(uint64_t buf_ipa, uint64_t len) {
   for (uint64_t i = 0; i < len; i++) {
     hyp_putc(p[i]);
   }
+  hyp_con_end();
   return (int64_t)len;
 }
 
@@ -698,12 +720,22 @@ static void schedule(hyp_trap_frame_t *f) {
     hyp_unlock_irqrestore(&prev->vgic_lock, vl);
   }
 
-  if (!next) {
-    /* No claimable vCPU: go idle. cur_vcpu (== pc->current) becomes NULL; the
-     * core wfi's and is woken by CNTHP or a reschedule SGI, then re-runs
-     * schedule() from the IRQ return path. */
+  /* If nothing is claimable, idle: pc->current = NULL and wfi with IRQs unmasked
+   * until a CNTHP or reschedule-SGI wakes us; then re-pick. We do NOT return to
+   * the vector with a stale `f` (that would re-run the saved-away prev) — we only
+   * leave this function once we have a `next` and have rewritten `f`. */
+  while (!next) {
     pc->current = (void *)0;
-    return;
+    uint64_t pstate;
+    __asm__ __volatile__("mrs %0, daif" : "=r"(pstate));
+    __asm__ __volatile__("msr daifclr, #2\n\twfi\n\tisb" ::: "memory"); /* unmask I, wait, an IRQ handler may run */
+    __asm__ __volatile__("msr daif, %0" :: "r"(pstate) : "memory");
+    uint64_t s2 = hyp_lock_irqsave(&sched_lock);
+    next = pick_next_locked(pc);
+    if (next) {
+      pcpu_idle_mask &= ~(1u << pc->cpu_id);
+    }
+    hyp_unlock_irqrestore(&sched_lock, s2);
   }
 
   uint64_t vl2 = hyp_lock_irqsave(&next->vgic_lock);
@@ -784,6 +816,18 @@ void vgic_inject(vcpu_t *t, uint32_t intid) {
 
   if (resident >= 0)   hyp_send_resched_sgi(resident); /* poke its core to drain */
   else if (idle >= 0)  hyp_send_resched_sgi(idle);     /* wake an idle core */
+}
+
+/* Drain THIS pCPU's current vCPU pending bitmap into its live LRs (reschedule-SGI
+ * handler). The vCPU is resident here, so the live LRs are its. No-op if idle. */
+void vcpu_drain_current_pending(void) {
+  vcpu_t *v = cur_vcpu;
+  if (!v) {
+    return; /* idle pCPU: nothing resident; schedule() runs on the IRQ return */
+  }
+  uint64_t fl = hyp_lock_irqsave(&v->vgic_lock);
+  vgic_drain_pending_locked(v);
+  hyp_unlock_irqrestore(&v->vgic_lock, fl);
 }
 
 /* Inject the timer IRQ into any vCPU whose vtimer deadline elapsed. SMP: this

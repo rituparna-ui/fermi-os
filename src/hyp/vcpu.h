@@ -242,6 +242,14 @@ void vcpu_check_watchdogs(hyp_trap_frame_t *f);
  * device SPIs). */
 void vgic_inject(vcpu_t *t, uint32_t intid);
 
+/* SMP: physical SGI INTID the hyp sends core-to-core to force a reschedule /
+ * pending-bitmap drain. SGI 0 in the EL2 (physical) GIC. */
+#define HYP_RESCHED_SGI 0
+
+/* SMP: drain THIS pCPU's current vCPU pending bitmap into its live List
+ * Registers. Called from the reschedule-SGI IRQ handler. No-op if idle. */
+void vcpu_drain_current_pending(void);
+
 /* Ring the doorbell from `from` to its configured peer: inject DOORBELL_INTID
  * into the peer and mark it runnable. Returns 0 on success, -1 if no peer. */
 int vcpu_ring_doorbell(vcpu_t *from);

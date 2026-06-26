@@ -1315,6 +1315,23 @@ static void hyp_vcon_putc(uint8_t c) {
   }
 }
 
+/* Console for the second, fully-independent VM (vCPU 3 / VMID 3). It writes to
+ * its own MMIO console (IPA 0x09000000 in its private IPA space); the hypervisor
+ * forwards it here, line-buffered, prefixed [VM3] — isolated from Linux's. */
+static void hyp_vm3_putc(uint8_t c) {
+  static char line[256];
+  static int n;
+  if (c == '\n' || n >= (int)sizeof(line) - 1) {
+    line[n] = 0;
+    hyp_puts("[VM3] ");
+    hyp_puts(line);
+    hyp_puts("\n");
+    n = 0;
+  } else if (c != '\r') {
+    line[n++] = (char)c;
+  }
+}
+
 static void hyp_vcon_tx(void) {
   struct vnet_q *q = &g_vcon.q[1];
   if (!q->ready || !q->desc || !q->avail || !q->used || q->num == 0)
@@ -2139,6 +2156,19 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
       hyp_tlbi_mig_page(ipa);
     }
     return; /* re-execute now that the page is mapped */
+  }
+
+  /* Second independent VM (vCPU 3 / VMID 3): a write to its own console MMIO
+   * (IPA 0x09000000, in its private IPA space). Forward the byte and step over.
+   * This is isolated from Linux's identically-addressed console by VMID. */
+  if (current_vcpu == 3 && ((esr >> 6) & 1) /* write */ &&
+      ipa >= 0x09000000ULL && ipa < 0x09001000ULL) {
+    uint64_t isv = (esr >> 24) & 1;
+    uint64_t srt = (esr >> 16) & 0x1F;
+    if (isv)
+      hyp_vm3_putc((srt == 31) ? 0 : (uint8_t)frame->x[srt]);
+    MSR(elr_el2, MRS(elr_el2) + 4);
+    return;
   }
 
   uint64_t hs = (uint64_t)__hyp_start;

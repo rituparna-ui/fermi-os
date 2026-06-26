@@ -19,6 +19,18 @@
 .global guest3_payload_end
 
 guest3_payload:
+	// Greet via THIS VM's own console device at IPA 0x09000000 — in VM3's own
+	// IPA space (VMID 3), unmapped in its stage-2, so each byte traps to EL2
+	// and the hypervisor forwards it. (Linux uses the same IPA but a different
+	// VMID/stage-2, so the two consoles are fully isolated.)
+	adr	x4, 99f
+	movz	x5, #0x0900, lsl #16    // x5 = 0x09000000 : VM3 console MMIO
+2:
+	ldrb	w6, [x4], #1
+	cbz	w6, 3f
+	str	w6, [x5]
+	b	2b
+3:
 	movz	x10, #0x4001, lsl #16   // x10 = 0x40010000 : counter / working-set base
 	str	xzr, [x10]              // counter = 0
 1:
@@ -49,4 +61,7 @@ guest3_payload:
 	wfi                            // yield (trapped -> hypervisor world-switch),
                                        // so this demo guest barely steals CPU
 	b	1b
+99:
+	.asciz "Hello from independent VM3 -- my own VMID, RAM, and console\n"
+.align 2
 guest3_payload_end:

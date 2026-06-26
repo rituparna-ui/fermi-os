@@ -522,6 +522,21 @@ core time-sliced onto one physical CPU, the IPI fan-out + `stop_machine` of a
 soft lockups, no anomalies. (A true higher core count would need a multi-pCPU
 host — out of scope for this single-CPU hypervisor.)
 
+### A second, fully-independent VM
+*Why:* true multi-tenancy — a VM completely separate from the Linux VM. The
+migratable guest (vCPU 3) already had its own VMID (3), its own 2 MiB RAM
+window, and an isolated stage-2 (proven by migration/snapshot). This completes
+it into a proper VM by giving it **its own console device**: it writes a greeting
+to MMIO `0x09000000` *in its own IPA space*; that page is unmapped in its
+stage-2, so each byte traps to EL2 and the hypervisor forwards it as `[VM3] …`.
+Linux uses the *same* guest-physical address for its PL011, but a different VMID
+/ stage-2 — so the two consoles are completely isolated, demonstrating per-VM
+device namespaces.
+*Verified:* `[VM3] Hello from independent VM3 -- my own VMID, RAM, and console`
+appears on the hypervisor serial, concurrently with the 3-core SMP Linux VM
+booting to its ext4 root (`ROOTFS_ON_VDA`, `ALLDONE`) — three mutually-isolated
+VMs (Fermi, Linux, VM3) on one physical CPU. No anomalies.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)

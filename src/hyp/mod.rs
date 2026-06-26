@@ -834,7 +834,7 @@ fn hyp_world_switch(frame: *mut El2Frame) {
     }
 }
 
-/// Build the Linux-slot guest's stage-2: a 256 MiB RAM window at IPA 0x40000000
+/// Build the Linux-slot guest's stage-2: a 1 GiB RAM window at IPA 0x40000000
 /// backed by Fermi-invisible physical RAM, plus the PL011 UART.
 fn hyp_build_linux_stage2() {
     let l0 = LX_L0.get();
@@ -854,7 +854,7 @@ fn hyp_build_linux_stage2() {
         (*l1).0[0] = phys_of(l2_dev) | S2_TABLE | S2_VALID; // IPA 0..1 GiB
         (*l1).0[1] = phys_of(l2_ram) | S2_TABLE | S2_VALID; // IPA 1..2 GiB
 
-        // RAM: IPA [0x40000000, +256 MiB) -> phys [LINUX_PHYS_BASE, +256 MiB).
+        // RAM: IPA [0x40000000, +LINUX_RAM_SIZE) -> phys [LINUX_PHYS_BASE, +sz).
         let blocks = LINUX_RAM_SIZE / SIZE_2M;
         let base_idx = (LINUX_IPA_BASE % SIZE_1G) / SIZE_2M; // = 0
         for i in 0..blocks {

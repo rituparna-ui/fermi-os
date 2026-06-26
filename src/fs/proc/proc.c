@@ -297,11 +297,18 @@ static int write_vmctl(struct vnode *n, file_t *f, const void *buf,
   (void)n;
   (void)f;
   const char *p = (const char *)buf;
-  /* parse a leading word + a trailing decimal id */
+  /* match a command word as a prefix of the input */
+  struct { const char *w; uint64_t op; } cmds[] = {
+    {"pause", VMCTL_PAUSE}, {"resume", VMCTL_RESUME}, {"migrate", VMCTL_MIGRATE},
+    {"snapshot", VMCTL_SNAPSHOT}, {"restore", VMCTL_RESTORE},
+  };
   uint64_t op = (uint64_t)-1;
-  if (count >= 5 && p[0] == 'p') op = VMCTL_PAUSE;        /* pause   */
-  else if (count >= 6 && p[0] == 'r') op = VMCTL_RESUME;  /* resume  */
-  else if (count >= 7 && p[0] == 'm') op = VMCTL_MIGRATE; /* migrate */
+  for (unsigned c = 0; c < sizeof(cmds) / sizeof(cmds[0]); c++) {
+    const char *w = cmds[c].w;
+    size_t i = 0;
+    while (w[i] && i < count && p[i] == w[i]) i++;
+    if (w[i] == 0) { op = cmds[c].op; break; } /* full word matched */
+  }
   uint64_t id = 0;
   int seen = 0;
   for (size_t i = 0; i < count; i++)

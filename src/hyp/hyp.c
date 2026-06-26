@@ -88,6 +88,7 @@ __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_dev
 #define MIG_PAGES (MIG_RAM_SIZE / 4096)  /* 512 pages                          */
 #define MIG_SRC 0x281000000ULL          /* source window  (~10 GiB + 16 MiB)   */
 #define MIG_DEST 0x281200000ULL         /* destination window (SRC + 2 MiB)    */
+#define MIG_SNAP 0x281400000ULL         /* snapshot/checkpoint window (+4 MiB) */
 #define MIG_COUNTER_OFF 0x10000ULL       /* guest keeps its counter here        */
 
 extern uint8_t guest3_payload[];
@@ -120,6 +121,8 @@ __attribute__((section(".hyp_tables"))) static uint8_t g_mig_dirty[MIG_PAGES];
 __attribute__((section(".hyp_tables"))) static uint8_t g_mig_present[MIG_PAGES];
 __attribute__((section(".hyp_tables"))) static uint64_t g_mig_cur;   /* phys window the guest runs from */
 __attribute__((section(".hyp_tables"))) static uint64_t g_mig_faulted; /* post-copy pages faulted in     */
+__attribute__((section(".hyp_tables"))) static int g_snap_valid;     /* a checkpoint exists             */
+__attribute__((section(".hyp_tables"))) static vcpu_t g_snap_vcpu;   /* saved vCPU context (checkpoint) */
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t mig_l0[512];
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t mig_l1[512];
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t mig_l2[512];
@@ -1581,6 +1584,36 @@ static void hyp_handle_hvc(el2_frame_t *f) {
         g_mig_armed = 1; /* the tick-driven state machine starts the migration */
       else
         ret = HVC_ERR_BADCALL;
+      break;
+    case VMCTL_SNAPSHOT:
+      /* Checkpoint vCPU 3: save its RAM image + full context. (vCPU 3 is
+       * descheduled while we run here, so vcpus[3] holds its saved state.) */
+      if (id == 3 && vcpus[3].state != VCPU_UNUSED) {
+        memcpy((void *)MIG_SNAP, (void *)g_mig_cur, MIG_RAM_SIZE);
+        g_snap_vcpu = vcpus[3];
+        g_snap_valid = 1;
+        uint64_t c = *(volatile uint64_t *)(g_mig_cur + MIG_COUNTER_OFF);
+        hyp_puts("[HYP] vmctl snapshot vCPU3: checkpoint taken; counter=");
+        hyp_puthex(c);
+        hyp_puts("\n");
+      } else {
+        ret = HVC_ERR_BADCALL;
+      }
+      break;
+    case VMCTL_RESTORE:
+      /* Rewind vCPU 3 to its checkpoint: restore RAM + context. */
+      if (id == 3 && g_snap_valid) {
+        memcpy((void *)g_mig_cur, (void *)MIG_SNAP, MIG_RAM_SIZE);
+        vcpus[3] = g_snap_vcpu;
+        vcpus[3].vttbr = ((uint64_t)mig_l0) | (3ULL << 48); /* current tables */
+        vcpus[3].state = VCPU_READY;
+        uint64_t c = *(volatile uint64_t *)(g_mig_cur + MIG_COUNTER_OFF);
+        hyp_puts("[HYP] vmctl restore vCPU3: rewound to checkpoint; counter=");
+        hyp_puthex(c);
+        hyp_puts("\n");
+      } else {
+        ret = HVC_ERR_BADCALL;
+      }
       break;
     default:
       ret = HVC_ERR_BADCALL;

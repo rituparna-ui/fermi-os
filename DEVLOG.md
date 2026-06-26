@@ -456,6 +456,17 @@ scheduler). Fermi exposes it as a writable **`/proc/vmctl`** (parsing
 `vmctl migrate 3` triggers the full pre-copy + post-copy round trip on demand
 (and only then). No anomalies.
 
+### Snapshot / restore (checkpoint + rewind)
+*Why:* a recognizable VMM capability distinct from migration — checkpoint a
+guest and later rewind it to that exact point. `vmctl snapshot 3` saves vCPU 3's
+full context (`vcpu_t`: regs, PC, sysregs, vGIC, FP, timer) plus its RAM image to
+a dedicated window (`MIG_SNAP`); `vmctl restore 3` copies both back and marks the
+vCPU ready, rewinding execution. (vCPU 3 is descheduled while the control
+hypercall runs, so its struct holds an up-to-date context.)
+*Verified:* snapshot at `counter=0x8ff`; let the guest run (HVC count 2203 →
+3092); `restore` → the RAM counter is back to `0x8ff` and the vCPU's HVC count
+drops to ~2391 — the guest literally rewound to the checkpoint. No anomalies.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)

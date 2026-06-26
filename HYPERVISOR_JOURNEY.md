@@ -343,6 +343,14 @@ qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on -m 8G \
   (the standard SMP mechanism). Verified: `A0` → CPU_ON → `A1` — two cores, one
   address space, distinct affinity.
 
+- **M24 — OS-grade device tree (done):** `fdt.c` now emits the full contract a
+  real AArch64 OS reads — `/chosen` (bootargs + stdout-path), `/psci`
+  (method=hvc), `/cpus` (two PSCI-enabled cores), `/timer` (arch-timer PPIs), and
+  a GICv3 `/intc` with phandle. The foreign mini-guest parses it and reports
+  `gic=0x8000000 ncpus=2 bootargs="console=ttyAMA0 earlycon"`. Booting a real
+  Linux `Image` is out of scope in-sandbox (multi-MB binary), but the
+  hypervisor-side boot interface is complete.
+
 ## 14. Status
 
 The hypervisor is feature-complete for a small multi-tenant Type-1 design:

@@ -858,10 +858,17 @@ void kernel_main() {
   hyp_run_dual_fermios();     /* M9c */
 #endif
 
+#ifdef HYP_RUN_LINUX
+  /* M28: boot a real aarch64 Linux kernel as an EL1 guest. Opt-in (needs the
+   * embedded Image + a large RAM block). This is the focus of the build — it
+   * does not fall through to the interactive FermiOS guests. */
+  hyp_run_linux();
+#else
   /* Hand the console to TWO preemptive, interactive FermiOS guests. Does not
    * return — Ctrl-X switches which guest's shell receives input.
    * (hyp_run_interactive_guest() runs a single interactive guest if preferred.) */
   hyp_run_multi_interactive();
+#endif
 #endif
 
   timer_init();

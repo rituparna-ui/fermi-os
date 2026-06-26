@@ -9,3 +9,8 @@ user/*.elf
 user/*.bin
 wasabi-toolbag/
 
+/linux-image/Image
+/linux-image/linux.tar.xz
+/linux-image/src/
+/linux-image/*.log
+/linux-image/build.sh

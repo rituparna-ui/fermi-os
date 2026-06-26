@@ -2301,3 +2301,141 @@ void hyp_run_observability(void) {
   stage2_destroy(&s2);
   pmm_free_pages(ram, FERMI_GUEST_RAM / 0x1000);
 }
+
+/* ---- Milestone 28: boot a REAL aarch64 Linux kernel as an EL1 guest ---- */
+
+#ifdef HAVE_LINUX_IMAGE
+extern char __linux_blob_start[];
+extern char __linux_blob_end[];
+
+#define LX_RAM_SIZE  (256ULL * 1024 * 1024) /* 256 MiB for Linux */
+#define LX_DTB_IPA   0x48000000ULL          /* DTB 128 MiB into RAM, clear of the kernel */
+
+void hyp_run_linux(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uint64_t img_len = (uint64_t)(__linux_blob_end - __linux_blob_start);
+  uart_printf("[HYP] M28: booting REAL aarch64 Linux as an EL1 guest (Image %u bytes)\n",
+              img_len);
+
+  uintptr_t ram = pmm_allocate_pages(LX_RAM_SIZE / 0x1000);
+  static stage2_t s2;
+  if (!ram || !stage2_create(&s2, /*vmid=*/1)) {
+    uart_errorln("[HYP] M28: setup failed (need a large contiguous RAM block)");
+    return;
+  }
+  stage2_map(&s2, GUEST_ENTRY_IPA, (uint64_t)ram, LX_RAM_SIZE, 0);
+  /* Straight-through PL011 so Linux earlycon=pl011,0x09000000 prints directly. */
+  stage2_map(&s2, UART_BASE, UART_BASE, 0x1000, /*device=*/1);
+
+  /* Copy the Image to the RAM base (text_offset=0) and make it coherent. */
+  uint64_t kva = PHYS_TO_VIRT((uint64_t)ram);
+  for (uint64_t i = 0; i < img_len; i++) {
+    ((volatile uint8_t *)kva)[i] = ((volatile uint8_t *)__linux_blob_start)[i];
+  }
+
+  /* Build the OS-grade DTB at LX_DTB_IPA describing this RAM + UART. */
+  uint64_t dtb_kva = kva + (LX_DTB_IPA - GUEST_ENTRY_IPA);
+  uint32_t dtb_sz = fdt_build((void *)dtb_kva, 0x4000, GUEST_ENTRY_IPA,
+                              LX_RAM_SIZE, UART_BASE);
+  if (!dtb_sz) {
+    uart_errorln("[HYP] M28: DTB build failed");
+    stage2_destroy(&s2);
+    pmm_free_pages(ram, LX_RAM_SIZE / 0x1000);
+    return;
+  }
+  /* Make the kernel image coherent for instruction fetch. Sync only the Image
+   * span (rounded up) — NOT the whole 128 MiB gap to the DTB, which would be a
+   * multi-million-iteration loop. The DTB is plain data the kernel reads after
+   * its own MMU/cache setup, so it needs no I-cache sync. */
+  guest_sync_icache(kva, (img_len + 0xFFFFUL) & ~0xFFFFUL);
+  uart_printf("[HYP] Image@%x DTB@%x (%u bytes); entering Linux ...\n",
+              GUEST_ENTRY_IPA, LX_DTB_IPA, (uint64_t)dtb_sz);
+  uart_println("[HYP] ---- Linux output (earlycon) follows ----");
+
+  static vcpu_t v;
+  for (int i = 0; i < 31; i++) v.x[i] = 0;
+  v.x[0] = LX_DTB_IPA;     /* AArch64 boot protocol: x0 = DTB, x1..x3 = 0 */
+  v.pc = GUEST_ENTRY_IPA;
+  v.pstate = 0x3C5;        /* EL1h, DAIF masked (Linux unmasks itself) */
+  v.sp_el1 = 0;
+  v.vttbr = stage2_vttbr(&s2);
+  v.hcr_extra = HCR_IMO;   /* route phys IRQ to EL2 so CNTHP can preempt */
+  v.vmid = 1;
+  v.name = "linux";
+  vgic_init();
+  vgic_vcpu_reset(&v.vgic);
+  vgic_set_current(&v.vgic);
+  vuart_init(&v.vuart, "linux");
+  gic_enable_irq(30);
+  gic_enable_irq(HYP_CNTHP_PPI);
+
+  uint64_t freq;
+  __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
+  uint64_t host_daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(host_daif));
+  __asm__ __volatile__("msr daifset, #3");
+
+  /* Run Linux for a bounded number of EL2-timer slices, servicing its traps
+   * (stage-2 MMIO to the vGIC, PSCI HVCs, timer IRQs). earlycon output appears
+   * via the straight-through UART. */
+  uint64_t exits = 0;
+  for (int slice = 0; slice < 30; slice++) {
+    cnthp_arm(freq / 50); /* 20 ms */
+    int slice_done = 0;
+    long guard = 2000000;
+    while (!slice_done && guard-- > 0) {
+      vcpu_enter(&v);
+      vcpu_stat_account(&v);
+      exits++;
+      if (v.exit_reason == HYP_EXC_IRQ) {
+        uint64_t intid = gic_ack_irq();
+        if (intid == HYP_CNTHP_PPI) {
+          cnthp_disarm();
+          gic_end_irq(intid);
+          slice_done = 1;
+        } else if (intid == 30) {
+          vgic_inject_hw(30);
+        } else if (intid != GIC_INTID_NO_PENDING) {
+          gic_end_irq(intid);
+        }
+      } else if (v.exit_reason == HYP_EXC_SYNC && ESR_EC_OF(v.esr) == 0x16) {
+        psci_action_t act = psci_handle(&v);
+        if (act == PSCI_ACT_OFF || act == PSCI_ACT_RESET) {
+          uart_println("\n[HYP] Linux issued PSCI shutdown/reset");
+          slice_done = 1;
+          slice = 999; /* end the outer loop too */
+        }
+      } else if (!df_service_exit(&v)) {
+        /* A trap we don't emulate (Linux exercises more of the GIC/sysregs
+         * than our minimal model). Report the first one and stop cleanly. */
+        uint64_t ipa = ((v.hpfar >> 4) << 12) | (v.far & 0xFFF);
+        uart_println("");
+        uart_printf("[HYP] Linux hit an unemulated trap: EC=%x (%s) ELR=%x FAR=%x IPA=%x\n",
+                    ESR_EC_OF(v.esr), hyp_ec_name(ESR_EC_OF(v.esr)), v.pc,
+                    v.far, ipa);
+        slice_done = 1;
+        slice = 999;
+      }
+    }
+    cnthp_disarm();
+  }
+
+  __asm__ __volatile__("msr daif, %0" ::"r"(host_daif));
+  vuart_flush(&v.vuart);
+  uart_println("");
+  uart_printf("[HYP] M28: Linux guest ran (%u exits); ", exits);
+  vcpu_stats_dump(&v);
+
+  stage2_destroy(&s2);
+  pmm_free_pages(ram, LX_RAM_SIZE / 0x1000);
+}
+#else
+void hyp_run_linux(void) {
+  if (hyp_at_el2()) {
+    uart_println("[HYP] M28: no Linux Image embedded (build with HAVE_LINUX_IMAGE)");
+  }
+}
+#endif

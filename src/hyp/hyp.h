@@ -157,4 +157,11 @@ void hyp_run_fault_isolation(void);
  * the host timer. */
 void hyp_run_observability(void);
 
+/* Milestone 28: boot a REAL aarch64 Linux kernel as an EL1 guest. Loads the
+ * embedded Image at the RAM base, builds an OS-grade DTB, and enters per the
+ * AArch64 boot protocol (x0=DTB); Linux's earlycon output appears on the
+ * console. Only built when build/linux/Image exists (HAVE_LINUX_IMAGE).
+ * No-op at EL1; runs before the host timer. */
+void hyp_run_linux(void);
+
 #endif /* HYP_HYP_H */

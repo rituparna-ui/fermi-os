@@ -18,6 +18,16 @@ TARGET := $(BUILD_DIR)/kernel.elf
 S_SOURCES := $(shell find $(SRC_DIR) -path "$(SRC_DIR)/hyp/miniguest" -prune -o -name "*.S" -print)
 C_SOURCES := $(shell find $(SRC_DIR) -path "$(SRC_DIR)/hyp/miniguest" -prune -o -name "*.c" -print)
 
+# linux_blob.S .incbin's build/linux/Image; only compile it when that Image
+# exists (M28). Otherwise prune it and the build proceeds without Linux.
+# (CFLAGS/ASFLAGS get -DHAVE_LINUX_IMAGE appended after their definitions below.)
+S_SOURCES := $(filter-out $(SRC_DIR)/hyp/linux_blob.S, $(S_SOURCES))
+LINUX_IMAGE := linux-image/Image
+HAVE_LINUX := $(wildcard $(LINUX_IMAGE))
+ifneq ($(HAVE_LINUX),)
+S_SOURCES += $(SRC_DIR)/hyp/linux_blob.S
+endif
+
 # Object File Mapping
 # src/boot.S      -> build/boot.o
 # src/kernel.c  	-> build/kernel.o
@@ -81,6 +91,13 @@ CFLAGS := -ffreestanding -g -nostdlib -nostartfiles -Wall -Wextra -O0 -mstrict-a
 # Assemble .S through the C preprocessor so future #include / #define expand correctly
 ASFLAGS := -g -MMD -MP
 LDFLAGS := -nostdlib -g -T linker.ld
+
+# M28: when a real Linux Image is present, define HAVE_LINUX_IMAGE for both C
+# and the assembler (so hyp.c compiles hyp_run_linux and linux_blob.S incbin's
+# the Image).
+ifneq ($(HAVE_LINUX),)
+CFLAGS  += -DHAVE_LINUX_IMAGE
+endif
 
 # QEMU Config
 DISK_IMG := $(BUILD_DIR)/disk.img

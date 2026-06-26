@@ -479,6 +479,21 @@ reports `actual` back.
 raised` → `guest inflated 0x80 pages (512 KiB given to host)`. Linux still boots
 to its ext4 root with the device present. No anomalies.
 
+### Demand-paged guest RAM (lazy stage-2)
+*Why:* real hypervisors don't pre-map a guest's whole RAM — they populate it on
+first touch (overcommit). Instead of mapping all 512 × 2 MiB blocks of Linux's
+1 GiB window up front, leave them unmapped; on a stage-2 fault in the RAM range
+the handler maps that one block (IPA→phys is linear), TLBIs the VMID, counts it,
+and re-executes. (Device-MMIO faults are IPA < 1 GiB and handled separately;
+RAM faults are IPA ≥ `0x40000000`.)
+*A gotcha it surfaced:* the `g_lazy_paging` flag (a `static int … = 1` in
+`.hyp_tables`) read as **0** — `.hyp_tables` is a `NOLOAD` section, so static
+initializers are never loaded. All hypervisor globals must be set explicitly in
+`hyp_init`; fixed by initializing it there.
+*Verified:* demand-page faults stream in (`resident=1,2,3,4,16,32…`) and Linux
+boots all the way to its ext4 root with only ~32 of 512 blocks (~64 MiB of
+1 GiB) ever mapped — the rest stays unmapped. No anomalies.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)

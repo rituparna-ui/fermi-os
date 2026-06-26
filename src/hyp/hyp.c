@@ -73,6 +73,10 @@ extern uint8_t __hyp_end[];
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l0[512];
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l1[512];
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_ram[512]; /* IPA 1-2 GiB (RAM)     */
+/* Demand paging: when set, the Linux RAM window is left unmapped and populated
+ * 2 MiB block at a time on first access (lazy stage-2). */
+__attribute__((section(".hyp_tables"))) static int g_lazy_paging; /* set in hyp_init */
+__attribute__((section(".hyp_tables"))) static uint64_t g_lx_resident;
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_dev[512]; /* IPA 0-1 GiB (devices) */
 
 /* Third guest (vCPU 2): a tiny silent bare-metal payload in its own isolated
@@ -297,6 +301,8 @@ void hyp_init(void) {
    * stage-2 tables and guest 1 payload are in place. */
   memset(vcpus, 0, sizeof(vcpus));
   current_vcpu = 0;
+  g_lazy_paging = 1; /* .hyp_tables is NOLOAD: set runtime defaults explicitly */
+  g_lx_resident = 0;
 
   /* Sanity: confirm we really are at EL2. */
   uint64_t el = (MRS(CurrentEL) >> 2) & 0x3;
@@ -574,14 +580,17 @@ static void hyp_build_linux_stage2(void) {
   lx_l1[0] = ((uint64_t)lx_l2_dev) | S2_TABLE | S2_VALID; /* IPA 0..1 GiB    */
   lx_l1[1] = ((uint64_t)lx_l2_ram) | S2_TABLE | S2_VALID; /* IPA 1..2 GiB    */
 
-  /* RAM: IPA [0x40000000, +256 MiB) -> phys [LINUX_PHYS_BASE, +256 MiB). */
+  /* RAM: IPA [0x40000000, +1 GiB) -> phys [LINUX_PHYS_BASE, +1 GiB). With
+   * demand paging enabled the blocks are left unmapped here and faulted in on
+   * first access (see hyp_handle_abort); otherwise map them all up front. */
   uint64_t blocks = LINUX_RAM_SIZE / _2MB;
   uint64_t base_idx = (LINUX_IPA_BASE % _1GB) / _2MB; /* = 0 */
-  for (uint64_t i = 0; i < blocks; i++) {
-    uint64_t pa = LINUX_PHYS_BASE + i * _2MB;
-    lx_l2_ram[base_idx + i] =
-        pa | S2_VALID | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
-  }
+  if (!g_lazy_paging)
+    for (uint64_t i = 0; i < blocks; i++) {
+      uint64_t pa = LINUX_PHYS_BASE + i * _2MB;
+      lx_l2_ram[base_idx + i] =
+          pa | S2_VALID | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
+    }
 
   /* NOTE: the PL011 UART (IPA 0x09000000) is deliberately NOT mapped here.
    * Leaving it unmapped makes the guest's UART MMIO trap to EL2, where it is
@@ -2182,6 +2191,29 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
     }
     MSR(elr_el2, MRS(elr_el2) + 4); /* step past the trapped instruction */
     return;
+  }
+
+  /* Demand-paged Linux RAM (lazy stage-2): a fault in the RAM window on an
+   * as-yet-unmapped 2 MiB block. Map it (IPA->phys is linear) and re-execute. */
+  if ((current_vcpu == 1 || current_vcpu == 2) && g_lazy_paging &&
+      ipa >= LINUX_IPA_BASE && ipa < LINUX_IPA_BASE + LINUX_RAM_SIZE) {
+    uint64_t idx = (ipa - LINUX_IPA_BASE) / _2MB;
+    if (idx < 512 && lx_l2_ram[idx] == 0) {
+      uint64_t pa = LINUX_PHYS_BASE + idx * _2MB;
+      lx_l2_ram[idx] =
+          pa | S2_VALID | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
+      __asm__ __volatile__("dsb ish");
+      hyp_tlbi_mig_page(ipa); /* current VMID = Linux; invalidate this IPA */
+      uint64_t n = ++g_lx_resident;
+      if (n <= 4 || (n % 16) == 0) {
+        hyp_puts("[HYP] demand-paged Linux RAM: resident=");
+        hyp_puthex(n);
+        hyp_puts(" blocks (");
+        hyp_puthex(n * 2);
+        hyp_puts(" MiB of 1024)\n");
+      }
+      return; /* re-execute the access now that the block is mapped */
+    }
   }
 
   /* Linux guest hit an unhandled fault: reap it (keeping the primary guest

@@ -77,6 +77,19 @@ __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_ram
  * 2 MiB block at a time on first access (lazy stage-2). */
 __attribute__((section(".hyp_tables"))) static int g_lazy_paging; /* set in hyp_init */
 __attribute__((section(".hyp_tables"))) static uint64_t g_lx_resident;
+
+/* The Linux guest is SMP with 3 cores, hosted on vCPUs 1, 2, 4 (vCPU 0 is
+ * Fermi, vCPU 3 is the migratable guest). These helpers map between core
+ * affinity (aff0 0..2) and vCPU index, and identify Linux cores. (A single
+ * physical CPU caps stable SMP here; see DEVLOG — 4 cores soft-locks.) */
+#define LINUX_NCPU 3
+static inline int is_linux_vcpu(int v) {
+  return v == 1 || v == 2 || v == 4;
+}
+static inline int lx_vcpu_for_aff(int aff0) {
+  static const int m[LINUX_NCPU] = {1, 2, 4};
+  return (aff0 >= 0 && aff0 < LINUX_NCPU) ? m[aff0] : -1;
+}
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t lx_l2_dev[512]; /* IPA 0-1 GiB (devices) */
 
 /* Third guest (vCPU 2): a tiny silent bare-metal payload in its own isolated
@@ -643,12 +656,17 @@ static void hyp_create_linux_guest(void) {
  * UNUSED (parked); Linux's boot CPU brings it online via PSCI CPU_ON, which
  * fills in its entry PC and marks it READY. */
 static void hyp_create_linux_secondary(void) {
-  vcpu_t *v = &vcpus[2];
-  memset(v, 0, sizeof(*v));
-  v->id = 2;
-  v->state = VCPU_UNUSED;                        /* parked until CPU_ON       */
-  v->mpidr = 0x80000001ULL;                      /* core 1 (aff0=1)           */
-  v->vttbr = ((uint64_t)lx_l0) | (1ULL << 48);   /* shares Linux VMID 1       */
+  /* Linux SMP secondaries: cores 1..3 (aff0 1..3) on vCPUs 2, 4, 5. Each shares
+   * the primary Linux guest's stage-2 (VMID 1) and is parked until CPU_ON. */
+  static const int idx[LINUX_NCPU - 1] = {2, 4};
+  for (int k = 0; k < LINUX_NCPU - 1; k++) {
+    vcpu_t *v = &vcpus[idx[k]];
+    memset(v, 0, sizeof(*v));
+    v->id = idx[k];
+    v->state = VCPU_UNUSED;                       /* parked until CPU_ON */
+    v->mpidr = 0x80000000ULL | (uint64_t)(k + 1); /* aff0 = 1,2,3        */
+    v->vttbr = ((uint64_t)lx_l0) | (1ULL << 48);  /* shares Linux VMID 1 */
+  }
 }
 
 /* Migratable guest (vCPU 3): a tiny counter payload in its own 2 MiB window,
@@ -1850,12 +1868,12 @@ static void hyp_handle_sysreg(el2_frame_t *f) {
     uint64_t wval = (rt == 31) ? 0 : f->x[rt];
     if (crm == 11 && op2 == 5 && !is_read) {
       /* ICC_SGI1R_EL1 write => generate an SGI. Inject a virtual SGI into the
-       * targeted Linux core(s). Only Linux (vCPU 1/2) participates in SMP. */
+       * targeted Linux core(s). */
       uint32_t intid = (uint32_t)((wval >> 24) & 0xF);
       int irm = (int)((wval >> 40) & 1);
-      if (current_vcpu == 1 || current_vcpu == 2) {
-        for (int aff0 = 0; aff0 < 2; aff0++) {
-          int vc = 1 + aff0; /* aff0 0 => core0=vCPU1, aff0 1 => core1=vCPU2 */
+      if (is_linux_vcpu(current_vcpu)) {
+        for (int aff0 = 0; aff0 < LINUX_NCPU; aff0++) {
+          int vc = lx_vcpu_for_aff(aff0);
           int hit = irm ? (vc != current_vcpu) : (int)((wval >> aff0) & 1);
           if (hit)
             hyp_vgic_inject_ex(vc, intid, 0 /* software SGI */);
@@ -1938,7 +1956,7 @@ static void hyp_handle_sysreg(el2_frame_t *f) {
 #define GICD_LO 0x08000000ULL
 #define GICD_HI 0x08010000ULL
 #define GICR_LO 0x080A0000ULL
-#define GICR_HI 0x080E0000ULL /* 2 redistributor frames (0x20000 each) for SMP */
+#define GICR_HI 0x08100000ULL /* 3 redistributor frames (0x20000 each) for SMP */
 
 __attribute__((section(".hyp_tables"))) static struct {
   uint32_t gicd_ctlr;
@@ -2063,7 +2081,7 @@ static int hyp_emulate_gic(uint64_t ipa, int is_write, uint64_t *val) {
         /* high word (affinity, read at +0x0C or as part of a 64-bit read)     */
         /* identifies the core. core 1 is the last redistributor.             */
         *val = ((uint64_t)core << 32) | ((uint64_t)core << 8) |
-               ((core == 1) ? (1ULL << 4) : 0); /* core 1 = last redistributor */
+               ((core == LINUX_NCPU - 1) ? (1ULL << 4) : 0); /* last redistributor */
         break;
       case 0x000C: *val = core; break;                    /* TYPER high (aff) */
       case 0x0014: *val = 0; break;                       /* WAKER: awake     */
@@ -2146,7 +2164,7 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
   }
 
   /* Linux guest (either core): emulate trapped GIC / PL011 / virtio-mmio. */
-  if ((current_vcpu == 1 || current_vcpu == 2) &&
+  if (is_linux_vcpu(current_vcpu) &&
       ((ipa >= GICD_LO && ipa < GICD_HI) || (ipa >= GICR_LO && ipa < GICR_HI) ||
        (ipa >= PL011_LO && ipa < PL011_HI) ||
        (ipa >= VIRTIO_LO && ipa < VIRTIO_HI) ||
@@ -2214,7 +2232,7 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
 
   /* Demand-paged Linux RAM (lazy stage-2): a fault in the RAM window on an
    * as-yet-unmapped 2 MiB block. Map it (IPA->phys is linear) and re-execute. */
-  if ((current_vcpu == 1 || current_vcpu == 2) && g_lazy_paging &&
+  if (is_linux_vcpu(current_vcpu) && g_lazy_paging &&
       ipa >= LINUX_IPA_BASE && ipa < LINUX_IPA_BASE + LINUX_RAM_SIZE) {
     uint64_t idx = (ipa - LINUX_IPA_BASE) / _2MB;
     if (idx < 512 && lx_l2_ram[idx] == 0) {

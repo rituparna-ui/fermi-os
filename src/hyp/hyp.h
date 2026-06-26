@@ -71,7 +71,7 @@
 #define VCPU_RUNNING 2
 #define VCPU_PAUSED 3 /* administratively paused (vmctl) — not scheduled */
 
-#define NUM_VCPUS 4 /* 0=Fermi, 1=Linux core0, 2=Linux core1, 3=migratable guest */
+#define NUM_VCPUS 5 /* 0=Fermi, {1,2,4}=Linux cores 0..2, 3=migratable guest */
 
 /* Per-vCPU control block: everything needed to suspend a guest at EL2 and
  * later resume it. Lives in hypervisor-private memory (.hyp_tables) so guests

@@ -508,6 +508,20 @@ redistributes CPU only among CPU-bound competitors — an idle, WFI-yielding gue
 doesn't consume its larger budget.) Also fixed a bug where PSCI `CPU_ON`'s memset
 zeroed a secondary's weight. No anomalies.
 
+### Scaling SMP: 3-core Linux (and the single-pCPU ceiling)
+*Why:* push the SMP machinery past two cores. Generalized the core↔vCPU mapping
+(`is_linux_vcpu`, `lx_vcpu_for_aff`) so the Linux cores live on vCPUs {1, 2, 4}
+(vCPU 0 = Fermi, vCPU 3 = the migratable guest), created the extra parked
+secondaries, widened the emulated GICR to N redistributor frames, extended the
+SGI fan-out and DTB (`cpu@0..2`).
+*The ceiling:* **4 cores didn't work** — the 4th core's bring-up stalled and
+`smp_call_function_many` soft-locked (`CPU#2 stuck for 22s`). With every guest
+core time-sliced onto one physical CPU, the IPI fan-out + `stop_machine` of a
+4-core guest can't make progress fast enough. **3 cores is the stable maximum**:
+`SMP: Total of 3 processors activated`, boots all the way to the ext4 root, no
+soft lockups, no anomalies. (A true higher core count would need a multi-pCPU
+host — out of scope for this single-CPU hypervisor.)
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)

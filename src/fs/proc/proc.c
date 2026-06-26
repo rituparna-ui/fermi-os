@@ -182,7 +182,8 @@ static int gen_vms(char *buf, size_t buflen) {
     const char *sn = (st == 2) ? "RUNNING" : (st == 1) ? "READY  "
                      : (st == 3) ? "PAUSED " : "UNUSED ";
     const char *name = (i == 0) ? "Fermi " : (i == 1) ? "Lin#0 "
-                       : (i == 2) ? "Lin#1 " : "Migr8 ";
+                       : (i == 2) ? "Lin#1 " : (i == 3) ? "Migr8 "
+                       : (i == 4) ? "Lin#2 " : "Lin#3 ";
     int w = ksnprintf(buf + pos, buflen - pos,
                       "%u    %s %s %u %u %u %u %u\n", i, name, sn,
                       hvc_call(HVC_VM_STAT, i, VMSTAT_WEIGHT, 0),

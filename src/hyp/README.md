@@ -102,6 +102,7 @@ timer `CNTHP` (PPI 26) instead.
 | M20 | **Paravirt network device:** a guest does a real NIC round-trip (MAC query + ARP to the gateway + RX of the reply) via net hypercalls. |
 | M21 | **Dynamic VM lifecycle:** create/run/destroy a VM at runtime with leak-free stage-2 teardown (free-page count returns to baseline across cycles). |
 | M22 | **Foreign (non-FermiOS) guest:** boot a standalone AArch64 guest via the standard `x0=DTB` boot protocol; it parses the hypervisor-built device tree to discover its UART + RAM. |
+| M23 | **SMP guest:** two vCPUs in one VM (shared stage-2, distinct VMPIDR); the boot vCPU brings up the secondary via PSCI `CPU_ON`. |
 
 The default hypervisor build runs **two** interactive FermiOS guests (M14);
 `Ctrl-X` cycles console focus. Build with `-DHYP_RUN_DEMOS` to run the

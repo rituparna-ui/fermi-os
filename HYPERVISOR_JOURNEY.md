@@ -337,15 +337,22 @@ qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on -m 8G \
   `miniguest: discovered via DTB -> uart=0x9000000 mem_base=0x40000000
   mem_size=0x200000`. Proves the hypervisor is generic, not FermiOS-specific.
 
+- **M23 — SMP guest (done):** one VM with two vCPUs sharing a single stage-2
+  address space, each with a distinct virtual MPIDR (`VMPIDR_EL2`, wired per-vCPU
+  in `world_switch.S`). The boot vCPU brings up the secondary via PSCI `CPU_ON`
+  (the standard SMP mechanism). Verified: `A0` → CPU_ON → `A1` — two cores, one
+  address space, distinct affinity.
+
 ## 14. Status
 
 The hypervisor is feature-complete for a small multi-tenant Type-1 design:
 VHE EL2 host; multiple stage-2-isolated guests; preemptive scheduling;
-interactive per-guest consoles; PSCI; inter-VM shared memory + interrupt
-doorbells; a unified hypercall ABI; an audited guest→host boundary; paravirt
-disk + network with safe IPA translation; leak-free dynamic VM lifecycle; and a
-generic DTB-booted foreign guest. Further work would be breadth (a full foreign
-OS, SMP/multi-vCPU-per-VM, more devices) rather than missing fundamentals.
+interactive per-guest consoles; PSCI (incl. SMP CPU_ON); inter-VM shared memory
++ interrupt doorbells; a unified hypercall ABI; an audited guest→host boundary;
+paravirt disk + network with safe IPA translation; leak-free dynamic VM
+lifecycle; a generic DTB-booted foreign guest; and SMP (multi-vCPU) guests.
+Further work would be breadth (a full foreign OS, more emulated devices) rather
+than missing fundamentals.
 
 ---
 

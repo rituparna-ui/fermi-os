@@ -75,6 +75,7 @@ kernel is embedded as the guest image.
 | M24 | OS‑grade device tree | `bbf30b6` |
 | M25 | vCPU fault isolation | `5d6dd69` |
 | M26 | Full regression script + capstone verification | `28bf4ac` |
+| M27 | Per-VM observability (vCPU exit accounting) | `b06a0fc` |
 
 ### Source layout (`src/hyp/`, ~4,900 LOC)
 

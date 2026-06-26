@@ -105,6 +105,7 @@ timer `CNTHP` (PPI 26) instead.
 | M23 | **SMP guest:** two vCPUs in one VM (shared stage-2, distinct VMPIDR); the boot vCPU brings up the secondary via PSCI `CPU_ON`. |
 | M24 | **OS-grade device tree:** the DTB now carries `/chosen`, `/psci`, `/cpus`, `/timer` and a GICv3 `/intc` — the boot contract a real AArch64 OS reads. |
 | M25 | **vCPU fault isolation:** a misbehaving guest's illegal access is decoded and reaps only that VM; the host + sibling VMs keep running. |
+| M27 | **Per-VM observability:** every guest exit is accounted by class (hvc/mmio/irq/fault) for a virsh-style introspection summary. |
 
 The default hypervisor build runs **two** interactive FermiOS guests (M14);
 `Ctrl-X` cycles console focus. Build with `-DHYP_RUN_DEMOS` to run the

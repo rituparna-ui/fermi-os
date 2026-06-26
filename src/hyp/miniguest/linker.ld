@@ -12,7 +12,13 @@ SECTIONS
   }
   .rodata : { *(.rodata*) }
   .data   : { *(.data*) }
-  .bss    : { *(.bss*) *(COMMON) }
+  .bss : {
+    _mini_bss_start = .;
+    *(.bss*)
+    *(COMMON)
+    . = ALIGN(8);
+    _mini_bss_end = .;
+  }
   . = ALIGN(16);
   _mini_end = .;
 }

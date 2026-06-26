@@ -1935,7 +1935,7 @@ void hyp_run_miniguest(void) {
   /* Build a DTB into guest RAM at MG_DTB_IPA and self-check it. The guest sees
    * its RAM as [0x40000000, +2 MiB) and a PL011 at the architected UART base. */
   uint64_t dtb_kva = kva + (MG_DTB_IPA - GUEST_ENTRY_IPA);
-  uint32_t dtb_sz = fdt_build((void *)dtb_kva, 0x1000, GUEST_ENTRY_IPA,
+  uint32_t dtb_sz = fdt_build((void *)dtb_kva, 0x4000, GUEST_ENTRY_IPA,
                               MG_FOREIGN_RAM, UART_BASE);
   if (!dtb_sz || !fdt_check((void *)dtb_kva)) {
     uart_errorln("[HYP] M22: DTB build failed");

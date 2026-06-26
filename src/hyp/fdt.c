@@ -105,6 +105,21 @@ static void prop_reg2(emit_t *e, const char *name, uint64_t addr, uint64_t sz) {
   prop(e, name, cells, sizeof(cells));
 }
 
+/* An empty property (e.g. "interrupt-controller;"). */
+static void prop_empty(emit_t *e, const char *name) {
+  prop(e, name, (const void *)0, 0);
+}
+
+/* A big-endian u32 array property. */
+static void prop_cells(emit_t *e, const char *name, const uint32_t *cells,
+                       int n) {
+  uint32_t tmp[24];
+  for (int i = 0; i < n && i < 24; i++) {
+    tmp[i] = bswap32(cells[i]);
+  }
+  prop(e, name, tmp, (uint32_t)n * 4);
+}
+
 uint32_t fdt_build(void *buf, uint32_t cap, uint64_t mem_base,
                    uint64_t mem_size, uint64_t uart_base) {
   if (cap < 256) {
@@ -127,11 +142,21 @@ uint32_t fdt_build(void *buf, uint32_t cap, uint64_t mem_base,
   emit_t e = {.base = b, .cap = cap, .soff = struct_off,
               .str0 = strings_off, .scur = strings_off, .overflow = 0};
 
+  /* GICv3 phandle, referenced by interrupt-producing nodes. */
+  const uint32_t GIC_PHANDLE = 1;
+
   /* Root node. */
   begin_node(&e, "");
   prop_u32(&e, "#address-cells", 2);
   prop_u32(&e, "#size-cells", 2);
+  prop_u32(&e, "interrupt-parent", GIC_PHANDLE);
   prop(&e, "compatible", "linux,dummy-virt", 17);
+
+  /* /chosen — boot arguments + console. A real OS reads stdout-path here. */
+  begin_node(&e, "chosen");
+  prop(&e, "bootargs", "console=ttyAMA0 earlycon", 25);
+  prop(&e, "stdout-path", "/pl011@9000000", 15);
+  end_node(&e);
 
   /* /memory@<base> */
   begin_node(&e, "memory@40000000");
@@ -139,10 +164,68 @@ uint32_t fdt_build(void *buf, uint32_t cap, uint64_t mem_base,
   prop_reg2(&e, "reg", mem_base, mem_size);
   end_node(&e);
 
-  /* /pl011@<uart> */
+  /* /psci — power/SMP services (an OS uses CPU_ON to start secondaries). */
+  begin_node(&e, "psci");
+  prop(&e, "compatible", "arm,psci-1.0", 13);
+  prop(&e, "method", "hvc", 4);
+  end_node(&e);
+
+  /* /cpus with two PSCI-bring-up cores (matches M23 SMP). */
+  begin_node(&e, "cpus");
+  prop_u32(&e, "#address-cells", 1);
+  prop_u32(&e, "#size-cells", 0);
+  begin_node(&e, "cpu@0");
+  prop(&e, "device_type", "cpu", 4);
+  prop(&e, "compatible", "arm,cortex-a72", 15);
+  prop_u32(&e, "reg", 0);
+  prop(&e, "enable-method", "psci", 5);
+  end_node(&e);
+  begin_node(&e, "cpu@1");
+  prop(&e, "device_type", "cpu", 4);
+  prop(&e, "compatible", "arm,cortex-a72", 15);
+  prop_u32(&e, "reg", 1);
+  prop(&e, "enable-method", "psci", 5);
+  end_node(&e);
+  end_node(&e); /* cpus */
+
+  /* /timer — ARM generic timer. interrupts: <type ppi flags> triplets for
+   * secure-phys(13), non-secure-phys(14), virt(11), hyp(10); GIC_PPI=1,
+   * level-low active = 0x108. */
+  begin_node(&e, "timer");
+  prop(&e, "compatible", "arm,armv8-timer", 16);
+  {
+    uint32_t it[12] = {1, 13, 0x108, 1, 14, 0x108, 1, 11, 0x108, 1, 10, 0x108};
+    prop_cells(&e, "interrupts", it, 12);
+  }
+  prop_empty(&e, "always-on");
+  end_node(&e);
+
+  /* /intc — GICv3: distributor @0x08000000 (64K) + redistributor @0x080A0000
+   * (128K). This is the interrupt-parent referenced above. */
+  begin_node(&e, "intc@8000000");
+  prop(&e, "compatible", "arm,gic-v3", 11);
+  prop_u32(&e, "#interrupt-cells", 3);
+  prop_empty(&e, "interrupt-controller");
+  prop_u32(&e, "#address-cells", 2);
+  prop_u32(&e, "#size-cells", 2);
+  prop_empty(&e, "ranges");
+  {
+    /* two reg ranges: GICD then GICR (each addr,size as 2+2 cells). */
+    uint64_t regs[4] = {bswap64(0x08000000ULL), bswap64(0x10000ULL),
+                        bswap64(0x080A0000ULL), bswap64(0x20000ULL)};
+    prop(&e, "reg", regs, sizeof(regs));
+  }
+  prop_u32(&e, "phandle", GIC_PHANDLE);
+  end_node(&e);
+
+  /* /pl011@<uart> — with its GIC SPI interrupt (SPI 1, level-high = 0x4). */
   begin_node(&e, "pl011@9000000");
   prop(&e, "compatible", "arm,pl011", 10);
   prop_reg2(&e, "reg", uart_base, 0x1000);
+  {
+    uint32_t it[3] = {0, 1, 0x4}; /* GIC_SPI=0, intid 1, level-high */
+    prop_cells(&e, "interrupts", it, 3);
+  }
   end_node(&e);
 
   end_node(&e); /* root */

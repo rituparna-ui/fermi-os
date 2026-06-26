@@ -19,6 +19,15 @@ _mini_start:
 	add	x1, x1, x2
 	mov	sp, x1
 
+	// Zero BSS — the guest's RAM comes from the host PMM (not zero-filled), so
+	// our uninitialised globals would otherwise hold garbage.
+	adr	x2, _mini_bss_start
+	adr	x3, _mini_bss_end
+2:	cmp	x2, x3
+	b.hs	3f
+	str	xzr, [x2], #8
+	b	2b
+3:
 	mov	x0, x19			// x0 = DTB pointer
 	bl	mini_main
 1:	wfi

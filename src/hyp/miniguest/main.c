@@ -39,9 +39,12 @@ static int str_pfx(const char *s, const char *pfx) {
   return 1;
 }
 
-/* Discovered hardware. */
+/* Discovered hardware / config. */
 static volatile uint32_t *g_uart;    /* PL011 base (set from DTB)        */
 static uint64_t g_mem_base, g_mem_size;
+static char     g_bootargs[64];      /* /chosen bootargs                 */
+static int      g_ncpus;             /* count of cpu@N nodes             */
+static uint64_t g_gicd;              /* GIC distributor base             */
 
 /* --- UART (PL011) — only what we need to print. --- */
 static void uart_putc(char c) {
@@ -83,6 +86,9 @@ static void parse_dtb(const uint8_t *dtb) {
       cur[i] = 0;
       p += i + 1;
       p = (const uint8_t *)(((uintptr_t)p + 3) & ~3UL);
+      if (str_pfx(cur, "cpu@")) {
+        g_ncpus++;
+      }
     } else if (tok == FDT_PROP) {
       uint32_t len = be32(*(const uint32_t *)p); p += 4;
       uint32_t noff = be32(*(const uint32_t *)p); p += 4;
@@ -96,7 +102,13 @@ static void parse_dtb(const uint8_t *dtb) {
         } else if (str_pfx(cur, "memory")) {
           g_mem_base = addr;
           g_mem_size = size;
+        } else if (str_pfx(cur, "intc")) {
+          g_gicd = addr;
         }
+      } else if (str_eq(pname, "bootargs") && len > 0) {
+        uint32_t n = len < sizeof(g_bootargs) ? len : sizeof(g_bootargs) - 1;
+        for (uint32_t i = 0; i < n; i++) g_bootargs[i] = (char)val[i];
+        g_bootargs[n] = 0;
       }
       p += len;
       p = (const uint8_t *)(((uintptr_t)p + 3) & ~3UL);
@@ -129,5 +141,14 @@ void mini_main(uint64_t dtb_ipa) {
   uart_puts(" mem_size=");
   uart_hex(g_mem_size);
   uart_putc('\n');
+
+  /* OS-grade tree facts (M24): the things a real AArch64 OS needs. */
+  uart_puts("miniguest: gic=");
+  uart_hex(g_gicd);
+  uart_puts(" ncpus=");
+  uart_putc((char)('0' + (g_ncpus % 10)));
+  uart_puts(" bootargs=\"");
+  uart_puts(g_bootargs[0] ? g_bootargs : "(none)");
+  uart_puts("\"\n");
   uart_puts("miniguest: done.\n");
 }

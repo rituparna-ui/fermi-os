@@ -104,6 +104,7 @@ timer `CNTHP` (PPI 26) instead.
 | M22 | **Foreign (non-FermiOS) guest:** boot a standalone AArch64 guest via the standard `x0=DTB` boot protocol; it parses the hypervisor-built device tree to discover its UART + RAM. |
 | M23 | **SMP guest:** two vCPUs in one VM (shared stage-2, distinct VMPIDR); the boot vCPU brings up the secondary via PSCI `CPU_ON`. |
 | M24 | **OS-grade device tree:** the DTB now carries `/chosen`, `/psci`, `/cpus`, `/timer` and a GICv3 `/intc` — the boot contract a real AArch64 OS reads. |
+| M25 | **vCPU fault isolation:** a misbehaving guest's illegal access is decoded and reaps only that VM; the host + sibling VMs keep running. |
 
 The default hypervisor build runs **two** interactive FermiOS guests (M14);
 `Ctrl-X` cycles console focus. Build with `-DHYP_RUN_DEMOS` to run the

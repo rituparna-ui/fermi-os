@@ -351,6 +351,13 @@ qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on -m 8G \
   Linux `Image` is out of scope in-sandbox (multi-MB binary), but the
   hypervisor-side boot interface is complete.
 
+- **M25 — vCPU fault isolation (done):** the runtime complement to the M18
+  audit. A misbehaving guest (wild store to an unmapped IPA) takes a stage-2
+  fault to EL2; the hypervisor decodes it richly (`vm_fault_report`), reaps only
+  that VM (stage-2 teardown + RAM release), and the host + a sibling VM keep
+  running. Verified: `badvm FAULT … IPA=0x80000000` → reaped → `GGG` (good VM
+  ran afterward) → PASS.
+
 ## 14. Status
 
 The hypervisor is feature-complete for a small multi-tenant Type-1 design:
@@ -358,9 +365,10 @@ VHE EL2 host; multiple stage-2-isolated guests; preemptive scheduling;
 interactive per-guest consoles; PSCI (incl. SMP CPU_ON); inter-VM shared memory
 + interrupt doorbells; a unified hypercall ABI; an audited guest→host boundary;
 paravirt disk + network with safe IPA translation; leak-free dynamic VM
-lifecycle; a generic DTB-booted foreign guest; and SMP (multi-vCPU) guests.
-Further work would be breadth (a full foreign OS, more emulated devices) rather
-than missing fundamentals.
+lifecycle; a generic DTB-booted foreign guest with an OS-grade device tree; SMP
+(multi-vCPU) guests; and runtime fault isolation (a bad guest is contained).
+Further work would be breadth (booting a real OS binary, more emulated devices)
+rather than missing fundamentals.
 
 ---
 

@@ -443,6 +443,19 @@ EL2 load just made it surface.)
 through the transmitq, while the SMP Linux guest boots to its ext4 root, the
 live-migration round trip completes, and there are **no parks/anomalies**.
 
+### vmctl — an interactive guest control plane
+*Why:* turn the scripted demos into an *operable* hypervisor — list, pause,
+resume, and migrate guests by hand. A control hypercall `HVC_VM_CTL(op, id)`
+(ops: pause/resume/migrate) drives a new `VCPU_PAUSED` state (skipped by the
+scheduler). Fermi exposes it as a writable **`/proc/vmctl`** (parsing
+`pause N` / `resume N` / `migrate N`) plus `vms` and `vmctl` shell builtins;
+`/proc/vms` shows the `PAUSED` state. Live migration is no longer auto-triggered
+— it's *armed on demand* by `vmctl migrate 3`.
+*Verified by driving Fermi's shell:* `vmctl pause 3` freezes vCPU 3's HVC count
+(2494 → 2494) and shows `PAUSED`; `vmctl resume 3` resumes it (climbs to 2893);
+`vmctl migrate 3` triggers the full pre-copy + post-copy round trip on demand
+(and only then). No anomalies.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)

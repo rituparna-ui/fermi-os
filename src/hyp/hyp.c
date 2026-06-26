@@ -94,10 +94,14 @@ extern uint8_t guest3_payload[];
 extern uint8_t guest3_payload_end[];
 
 /* Live-migration state machine, driven from the scheduler tick so the guest
- * keeps running between phases. */
+ * keeps running between phases. The demo migrates the guest out with PRE-COPY
+ * (iterative dirty-tracked copy + brief stop) then back with POST-COPY (switch
+ * first, demand-fault pages in) — the two canonical live-migration techniques. */
 #define MIGS_NONE 0
-#define MIGS_LIVE 1     /* pre-copied; guest running with dirty tracking on */
-#define MIGS_DONE 2
+#define MIGS_PRECOPY 1  /* iterative pre-copy with dirty tracking (way out)   */
+#define MIGS_COOLDOWN 2 /* run on the destination for a while                 */
+#define MIGS_POSTCOPY 3 /* switched to target; demand-faulting pages in (back) */
+#define MIGS_DONE 4
 
 /* The vCPUs and the index of the one currently running. In .hyp_tables
  * (NOLOAD); initialised explicitly in hyp_init(). */
@@ -112,6 +116,9 @@ __attribute__((section(".hyp_tables"))) static uint64_t g_mig_live_ticks;
 __attribute__((section(".hyp_tables"))) static uint64_t g_mig_round;
 __attribute__((section(".hyp_tables"))) static uint64_t g_mig_post_logs;
 __attribute__((section(".hyp_tables"))) static uint8_t g_mig_dirty[MIG_PAGES];
+__attribute__((section(".hyp_tables"))) static uint8_t g_mig_present[MIG_PAGES];
+__attribute__((section(".hyp_tables"))) static uint64_t g_mig_cur;   /* phys window the guest runs from */
+__attribute__((section(".hyp_tables"))) static uint64_t g_mig_faulted; /* post-copy pages faulted in     */
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t mig_l0[512];
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t mig_l1[512];
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t mig_l2[512];
@@ -638,6 +645,7 @@ static void hyp_create_mig_guest(void) {
     mig_l3[i] = (MIG_SRC + i * 4096) | S2_PAGE | S2_AF | S2_SH_INNER |
                 S2_AP_RW | S2_MEM_NORMAL;
   __asm__ __volatile__("dsb ish");
+  g_mig_cur = MIG_SRC; /* the guest initially runs from the source window */
 
   /* Copy the payload into the source window (physical, MMU off). */
   uint64_t len = (uint64_t)(guest3_payload_end - guest3_payload);
@@ -1736,21 +1744,40 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
   uint64_t ipa_page = (hpfar >> 4) << 12; /* HPFAR[43:4] = IPA[51:12] */
   uint64_t ipa = ipa_page | (far & 0xFFF);
 
-  /* Live-migration dirty tracking: a write by the migratable guest (vCPU 3) to
-   * one of its write-protected pages during the live window. Record the page as
-   * dirty, re-grant write permission, and RE-EXECUTE the store (do not advance
-   * ELR). */
-  if (current_vcpu == 3 && g_mig_state == MIGS_LIVE && ((esr >> 6) & 1) &&
+  /* Live-migration PRE-COPY dirty tracking: a write by the migratable guest
+   * (vCPU 3) to one of its write-protected pages. Mark dirty, re-grant write,
+   * and RE-EXECUTE the store (do not advance ELR). */
+  if (current_vcpu == 3 && g_mig_state == MIGS_PRECOPY && ((esr >> 6) & 1) &&
       ipa >= MIG_IPA_BASE && ipa < MIG_IPA_BASE + MIG_RAM_SIZE) {
     uint64_t idx = (ipa - MIG_IPA_BASE) / 4096;
     if (idx < MIG_PAGES) {
       g_mig_dirty[idx] = 1;
-      mig_l3[idx] = (MIG_SRC + idx * 4096) | S2_PAGE | S2_AF | S2_SH_INNER |
+      mig_l3[idx] = (g_mig_cur + idx * 4096) | S2_PAGE | S2_AF | S2_SH_INNER |
                     S2_AP_RW | S2_MEM_NORMAL;
       __asm__ __volatile__("dsb ish");
-      hyp_tlbi_mig_page(ipa); /* VMID-3 only; don't flush other guests */
+      hyp_tlbi_mig_page(ipa);
     }
     return; /* re-execute the store with write permission now granted */
+  }
+
+  /* Live-migration POST-COPY demand fault-in: the guest (vCPU 3) touched a page
+   * that is not yet present at the migration target. Copy it from the source of
+   * truth, map it, mark present, and RE-EXECUTE the access. Handles both data
+   * and instruction aborts (the code page faults in on the first fetch). */
+  if (current_vcpu == 3 && g_mig_state == MIGS_POSTCOPY &&
+      ipa >= MIG_IPA_BASE && ipa < MIG_IPA_BASE + MIG_RAM_SIZE) {
+    uint64_t idx = (ipa - MIG_IPA_BASE) / 4096;
+    if (idx < MIG_PAGES && !g_mig_present[idx]) {
+      uint64_t target = (g_mig_cur == MIG_SRC) ? MIG_DEST : MIG_SRC;
+      memcpy((void *)(target + idx * 4096), (void *)(g_mig_cur + idx * 4096), 4096);
+      mig_l3[idx] = (target + idx * 4096) | S2_PAGE | S2_AF | S2_SH_INNER |
+                    S2_AP_RW | S2_MEM_NORMAL;
+      g_mig_present[idx] = 1;
+      g_mig_faulted++;
+      __asm__ __volatile__("dsb ish");
+      hyp_tlbi_mig_page(ipa);
+    }
+    return; /* re-execute now that the page is mapped */
   }
 
   uint64_t hs = (uint64_t)__hyp_start;
@@ -1938,7 +1965,9 @@ static void hyp_uart_rx_kick(void) {
  * guest's stage-2 to the destination and poisons the source. */
 #define MIG_MAX_ROUNDS 8
 #define MIG_CONVERGE 2      /* converged once a round dirties <= this many pages */
-#define MIG_WINDOW_TICKS 15 /* live-run window between pre-copy rounds            */
+#define MIG_WINDOW_TICKS 50 /* live-run window between pre-copy rounds (long
+                             * enough that the light WFI guest is scheduled and
+                             * dirties its working set)                          */
 
 /* Targeted stage-2 TLB invalidation for the migratable guest's VMID only, so a
  * migration does NOT flush the other guests' (Fermi/Linux) TLBs. */
@@ -1965,7 +1994,7 @@ static void hyp_tlbi_mig_all(void) {
 static void hyp_mig_protect_all(void) {
   for (uint64_t i = 0; i < MIG_PAGES; i++) {
     g_mig_dirty[i] = 0;
-    mig_l3[i] = (MIG_SRC + i * 4096) | S2_PAGE | S2_AF | S2_SH_INNER |
+    mig_l3[i] = (g_mig_cur + i * 4096) | S2_PAGE | S2_AF | S2_SH_INNER |
                 S2_AP_RO | S2_MEM_NORMAL;
   }
   __asm__ __volatile__("dsb ish");
@@ -1974,83 +2003,130 @@ static void hyp_mig_protect_all(void) {
 
 static void hyp_migration_step(void) {
   const uint64_t page_rw = S2_PAGE | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
+  uint64_t other = (g_mig_cur == MIG_SRC) ? MIG_DEST : MIG_SRC;
 
   if (g_mig_state == MIGS_NONE) {
     if (vcpus[3].state == VCPU_UNUSED || vcpus[3].hvc_count <= 60)
       return; /* wait until the guest has been running for a while */
-    uint64_t pre = *(volatile uint64_t *)(MIG_SRC + MIG_COUNTER_OFF);
-    hyp_puts("[HYP] live-migrate vCPU3: iterative pre-copy starting; counter=");
+    uint64_t pre = *(volatile uint64_t *)(g_mig_cur + MIG_COUNTER_OFF);
+    hyp_puts("[HYP] === PRE-COPY migration (way out) ===; counter=");
     hyp_puthex(pre);
     hyp_puts("\n");
-    hyp_mig_protect_all();                       /* round 0: protect + full copy */
-    memcpy((void *)MIG_DEST, (void *)MIG_SRC, MIG_RAM_SIZE);
-    g_mig_state = MIGS_LIVE;
+    hyp_mig_protect_all();
+    memcpy((void *)other, (void *)g_mig_cur, MIG_RAM_SIZE);
+    g_mig_state = MIGS_PRECOPY;
     g_mig_round = 1;
     g_mig_live_ticks = 0;
     return;
   }
 
-  if (g_mig_state == MIGS_LIVE) {
+  if (g_mig_state == MIGS_PRECOPY) {
     if (++g_mig_live_ticks < MIG_WINDOW_TICKS)
-      return; /* let the guest run and dirty pages (tracked via write faults) */
+      return;
     g_mig_live_ticks = 0;
-
-    /* Copy the pages dirtied during this window to the destination. */
     int dirty = 0;
     for (uint64_t i = 0; i < MIG_PAGES; i++)
       if (g_mig_dirty[i]) {
-        memcpy((void *)(MIG_DEST + i * 4096), (void *)(MIG_SRC + i * 4096), 4096);
+        memcpy((void *)(other + i * 4096), (void *)(g_mig_cur + i * 4096), 4096);
         dirty++;
       }
-    hyp_puts("[HYP] live-migrate: pre-copy round ");
+    hyp_puts("[HYP] pre-copy round ");
     hyp_puthex(g_mig_round);
     hyp_puts(" re-copied ");
     hyp_puthex((uint64_t)dirty);
     hyp_puts(" dirty page(s)\n");
 
-    int converged = (dirty <= MIG_CONVERGE);
-    int last = (g_mig_round >= MIG_MAX_ROUNDS);
-    if (converged || last) {
-      /* Final stop-and-copy: the dirty pages were just synced above; re-point
-       * the whole window to DEST, flush, and poison the old window. */
+    if (dirty <= MIG_CONVERGE || g_mig_round >= MIG_MAX_ROUNDS) {
       for (uint64_t i = 0; i < MIG_PAGES; i++)
-        mig_l3[i] = (MIG_DEST + i * 4096) | page_rw;
+        mig_l3[i] = (other + i * 4096) | page_rw;
       __asm__ __volatile__("dsb ish");
       hyp_tlbi_mig_all();
-      uint64_t cnt = *(volatile uint64_t *)(MIG_DEST + MIG_COUNTER_OFF);
-      memset((void *)MIG_SRC, 0xEE, MIG_RAM_SIZE);
-      hyp_puts("[HYP] live-migrate: ");
-      hyp_puts(converged ? "converged" : "round cap");
-      hyp_puts(" -> stop-copy; stage-2 now SRC->DEST; SRC poisoned; counter(DEST)=");
+      uint64_t cnt = *(volatile uint64_t *)(other + MIG_COUNTER_OFF);
+      memset((void *)g_mig_cur, 0xEE, MIG_RAM_SIZE);
+      hyp_puts("[HYP] pre-copy ");
+      hyp_puts((dirty <= MIG_CONVERGE) ? "converged" : "round cap");
+      hyp_puts(" -> stop-copy; now running from the destination; old window poisoned; counter=");
       hyp_puthex(cnt);
       hyp_puts("\n");
-      g_mig_state = MIGS_DONE;
-      g_mig_post_logs = 0;
+      g_mig_cur = other;        /* guest now runs from the destination */
+      g_mig_state = MIGS_COOLDOWN;
+      g_mig_live_ticks = 0;
       return;
     }
-    /* Not converged: re-protect for another round and keep the guest running. */
     hyp_mig_protect_all();
     g_mig_round++;
+    return;
+  }
+
+  if (g_mig_state == MIGS_COOLDOWN) {
+    if (++g_mig_live_ticks < 40)
+      return; /* let the guest run on the destination for a bit */
+    /* Begin POST-COPY back to `other`: switch the guest to the target window
+     * immediately with every page UNMAPPED, then demand-fault pages in. */
+    uint64_t pre = *(volatile uint64_t *)(g_mig_cur + MIG_COUNTER_OFF);
+    for (uint64_t i = 0; i < MIG_PAGES; i++) {
+      g_mig_present[i] = 0;
+      mig_l3[i] = 0; /* invalid -> first access faults to EL2 */
+    }
+    __asm__ __volatile__("dsb ish");
+    hyp_tlbi_mig_all();
+    g_mig_faulted = 0;
+    hyp_puts("[HYP] === POST-COPY migration (way back) ===; switched target, all ");
+    hyp_puthex(MIG_PAGES);
+    hyp_puts(" pages unmapped; demand-faulting in; counter=");
+    hyp_puthex(pre);
+    hyp_puts("\n");
+    /* `other` is the migration source-of-truth (current backing); the target is
+     * the previous window. Swap roles: the guest will run from `target`. */
+    g_mig_state = MIGS_POSTCOPY;
+    g_mig_live_ticks = 0;
+    return;
+  }
+
+  if (g_mig_state == MIGS_POSTCOPY) {
+    if (++g_mig_live_ticks < 60)
+      return; /* let the guest demand-fault its working set in */
+    /* Background-copy any pages the guest hasn't touched yet, completing the
+     * migration; then poison the old (source) window. */
+    uint64_t target = other;       /* the window we are migrating INTO */
+    uint64_t source = g_mig_cur;   /* still holds the up-to-date pages   */
+    int bg = 0;
+    for (uint64_t i = 0; i < MIG_PAGES; i++)
+      if (!g_mig_present[i]) {
+        memcpy((void *)(target + i * 4096), (void *)(source + i * 4096), 4096);
+        mig_l3[i] = (target + i * 4096) | page_rw;
+        bg++;
+      }
+    __asm__ __volatile__("dsb ish");
+    hyp_tlbi_mig_all();
+    memset((void *)source, 0xEE, MIG_RAM_SIZE);
+    uint64_t cnt = *(volatile uint64_t *)(target + MIG_COUNTER_OFF);
+    hyp_puts("[HYP] post-copy complete: demand-faulted ");
+    hyp_puthex(g_mig_faulted);
+    hyp_puts(" page(s), background-copied ");
+    hyp_puthex((uint64_t)bg);
+    hyp_puts("; old window poisoned; counter=");
+    hyp_puthex(cnt);
+    hyp_puts("\n");
+    g_mig_cur = target;
+    g_mig_state = MIGS_DONE;
+    g_mig_post_logs = 0;
+    g_mig_live_ticks = 0;
     return;
   }
 
   if (g_mig_state == MIGS_DONE) {
     if (g_mig_post_logs < 3) {
       if ((g_mig_live_ticks++ % 25) == 0) {
-        uint64_t cnt = *(volatile uint64_t *)(MIG_DEST + MIG_COUNTER_OFF);
-        uint64_t poison = *(volatile uint64_t *)(MIG_SRC + MIG_COUNTER_OFF);
-        hyp_puts("[HYP] post-migrate: vCPU3 counter(DEST)=");
+        uint64_t cnt = *(volatile uint64_t *)(g_mig_cur + MIG_COUNTER_OFF);
+        hyp_puts("[HYP] post-migrate: vCPU3 counter=");
         hyp_puthex(cnt);
-        hyp_puts(" climbing; SRC still poisoned=");
-        hyp_puthex(poison);
-        hyp_puts("\n");
+        hyp_puts(" still climbing (survived pre-copy + post-copy round trip)\n");
         if (++g_mig_post_logs == 3)
           hyp_puts("[HYP] migratable guest retired post-migration; CPU freed\n");
       }
     } else {
-      /* Demo complete: retire vCPU3 so it stops competing with Linux. Setting
-       * UNUSED sticks on the next tick where it is not the running vCPU. */
-      vcpus[3].state = VCPU_UNUSED;
+      vcpus[3].state = VCPU_UNUSED; /* retire; frees CPU for Linux */
     }
   }
 }

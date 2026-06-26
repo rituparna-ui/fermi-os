@@ -402,6 +402,26 @@ while `SRC poisoned=0xeeee…` — the counter is continuous across the move and
 guest provably runs from the destination. All concurrent with the SMP Linux
 guest booting from its ext4 root disk. No anomalies.
 
+### Post-copy migration (the way back) — both techniques, bidirectional
+*Why:* round out the migration story with the *other* canonical live-migration
+method. Where pre-copy copies RAM up front and switches last, **post-copy**
+switches to the target *first* (minimal downtime) and demand-faults pages in
+afterward. The demo now migrates the guest out with pre-copy (SRC→DEST) and back
+with post-copy (DEST→SRC) — a bidirectional round trip exercising both methods.
+- **Switch first:** mark every target page invalid in the guest's stage-2 and
+  point the guest at the target. The guest's very next instruction fetch faults.
+- **Demand fault-in:** a stage-2 *translation* fault (data OR instruction — the
+  code page faults in on the first fetch) copies that page from the source of
+  truth into the target, maps it, marks it present, and re-executes the access.
+- **Background copy:** after the guest has faulted in its working set, copy the
+  remaining untouched pages and poison the source.
+*Verified:* `POST-COPY … all 0x200 pages unmapped; demand-faulting in` →
+`post-copy complete: demand-faulted 0x2 page(s)` (exactly the code + counter
+pages = the working set), `background-copied 0x1fe` (510). The counter is
+monotonic across the *entire* round trip (`0x3d → 0x69 → 0x9b → climbing`), the
+guest provably survives both migrations, the demo guest then retires, and the
+SMP Linux guest still boots to its ext4 root disk concurrently. No anomalies.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)

@@ -2317,7 +2317,7 @@ void hyp_run_linux(void) {
   }
 
   uint64_t img_len = (uint64_t)(__linux_blob_end - __linux_blob_start);
-  uart_printf("[HYP] M28: booting REAL aarch64 Linux as an EL1 guest (Image %u bytes)\n",
+  uart_printf("[HYP] M30: booting REAL aarch64 Linux (Image %u bytes) to USERSPACE\n",
               img_len);
 
   uintptr_t ram = pmm_allocate_pages(LX_RAM_SIZE / 0x1000);
@@ -2381,11 +2381,16 @@ void hyp_run_linux(void) {
   /* Run Linux for a bounded number of EL2-timer slices, servicing its traps
    * (stage-2 MMIO to the vGIC, PSCI HVCs, timer IRQs). earlycon output appears
    * via the straight-through UART. */
+  /* Slice budget sized for a full boot -> initramfs unpack -> userspace ->
+   * PSCI power-off. Userspace exec + console I/O take far more emulated time
+   * than the bare-kernel probe did, so this is generous; a clean PSCI OFF/RESET
+   * breaks out early via `done`, so the cap only bounds a wedged guest. */
   uint64_t exits = 0;
-  for (int slice = 0; slice < 30; slice++) {
+  int done = 0;
+  for (int slice = 0; slice < 600 && !done; slice++) {
     cnthp_arm(freq / 50); /* 20 ms */
     int slice_done = 0;
-    long guard = 2000000;
+    long guard = 4000000;
     while (!slice_done && guard-- > 0) {
       vcpu_enter(&v);
       vcpu_stat_account(&v);
@@ -2406,7 +2411,7 @@ void hyp_run_linux(void) {
         if (act == PSCI_ACT_OFF || act == PSCI_ACT_RESET) {
           uart_println("\n[HYP] Linux issued PSCI shutdown/reset");
           slice_done = 1;
-          slice = 999; /* end the outer loop too */
+          done = 1; /* end the outer loop too */
         }
       } else if (!df_service_exit(&v)) {
         /* A trap we don't emulate (Linux exercises more of the GIC/sysregs
@@ -2417,7 +2422,7 @@ void hyp_run_linux(void) {
                     ESR_EC_OF(v.esr), hyp_ec_name(ESR_EC_OF(v.esr)), v.pc,
                     v.far, ipa);
         slice_done = 1;
-        slice = 999;
+        done = 1;
       }
     }
     cnthp_disarm();
@@ -2431,7 +2436,7 @@ void hyp_run_linux(void) {
   __asm__ __volatile__("msr daif, %0" ::"r"(host_daif));
   vuart_flush(&v.vuart);
   uart_println("");
-  uart_printf("[HYP] M28: Linux guest ran (%u exits); ", exits);
+  uart_printf("[HYP] M30: Linux guest ran (%u exits); ", exits);
   vcpu_stats_dump(&v);
 
   stage2_destroy(&s2);

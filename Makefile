@@ -99,6 +99,12 @@ ifneq ($(HAVE_LINUX),)
 CFLAGS  += -DHAVE_LINUX_IMAGE
 endif
 
+# Opt-in extra defines without clobbering the auto-appended ones above, e.g.
+#   make EXTRA_CFLAGS=-DHYP_RUN_LINUX all
+# (overriding CFLAGS= on the command line would drop -DHAVE_LINUX_IMAGE).
+CFLAGS += $(EXTRA_CFLAGS)
+ASFLAGS += $(EXTRA_CFLAGS)
+
 # QEMU Config
 DISK_IMG := $(BUILD_DIR)/disk.img
 DISK_SIZE := 1G

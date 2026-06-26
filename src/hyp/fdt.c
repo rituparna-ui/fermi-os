@@ -144,6 +144,11 @@ uint32_t fdt_build(void *buf, uint32_t cap, uint64_t mem_base,
 
   /* GICv3 phandle, referenced by interrupt-producing nodes. */
   const uint32_t GIC_PHANDLE = 1;
+  /* Fixed-clock phandle, referenced by the PL011 as its uartclk + apb_pclk.
+   * The AMBA bus probe REQUIRES an "apb_pclk" clock or it aborts, so the
+   * PL011 only registers ttyAMA0 (letting init open /dev/console) when this
+   * clock is wired. Matches QEMU virt's own binding. */
+  const uint32_t CLK_PHANDLE = 2;
 
   /* Root node. */
   begin_node(&e, "");
@@ -218,14 +223,36 @@ uint32_t fdt_build(void *buf, uint32_t cap, uint64_t mem_base,
   prop_u32(&e, "phandle", GIC_PHANDLE);
   end_node(&e);
 
-  /* /pl011@<uart> — with its GIC SPI interrupt (SPI 1, level-high = 0x4). */
+  /* /apb-pclk — a 24 MHz fixed-clock the PL011 references. The common-clock
+   * framework (CONFIG_COMMON_CLK) instantiates "fixed-clock" nodes via
+   * CLK_OF_DECLARE, so this resolves before the AMBA bus probes the UART. */
+  begin_node(&e, "apb-pclk");
+  prop(&e, "compatible", "fixed-clock", 12);
+  prop_u32(&e, "#clock-cells", 0);
+  prop_u32(&e, "clock-frequency", 24000000);
+  prop_u32(&e, "phandle", CLK_PHANDLE);
+  end_node(&e);
+
+  /* /pl011@<uart> — a proper AMBA PrimeCell so the amba-pl011 driver binds and
+   * registers ttyAMA0 (which lets userspace init open /dev/console).
+   *   - compatible MUST include "arm,primecell" or of_amba_device_create makes
+   *     a plain platform_device the pl011 driver never matches.
+   *   - clocks/clock-names supply the mandatory "apb_pclk" (+ "uartclk").
+   * The GIC SPI interrupt is declared for completeness; console TX is polled,
+   * so it works even though the hypervisor doesn't route this SPI to the guest. */
   begin_node(&e, "pl011@9000000");
-  prop(&e, "compatible", "arm,pl011", 10);
+  /* String-list compatible: "arm,pl011\0arm,primecell\0". */
+  prop(&e, "compatible", "arm,pl011\0arm,primecell", 24);
   prop_reg2(&e, "reg", uart_base, 0x1000);
   {
     uint32_t it[3] = {0, 1, 0x4}; /* GIC_SPI=0, intid 1, level-high */
     prop_cells(&e, "interrupts", it, 3);
   }
+  {
+    uint32_t clks[2] = {CLK_PHANDLE, CLK_PHANDLE}; /* uartclk, apb_pclk */
+    prop_cells(&e, "clocks", clks, 2);
+  }
+  prop(&e, "clock-names", "uartclk\0apb_pclk", 17); /* both strings NUL-term */
   end_node(&e);
 
   end_node(&e); /* root */

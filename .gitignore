@@ -14,3 +14,7 @@ wasabi-toolbag/
 /linux-image/src/
 /linux-image/*.log
 /linux-image/build.sh
+/linux-image/init
+/linux-image/init.c
+/linux-image/initramfs.list
+/virt.dtb

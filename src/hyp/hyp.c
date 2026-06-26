@@ -1242,6 +1242,126 @@ static int hyp_emulate_vnet(uint64_t ipa, int is_write, uint64_t *val) {
   return 1;
 }
 
+/* ------------------------- emulated virtio-console ------------------------- */
+/* A virtio-mmio (version 2) console (DeviceID 3) => /dev/hvc0. Two virtqueues
+ * (0 = receiveq host->guest, 1 = transmitq guest->host). Unlike the PL011, the
+ * guest's output is delivered in batches (one trap per buffer, not per byte).
+ * The hypervisor forwards transmitted lines to its own serial, prefixed, so the
+ * channel is demonstrably end-to-end. */
+#define VCON_LO 0x0a000600ULL
+#define VCON_HI 0x0a000800ULL
+#define VCON_INTID 37 /* DT: virtio_console interrupts = <0 5 4> => SPI 5 => 37 */
+
+__attribute__((section(".hyp_tables"))) static struct {
+  uint32_t status;
+  uint32_t dev_feat_sel, drv_feat_sel;
+  uint32_t int_status;
+  uint32_t q_sel;
+  struct vnet_q q[2]; /* 0 = receiveq, 1 = transmitq */
+} g_vcon;
+
+/* Forward one transmitted byte, line-buffered, to the hypervisor serial. */
+static void hyp_vcon_putc(uint8_t c) {
+  static char line[256];
+  static int n;
+  if (c == '\n' || n >= (int)sizeof(line) - 1) {
+    line[n] = 0;
+    hyp_puts("[guest hvc0] ");
+    hyp_puts(line);
+    hyp_puts("\n");
+    n = 0;
+  } else if (c != '\r') {
+    line[n++] = (char)c;
+  }
+}
+
+static void hyp_vcon_tx(void) {
+  struct vnet_q *q = &g_vcon.q[1];
+  if (!q->ready || !q->desc || !q->avail || !q->used || q->num == 0)
+    return;
+  struct vq_desc *desc = lx_gpa(q->desc);
+  volatile uint16_t *avail = lx_gpa(q->avail);
+  volatile uint16_t *used16 = lx_gpa(q->used);
+  if (!desc || !avail || !used16)
+    return;
+  uint16_t aidx = avail[1];
+  int worked = 0;
+  while (q->last_avail != aidx) {
+    uint16_t head = avail[2 + (q->last_avail % q->num)];
+    if (head >= q->num)
+      break;
+    uint16_t idx = head;
+    uint32_t total = 0;
+    for (int g = 0; g < 64; g++) {
+      struct vq_desc *d = &desc[idx];
+      uint8_t *p = lx_gpa(d->addr);
+      if (p)
+        for (uint32_t i = 0; i < d->len; i++) {
+          hyp_vcon_putc(p[i]);
+          total++;
+        }
+      if (!(d->flags & VRING_F_NEXT))
+        break;
+      idx = d->next;
+      if (idx >= q->num)
+        break;
+    }
+    volatile uint32_t *ur = (volatile uint32_t *)(used16 + 2);
+    uint16_t uidx = used16[1];
+    uint16_t us = uidx % q->num;
+    ur[us * 2 + 0] = head;
+    ur[us * 2 + 1] = total;
+    __asm__ __volatile__("dsb ish");
+    used16[1] = uidx + 1;
+    q->last_avail++;
+    worked = 1;
+  }
+  if (worked) {
+    __asm__ __volatile__("dsb ish");
+    g_vcon.int_status |= 1;
+    hyp_vgic_inject_ex(1 /* Linux */, VCON_INTID, 0 /* SW */);
+  }
+}
+
+static int hyp_emulate_vcon(uint64_t ipa, int is_write, uint64_t *val) {
+  uint64_t off = ipa - VCON_LO;
+  uint32_t s = g_vcon.q_sel < 2 ? g_vcon.q_sel : 0;
+  if (is_write) {
+    switch (off) {
+    case 0x014: g_vcon.dev_feat_sel = (uint32_t)*val; break;
+    case 0x024: g_vcon.drv_feat_sel = (uint32_t)*val; break;
+    case 0x030: g_vcon.q_sel = (uint32_t)*val; break;
+    case 0x038: g_vcon.q[s].num = (uint32_t)*val; break;
+    case 0x044: g_vcon.q[s].ready = (uint32_t)*val; break;
+    case 0x050: if ((uint32_t)*val == 1) hyp_vcon_tx(); break; /* QueueNotify */
+    case 0x064: g_vcon.int_status &= ~(uint32_t)*val; break;
+    case 0x070: g_vcon.status = (uint32_t)*val; break;
+    case 0x080: g_vcon.q[s].desc = (g_vcon.q[s].desc & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x084: g_vcon.q[s].desc = (g_vcon.q[s].desc & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    case 0x090: g_vcon.q[s].avail = (g_vcon.q[s].avail & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x094: g_vcon.q[s].avail = (g_vcon.q[s].avail & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    case 0x0a0: g_vcon.q[s].used = (g_vcon.q[s].used & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x0a4: g_vcon.q[s].used = (g_vcon.q[s].used & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    default: break;
+    }
+    return 1;
+  }
+  switch (off) {
+  case 0x000: *val = 0x74726976; break;       /* Magic                       */
+  case 0x004: *val = 2; break;                /* Version 2                   */
+  case 0x008: *val = 3; break;                /* DeviceID 3 = console        */
+  case 0x00c: *val = 0x554d4551; break;       /* VendorID                    */
+  case 0x010: *val = (g_vcon.dev_feat_sel == 1) ? (1u << 0) : 0; break; /* VERSION_1 */
+  case 0x034: *val = 256; break;              /* QueueNumMax                 */
+  case 0x044: *val = g_vcon.q[s].ready; break;
+  case 0x060: *val = g_vcon.int_status; break;
+  case 0x070: *val = g_vcon.status; break;
+  case 0x0fc: *val = 0; break;                /* ConfigGeneration            */
+  default: *val = 0; break;
+  }
+  return 1;
+}
+
 /* ------------------------------- traps ------------------------------------ */
 
 static const char *ec_name(uint64_t ec) {
@@ -1637,8 +1757,8 @@ static int hyp_emulate_pl011(uint64_t ipa, int is_write, uint64_t *val) {
              * virtio-blk signature, then bring up eth0 and ping the
              * hypervisor-emulated host (10.0.0.1) over virtio-net. */
             lrx_push_str(
-                "nproc; cat /etc/motd; ifconfig eth0 10.0.0.2 up; "
-                "ping -c 1 10.0.0.1; echo ALLDONE\n");
+                "nproc; cat /etc/motd; echo HVC0_VIRTIO_OK > /dev/hvc0; "
+                "ifconfig eth0 10.0.0.2 up; ping -c 1 10.0.0.1; echo ALLDONE\n");
           }
           hyp_uart_rx_kick();
         }
@@ -1808,11 +1928,13 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
        (ipa >= PL011_LO && ipa < PL011_HI) ||
        (ipa >= VIRTIO_LO && ipa < VIRTIO_HI) ||
        (ipa >= VBLK_LO && ipa < VBLK_HI) ||
-       (ipa >= VNET_LO && ipa < VNET_HI))) {
+       (ipa >= VNET_LO && ipa < VNET_HI) ||
+       (ipa >= VCON_LO && ipa < VCON_HI))) {
     int is_uart = (ipa >= PL011_LO && ipa < PL011_HI);
     int is_virtio = (ipa >= VIRTIO_LO && ipa < VIRTIO_HI);
     int is_vblk = (ipa >= VBLK_LO && ipa < VBLK_HI);
     int is_vnet = (ipa >= VNET_LO && ipa < VNET_HI);
+    int is_vcon = (ipa >= VCON_LO && ipa < VCON_HI);
     vcpus[current_vcpu].mmio_emulated++;
     uint64_t isv = (esr >> 24) & 1;
     uint64_t sas = (esr >> 22) & 3;
@@ -1830,6 +1952,8 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
           hyp_emulate_vblk(ipa, 1, &v);
         else if (is_vnet)
           hyp_emulate_vnet(ipa, 1, &v);
+        else if (is_vcon)
+          hyp_emulate_vcon(ipa, 1, &v);
         else
           hyp_emulate_gic(ipa, 1, &v);
       } else {
@@ -1841,6 +1965,8 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
           hyp_emulate_vblk(ipa, 0, &v);
         else if (is_vnet)
           hyp_emulate_vnet(ipa, 0, &v);
+        else if (is_vcon)
+          hyp_emulate_vcon(ipa, 0, &v);
         else
           hyp_emulate_gic(ipa, 0, &v);
         if (sas == 0)

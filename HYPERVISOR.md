@@ -258,6 +258,14 @@ own registers and needs no context switch.
   injecting the device SPI. Verified: the guest's `virtio_net` driver (a module
   from the initramfs) brings up `eth0`, and `ping 10.0.0.1` gets ICMP echo
   replies (2/2, 0% loss) — exercising the full two-queue TX+RX path.
+- **Emulated virtio-console (virtio-mmio)**: a console device (DeviceID 3) at
+  IPA `0x0a000600` (IRQ SPI 5 / INTID 37) exposing `/dev/hvc0`, with two
+  virtqueues (0 = receiveq, 1 = transmitq). On a TX `QueueNotify` the hypervisor
+  gathers the guest's output bytes from the descriptor chain and forwards them
+  (line-buffered) to its own serial, then completes the buffers and injects the
+  SPI. Unlike the per-byte-trapping PL011, output is delivered in batches (one
+  trap per buffer). Verified: `echo … > /dev/hvc0` in the guest appears as
+  `[guest hvc0] …` on the hypervisor serial.
 
 ---
 

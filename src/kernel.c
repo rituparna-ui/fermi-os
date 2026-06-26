@@ -77,7 +77,14 @@ void early_init() {
 
   exceptions_init();
 
-  pmm_init(MEM_START, MEM_SIZE);
+  /* Reserve a guard at the very top of RAM. The MMU (stage-1) and, under the
+   * hypervisor, stage-2 both map [MEM_START, MEM_START+MEM_SIZE); but the PMM
+   * must not hand out the top of that range, because a task kernel stack placed
+   * at the boundary would have its exception trap frame (saved x0-x30 + FP) span
+   * past MEM_START+MEM_SIZE. Under the EL2 hypervisor the region just above is
+   * the (deliberately unmapped) Linux-guest window, so such a crossing faults.
+   * Keeping a guard below the mapped top avoids it. */
+  pmm_init(MEM_START, MEM_SIZE - PMM_TOP_GUARD);
   pmm_print_info();
 
   uint64_t *l1_phys = mmu_init();

@@ -112,4 +112,12 @@
 		reg = <0x0 0x0a000400 0x0 0x200>;
 		interrupts = <0 4 4>;
 	};
+
+	/* Emulated virtio-console (virtio-mmio, device id 3) => /dev/hvc0. The
+	 * hypervisor forwards transmitted data to its own serial. IRQ SPI 5. */
+	virtio_console@a000600 {
+		compatible = "virtio,mmio";
+		reg = <0x0 0x0a000600 0x0 0x200>;
+		interrupts = <0 5 4>;
+	};
 };

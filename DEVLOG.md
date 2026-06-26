@@ -422,6 +422,27 @@ monotonic across the *entire* round trip (`0x3d → 0x69 → 0x9b → climbing`)
 guest provably survives both migrations, the demo guest then retires, and the
 SMP Linux guest still boots to its ext4 root disk concurrently. No anomalies.
 
+### Emulated virtio-console (+ a Fermi top-of-RAM guard)
+*Why:* complete the virtio device set (rng/blk/net/**console**) with a
+paravirtual console — and, unlike the PL011, deliver output in *batches* (one
+trap per buffer, not per byte). A virtio-mmio console (DeviceID 3) at IPA
+`0x0a000600` (SPI 5 / INTID 37) with two virtqueues; on a transmit-queue notify
+the hypervisor gathers the guest's bytes and forwards them line-buffered to its
+serial. `CONFIG_VIRTIO_CONSOLE=y`, so the built-in driver creates `/dev/hvc0`.
+*A pre-existing Fermi bug it exposed:* during verification Fermi sometimes
+**parked** — `exception_common` doing `ldr x1,[sp,#680]` faulted reading its
+trap frame at `~0x240000208`, i.e. a task kernel stack sat at the very top of
+Fermi's 8 GiB RAM and its trap frame (saved x0–x30 + FP/SIMD, ~700 bytes) spanned
+past `MEM_START+MEM_SIZE` into the (deliberately unmapped) Linux-guest window.
+The hypervisor's isolation correctly faulted it, but parking halts the box. Fix:
+reserve a 16 MiB **top-of-RAM guard** — the PMM hands out only `[MEM_START,
+MEM_START+MEM_SIZE-16MiB)` while stage-1 and stage-2 still map the full range,
+so no stack reaches the boundary. (The bug predates virtio-console; the extra
+EL2 load just made it surface.)
+*Verified (two consecutive 150 s runs):* `[guest hvc0] HVC0_VIRTIO_OK` forwarded
+through the transmitq, while the SMP Linux guest boots to its ext4 root, the
+live-migration round trip completes, and there are **no parks/anomalies**.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)

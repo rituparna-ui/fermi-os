@@ -5,6 +5,10 @@
 
 #define MEM_START 0x40000000ULL
 #define MEM_SIZE (8ULL * 1024 * 1024 * 1024)
+/* Top-of-RAM guard kept out of the PMM (still stage-1/stage-2 mapped) so a
+ * task stack at the boundary can't have its trap frame cross MEM_START+MEM_SIZE
+ * into the unmapped region above (the Linux-guest window under the hypervisor). */
+#define PMM_TOP_GUARD (16ULL * 1024 * 1024)
 #define PAGE_SIZE 4096
 // Page size = 2^PAGE_SHIFT
 #define PAGE_SHIFT 12

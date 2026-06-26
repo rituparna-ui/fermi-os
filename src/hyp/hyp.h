@@ -152,4 +152,9 @@ void hyp_run_smp_guest(void);
  * before the host timer. */
 void hyp_run_fault_isolation(void);
 
+/* Milestone 27: per-VM observability. Boot a full FermiOS guest, account every
+ * exit by class, and dump a virsh-style exit summary. No-op at EL1; runs before
+ * the host timer. */
+void hyp_run_observability(void);
+
 #endif /* HYP_HYP_H */

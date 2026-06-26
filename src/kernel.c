@@ -854,6 +854,7 @@ void kernel_main() {
   hyp_run_miniguest();        /* M22 */
   hyp_run_smp_guest();        /* M23 */
   hyp_run_fault_isolation();  /* M25 */
+  hyp_run_observability();    /* M27 */
   hyp_run_dual_fermios();     /* M9c */
 #endif
 

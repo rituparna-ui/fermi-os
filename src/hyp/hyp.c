@@ -334,6 +334,32 @@ static const char *hyp_ec_name(uint64_t ec) {
   }
 }
 
+/* --- Per-VM observability (M27) --- */
+
+void vcpu_stat_account(vcpu_t *v) {
+  v->stats.exits++;
+  if (v->exit_reason == HYP_EXC_IRQ) {
+    v->stats.irq++;
+    return;
+  }
+  if (v->exit_reason == HYP_EXC_SYNC) {
+    switch (ESR_EC(v->esr)) {
+    case 0x16: v->stats.hvc++; return;  /* HVC */
+    case 0x24: v->stats.mmio++; return; /* stage-2 data abort (MMIO) */
+    default:   v->stats.other++; return;
+    }
+  }
+  v->stats.other++;
+}
+
+void vcpu_stats_dump(const vcpu_t *v) {
+  uart_printf("[HYP] vm '%s' (vmid=%u) exit stats:\n",
+              v->name ? v->name : "vm", (uint64_t)v->vmid);
+  uart_printf("        total=%u  hvc=%u  mmio=%u  irq=%u  fault=%u  other=%u\n",
+              v->stats.exits, v->stats.hvc, v->stats.mmio, v->stats.irq,
+              v->stats.fault, v->stats.other);
+}
+
 /* PCI windows the guest's pci.c / virtio drivers touch. We emulate them as
  * "no device present": reads return all-1s (vendor 0xFFFF), writes are dropped.
  * This lets the guest's PCI enumeration + virtio init cleanly find nothing and
@@ -2183,4 +2209,95 @@ void hyp_run_fault_isolation(void) {
   int ok = (!bad_alive) && (good_runs == 3);
   uart_printf("[HYP] M25: %s (bad VM reaped=%s, good VM ran %u times, host alive)\n",
               ok ? "PASS" : "FAIL", bad_alive ? "no" : "yes", good_runs);
+}
+
+/* ---- Milestone 27: per-VM observability (exit accounting) ---- */
+
+void hyp_run_observability(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M27: per-VM observability — accounting a FermiOS guest's exits");
+
+  uintptr_t ram = pmm_allocate_pages(FERMI_GUEST_RAM / 0x1000);
+  static stage2_t s2;
+  if (!ram || !stage2_create(&s2, /*vmid=*/1)) {
+    return;
+  }
+  stage2_map(&s2, GUEST_ENTRY_IPA, (uint64_t)ram, FERMI_GUEST_RAM, 0);
+  uintptr_t ecam = stage2_back_ecam(&s2);
+
+  uint64_t blob_len = (uint64_t)(__guest_blob_end - __guest_blob_start);
+  uint64_t kva = PHYS_TO_VIRT((uint64_t)ram);
+  for (uint64_t b = 0; b < blob_len; b++) {
+    ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)__guest_blob_start)[b];
+  }
+  guest_sync_icache(kva, (blob_len + 0xFFF) & ~0xFFFULL);
+
+  static vcpu_t v;
+  for (int i = 0; i < 31; i++) v.x[i] = 0;
+  v.pc = GUEST_ENTRY_IPA;
+  v.pstate = 0x3C5;
+  v.sp_el1 = 0;
+  v.vttbr = stage2_vttbr(&s2);
+  v.hcr_extra = HCR_IMO;
+  v.vmid = 1;
+  v.name = "statvm";
+  vgic_init();
+  vgic_vcpu_reset(&v.vgic);
+  vgic_set_current(&v.vgic);
+  vuart_init(&v.vuart, "statvm");
+  gic_enable_irq(30);
+  gic_enable_irq(HYP_CNTHP_PPI);
+
+  uint64_t freq;
+  __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(freq));
+
+  uint64_t host_daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(host_daif));
+  __asm__ __volatile__("msr daifset, #3");
+
+  /* Run the guest for a few EL2-timer-bounded slices, accounting every exit. */
+  for (int slice = 0; slice < 3; slice++) {
+    cnthp_arm(freq / 50); /* 20 ms */
+    int slice_done = 0;
+    long guard = 400000;
+    while (!slice_done && guard-- > 0) {
+      vcpu_enter(&v);
+      vcpu_stat_account(&v); /* <-- the observability hook */
+
+      if (v.exit_reason == HYP_EXC_IRQ) {
+        uint64_t intid = gic_ack_irq();
+        if (intid == HYP_CNTHP_PPI) {
+          cnthp_disarm();
+          gic_end_irq(intid);
+          slice_done = 1;
+        } else if (intid == 30) {
+          vgic_inject_hw(30);
+        } else if (intid != GIC_INTID_NO_PENDING) {
+          gic_end_irq(intid);
+        }
+      } else if (v.exit_reason == HYP_EXC_SYNC && ESR_EC_OF(v.esr) == 0x16) {
+        if (psci_handle(&v) == PSCI_ACT_OFF) { slice_done = 1; }
+      } else if (!df_service_exit(&v)) {
+        v.stats.fault++;
+        slice_done = 1;
+      }
+    }
+    cnthp_disarm();
+  }
+
+  __asm__ __volatile__("msr daif, %0" ::"r"(host_daif));
+  vuart_flush(&v.vuart);
+  uart_println("");
+  vcpu_stats_dump(&v);
+  uart_printf("[HYP] M27: done (%s)\n",
+              v.stats.exits > 0 ? "exit accounting live" : "no exits?!");
+
+  if (ecam) {
+    pmm_free_pages(ecam, ECAM_BUS0_SIZE / 0x1000);
+  }
+  stage2_destroy(&s2);
+  pmm_free_pages(ram, FERMI_GUEST_RAM / 0x1000);
 }

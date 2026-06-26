@@ -38,6 +38,17 @@ typedef struct vcpu_fp {
   uint64_t fpsr, fpcr;
 } __attribute__((aligned(16))) vcpu_fp_t;
 
+/* Per-vCPU exit accounting (observability / introspection). Bucketed by the
+ * class of trap that brought the guest to EL2. */
+typedef struct vcpu_stats {
+  uint64_t exits;  /* total guest exits         */
+  uint64_t hvc;    /* HVC hypercalls (EC 0x16)  */
+  uint64_t mmio;   /* stage-2 data aborts to emulated MMIO (EC 0x24) */
+  uint64_t irq;    /* physical IRQ exits        */
+  uint64_t fault;  /* unhandled/fatal exits     */
+  uint64_t other;  /* anything else             */
+} vcpu_stats_t;
+
 /* vGIC virtual-interface state (per-vCPU; the ICH_* regs are shared HW). */
 typedef struct vcpu_vgic {
   uint64_t hcr, vmcr, ap0r0, ap1r0;
@@ -72,6 +83,7 @@ typedef struct vcpu {
   vcpu_fp_t   fp;    /* q0-q31 + FPSR/FPCR                            */
   vcpu_vgic_t vgic;  /* virtual GIC interface state                   */
   vuart_t     vuart; /* virtual PL011 console                         */
+  vcpu_stats_t stats; /* per-vCPU exit accounting                     */
 
   /* ---- bookkeeping (not touched by asm) ---- */
   uint32_t vmid;
@@ -83,6 +95,13 @@ typedef struct vcpu {
  * return, v->exit_reason / v->esr / v->pc etc. describe the exit, and the host
  * scheduler regains control. Implemented in world_switch.S. */
 void vcpu_enter(vcpu_t *v);
+
+/* Account one just-returned exit into v->stats, bucketed by class. Call once
+ * immediately after vcpu_enter(). (Defined in hyp.c.) */
+void vcpu_stat_account(vcpu_t *v);
+
+/* Print a virsh-style per-VM exit summary. (Defined in hyp.c.) */
+void vcpu_stats_dump(const vcpu_t *v);
 
 /* Save the live guest EL1 sysreg bank (via _EL12) + FP into the structs, and
  * restore them. Used by the multi-guest scheduler around a world switch.

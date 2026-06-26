@@ -17,6 +17,8 @@
 #define GICR_IGROUPR0 (GICR_SGI_BASE + 0x0080)
 #define GICR_IGRPMODR0 (GICR_SGI_BASE + 0x0D00)
 #define GICR_ISENABLER0 (GICR_SGI_BASE + 0x0100)
+#define GICR_ICENABLER0 (GICR_SGI_BASE + 0x0180)
+#define GICD_ICENABLER (GICD_BASE + 0x0180)
 #define GICR_WAKER_PROCESSOR_SLEEP (1U << 1)
 #define GICR_WAKER_CHILDREN_ASLEEP (1U << 2)
 
@@ -24,6 +26,7 @@
 
 void gic_init(void);
 void gic_enable_irq(uint32_t intid);
+void gic_disable_irq(uint32_t intid);
 uint64_t gic_ack_irq(void);
 void gic_end_irq(uint64_t intid);
 

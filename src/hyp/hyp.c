@@ -2423,6 +2423,11 @@ void hyp_run_linux(void) {
     cnthp_disarm();
   }
 
+  /* Disable the PPIs we enabled for the guest run so the host isn't left with
+   * an armed CNTHP/timer PPI that storms its own (post-return) IRQ path. */
+  cnthp_disarm();
+  gic_disable_irq(HYP_CNTHP_PPI);
+  gic_disable_irq(30);
   __asm__ __volatile__("msr daif, %0" ::"r"(host_daif));
   vuart_flush(&v.vuart);
   uart_println("");

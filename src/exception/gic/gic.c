@@ -77,6 +77,16 @@ void gic_enable_irq(uint32_t intid) {
   uart_printf("[GIC] Enabled IRQ %d\n", (uint64_t)intid);
 }
 
+void gic_disable_irq(uint32_t intid) {
+  /* Write-1-to-clear in the ICENABLER register for this INTID. */
+  if (intid < 32) {
+    mmio_write32(GICR_ICENABLER0, (1U << intid));
+  } else {
+    uint32_t reg = GICD_ICENABLER + (intid / 32) * 4;
+    mmio_write32(reg, (1U << (intid % 32)));
+  }
+}
+
 uint64_t gic_ack_irq() {
   uint64_t ack;
   __asm__ __volatile__("mrs %0, icc_iar1_el1" : "=r"(ack));

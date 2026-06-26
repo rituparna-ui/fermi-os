@@ -107,68 +107,136 @@ uint32_t vgic_num_lr(void) { return vgic_nr_lr; }
 /* --- GICD/GICR MMIO emulation (windows left stage-2-unmapped) --- */
 
 #define GICD_IPA_BASE 0x08000000ULL
-#define GICD_IPA_END  0x08010000ULL
+#define GICD_IPA_END  0x08010000ULL  /* 64 KiB distributor                */
 #define GICR_IPA_BASE 0x080A0000ULL
-#define GICR_IPA_END  0x080C0000ULL
+#define GICR_IPA_END  0x080C0000ULL  /* RD frame (+0) + SGI frame (+0x10000) */
+#define GICR_SGI_OFF  0x10000U        /* SGI/PPI frame within the redistributor */
 
-#define R_GICD_CTLR           0x0000
-#define R_GICD_ISENABLER0     0x0100
-#define R_GICR_WAKER          0x0014
-#define R_GICR_SGI_IGROUPR0   0x10080
-#define R_GICR_SGI_IGRPMODR0  0x10D00
-#define R_GICR_SGI_ISENABLER0 0x10100
+/* GICD register offsets (within the 64 KiB distributor). */
+#define R_GICD_CTLR     0x0000
+#define R_GICD_TYPER    0x0004
+#define R_GICD_IIDR     0x0008
+#define R_GICD_TYPER2   0x000C
+#define R_GICD_IGROUPR  0x0080   /* .. 0x00FC */
+#define R_GICD_ISENABLER 0x0100  /* .. 0x017C */
+#define R_GICD_ICENABLER 0x0180  /* .. 0x01FC */
+#define R_GICD_IPRIORITYR 0x0400 /* .. 0x07FC */
+#define R_GICD_ICFGR    0x0C00   /* .. 0x0CFC */
+#define R_GICD_IROUTER  0x6000   /* .. 0x7FD8 */
+#define R_PIDR2         0xFFE8   /* GICD_PIDR2 == GICR_PIDR2 */
+
+/* GICR RD-frame register offsets. */
+#define R_GICR_CTLR     0x0000
+#define R_GICR_IIDR     0x0004
+#define R_GICR_TYPER    0x0008   /* 64-bit */
+#define R_GICR_WAKER    0x0014
+
+/* GICR SGI-frame (offset GICR_SGI_OFF) register offsets. */
+#define R_SGI_IGROUPR0   0x0080
+#define R_SGI_ISENABLER0 0x0100
+#define R_SGI_ICENABLER0 0x0180
+#define R_SGI_IPRIORITYR 0x0400  /* .. 0x041C */
+#define R_SGI_ICFGR0     0x0C00
+#define R_SGI_ICFGR1     0x0C04
+#define R_SGI_IGRPMODR0  0x0D00
 
 #define GICD_CTLR_ARE_NS  (1U << 4)
 #define GICD_CTLR_EN_G1NS (1U << 1)
+#define PIDR2_ARCH_GICV3  0x30U   /* bits[7:4]=0b0011 => GICv3 */
 
 int vgic_mmio_is_target(uint64_t ipa) {
   return (ipa >= GICD_IPA_BASE && ipa < GICD_IPA_END) ||
          (ipa >= GICR_IPA_BASE && ipa < GICR_IPA_END);
 }
 
+/* GICD_TYPER: ITLinesNumber[4:0] encodes (SPIs+1)/32 - 1. We expose 32 lines
+ * (the SGI/PPI block only) => ITLinesNumber=0; no LPIs/MBIS/ESPI/RSS. */
+#define GICD_TYPER_VAL  0x00000000U
+
 void vgic_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
                        int size_bytes) {
-  /* Fail-safe: never dereference a NULL per-vCPU model. The caller is supposed
-   * to vgic_set_current() before servicing a guest's GICD/GICR MMIO trap; if it
-   * somehow did not, a guest access to the (unmapped, trapping) vGIC window
-   * would otherwise NULL-deref at EL2 and crash the host. Treat it as "no
-   * device": reads return 0, writes are dropped. */
+  /* Fail-safe: never dereference a NULL per-vCPU model. */
   if (!cur) {
-    if (!is_write && val) {
-      *val = 0;
-    }
+    if (!is_write && val) *val = 0;
     return;
   }
-  uint64_t off = (ipa >= GICR_IPA_BASE) ? (ipa - GICR_IPA_BASE)
-                                        : (ipa - GICD_IPA_BASE);
-  uint32_t size_mask =
-      (size_bytes >= 4) ? 0xFFFFFFFFU : ((1U << (size_bytes * 8)) - 1U);
+  uint64_t size_mask = (size_bytes >= 8) ? ~0ULL
+                       : (size_bytes >= 4) ? 0xFFFFFFFFULL
+                       : (((uint64_t)1 << (size_bytes * 8)) - 1U);
+  int in_gicr = (ipa >= GICR_IPA_BASE);
+  uint64_t off = in_gicr ? (ipa - GICR_IPA_BASE) : (ipa - GICD_IPA_BASE);
 
+  /* ---------------- writes ---------------- */
   if (is_write) {
     uint32_t w = (uint32_t)*val & size_mask;
-    switch (off) {
-    case R_GICD_CTLR:
-      cur->gicd_ctlr = w & (GICD_CTLR_ARE_NS | GICD_CTLR_EN_G1NS);
-      break;
-    case R_GICD_ISENABLER0:     cur->gicd_isenabler0 |= w; break;
-    case R_GICR_WAKER:          /* ProcessorSleep handled on read */ break;
-    case R_GICR_SGI_IGROUPR0:   cur->gicr_igroupr0 = w; break;
-    case R_GICR_SGI_IGRPMODR0:  cur->gicr_igrpmodr0 = w; break;
-    case R_GICR_SGI_ISENABLER0: cur->gicr_isenabler0 |= w; break;
-    default: break;
+    if (!in_gicr) { /* GICD */
+      if (off == R_GICD_CTLR) {
+        cur->gicd_ctlr = w & (GICD_CTLR_ARE_NS | GICD_CTLR_EN_G1NS);
+      } else if (off >= R_GICD_ISENABLER && off < R_GICD_ISENABLER + 0x80) {
+        if (off == R_GICD_ISENABLER) cur->gicd_isenabler0 |= w;
+      }
+      /* IGROUPR/ICENABLER/IPRIORITYR/ICFGR/IROUTER: accept + drop (no real
+       * SPIs are wired to this guest). */
+      return;
     }
+    /* GICR */
+    if (off >= GICR_SGI_OFF) {
+      uint32_t so = (uint32_t)(off - GICR_SGI_OFF);
+      switch (so) {
+      case R_SGI_IGROUPR0:   cur->gicr_igroupr0 = w; break;
+      case R_SGI_ISENABLER0: cur->gicr_isenabler0 |= w; break;
+      case R_SGI_ICENABLER0: cur->gicr_isenabler0 &= ~w; break;
+      case R_SGI_IGRPMODR0:  cur->gicr_igrpmodr0 = w; break;
+      default: break; /* IPRIORITYR/ICFGR: accept + drop */
+      }
+    }
+    /* GICR RD frame writes (CTLR, WAKER): accept; ProcessorSleep clears
+     * immediately (ChildrenAsleep reads back 0). */
     return;
   }
 
-  uint32_t r = 0;
+  /* ---------------- reads ---------------- */
+  uint64_t r = 0;
+  if (!in_gicr) { /* GICD */
+    switch (off) {
+    case R_GICD_CTLR:   r = cur->gicd_ctlr; break;
+    case R_GICD_TYPER:  r = GICD_TYPER_VAL; break;
+    case R_GICD_IIDR:   r = 0x43B; /* JEP106 ARM, arbitrary impl */ break;
+    case R_GICD_TYPER2: r = 0; break;
+    case R_PIDR2:       r = PIDR2_ARCH_GICV3; break;
+    default:
+      if (off == R_GICD_ISENABLER) r = cur->gicd_isenabler0;
+      else r = 0;
+      break;
+    }
+    *val = r & size_mask;
+    return;
+  }
+  /* GICR */
+  if (off >= GICR_SGI_OFF) {
+    uint32_t so = (uint32_t)(off - GICR_SGI_OFF);
+    switch (so) {
+    case R_SGI_IGROUPR0:   r = cur->gicr_igroupr0; break;
+    case R_SGI_ISENABLER0: r = cur->gicr_isenabler0; break;
+    case R_SGI_ICENABLER0: r = cur->gicr_isenabler0; break;
+    case R_SGI_IGRPMODR0:  r = cur->gicr_igrpmodr0; break;
+    default: r = 0; break;
+    }
+    *val = r & size_mask;
+    return;
+  }
   switch (off) {
-  case R_GICD_CTLR:           r = cur->gicd_ctlr; break;
-  case R_GICD_ISENABLER0:     r = cur->gicd_isenabler0; break;
-  case R_GICR_WAKER:          r = 0; /* ChildrenAsleep clear -> poll exits */ break;
-  case R_GICR_SGI_IGROUPR0:   r = cur->gicr_igroupr0; break;
-  case R_GICR_SGI_IGRPMODR0:  r = cur->gicr_igrpmodr0; break;
-  case R_GICR_SGI_ISENABLER0: r = cur->gicr_isenabler0; break;
-  default: r = 0; break;
+  case R_GICR_CTLR:  r = 0; /* RWP=0: no pending register writes */ break;
+  case R_GICR_IIDR:  r = 0x43B; break;
+  case R_GICR_TYPER: /* 64-bit: Last=1 (only redistributor), affinity in
+                      * [63:32] = 0, Processor_Number in [23:8] = 0. */
+    r = (uint64_t)(1U << 4); /* GICR_TYPER_LAST */
+    break;
+  case R_GICR_TYPER + 4: r = 0; /* high word of TYPER (affinity 0) */ break;
+  case R_GICR_WAKER: r = 0; /* ChildrenAsleep=0 -> guest's wakeup poll exits */
+    break;
+  case R_PIDR2:      r = PIDR2_ARCH_GICV3; break;
+  default:           r = 0; break;
   }
   *val = r & size_mask;
 }

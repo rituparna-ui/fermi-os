@@ -535,6 +535,12 @@ fn dispatch(line: &str) {
             }
         }
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
+        "parsum" => {
+            let n = parse_u64(arg1).unwrap_or(1000000).max(1);
+            let (res, expect, chunks) = crate::smp::parsum(n);
+            kprintln!("parsum 1..={}: {} chunks across 2 cores -> {} (expect {}) -> {}",
+                      n, chunks, res, expect, if res == expect { "OK" } else { "MISMATCH" });
+        }
         "smpsched" => {
             let k = parse_u64(arg1).unwrap_or(120).max(1);
             let free_before = crate::mm::heap::free_bytes();

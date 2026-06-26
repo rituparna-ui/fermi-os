@@ -268,6 +268,54 @@ pub fn pool_seed(k: u64) -> u64 {
     sum
 }
 
+// ===== Parallel reduction over the symmetric pool: sum(1..=n) across cores =====
+const PARSUM_CHUNKS: usize = 64;
+static mut PARSUM_RANGE: [(u64, u64); PARSUM_CHUNKS] = [(0, 0); PARSUM_CHUNKS];
+static PARSUM_BASE: AtomicU64 = AtomicU64::new(0);
+static PARSUM_RESULT: AtomicU64 = AtomicU64::new(0);
+static PARSUM_DONE: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn parsum_task() {
+    let core = (mrs!(mpidr_el1) & 0xff) as usize & 1;
+    let pid = unsafe { (*(POOL_CUR[core] as *mut Task)).pid };
+    let idx = (pid - PARSUM_BASE.load(Ordering::Relaxed)) as usize;
+    if idx < PARSUM_CHUNKS {
+        let (lo, hi) = unsafe { PARSUM_RANGE[idx] };
+        let mut acc = 0u64;
+        let mut i = lo;
+        while i <= hi { acc = acc.wrapping_add(i); i += 1; }
+        PARSUM_RESULT.fetch_add(acc, Ordering::Relaxed);
+    }
+    PARSUM_DONE.fetch_add(1, Ordering::Relaxed);
+    smp_pool_return();
+}
+
+/// Compute sum(1..=n) by splitting it into chunks run as pooled tasks across
+/// BOTH cores, then return (result, expected, chunks).
+pub fn parsum(n: u64) -> (u64, u64, u64) {
+    let chunks = if n < PARSUM_CHUNKS as u64 { n.max(1) } else { PARSUM_CHUNKS as u64 };
+    PARSUM_RESULT.store(0, Ordering::Relaxed);
+    PARSUM_DONE.store(0, Ordering::Relaxed);
+    let base = POOL_NEXT_PID.load(Ordering::Relaxed);
+    PARSUM_BASE.store(base, Ordering::Relaxed);
+    let per = n / chunks;
+    for c in 0..chunks {
+        let lo = c * per + 1;
+        let hi = if c == chunks - 1 { n } else { (c + 1) * per };
+        unsafe { PARSUM_RANGE[c as usize] = (lo, hi); }
+        let pid = POOL_NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        let t = sched::make_pool_task("parsum", pid, parsum_task);
+        if !t.is_null() { pool_push(t); }
+    }
+    // Wait (bounded) for all chunk tasks to finish.
+    let deadline = crate::exception::timer::uptime_ms() + 8000;
+    while PARSUM_DONE.load(Ordering::Relaxed) < chunks {
+        if crate::exception::timer::uptime_ms() >= deadline { break; }
+        sched::sleep_ms(5);
+    }
+    (PARSUM_RESULT.load(Ordering::Relaxed), n * (n + 1) / 2, chunks)
+}
+
 extern "C" fn pool_task_body() {
     let first = (mrs!(mpidr_el1) & 0xff) as usize & 1;
     let mut migrated = false;

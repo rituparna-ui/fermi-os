@@ -26,6 +26,17 @@ task_trampoline:
 1:  wfi
     b   1b
 
+
+// Pool-task trampoline: like task_trampoline but does NOT unmask IRQs, so a
+// symmetric-pool task runs with the IRQ state the scheduler set (masked =
+// non-preemptible). x19 = entry fn. The entry calls smp_pool_return and never
+// returns; the wfi loop is just a safety net.
+.global pool_trampoline
+pool_trampoline:
+    blr x19
+1:  wfi
+    b   1b
+
 .global context_switch
 context_switch:
     sub sp, sp, #160

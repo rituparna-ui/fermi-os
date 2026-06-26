@@ -132,6 +132,7 @@ pub extern "C" fn kernel_main() -> ! {
     exception::timer::start(exception::timer::TIMER_INTERVAL_MS);
     // Seed a shared work queue (single-threaded), then bring up core 1 so both
     // cores drain it concurrently via a SpinLock (symmetric work distribution).
+    smp::pool_init(); // per-core scheduler contexts (single-threaded)
     smp::wq_seed(8000);
     smp::bringup();
 
@@ -217,6 +218,7 @@ pub extern "C" fn kernel_main() -> ! {
     // Preemptive demo tasks.
     sched::create_task("netd", netd);
     sched::create_task("smpw", smp::smp_core0_worker);
+    sched::create_task("psch0", smp::pool_sched_core0);
     sched::create_user_task("user1");
     sched::create_task("shell", shell::shell_task);
     // Load an ELF binary from FAT32 and run it at EL0 (milestone 17).

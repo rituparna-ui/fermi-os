@@ -535,6 +535,19 @@ fn dispatch(line: &str) {
             }
         }
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
+        "smpsched" => {
+            let k = parse_u64(arg1).unwrap_or(120).max(1);
+            crate::smp::pool_seed(k);
+            kprintln!("seeded {} pooled tasks; draining on both cores...", k);
+            sched::sleep_ms(1500);
+            let (r0, r1, s0, s1, seeded, rem) = crate::smp::pool_stats();
+            let expect = (1000..1000 + seeded).sum::<u64>();
+            kprintln!("  core0 ran {} tasks (pid-sum {})", r0, s0);
+            kprintln!("  core1 ran {} tasks (pid-sum {})", r1, s1);
+            kprintln!("  total {}/{} run, {} remaining, checksum {} (expect {}) -> {}",
+                      r0 + r1, seeded, rem, s0 + s1, expect,
+                      if r0 + r1 == seeded && s0 + s1 == expect { "OK" } else { "incomplete" });
+        }
         "smptest" => {
             let (c0, c1, s0, s1, enq, rem) = crate::smp::wq_stats();
             let expect = if enq > 0 { enq * (enq - 1) / 2 } else { 0 };

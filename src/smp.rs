@@ -171,6 +171,7 @@ fn c1_schedule() {
 extern "C" fn c1_task_a() {
     loop {
         C1_A_BEATS.fetch_add(1, Ordering::Relaxed);
+        if pool_run_one(1) { continue; }       // symmetric pool first
         if !wq_consume(false) {
             for _ in 0..200_000u64 { core::hint::spin_loop(); }
         }
@@ -209,6 +210,108 @@ pub fn c1_preempt() {
 pub fn is_secondary() -> bool {
     let mpidr: u64 = mrs!(mpidr_el1);
     (mpidr & 0xFF) != 0
+}
+
+
+// ===== Symmetric run-to-completion task pool (shared by BOTH cores) =====
+// A shared SpinLock run queue of real Tasks. A core POPS a task (removing it,
+// so no other core can take it), context_switches to it via a per-core
+// scheduler context, the task runs to completion and switches back — never
+// requeued mid-flight, so the "prev on two stacks" race cannot occur. Pool
+// tasks run with IRQs masked (pool_trampoline never unmasks + pool_run_one
+// masks around the nested switch) so neither core's preemptive scheduler is
+// corrupted by the nested context switch.
+const POOL_CAP: usize = 512;
+struct PoolQ { buf: [u64; POOL_CAP], head: usize, tail: usize, len: usize, seeded: u64 }
+static POOLQ: SpinLock<PoolQ> = SpinLock::new(PoolQ { buf: [0; POOL_CAP], head: 0, tail: 0, len: 0, seeded: 0 });
+static mut SCHED_CTX: [u64; 2] = [0, 0];
+static mut POOL_CUR: [u64; 2] = [0, 0];
+static POOL_RAN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static POOL_SUM: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Allocate the per-core scheduler save-contexts. Call once, single-threaded.
+pub fn pool_init() {
+    unsafe {
+        SCHED_CTX[0] = sched::alloc_bare_task() as u64;
+        SCHED_CTX[1] = sched::alloc_bare_task() as u64;
+    }
+}
+
+fn pool_push(t: *mut Task) {
+    let mut q = POOLQ.lock_irqsave();
+    if q.len < POOL_CAP { let i = q.tail; q.buf[i] = t as u64; q.tail = (i + 1) % POOL_CAP; q.len += 1; }
+}
+fn pool_pop() -> *mut Task {
+    let mut q = POOLQ.lock_irqsave();
+    if q.len == 0 { return core::ptr::null_mut(); }
+    let i = q.head; let v = q.buf[i]; q.head = (i + 1) % POOL_CAP; q.len -= 1; v as *mut Task
+}
+
+/// Seed `k` pooled tasks (distinct pids) into the shared queue.
+pub fn pool_seed(k: u64) {
+    for i in 0..k {
+        let t = sched::make_pool_task("pool", 1000 + i, pool_task_body);
+        if !t.is_null() {
+            pool_push(t);
+            POOLQ.lock_irqsave().seeded += 1;
+        }
+    }
+}
+
+extern "C" fn pool_task_body() {
+    let core = (mrs!(mpidr_el1) & 0xff) as usize & 1;
+    let t = unsafe { POOL_CUR[core] } as *mut Task;
+    let pid = unsafe { (*t).pid };
+    POOL_RAN[core].fetch_add(1, Ordering::Relaxed);
+    POOL_SUM[core].fetch_add(pid, Ordering::Relaxed);
+    for _ in 0..300_000u64 { core::hint::spin_loop(); }
+    smp_pool_return();
+}
+
+fn smp_pool_return() -> ! {
+    let core = (mrs!(mpidr_el1) & 0xff) as usize & 1;
+    unsafe {
+        let t = POOL_CUR[core] as *mut Task;
+        (*t).state = crate::sched::TASK_DEAD;
+        let ctx = SCHED_CTX[core] as *mut Task;
+        sched::raw_context_switch(t, ctx);
+    }
+    loop { unsafe { core::arch::asm!("wfi") } }
+}
+
+/// Run one pooled task on `core` non-preemptibly. Returns true if one ran.
+pub fn pool_run_one(core: usize) -> bool {
+    if unsafe { SCHED_CTX[core] } == 0 { return false; }
+    let t = pool_pop();
+    if t.is_null() { return false; }
+    let daif: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
+        core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+        POOL_CUR[core] = t as u64;
+        (*t).state = TASK_RUNNING;
+        let ctx = SCHED_CTX[core] as *mut Task;
+        sched::raw_context_switch(ctx, t); // run task to completion; returns here
+        core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack));
+    }
+    true
+}
+
+/// Core 0 worker: drain a few pooled tasks per scheduler slice, then yield.
+pub extern "C" fn pool_sched_core0() {
+    loop {
+        let mut n = 0;
+        while pool_run_one(0) { n += 1; if n >= 4 { break; } }
+        sched::sleep_ms(2);
+    }
+}
+
+/// (ran0, ran1, sum0, sum1, seeded, remaining)
+pub fn pool_stats() -> (u64, u64, u64, u64, u64, usize) {
+    let q = POOLQ.lock_irqsave();
+    (POOL_RAN[0].load(Ordering::Relaxed), POOL_RAN[1].load(Ordering::Relaxed),
+     POOL_SUM[0].load(Ordering::Relaxed), POOL_SUM[1].load(Ordering::Relaxed),
+     q.seeded, q.len)
 }
 
 #[no_mangle]

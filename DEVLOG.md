@@ -378,20 +378,24 @@ there, with the guest none the wiser.
   handler marks that page dirty, re-grants write, TLBIs, and *re-executes* the
   store (ELR not advanced).
 - **Iterative rounds:** repeat — re-copy only the pages dirtied since the last
-  round, re-protect, let the guest run — until the dirty set is small ("converged")
-  or a round cap is hit. The guest here has a 16-page working set, so each round
-  re-copies ~16 pages and it hits the round cap (a faithful "busy guest" case).
+  round, re-protect, let the guest run — until the dirty set is small enough
+  ("converged", ≤2 pages) or a round cap is hit. The guest's working set
+  *shrinks* over time (`ws = clamp(80 - counter, 1, 16)`), so the per-round dirty
+  count visibly decreases (e.g. `16 → 16 → 9 → 2 → converged`), exactly like
+  real pre-copy reducing downtime before the final sync.
 - **Stop-and-copy:** final dirty flush, re-point the guest's stage-2 (`mig_l3`)
-  SRC→DEST, TLBI, poison SRC.
+  SRC→DEST, TLBI, poison SRC. Afterward the demo guest is **retired** (so it
+  stops competing with Linux for the one physical CPU).
 The whole state machine is driven from the scheduler tick so the guest keeps
 running between phases.
-*A bug it surfaced — over-broad TLBI starves co-resident guests:* the first
-iterative version used `tlbi alle1is` (invalidate ALL VMIDs) on every
-write-fault and every round — 80+ full flushes that blew away Fermi's and
-Linux's TLBs too, starving them until Fermi took a wild fault and parked (so
-Linux never booted). Fix: scope invalidation to the migratable guest's VMID
-(`tlbi ipas2e1is` + `vmalle1is` for a page; select VTTBR + `vmalls12e1is` for the
-whole VMID). After that the other guests are untouched.
+*Two co-tenant bugs it surfaced:* (1) over-broad `tlbi alle1is` (ALL VMIDs) on
+every write-fault/round blew away Fermi's and Linux's TLBs too — fixed by
+scoping invalidation to the migratable guest's VMID (`tlbi ipas2e1is`+`vmalle1is`
+per page; select-VTTBR + `vmalls12e1is` for the VMID). (2) A busy-spinning
+migratable guest starved Linux's IPI-sensitive module loading (`stop_machine`)
+during the migration window, stalling Linux's boot — fixed by making the demo
+guest **WFI-yield** (so it barely uses CPU) and retiring it once migration is
+done.
 *Verified:* `pre-copy round 1..5 re-copied 0x10 (16) dirty page(s)` →
 `round cap -> stop-copy … counter(DEST)=0x57` → `post-migrate counter climbing`
 while `SRC poisoned=0xeeee…` — the counter is continuous across the move and the

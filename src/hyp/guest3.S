@@ -24,21 +24,29 @@ guest3_payload:
 1:
 	ldr	x11, [x10]
 	add	x11, x11, #1            // counter++
-	// Write the counter across a 16-page working set (pages 16..31) so the
-	// hypervisor's iterative pre-copy has a non-trivial dirty set to track.
-	mov	x12, #16
-	mov	x13, x10
-3:
+	// Working set SHRINKS as the counter grows: ws = clamp(80 - counter, 1, 16).
+	// So during a migration the per-round dirty set decreases 16 -> ... -> 1,
+	// letting iterative pre-copy actually converge.
+	mov	x14, #80
+	subs	x14, x14, x11          // 80 - counter (signed)
+	b.gt	7f
+	mov	x14, #1                 // counter >= 80 -> ws = 1
+	b	8f
+7:
+	cmp	x14, #16
+	b.le	8f
+	mov	x14, #16                // clamp high to 16
+8:
+	mov	x13, x10                // write the counter to pages 16 .. 16+ws-1
+9:
 	str	x11, [x13]
 	add	x13, x13, #0x1000
-	subs	x12, x12, #1
-	b.ne	3b
+	subs	x14, x14, #1
+	b.ne	9b
 	mov	x0, #HVC_PING
 	mov	x1, #0
 	hvc	#0                      // bump this vCPU's hvc_count (liveness)
-	movz	x9, #0x40, lsl #16      // brief busy-spin between iterations
-2:
-	subs	x9, x9, #1
-	b.ne	2b
+	wfi                            // yield (trapped -> hypervisor world-switch),
+                                       // so this demo guest barely steals CPU
 	b	1b
 guest3_payload_end:

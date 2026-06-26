@@ -1936,7 +1936,7 @@ static void hyp_uart_rx_kick(void) {
  * (tracked via stage-2 write faults), until the dirty set is small enough to
  * "converge" or a round cap is hit — then a final stop-and-copy re-points the
  * guest's stage-2 to the destination and poisons the source. */
-#define MIG_MAX_ROUNDS 5
+#define MIG_MAX_ROUNDS 8
 #define MIG_CONVERGE 2      /* converged once a round dirties <= this many pages */
 #define MIG_WINDOW_TICKS 15 /* live-run window between pre-copy rounds            */
 
@@ -2035,15 +2035,22 @@ static void hyp_migration_step(void) {
   }
 
   if (g_mig_state == MIGS_DONE) {
-    if (g_mig_post_logs < 3 && (g_mig_live_ticks++ % 25) == 0) {
-      uint64_t cnt = *(volatile uint64_t *)(MIG_DEST + MIG_COUNTER_OFF);
-      uint64_t poison = *(volatile uint64_t *)(MIG_SRC + MIG_COUNTER_OFF);
-      hyp_puts("[HYP] post-migrate: vCPU3 counter(DEST)=");
-      hyp_puthex(cnt);
-      hyp_puts(" climbing; SRC still poisoned=");
-      hyp_puthex(poison);
-      hyp_puts("\n");
-      g_mig_post_logs++;
+    if (g_mig_post_logs < 3) {
+      if ((g_mig_live_ticks++ % 25) == 0) {
+        uint64_t cnt = *(volatile uint64_t *)(MIG_DEST + MIG_COUNTER_OFF);
+        uint64_t poison = *(volatile uint64_t *)(MIG_SRC + MIG_COUNTER_OFF);
+        hyp_puts("[HYP] post-migrate: vCPU3 counter(DEST)=");
+        hyp_puthex(cnt);
+        hyp_puts(" climbing; SRC still poisoned=");
+        hyp_puthex(poison);
+        hyp_puts("\n");
+        if (++g_mig_post_logs == 3)
+          hyp_puts("[HYP] migratable guest retired post-migration; CPU freed\n");
+      }
+    } else {
+      /* Demo complete: retire vCPU3 so it stops competing with Linux. Setting
+       * UNUSED sticks on the next tick where it is not the running vCPU. */
+      vcpus[3].state = VCPU_UNUSED;
     }
   }
 }

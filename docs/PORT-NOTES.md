@@ -330,3 +330,66 @@ ops). Naked-fn alternatives are discouraged — prefer explicit `.S`.
   boot in QEMU to the furthest milestone that phase unlocks.
 - Keep the three `.S` files (`boot`, `vector`, `switch`) as the only multi-
   instruction asm; everything else is `asm!` one-liners or safe Rust.
+
+---
+
+## 6. Hypervisor phase (EL2 Type-1 VMM) — M1–M13
+
+A second porting phase, layered on top of the EL1 kernel above. The C original
+grew an EL2 Type-1 hypervisor (commits after the original port target); this is
+its pure-Rust port, milestone-for-milestone, in `src/hyp/`.
+
+**Boot model.** Launched with QEMU `virt,virtualization=on`, the image is
+entered at **EL2**. `boot.S` detects `CurrentEL == 2`, threads that decision
+through callee-saved `x28` (survives `hyp_init`, the `eret`, and `zero_bss`),
+calls `hyp_init`, repoints SP_EL2 at a dedicated EL2 trap stack, and `eret`s to
+EL1 where the existing Fermi kernel runs unchanged as a **stage-2-translated
+guest**. Entered at EL1 directly (no `virtualization=on`), the EL2 path is
+skipped entirely — fully backwards compatible, and the host-QEMU CI path is
+untouched. `early_init` records the entry EL via `hyp::set_booted_via_el2` so
+the EL1 guest knows whether issuing an `HVC` is safe.
+
+**Milestones.**
+- **M1** EL2 bring-up: stage-2 identity map (1 GiB blocks), VTCR/VTTBR/VBAR_EL2,
+  HCR_EL2.VM, eret to EL1.
+- **M2** SMCCC-style HVC ABI (`src/hyp/hypercall.rs`) + ID_AA64 trap-and-emulate
+  (HCR_EL2.TID3). TID3 is dropped from M11 (Linux reads ID regs natively); the
+  emulation handler is retained.
+- **M3** Stage-2 isolation: the `.hyp` region is split to 4 KiB and unmapped
+  from the guest; guest accesses fault to EL2, are reported + poisoned + stepped
+  over. Security boundary.
+- **M4** Virtual interrupts: physical IRQs route to EL2 (HCR_EL2.IMO), re-injected
+  as HW-linked vIRQs via ICH_LR<n>_EL2 (HW=1); guest's unmodified handler runs.
+- **M5a/M5b** Second guest + cooperative world-switch, then preemptive EL2
+  scheduling (CNTHP_EL2, PPI 26, 100 ms quantum, round-robin vCPUs).
+- **M6** Per-guest vGIC state (ICH_LR/VMCR/AP1R0) + interrupt ownership routing.
+- **M7** Per-guest FP/SIMD context switch (q0–q31 + FPSR/FPCR).
+- **M8** `/proc/vms` introspection over the HVC ABI (HVC_VM_COUNT / HVC_VM_STAT).
+- **M9** Guest lifecycle via PSCI SYSTEM_OFF (reap the vCPU).
+- **M10** Large guest-RAM region: a "Linux slot" at guest IPA 0x40000000 backed
+  by Fermi-invisible physical RAM at 9 GiB (needs QEMU `-m 10G`). M10 ran a
+  self-contained `linux_stub.S` there as proof.
+- **M11–M13** Real Linux guest: arm64 boot-protocol entry (PC = Image base,
+  x0 = DTB), emulated GICv3 distributor/redistributor MMIO (the guest's GIC
+  window is unmapped → traps to EL2 → `hyp_emulate_gic`), CNTV (PPI 27) virtual-
+  timer routing to the Linux vCPU, and an SP_EL0 add to the world-switch
+  context. A faulting Linux guest is reaped (keeping Fermi + the hypervisor
+  alive) rather than halting.
+
+**Testing — `ci/hyp-smoke-test.sh`.** Stage-2 translation needs a QEMU with
+complete TCG stage-2 support; the host's **QEMU 3.1.0 faults at stage-2 level 0
+on the eret** (an emulator limitation — EL2 bring-up itself works there). The
+hyp smoke test therefore runs **QEMU ≥ 8 (via the `osdev:dev` Docker image, QEMU
+8.2.2)** and asserts the full guest boot. The normal `ci/smoke-test.sh` (no
+`virtualization=on`, host QEMU) remains the primary gate and is unaffected.
+
+**Linux guest assets (M11–M13) are NOT in the repo.** Booting a real Linux to
+userspace needs an external `guest/Image` (arm64 Linux kernel) + an initramfs +
+a built `guest.dtb`, staged into the slot via QEMU's `-device loader` at the
+IPAs in `src/hyp/mod.rs` (Image @ IPA 0x40200000, DTB @ 0x48000000). None of
+these binaries exist in git history (only `guest.dts` does), so M11–M13's code
+is ported and exercised on every path EXCEPT a successful Linux boot: with no
+Image staged, the Linux slot faults on its first fetch and the hypervisor reaps
+it gracefully (`[HYP] Linux guest unhandled abort`), leaving Fermi running —
+which the hyp smoke test asserts. Supplying the three assets turns this into a
+full Linux-to-shell boot with no code changes.

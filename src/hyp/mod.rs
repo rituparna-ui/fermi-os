@@ -27,8 +27,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 // EL2 exception vector table + el2_common save/restore trampoline.
 global_asm!(include_str!("vector_el2.S"));
-// Linux-slot guest bring-up stub (M10), copied into the guest's high RAM.
-global_asm!(include_str!("linux_stub.S"));
+// The M10 bring-up stub (linux_stub.S) is retained in the tree as a stand-in
+// the slot can run when no real Image is staged, but from M11 the guest enters
+// a real Linux Image staged by QEMU's loader, so it is not linked in here.
 
 // --- Stage-2 (VMSAv8-64) descriptor bits ------------------------------------
 // These differ from stage-1: no MAIR indirection (MemAttr[5:2] encodes the type
@@ -45,8 +46,13 @@ const S2_MEM_DEVICE: u64 = 0x0 << 2; // MemAttr = Device-nGnRnE
 // --- HCR_EL2 bits ------------------------------------------------------------
 const HCR_VM: u64 = 1 << 0; // Enable stage-2 translation for EL1&0
 const HCR_IMO: u64 = 1 << 4; // Route physical IRQ to EL2 + enable vIRQ
-const HCR_TID3: u64 = 1 << 18; // Trap ID group 3 (ID_AA64*) reads to EL2
 const HCR_RW: u64 = 1 << 31; // EL1 execution state is AArch64
+
+// Trap ID group 3 (ID_AA64*) reads to EL2. The M2 demo set this to exercise
+// trap-and-emulate (hyp_handle_sysreg); from M11 it is left clear so the Linux
+// guest reads ID registers natively. Kept for documentation/reference.
+#[allow(dead_code)]
+const HCR_TID3: u64 = 1 << 18;
 
 // --- GICv3 EL2 control bits (System Register / virtual CPU interface) --------
 const ICC_SRE_SRE: u64 = 1 << 0; // System Register interface enable
@@ -184,6 +190,7 @@ struct Vcpu {
 
     // Saved EL1 system-register context.
     sp_el1: u64,
+    sp_el0: u64,
     elr_el1: u64,
     spsr_el1: u64,
     sctlr_el1: u64,
@@ -227,6 +234,7 @@ impl Vcpu {
             pstate: 0,
             vttbr: 0,
             sp_el1: 0,
+            sp_el0: 0,
             elr_el1: 0,
             spsr_el1: 0,
             sctlr_el1: 0,
@@ -287,7 +295,7 @@ fn gic_write32(addr: usize, val: u32) {
 // UART so the guest can drive earlycon. Requires QEMU `-m 10G`.
 const LINUX_PHYS_BASE: u64 = 0x2_4000_0000; // 9 GiB: past Fermi's 8 GiB view
 const LINUX_IPA_BASE: u64 = 0x4000_0000; // arm64 RAM base the guest sees
-const LINUX_RAM_SIZE: u64 = 256 * 1024 * 1024;
+const LINUX_RAM_SIZE: u64 = 1024 * 1024 * 1024;
 #[link_section = ".hyp_tables"]
 static LX_L0: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
 #[link_section = ".hyp_tables"]
@@ -296,11 +304,6 @@ static LX_L1: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]
 static LX_L2_RAM: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512])); // IPA 1-2 GiB
 #[link_section = ".hyp_tables"]
 static LX_L2_DEV: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512])); // IPA 0-1 GiB
-
-extern "C" {
-    static linux_stub: u8;
-    static linux_stub_end: u8;
-}
 
 /// Accessor for the running vCPU (mutable pointer). Single-core: only ever used
 /// from EL2 trap context, which cannot reenter.
@@ -561,9 +564,11 @@ pub extern "C" fn hyp_init() {
         msr!("ich_hcr_el2", ICH_HCR_EN); // enable virtual CPU interface
         core::arch::asm!("isb");
 
-        // Enable stage-2, pin EL1 to AArch64, trap guest ID-register reads
-        // (TID3), and route physical IRQs to EL2 (IMO) so we can inject vIRQs.
-        msr!("hcr_el2", HCR_RW | HCR_VM | HCR_TID3 | HCR_IMO);
+        // Enable stage-2, pin EL1 to AArch64, and route physical IRQs to EL2
+        // (IMO) so we can inject vIRQs. (TID3 ID-register trapping from the M2
+        // demo is left off here — guests, including Linux, read ID registers
+        // natively; the M2 emulation path remains for reference.)
+        msr!("hcr_el2", HCR_RW | HCR_VM | HCR_IMO);
         core::arch::asm!("isb");
     }
 
@@ -578,7 +583,7 @@ pub extern "C" fn hyp_init() {
         *CURRENT_VCPU.get() = 0;
     }
     hyp_create_linux_guest();
-    hyp_puts("[HYP] created Linux-slot guest (vCPU 1): 256 MiB @ IPA 0x40000000\n");
+    hyp_puts("[HYP] created Linux-slot guest (vCPU 1): 1 GiB @ IPA 0x40000000\n");
 
     // Start the preemptive scheduling tick (CNTHP / PPI 26).
     hyp_tick_init();
@@ -602,10 +607,11 @@ fn hyp_tick_init() {
     gic_write32(GICR_WAKER, waker);
     while gic_read32(GICR_WAKER) & GICR_WAKER_CHILDREN_ASLEEP != 0 {}
 
-    // PPI 26 -> Group1 NS, then enable it (ISENABLER is write-1-to-set).
-    let grp = gic_read32(GICR_IGROUPR0) | (1 << HYP_TIMER_INTID);
+    // PPI 26 (CNTHP, scheduler tick) and PPI 27 (CNTV, the Linux guest's
+    // virtual timer) -> Group1 NS, enabled (ISENABLER is write-1-to-set).
+    let grp = gic_read32(GICR_IGROUPR0) | (1 << HYP_TIMER_INTID) | (1 << 27);
     gic_write32(GICR_IGROUPR0, grp);
-    gic_write32(GICR_ISENABLER0, 1 << HYP_TIMER_INTID);
+    gic_write32(GICR_ISENABLER0, (1 << HYP_TIMER_INTID) | (1 << 27));
 }
 
 /// Arm CNTHP_EL2 to fire one quantum from now.
@@ -629,6 +635,7 @@ fn hyp_tick_start() {
 unsafe fn hyp_save_el1(v: *mut Vcpu) {
     unsafe {
         (*v).sp_el1 = mrs!("sp_el1");
+        (*v).sp_el0 = mrs!("sp_el0");
         (*v).elr_el1 = mrs!("elr_el1");
         (*v).spsr_el1 = mrs!("spsr_el1");
         (*v).sctlr_el1 = mrs!("sctlr_el1");
@@ -655,6 +662,7 @@ unsafe fn hyp_save_el1(v: *mut Vcpu) {
 unsafe fn hyp_restore_el1(v: *mut Vcpu) {
     unsafe {
         msr!("sp_el1", (*v).sp_el1);
+        msr!("sp_el0", (*v).sp_el0);
         msr!("elr_el1", (*v).elr_el1);
         msr!("spsr_el1", (*v).spsr_el1);
         msr!("sctlr_el1", (*v).sctlr_el1);
@@ -866,24 +874,26 @@ fn hyp_build_linux_stage2() {
 fn hyp_create_linux_guest() {
     hyp_build_linux_stage2();
 
-    let stub = core::ptr::addr_of!(linux_stub) as *const u8;
-    let stub_end = core::ptr::addr_of!(linux_stub_end) as *const u8;
-    // SAFETY (single-core, pre-guest): copy the bring-up stub into the guest's
-    // high RAM (physical, MMU off). len is the linker-bounded stub size.
+    // The Linux Image and DTB are staged into the guest's high RAM by QEMU's
+    // generic loader (see Makefile), at IPAs 0x40200000 and 0x48000000. We just
+    // enter per the arm64 boot protocol: PC = Image base, x0 = DTB, EL1h, MMU
+    // off, x1..x3 = 0.
+    //
+    // When no real Image is loaded (the default in this tree — no guest/Image
+    // asset is committed), the slot's RAM is whatever QEMU left there; the guest
+    // faults on its first instruction and is reaped by hyp_handle_abort's
+    // current_vcpu==1 path, leaving the hypervisor and primary guest unharmed.
+    // SAFETY (single-core, pre-guest): exclusive access during boot.
     unsafe {
-        let len = stub_end as usize - stub as usize;
-        core::ptr::copy_nonoverlapping(stub, LINUX_PHYS_BASE as *mut u8, len);
-
-        // sctlr_el1 left 0 => stage-1 MMU off, as the stub and Linux's early
-        // entry both expect.
         let v = &mut (*VCPUS.get())[1];
         *v = Vcpu::zeroed();
         v.id = 1;
         v.state = VCPU_READY;
-        v.pc = LINUX_IPA_BASE; // entry (IPA) -> high RAM
+        v.pc = LINUX_IPA_BASE + 0x20_0000; // Image entry (IPA)
+        v.regs[0] = LINUX_IPA_BASE + 0x800_0000; // x0 = DTB (IPA 0x48000000)
         v.pstate = 0x3c5; // EL1h, DAIF masked
-        v.sp_el1 = LINUX_IPA_BASE + LINUX_RAM_SIZE;
         v.vttbr = phys_of(LX_L0.get()) | (1 << 48); // VMID 1
+                                                    // sctlr_el1 left 0 => stage-1 MMU off, as Linux's early entry expects.
     }
 }
 
@@ -1112,10 +1122,82 @@ fn hyp_handle_sysreg(frame: *mut El2Frame) {
     }
 }
 
+// Minimal emulated GICv3 distributor + redistributor for the Linux guest. The
+// guest's GIC MMIO region is intentionally NOT mapped in its stage-2, so
+// accesses trap to EL2 and land here. We only need enough to satisfy Linux's
+// gic-v3 probe: report the right version/typer, complete the redistributor
+// WAKER handshake, and accept (mostly ignore) the configuration writes — actual
+// interrupt delivery for the guest's timer is done by the hypervisor injecting
+// virtual interrupts through the list registers.
+const GICD_LO: u64 = 0x0800_0000;
+const GICD_HI: u64 = 0x0801_0000;
+const GICR_LO: u64 = 0x080A_0000;
+const GICR_HI: u64 = 0x080C_0000;
+
+/// Emulated vGIC distributor/redistributor register state for the Linux guest.
+#[repr(C)]
+struct VgicMmio {
+    gicd_ctlr: u32,
+    gicr_ctlr: u32,
+}
+#[link_section = ".hyp_tables"]
+static G_VGIC: SyncUnsafeCell<VgicMmio> = SyncUnsafeCell::new(VgicMmio {
+    gicd_ctlr: 0,
+    gicr_ctlr: 0,
+});
+
+/// Emulate a guest GICD/GICR MMIO access. Returns `Some(value)` (the read
+/// result, ignored for writes) if `ipa` is in the GIC window, else `None`.
+fn hyp_emulate_gic(ipa: u64, is_write: bool, val: u64) -> Option<u64> {
+    // SAFETY (single-core): EL2 trap context owns the emulated GIC state.
+    let g = G_VGIC.get();
+    unsafe {
+        if (GICD_LO..GICD_HI).contains(&ipa) {
+            let off = ipa - GICD_LO;
+            if is_write {
+                if off == 0x000 {
+                    (*g).gicd_ctlr = val as u32;
+                }
+                // enables / priorities / routing: accepted and ignored
+                Some(0)
+            } else {
+                Some(match off {
+                    0x000 => (*g).gicd_ctlr as u64, // GICD_CTLR
+                    0x004 => (1 << 0) | (9 << 19),  // TYPER: 64 INTID, IDbits=9
+                    0x008 => 0x0000_043b,           // IIDR (ARM)
+                    0xFFE8 => 0x30,                 // PIDR2 => GICv3
+                    _ => 0,
+                })
+            }
+        } else if (GICR_LO..GICR_HI).contains(&ipa) {
+            let off = ipa - GICR_LO; // RD frame at 0, SGI frame at 0x10000
+            if is_write {
+                if off == 0x000 {
+                    (*g).gicr_ctlr = val as u32;
+                }
+                // WAKER and per-PPI config: accepted and ignored
+                Some(0)
+            } else {
+                Some(match off {
+                    0x0000 => (*g).gicr_ctlr as u64, // GICR_CTLR
+                    0x0008 => 1 << 4,                // TYPER: Last=1, aff=0
+                    0x0014 => 0,                     // WAKER: not asleep
+                    0xFFE8 => 0x30,                  // PIDR2 => GICv3
+                    _ => 0,
+                })
+            }
+        } else {
+            None
+        }
+    }
+}
+
 /// Lower-EL abort. If the guest faulted trying to reach hypervisor-private
 /// memory, that's our isolation boundary doing its job: report it, poison the
 /// destination register on a read, and step over the access so the guest keeps
-/// running. Any other abort is an unexpected (real) fault — dump and park.
+/// running. The Linux guest (vCPU 1) also traps GIC MMIO (emulated) here, and
+/// any of its other faults reap it rather than killing the hypervisor. Any other
+/// abort is an unexpected (real) fault — dump and park.
 fn hyp_handle_abort(index: u64, frame: *mut El2Frame) {
     // SAFETY (single-core): see hyp_handle_hvc.
     unsafe { (*cur_vcpu()).abort_count += 1 };
@@ -1151,6 +1233,54 @@ fn hyp_handle_abort(index: u64, frame: *mut El2Frame) {
         return;
     }
 
+    // SAFETY (single-core): EL2 trap context.
+    let on_linux = unsafe { *CURRENT_VCPU.get() == 1 };
+
+    // Linux guest: emulate trapped GIC distributor/redistributor MMIO.
+    if on_linux && ((GICD_LO..GICD_HI).contains(&ipa) || (GICR_LO..GICR_HI).contains(&ipa)) {
+        let isv = (esr >> 24) & 1;
+        let sas = (esr >> 22) & 3; // access size: 0=byte,1=half,2=word,3=dword
+        let srt = ((esr >> 16) & 0x1F) as usize;
+        let wnr = (esr >> 6) & 1;
+        if isv != 0 {
+            if wnr != 0 {
+                let v = if srt == 31 { 0 } else { frame_x(frame, srt) };
+                hyp_emulate_gic(ipa, true, v);
+            } else if let Some(mut v) = hyp_emulate_gic(ipa, false, 0) {
+                v &= match sas {
+                    0 => 0xFF,
+                    1 => 0xFFFF,
+                    2 => 0xFFFF_FFFF,
+                    _ => u64::MAX,
+                };
+                if srt != 31 {
+                    set_frame_x(frame, srt, v);
+                }
+            }
+        }
+        // SAFETY: step past the trapped instruction.
+        unsafe {
+            msr!("elr_el2", mrs!("elr_el2") + 4);
+        }
+        return;
+    }
+
+    // Linux guest hit an unhandled fault: reap it (keeping the primary guest and
+    // hypervisor alive), logging where it died. This is also the path taken when
+    // no real Image is staged into the slot — the guest faults immediately and
+    // is reaped, leaving Fermi running.
+    if on_linux {
+        hyp_puts("\n[HYP] Linux guest unhandled abort: IPA=");
+        hyp_puthex(ipa);
+        hyp_puts(" ESR=");
+        hyp_puthex(esr);
+        hyp_puts(" ELR=");
+        hyp_puthex(mrs!("elr_el2"));
+        hyp_puts("\n");
+        hyp_vcpu_exit(frame);
+        return;
+    }
+
     // Not the isolation boundary — a real, unexpected fault. Dump once and park
     // (the DUMPED guard keeps a re-fault from spamming the log).
     if !DUMPED.swap(true, Ordering::Relaxed) {
@@ -1176,11 +1306,15 @@ fn hyp_handle_abort(index: u64, frame: *mut El2Frame) {
 
 // --- vGIC --------------------------------------------------------------------
 
-/// Which vCPU owns a given physical INTID. The primary guest (vCPU 0) owns the
-/// device/timer interrupts it programmed; extend this map as guests gain their
-/// own interrupt sources.
-fn hyp_intid_owner(_intid: u32) -> usize {
-    0
+/// Which vCPU owns a given physical INTID. CNTV (PPI 27) is the Linux guest's
+/// virtual timer; everything else (notably the primary guest's CNTP, INTID 30)
+/// belongs to vCPU 0.
+fn hyp_intid_owner(intid: u32) -> usize {
+    if intid == 27 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Inject a hardware-linked virtual interrupt into `target`'s vGIC. If the

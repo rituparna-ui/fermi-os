@@ -278,13 +278,14 @@ fn cmd_append(path: &str, text: &str) {
     kprintln!("append {}: {} ({} bytes)", path, if ok { "ok" } else { "failed" }, data.len());
 }
 
-fn cmd_write(name: &str, text: &str) {
-    // Create a root-level FAT32 file from a string (newline-terminated).
+fn cmd_write(path: &str, text: &str) {
+    // Create a FAT32 file from a string (newline-terminated). `path` may be a
+    // bare name (root) or a full path into a subdirectory.
     let mut data = alloc::vec::Vec::new();
     data.extend_from_slice(text.as_bytes());
     data.push(b'\n');
-    let ok = crate::fs::fat32::create(name.as_bytes(), &data);
-    kprintln!("write {}: {}", name, if ok { "ok" } else { "failed" });
+    let ok = vfs::create_file(path, &data);
+    kprintln!("write {}: {}", path, if ok { "ok" } else { "failed" });
 }
 
 fn cmd_hexdump(path: &str) {

@@ -210,6 +210,37 @@ pub fn unlink(path: &str) -> bool {
     crate::fs::fat32::delete(name.as_bytes())
 }
 
+/// Create (overwrite) a FAT32 file at `path`, placing it in its parent
+/// directory (supports nested dirs). Returns false if the parent isn't a
+/// FAT32 directory.
+pub fn create_file(path: &str, data: &[u8]) -> bool {
+    let bytes = path.as_bytes();
+    // Split into parent path + final component.
+    let slash = path.rfind('/');
+    let (parent_path, fname): (&str, &str) = match slash {
+        Some(i) if i > 0 => (&path[..i], &path[i + 1..]),
+        _ => ("/mnt/fat32", path), // bare name or root-anchored -> mount root
+    };
+    let _ = bytes;
+    let dir = resolve(parent_path);
+    if dir.is_null() {
+        return false;
+    }
+    unsafe {
+        if !(*dir).is_dir_fat32 {
+            return false;
+        }
+        let dir_cluster = (*dir).private0 as u32;
+        // Drop any cached child vnode of this name so a fresh lookup re-reads disk.
+        let mut c = (*dir).children;
+        while !c.is_null() {
+            if name_eq(&(*c).name, fname.as_bytes()) { drop_cached(c); break; }
+            c = (*c).next;
+        }
+        crate::fs::fat32::create_in(dir_cluster, fname.as_bytes(), data)
+    }
+}
+
 /// Drop a cached child vnode from its parent's list (does not free on disk).
 unsafe fn drop_cached(node: *mut Vnode) {
     let parent = (*node).parent;

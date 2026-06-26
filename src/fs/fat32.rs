@@ -398,15 +398,19 @@ fn cluster_write_data(first_cluster: u32, data: &[u8]) -> bool {
 
 /// Create a root-level file `name` (8.3) with `data`. Returns success.
 pub fn create(name: &[u8], data: &[u8]) -> bool {
+    let root = unsafe { VOL.get() }.root_cluster;
+    create_in(root, name, data)
+}
+
+/// Create (overwrite) a file `name` with `data` inside directory `dir_cluster`.
+pub fn create_in(dir_cluster: u32, name: &[u8], data: &[u8]) -> bool {
     let v = unsafe { VOL.get() };
     if !v.mounted {
         return false;
     }
-    // Overwrite semantics: if a file of this name already exists, remove it
-    // first (free its chain + mark its entry deleted) so we don't leave a
-    // duplicate directory entry.
-    if dir_find_loc(v.root_cluster, &to_83(name)).is_some() {
-        delete(name);
+    // Overwrite: remove any existing entry of this name in the target dir.
+    if dir_find_loc(dir_cluster, &to_83(name)).is_some() {
+        delete_in(dir_cluster, name);
     }
     let bytes_per_cluster = v.sectors_per_cluster * SECTOR as u32;
     let clusters_needed = if data.is_empty() {
@@ -439,7 +443,7 @@ pub fn create(name: &[u8], data: &[u8]) -> bool {
     e[20..22].copy_from_slice(&((first_cluster >> 16) as u16).to_le_bytes());
     e[26..28].copy_from_slice(&(first_cluster as u16).to_le_bytes());
     e[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
-    dir_add_entry(v.root_cluster, &e)
+    dir_add_entry(dir_cluster, &e)
 }
 
 /// Locate a file's directory entry: returns (sector, byte_offset, first_cluster).
@@ -480,12 +484,18 @@ fn dir_find_loc(dir_cluster: u32, target: &[u8; 11]) -> Option<(u32, usize, u32)
 /// Delete a root-level file: free its FAT cluster chain and mark the directory
 /// entry deleted (0xE5). Returns false if not found or not mounted.
 pub fn delete(name: &[u8]) -> bool {
+    let root = unsafe { VOL.get() }.root_cluster;
+    delete_in(root, name)
+}
+
+/// Delete a file named `name` inside the directory at `dir_cluster`.
+pub fn delete_in(dir_cluster: u32, name: &[u8]) -> bool {
     let v = unsafe { VOL.get() };
     if !v.mounted {
         return false;
     }
     let target = to_83(name);
-    let (sector, off, start) = match dir_find_loc(v.root_cluster, &target) {
+    let (sector, off, start) = match dir_find_loc(dir_cluster, &target) {
         Some(x) => x,
         None => return false,
     };

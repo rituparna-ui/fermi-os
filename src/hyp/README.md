@@ -106,7 +106,8 @@ timer `CNTHP` (PPI 26) instead.
 | M24 | **OS-grade device tree:** the DTB now carries `/chosen`, `/psci`, `/cpus`, `/timer` and a GICv3 `/intc` — the boot contract a real AArch64 OS reads. |
 | M25 | **vCPU fault isolation:** a misbehaving guest's illegal access is decoded and reaps only that VM; the host + sibling VMs keep running. |
 | M27 | **Per-VM observability:** every guest exit is accounted by class (hvc/mmio/irq/fault) for a virsh-style introspection summary. |
-| M28 | **Real Linux guest:** a full mainline Linux 6.6 boots as an EL1 guest via `x0=DTB`; it parses our device tree (memory/cmdline/cpus/PSCI/GIC) and runs early init. (Stops at the GICv3 distributor probe — beyond the minimal vGIC model.) |
+| M28 | **Real Linux guest:** a full mainline Linux 6.6 boots as an EL1 guest via `x0=DTB`; it parses our device tree (memory/cmdline/cpus/PSCI/GIC). |
+| M29 | **Fuller vGIC → Linux boots to init:** with a real GICD/GICR register model, Linux brings up its GICv3 + arch timer, switches clocksource, calibrates BogoMIPS, and execs `/sbin/init` (panics only for lack of a rootfs). |
 
 The default hypervisor build runs **two** interactive FermiOS guests (M14);
 `Ctrl-X` cycles console focus. Build with `-DHYP_RUN_DEMOS` to run the
@@ -153,11 +154,14 @@ so config reads return "no device" without trapping.
 
 ## Known limitations / future work
 
-- The **vGIC models only the small GICD/GICR register set FermiOS guests use**,
-  not the full GICv3 (PIDR/TYPER, per-CPU redistributor wakeup, etc.) that
-  Linux's driver probes. This is why real Linux (M28) boots through early init
-  but stops at the GICv3 distributor probe + arch-timer. A fuller vGIC would
-  carry Linux into interrupt-driven boot.
+- The vGIC (post-M29) emulates enough GICD/GICR for Linux's GICv3 driver to
+  come up, but it is still not a complete GICv3 (no SPI routing to guests, no
+  ITS/LPIs, single redistributor). A FermiOS or Linux guest boots and takes its
+  timer IRQ; richer interrupt topologies are future work.
+- Real Linux boots to the point of exec'ing init (M29) but has **no rootfs**
+  (kernel built with no initramfs), so it panics with "No working init found" —
+  the correct end of a kernel-only boot. Adding an initramfs would reach a
+  shell.
 - Guest *virtio* is not passed through (PCI config space is emulated as "no
   device"); real device access is via paravirt hypercalls instead (M19 block,
   M20 net), which translate guest buffer IPAs safely.

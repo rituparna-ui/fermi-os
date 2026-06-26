@@ -7,7 +7,7 @@ to this effort versus what came from other parallel work.
 
 - **Repo:** `git@github.com:rituparna-ui/fermi-os.git`
 - **This work:** branch **`fermi-hyp2`**, pushed to remote
-  **`feat/el2-vhe-hypervisor-fermios-guest`** (HEAD `aa0c67f`).
+  **`feat/el2-vhe-hypervisor-fermios-guest`** (HEAD `09f76c1`).
 - **Base:** all of this sits on top of the FermiOS kernel at `a2f1104` (the
   `main`‑line kernel: higher‑half AArch64, MMU, PMM, heap, GICv3, timer,
   scheduler + EL0 tasks, syscalls, VFS/FAT32/proc, PCI/virtio, shell).
@@ -77,6 +77,7 @@ kernel is embedded as the guest image.
 | M26 | Full regression script + capstone verification | `28bf4ac` |
 | M27 | Per-VM observability (vCPU exit accounting) | `b06a0fc` |
 | M28 | Boot a **real mainline Linux 6.6** kernel as an EL1 guest | `ec0c559` |
+| M29 | Fuller vGIC → Linux boots fully (GICv3 + timer + clocksource) to init | `09f76c1` |
 
 ### Source layout (`src/hyp/`, ~4,900 LOC)
 
@@ -186,11 +187,12 @@ else is parallel feature/experiment branches off the kernel.**
   cannot run it.
 - Guest *virtio* devices are not passed through (PCI is emulated as
   "no device"); real device access is via paravirt hypercalls (M19/M20).
-- A **real mainline Linux 6.6 kernel does boot** (M28) — it parses our DTB and
-  runs early init — but stops at the GICv3 distributor probe because the vGIC
-  models only the small register set FermiOS guests need, not the full GICD/GICR
-  set Linux requires. A fuller vGIC would carry Linux into interrupt-driven boot.
-  The Linux `Image` is gitignored; `src/hyp/build-linux.sh` reproduces it.
+- A **real mainline Linux 6.6 kernel boots fully** (M28+M29) — it parses our
+  DTB, brings up its GICv3 + arch timer, switches clocksource, calibrates
+  BogoMIPS, and execs `/sbin/init`. It panics only with "No working init found"
+  because the kernel is built with no rootfs/initramfs (the correct end of a
+  kernel-only boot). The Linux `Image` is gitignored; `src/hyp/build-linux.sh`
+  reproduces it. Adding an initramfs would reach a userspace shell.
 - One EL2 stack frame is shared by the serial scheduler (not reentrant across
   nested guest exits — fine as used).
 

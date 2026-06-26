@@ -358,6 +358,39 @@ qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on -m 8G \
   running. Verified: `badvm FAULT … IPA=0x80000000` → reaped → `GGG` (good VM
   ran afterward) → PASS.
 
+- **M27 — per-VM observability (done):** every guest exit is accounted by class
+  (hvc/mmio/irq/fault/other) into a per-VM stat block, printed as a virsh-style
+  summary when a VM exits. This is the introspection that later let us read the
+  Linux boot as "77 exits: 6 hvc, 41 mmio, 30 irq, 0 fault" — a live,
+  timer-driven kernel rather than a guess.
+
+- **M28 — boot a real mainline Linux (done):** the payoff of the OS-grade DTB.
+  `build-linux.sh` cross-compiles a tiny mainline Linux 6.6 `Image` (PL011 +
+  GICv3 + arch-timer + PSCI, `earlycon`); `hyp_run_linux()` allocates a 256 MiB
+  guest, loads the `Image` at IPA `0x40000000` per the AArch64 boot protocol
+  (`x0`=DTB), builds the device tree at `0x48000000`, and time-slices it off
+  `CNTHP`. Linux decompresses, parses our DTB, and runs early init. (Two real
+  gotchas: cpp predefines `linux`=1, so the embed section had to be renamed off
+  `.rodata.linux`; and `make clean` lived inside `build/`, so the multi-MB Image
+  was relocated to `linux-image/` and gitignored.)
+
+- **M29 — fuller vGIC, Linux boots to init (done):** M28 stalled at the GICv3
+  distributor probe because the vGIC only modelled the handful of registers
+  FermiOS guests touch. `vgic_mmio_emulate` was rewritten into a proper
+  offset-decoded GICD+GICR model (the two windows share offsets, so it branches
+  on the IPA): GICD `PIDR2=0x30` (the GICv3 arch-rev gate behind Linux's
+  "no distributor detected"), `TYPER`/`IIDR`, and accept-and-drop for
+  `IGROUPR/ISENABLER/ICENABLER/IPRIORITYR/ICFGR/IROUTER`; GICR redistributor
+  `PIDR2=0x30`, `TYPER` with `Last=1`, `WAKER` ChildrenAsleep-clears, `CTLR`
+  RWP=0; GICR SGI-frame group/enable regs. With this, Linux does "GICv3: CPU0:
+  found redistributor", "arch_timer: cp15 timer(s) running at 62.50MHz",
+  switches to the `arch_sys_counter` clocksource, calibrates BogoMIPS, frees
+  init memory, and execs `/sbin/init` — panicking only on "No working init
+  found" because the kernel was built with no rootfs. That is a **complete
+  kernel boot** under the hypervisor. (Also fixed: the host was left with `CNTHP`
+  PPI 26 armed after `hyp_run_linux` returned, storming its post-return IRQ
+  path; `gic_disable_irq` + `cnthp_disarm` on exit drop the storm to zero.)
+
 ## 14. Status
 
 The hypervisor is feature-complete for a small multi-tenant Type-1 design:
@@ -366,10 +399,13 @@ interactive per-guest consoles; PSCI (incl. SMP CPU_ON); inter-VM shared memory
 + interrupt doorbells; a unified hypercall ABI; an audited guest→host boundary;
 paravirt disk + network with safe IPA translation; leak-free dynamic VM
 lifecycle; a generic DTB-booted foreign guest with an OS-grade device tree; SMP
-(multi-vCPU) guests; and runtime fault isolation (a bad guest is contained). A
+(multi-vCPU) guests; runtime fault isolation (a bad guest is contained); per-VM
+exit observability; and — the capstone — **a real mainline Linux 6.6 kernel that
+boots fully**, bringing up its GICv3 + arch timer and exec'ing init (M28/M29). A
 single regression script (`src/hyp/run-demos.sh`, M26) boots the whole M1-M25
 suite in one QEMU run and asserts every milestone passes ("ALL MILESTONES PASS").
-Further work would be breadth (booting a real OS binary, more emulated devices)
+Further work would be breadth (an initramfs/rootfs so Linux reaches a userspace
+shell, PSCI CPU_ON for the Linux guest's secondary cores, more emulated devices)
 rather than missing fundamentals.
 
 ---

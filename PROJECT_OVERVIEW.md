@@ -76,6 +76,7 @@ kernel is embedded as the guest image.
 | M25 | vCPU fault isolation | `5d6dd69` |
 | M26 | Full regression script + capstone verification | `28bf4ac` |
 | M27 | Per-VM observability (vCPU exit accounting) | `b06a0fc` |
+| M28 | Boot a **real mainline Linux 6.6** kernel as an EL1 guest | `ec0c559` |
 
 ### Source layout (`src/hyp/`, ~4,900 LOC)
 
@@ -185,10 +186,11 @@ else is parallel feature/experiment branches off the kernel.**
   cannot run it.
 - Guest *virtio* devices are not passed through (PCI is emulated as
   "no device"); real device access is via paravirt hypercalls (M19/M20).
-- A real Linux `Image` is **not** booted — the OS‑grade DTB (M24) provides the
-  boot *contract*, but bringing a multi‑MB kernel binary + initramfs into the
-  sandbox isn't feasible. The foreign‑guest path (M22) is proven with a
-  purpose‑built standalone guest.
+- A **real mainline Linux 6.6 kernel does boot** (M28) — it parses our DTB and
+  runs early init — but stops at the GICv3 distributor probe because the vGIC
+  models only the small register set FermiOS guests need, not the full GICD/GICR
+  set Linux requires. A fuller vGIC would carry Linux into interrupt-driven boot.
+  The Linux `Image` is gitignored; `src/hyp/build-linux.sh` reproduces it.
 - One EL2 stack frame is shared by the serial scheduler (not reentrant across
   nested guest exits — fine as used).
 

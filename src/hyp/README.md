@@ -106,6 +106,7 @@ timer `CNTHP` (PPI 26) instead.
 | M24 | **OS-grade device tree:** the DTB now carries `/chosen`, `/psci`, `/cpus`, `/timer` and a GICv3 `/intc` — the boot contract a real AArch64 OS reads. |
 | M25 | **vCPU fault isolation:** a misbehaving guest's illegal access is decoded and reaps only that VM; the host + sibling VMs keep running. |
 | M27 | **Per-VM observability:** every guest exit is accounted by class (hvc/mmio/irq/fault) for a virsh-style introspection summary. |
+| M28 | **Real Linux guest:** a full mainline Linux 6.6 boots as an EL1 guest via `x0=DTB`; it parses our device tree (memory/cmdline/cpus/PSCI/GIC) and runs early init. (Stops at the GICv3 distributor probe — beyond the minimal vGIC model.) |
 
 The default hypervisor build runs **two** interactive FermiOS guests (M14);
 `Ctrl-X` cycles console focus. Build with `-DHYP_RUN_DEMOS` to run the
@@ -152,11 +153,13 @@ so config reads return "no device" without trapping.
 
 ## Known limitations / future work
 
+- The **vGIC models only the small GICD/GICR register set FermiOS guests use**,
+  not the full GICv3 (PIDR/TYPER, per-CPU redistributor wakeup, etc.) that
+  Linux's driver probes. This is why real Linux (M28) boots through early init
+  but stops at the GICv3 distributor probe + arch-timer. A fuller vGIC would
+  carry Linux into interrupt-driven boot.
 - Guest *virtio* is not passed through (PCI config space is emulated as "no
-  device"), so a FermiOS guest's in-kernel virtio drivers no-op. Real device
-  access is instead offered via paravirt hypercalls (M19 block); extending that
-  to net/console is straightforward.
+  device"); real device access is via paravirt hypercalls instead (M19 block,
+  M20 net), which translate guest buffer IPAs safely.
 - The world switch shares one EL2 stack frame, so the serial scheduler is not
   reentrant across nested guest exits (fine as used).
-- Further out: a general HVC hypercall ABI, real virtio passthrough, a
-  non-FermiOS guest, dynamic VM lifecycle, and a guest→host security audit.

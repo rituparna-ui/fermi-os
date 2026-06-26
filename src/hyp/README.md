@@ -108,7 +108,18 @@ timer `CNTHP` (PPI 26) instead.
 
 The default hypervisor build runs **two** interactive FermiOS guests (M14);
 `Ctrl-X` cycles console focus. Build with `-DHYP_RUN_DEMOS` to run the
-M3/M4/M9a/M11/M15/M16/M17/M9c self-tests first.
+M3/M4/M9a/M11/M15/M16/M17/M19/M20/M21/M22/M23/M24/M25/M9c self-tests first.
+
+### Regression run
+
+`src/hyp/run-demos.sh` builds the `-DHYP_RUN_DEMOS` image, boots the whole
+suite in one QEMU run, and asserts every milestone's PASS marker — a single
+end-to-end regression check:
+
+```sh
+docker run --rm -v "$PWD":/work -w /work osdev:dev bash src/hyp/run-demos.sh
+# -> "ALL MILESTONES PASS (M1-M25)"
+```
 
 ### M14: the hypervisor as the guest timer source
 

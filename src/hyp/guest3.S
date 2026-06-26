@@ -19,12 +19,20 @@
 .global guest3_payload_end
 
 guest3_payload:
-	movz	x10, #0x4001, lsl #16   // x10 = 0x40010000 : counter IPA
+	movz	x10, #0x4001, lsl #16   // x10 = 0x40010000 : counter / working-set base
 	str	xzr, [x10]              // counter = 0
 1:
 	ldr	x11, [x10]
-	add	x11, x11, #1
-	str	x11, [x10]              // counter++  (writes -> dirties this page)
+	add	x11, x11, #1            // counter++
+	// Write the counter across a 16-page working set (pages 16..31) so the
+	// hypervisor's iterative pre-copy has a non-trivial dirty set to track.
+	mov	x12, #16
+	mov	x13, x10
+3:
+	str	x11, [x13]
+	add	x13, x13, #0x1000
+	subs	x12, x12, #1
+	b.ne	3b
 	mov	x0, #HVC_PING
 	mov	x1, #0
 	hvc	#0                      // bump this vCPU's hvc_count (liveness)

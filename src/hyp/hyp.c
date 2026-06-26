@@ -109,6 +109,7 @@ __attribute__((section(".hyp_tables"))) static uint64_t g_midr;
 /* Migration bookkeeping. */
 __attribute__((section(".hyp_tables"))) static int g_mig_state;
 __attribute__((section(".hyp_tables"))) static uint64_t g_mig_live_ticks;
+__attribute__((section(".hyp_tables"))) static uint64_t g_mig_round;
 __attribute__((section(".hyp_tables"))) static uint64_t g_mig_post_logs;
 __attribute__((section(".hyp_tables"))) static uint8_t g_mig_dirty[MIG_PAGES];
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t mig_l0[512];
@@ -174,6 +175,8 @@ static void hyp_create_linux_guest(void);
 static void hyp_create_linux_secondary(void);
 static void hyp_create_mig_guest(void);
 static void hyp_migration_step(void);
+static void hyp_tlbi_mig_page(uint64_t ipa);
+static void hyp_tlbi_mig_all(void);
 static void hyp_tick_init(void);
 static void hyp_vgic_inject_ex(int target, uint32_t intid, int hw);
 static void hyp_tick_start(void);
@@ -1744,7 +1747,8 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
       g_mig_dirty[idx] = 1;
       mig_l3[idx] = (MIG_SRC + idx * 4096) | S2_PAGE | S2_AF | S2_SH_INNER |
                     S2_AP_RW | S2_MEM_NORMAL;
-      __asm__ __volatile__("dsb ish; tlbi alle1is; dsb ish; isb");
+      __asm__ __volatile__("dsb ish");
+      hyp_tlbi_mig_page(ipa); /* VMID-3 only; don't flush other guests */
     }
     return; /* re-execute the store with write permission now granted */
   }
@@ -1927,9 +1931,47 @@ static void hyp_uart_rx_kick(void) {
 }
 
 /* Drive the live migration of vCPU 3 across scheduler ticks (so the guest keeps
- * running between phases). One pre-copy round + a live window with stage-2
- * dirty tracking + a final stop-and-copy that re-points the guest's stage-2 to
- * the destination window and poisons the source. */
+ * running between phases). This is iterative pre-copy: an initial full copy,
+ * then repeated rounds that re-copy only the pages dirtied since the last round
+ * (tracked via stage-2 write faults), until the dirty set is small enough to
+ * "converge" or a round cap is hit — then a final stop-and-copy re-points the
+ * guest's stage-2 to the destination and poisons the source. */
+#define MIG_MAX_ROUNDS 5
+#define MIG_CONVERGE 2      /* converged once a round dirties <= this many pages */
+#define MIG_WINDOW_TICKS 15 /* live-run window between pre-copy rounds            */
+
+/* Targeted stage-2 TLB invalidation for the migratable guest's VMID only, so a
+ * migration does NOT flush the other guests' (Fermi/Linux) TLBs. */
+static void hyp_tlbi_mig_page(uint64_t ipa) {
+  /* current VTTBR_EL2 is already the migratable guest's (we're in its abort). */
+  uint64_t arg = ipa >> 12;
+  __asm__ __volatile__("dsb ish");
+  __asm__ __volatile__("tlbi ipas2e1is, %0" ::"r"(arg));
+  __asm__ __volatile__("dsb ish");
+  __asm__ __volatile__("tlbi vmalle1is"); /* flush combined stage1+2 walks */
+  __asm__ __volatile__("dsb ish; isb");
+}
+static void hyp_tlbi_mig_all(void) {
+  uint64_t save = MRS(vttbr_el2);
+  MSR(vttbr_el2, vcpus[3].vttbr); /* select the migratable guest's VMID */
+  __asm__ __volatile__("isb; dsb ish");
+  __asm__ __volatile__("tlbi vmalls12e1is"); /* all stage1+2 for this VMID */
+  __asm__ __volatile__("dsb ish; isb");
+  MSR(vttbr_el2, save); /* world-switch will re-set VTTBR anyway */
+  __asm__ __volatile__("isb");
+}
+
+/* Write-protect every guest page (read-only) and clear the dirty set. */
+static void hyp_mig_protect_all(void) {
+  for (uint64_t i = 0; i < MIG_PAGES; i++) {
+    g_mig_dirty[i] = 0;
+    mig_l3[i] = (MIG_SRC + i * 4096) | S2_PAGE | S2_AF | S2_SH_INNER |
+                S2_AP_RO | S2_MEM_NORMAL;
+  }
+  __asm__ __volatile__("dsb ish");
+  hyp_tlbi_mig_all();
+}
+
 static void hyp_migration_step(void) {
   const uint64_t page_rw = S2_PAGE | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
 
@@ -1937,45 +1979,58 @@ static void hyp_migration_step(void) {
     if (vcpus[3].state == VCPU_UNUSED || vcpus[3].hvc_count <= 60)
       return; /* wait until the guest has been running for a while */
     uint64_t pre = *(volatile uint64_t *)(MIG_SRC + MIG_COUNTER_OFF);
-    hyp_puts("[HYP] live-migrate vCPU3: pre-copy 2 MiB SRC->DEST; counter=");
+    hyp_puts("[HYP] live-migrate vCPU3: iterative pre-copy starting; counter=");
     hyp_puthex(pre);
     hyp_puts("\n");
-    /* Write-protect every page and clear the dirty set, then copy it all. */
-    for (uint64_t i = 0; i < MIG_PAGES; i++) {
-      g_mig_dirty[i] = 0;
-      mig_l3[i] = (MIG_SRC + i * 4096) | S2_PAGE | S2_AF | S2_SH_INNER |
-                  S2_AP_RO | S2_MEM_NORMAL;
-    }
-    __asm__ __volatile__("dsb ish; tlbi alle1is; dsb ish; isb");
+    hyp_mig_protect_all();                       /* round 0: protect + full copy */
     memcpy((void *)MIG_DEST, (void *)MIG_SRC, MIG_RAM_SIZE);
     g_mig_state = MIGS_LIVE;
+    g_mig_round = 1;
     g_mig_live_ticks = 0;
     return;
   }
 
   if (g_mig_state == MIGS_LIVE) {
-    if (++g_mig_live_ticks < 40)
+    if (++g_mig_live_ticks < MIG_WINDOW_TICKS)
       return; /* let the guest run and dirty pages (tracked via write faults) */
+    g_mig_live_ticks = 0;
+
+    /* Copy the pages dirtied during this window to the destination. */
     int dirty = 0;
     for (uint64_t i = 0; i < MIG_PAGES; i++)
       if (g_mig_dirty[i]) {
         memcpy((void *)(MIG_DEST + i * 4096), (void *)(MIG_SRC + i * 4096), 4096);
         dirty++;
       }
-    /* Re-point the guest's stage-2 from SRC to DEST (write-enabled), flush. */
-    for (uint64_t i = 0; i < MIG_PAGES; i++)
-      mig_l3[i] = (MIG_DEST + i * 4096) | page_rw;
-    __asm__ __volatile__("dsb ish; tlbi alle1is; dsb ish; isb");
-    uint64_t cnt = *(volatile uint64_t *)(MIG_DEST + MIG_COUNTER_OFF);
-    memset((void *)MIG_SRC, 0xEE, MIG_RAM_SIZE); /* poison the old window */
-    hyp_puts("[HYP] live-migrate: stop-copy synced ");
+    hyp_puts("[HYP] live-migrate: pre-copy round ");
+    hyp_puthex(g_mig_round);
+    hyp_puts(" re-copied ");
     hyp_puthex((uint64_t)dirty);
-    hyp_puts(" dirty page(s); stage-2 now SRC->DEST; SRC poisoned; counter(DEST)=");
-    hyp_puthex(cnt);
-    hyp_puts("\n");
-    g_mig_state = MIGS_DONE;
-    g_mig_live_ticks = 0;
-    g_mig_post_logs = 0;
+    hyp_puts(" dirty page(s)\n");
+
+    int converged = (dirty <= MIG_CONVERGE);
+    int last = (g_mig_round >= MIG_MAX_ROUNDS);
+    if (converged || last) {
+      /* Final stop-and-copy: the dirty pages were just synced above; re-point
+       * the whole window to DEST, flush, and poison the old window. */
+      for (uint64_t i = 0; i < MIG_PAGES; i++)
+        mig_l3[i] = (MIG_DEST + i * 4096) | page_rw;
+      __asm__ __volatile__("dsb ish");
+      hyp_tlbi_mig_all();
+      uint64_t cnt = *(volatile uint64_t *)(MIG_DEST + MIG_COUNTER_OFF);
+      memset((void *)MIG_SRC, 0xEE, MIG_RAM_SIZE);
+      hyp_puts("[HYP] live-migrate: ");
+      hyp_puts(converged ? "converged" : "round cap");
+      hyp_puts(" -> stop-copy; stage-2 now SRC->DEST; SRC poisoned; counter(DEST)=");
+      hyp_puthex(cnt);
+      hyp_puts("\n");
+      g_mig_state = MIGS_DONE;
+      g_mig_post_logs = 0;
+      return;
+    }
+    /* Not converged: re-protect for another round and keep the guest running. */
+    hyp_mig_protect_all();
+    g_mig_round++;
     return;
   }
 

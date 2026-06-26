@@ -377,16 +377,26 @@ there, with the guest none the wiser.
 - **Dirty tracking:** a guest write to a protected page faults to EL2; the
   handler marks that page dirty, re-grants write, TLBIs, and *re-executes* the
   store (ELR not advanced).
-- **Stop-and-copy:** after a live window, re-copy only the dirtied pages, then
-  re-point the guest's stage-2 (`mig_l3`) SRC→DEST, `tlbi`, and poison SRC.
+- **Iterative rounds:** repeat — re-copy only the pages dirtied since the last
+  round, re-protect, let the guest run — until the dirty set is small ("converged")
+  or a round cap is hit. The guest here has a 16-page working set, so each round
+  re-copies ~16 pages and it hits the round cap (a faithful "busy guest" case).
+- **Stop-and-copy:** final dirty flush, re-point the guest's stage-2 (`mig_l3`)
+  SRC→DEST, TLBI, poison SRC.
 The whole state machine is driven from the scheduler tick so the guest keeps
 running between phases.
-*Verified:* `pre-copy … counter=0x3d` → `stop-copy synced 0x1 dirty page(s)`
-(exactly the counter page) → `counter(DEST)=0x47` and then `0x51`, `0x5b`
-climbing, while `SRC poisoned=0xeeeeeeeeeeeeeeee` — the counter is continuous
-across the move and the guest provably runs from the destination (the source is
-poisoned yet it keeps counting). All concurrent with the SMP Linux guest booting
-from its ext4 root disk. No anomalies.
+*A bug it surfaced — over-broad TLBI starves co-resident guests:* the first
+iterative version used `tlbi alle1is` (invalidate ALL VMIDs) on every
+write-fault and every round — 80+ full flushes that blew away Fermi's and
+Linux's TLBs too, starving them until Fermi took a wild fault and parked (so
+Linux never booted). Fix: scope invalidation to the migratable guest's VMID
+(`tlbi ipas2e1is` + `vmalle1is` for a page; select VTTBR + `vmalls12e1is` for the
+whole VMID). After that the other guests are untouched.
+*Verified:* `pre-copy round 1..5 re-copied 0x10 (16) dirty page(s)` →
+`round cap -> stop-copy … counter(DEST)=0x57` → `post-migrate counter climbing`
+while `SRC poisoned=0xeeee…` — the counter is continuous across the move and the
+guest provably runs from the destination. All concurrent with the SMP Linux
+guest booting from its ext4 root disk. No anomalies.
 
 ---
 

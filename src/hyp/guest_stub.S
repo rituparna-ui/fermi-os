@@ -597,3 +597,41 @@ guest_smp_sec:
 	b	2b
 .global guest_smp_end
 guest_smp_end:
+
+// ---------------------------------------------------------------------------
+// Misbehaving guest (milestone 25). Prints 'B' then deliberately stores to an
+// IPA far outside its mapped RAM (0x80000000) — an illegal access that takes a
+// stage-2 fault to EL2. A correct hypervisor must CONTAIN this: decode it, kill
+// only this VM, and keep the host + other VMs running. After the bad store we
+// loop (we should never get here once the hypervisor reaps us).
+.section .text.guest, "ax"
+.balign 16
+.global guest_bad_start
+guest_bad_start:
+	movz	x10, #0x0000
+	movk	x10, #0x0900, lsl #16	// UART
+	mov	w11, #'B'
+	str	w11, [x10]		// liveness marker before the fault
+	// Wild write to an unmapped guest IPA -> stage-2 translation fault @EL2.
+	movz	x12, #0x0000
+	movk	x12, #0x8000, lsl #16	// x12 = 0x80000000 (unmapped)
+	mov	x13, #0xDEAD
+	str	x13, [x12]		// faults here
+1:	b	1b			// (unreached if contained)
+.global guest_bad_end
+guest_bad_end:
+
+// Well-behaved guest (milestone 25): prints 'G' and yields, forever. Used to
+// show that a sibling VM keeps running after the bad VM is reaped.
+.section .text.guest, "ax"
+.balign 16
+.global guest_good_start
+guest_good_start:
+	movz	x10, #0x0000
+	movk	x10, #0x0900, lsl #16
+	mov	w11, #'G'
+	str	w11, [x10]
+	hvc	#0			// yield
+	b	guest_good_start
+.global guest_good_end
+guest_good_end:

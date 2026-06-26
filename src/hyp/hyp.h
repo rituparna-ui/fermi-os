@@ -146,4 +146,10 @@ void hyp_run_miniguest(void);
  * runs before the host timer. */
 void hyp_run_smp_guest(void);
 
+/* Milestone 25: vCPU fault isolation. Run a misbehaving VM (illegal memory
+ * access) alongside a healthy one; the hypervisor decodes the fault, tears down
+ * ONLY the bad VM, and the healthy VM + host keep running. No-op at EL1; runs
+ * before the host timer. */
+void hyp_run_fault_isolation(void);
+
 #endif /* HYP_HYP_H */

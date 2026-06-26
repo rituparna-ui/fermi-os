@@ -2088,3 +2088,99 @@ void hyp_run_smp_guest(void) {
   stage2_destroy(&s2);
   pmm_free_pages(ram, SMP_RAM_SIZE / 0x1000);
 }
+
+/* ---- Milestone 25: vCPU fault isolation (contain a misbehaving guest) ---- */
+
+extern char guest_bad_start[];
+extern char guest_bad_end[];
+extern char guest_good_start[];
+extern char guest_good_end[];
+
+#define FI_RAM_SIZE 0x00200000ULL
+
+/* Richly decode a fatal guest exit so a contained crash is diagnosable. */
+static void vm_fault_report(vcpu_t *v) {
+  uint64_t ec = ESR_EC_OF(v->esr);
+  uint64_t ipa = ((v->hpfar >> 4) << 12) | (v->far & 0xFFF);
+  uart_printf("[HYP] !! VM '%s' FAULT: EC=%x (%s) ELR=%x FAR=%x IPA=%x ESR=%x\n",
+              v->name ? v->name : "vm", ec, hyp_ec_name(ec), v->pc, v->far,
+              ipa, v->esr);
+}
+
+/* Set up one VM with the given guest blob. Returns 1 on success. */
+static int fi_setup(vcpu_t *v, stage2_t *s2, uintptr_t *ram_out,
+                    const char *blob_start, const char *blob_end,
+                    uint32_t vmid, const char *name) {
+  uintptr_t ram = pmm_allocate_pages(FI_RAM_SIZE / 0x1000);
+  if (!ram || !stage2_create(s2, vmid)) {
+    return 0;
+  }
+  stage2_map(s2, GUEST_ENTRY_IPA, (uint64_t)ram, FI_RAM_SIZE, 0);
+  stage2_map(s2, UART_BASE, UART_BASE, 0x1000, /*device=*/1);
+  uint64_t len = (uint64_t)(blob_end - blob_start);
+  uint64_t kva = PHYS_TO_VIRT((uint64_t)ram);
+  for (uint64_t b = 0; b < len; b++) {
+    ((volatile uint8_t *)kva)[b] = ((volatile uint8_t *)blob_start)[b];
+  }
+  guest_sync_icache(kva, (len + 0xFFF) & ~0xFFFULL);
+
+  for (int i = 0; i < 31; i++) v->x[i] = 0;
+  v->pc = GUEST_ENTRY_IPA;
+  v->pstate = 0x3C5;
+  v->sp_el1 = GUEST_ENTRY_IPA + FI_RAM_SIZE;
+  v->vttbr = stage2_vttbr(s2);
+  v->mpidr = 0;
+  v->hcr_extra = 0;
+  v->vmid = vmid;
+  v->name = name;
+  *ram_out = ram;
+  return 1;
+}
+
+void hyp_run_fault_isolation(void) {
+  if (!hyp_at_el2()) {
+    return;
+  }
+
+  uart_println("[HYP] M25: fault isolation — a bad VM must not take down the host");
+
+  static stage2_t s2_bad, s2_good;
+  static vcpu_t v_bad, v_good;
+  uintptr_t ram_bad = 0, ram_good = 0;
+  if (!fi_setup(&v_bad, &s2_bad, &ram_bad, guest_bad_start, guest_bad_end,
+                1, "badvm") ||
+      !fi_setup(&v_good, &s2_good, &ram_good, guest_good_start, guest_good_end,
+                2, "goodvm")) {
+    return;
+  }
+
+  int bad_alive = 1, good_runs = 0;
+
+  /* Run the bad VM first: it should fault and be reaped. */
+  vcpu_enter(&v_bad);
+  if (!(v_bad.exit_reason == HYP_EXC_SYNC && ESR_EC_OF(v_bad.esr) == 0x16) &&
+      !df_service_exit(&v_bad)) {
+    vm_fault_report(&v_bad);
+    uart_println("[HYP] reaping VM 'badvm' (stage-2 teardown + RAM release)");
+    stage2_destroy(&s2_bad);
+    pmm_free_pages(ram_bad, FI_RAM_SIZE / 0x1000);
+    bad_alive = 0;
+  }
+
+  /* Now prove the healthy VM still runs fine afterwards. */
+  for (int i = 0; i < 3; i++) {
+    vcpu_enter(&v_good);
+    if (v_good.exit_reason == HYP_EXC_SYNC && ESR_EC_OF(v_good.esr) == 0x16) {
+      good_runs++; /* clean yield */
+    } else if (!df_service_exit(&v_good)) {
+      break;
+    }
+  }
+  stage2_destroy(&s2_good);
+  pmm_free_pages(ram_good, FI_RAM_SIZE / 0x1000);
+
+  uart_println("");
+  int ok = (!bad_alive) && (good_runs == 3);
+  uart_printf("[HYP] M25: %s (bad VM reaped=%s, good VM ran %u times, host alive)\n",
+              ok ? "PASS" : "FAIL", bad_alive ? "no" : "yes", good_runs);
+}

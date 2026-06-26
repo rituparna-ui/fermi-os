@@ -228,6 +228,7 @@ static mut SCHED_CTX: [u64; 2] = [0, 0];
 static mut POOL_CUR: [u64; 2] = [0, 0];
 static POOL_RAN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 static POOL_SUM: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static POOL_MIGRATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Allocate the per-core scheduler save-contexts. Call once, single-threaded.
 pub fn pool_init() {
@@ -259,13 +260,39 @@ pub fn pool_seed(k: u64) {
 }
 
 extern "C" fn pool_task_body() {
+    let first = (mrs!(mpidr_el1) & 0xff) as usize & 1;
+    let mut migrated = false;
+    // Several work rounds with cooperative yields between them. Each yield is
+    // a safe migration point — the task may resume on the other core.
+    for _ in 0..6 {
+        for _ in 0..120_000u64 { core::hint::spin_loop(); }
+        pool_yield();
+        let now = (mrs!(mpidr_el1) & 0xff) as usize & 1;
+        if now != first { migrated = true; }
+    }
+    if migrated { POOL_MIGRATIONS.fetch_add(1, Ordering::Relaxed); }
+    // Account completion on whichever core finishes it.
     let core = (mrs!(mpidr_el1) & 0xff) as usize & 1;
-    let t = unsafe { POOL_CUR[core] } as *mut Task;
-    let pid = unsafe { (*t).pid };
+    let pid = unsafe { (*(POOL_CUR[core] as *mut Task)).pid };
     POOL_RAN[core].fetch_add(1, Ordering::Relaxed);
     POOL_SUM[core].fetch_add(pid, Ordering::Relaxed);
-    for _ in 0..300_000u64 { core::hint::spin_loop(); }
     smp_pool_return();
+}
+
+/// Cooperative yield from inside a pool task: save this task's context and
+/// return to the per-core scheduler, which will requeue it. Another core may
+/// then pop and resume it — i.e. the task can migrate across cores. Safe: the
+/// task is fully saved (by context_switch) before it is requeued, so it is
+/// never runnable on two cores at once.
+fn pool_yield() {
+    let core = (mrs!(mpidr_el1) & 0xff) as usize & 1;
+    unsafe {
+        let t = POOL_CUR[core] as *mut Task;
+        (*t).state = TASK_READY; // yielded, not finished
+        let ctx = SCHED_CTX[core] as *mut Task;
+        sched::raw_context_switch(t, ctx);
+    }
+    // resumed here (possibly on a different core) when popped + switched back
 }
 
 fn smp_pool_return() -> ! {
@@ -291,8 +318,13 @@ pub fn pool_run_one(core: usize) -> bool {
         POOL_CUR[core] = t as u64;
         (*t).state = TASK_RUNNING;
         let ctx = SCHED_CTX[core] as *mut Task;
-        sched::raw_context_switch(ctx, t); // run task to completion; returns here
+        sched::raw_context_switch(ctx, t); // run task; returns when it yields or finishes
         core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack));
+    }
+    // If the task yielded (still READY) rather than finishing (DEAD), requeue
+    // it so either core can resume it — enabling cross-core migration.
+    if unsafe { (*t).state } == TASK_READY {
+        pool_push(t);
     }
     true
 }
@@ -306,12 +338,12 @@ pub extern "C" fn pool_sched_core0() {
     }
 }
 
-/// (ran0, ran1, sum0, sum1, seeded, remaining)
-pub fn pool_stats() -> (u64, u64, u64, u64, u64, usize) {
+/// (ran0, ran1, sum0, sum1, seeded, remaining, migrations)
+pub fn pool_stats() -> (u64, u64, u64, u64, u64, usize, u64) {
     let q = POOLQ.lock_irqsave();
     (POOL_RAN[0].load(Ordering::Relaxed), POOL_RAN[1].load(Ordering::Relaxed),
      POOL_SUM[0].load(Ordering::Relaxed), POOL_SUM[1].load(Ordering::Relaxed),
-     q.seeded, q.len)
+     q.seeded, q.len, POOL_MIGRATIONS.load(Ordering::Relaxed))
 }
 
 #[no_mangle]

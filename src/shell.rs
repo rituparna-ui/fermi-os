@@ -540,12 +540,12 @@ fn dispatch(line: &str) {
             crate::smp::pool_seed(k);
             kprintln!("seeded {} pooled tasks; draining on both cores...", k);
             sched::sleep_ms(1500);
-            let (r0, r1, s0, s1, seeded, rem) = crate::smp::pool_stats();
+            let (r0, r1, s0, s1, seeded, rem, mig) = crate::smp::pool_stats();
             let expect = (1000..1000 + seeded).sum::<u64>();
             kprintln!("  core0 ran {} tasks (pid-sum {})", r0, s0);
             kprintln!("  core1 ran {} tasks (pid-sum {})", r1, s1);
-            kprintln!("  total {}/{} run, {} remaining, checksum {} (expect {}) -> {}",
-                      r0 + r1, seeded, rem, s0 + s1, expect,
+            kprintln!("  total {}/{} run, {} remaining, {} migrated cores, checksum {} (expect {}) -> {}",
+                      r0 + r1, seeded, rem, mig, s0 + s1, expect,
                       if r0 + r1 == seeded && s0 + s1 == expect { "OK" } else { "incomplete" });
         }
         "smptest" => {

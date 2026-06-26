@@ -565,6 +565,7 @@ __attribute__((noreturn)) void vcpu_run_first(void) {
     hyp_unlock_irqrestore(&sched_lock, sl);
     hyp_panic("vcpu_run_first: no runnable vCPU");
   }
+  v->on_pcpu = (int)pc->cpu_id; /* reserve residency UNDER sched_lock (no double-pick) */
   pcpu_idle_mask &= ~(1u << pc->cpu_id);
   sched_arm_slice_for(v);
   hyp_unlock_irqrestore(&sched_lock, sl);
@@ -573,7 +574,6 @@ __attribute__((noreturn)) void vcpu_run_first(void) {
   vcpu_load_hw(v);
   vgic_restore(&v->vgic);
   vgic_drain_pending_locked(v);
-  v->on_pcpu = (int)pc->cpu_id;
   hyp_unlock_irqrestore(&v->vgic_lock, vl);
 
   vcpu_first_entry(&v->gp);
@@ -688,7 +688,16 @@ static void schedule(hyp_trap_frame_t *f) {
     return; /* nothing to do (also the common single-runnable case) */
   }
   account_cpu_time(); /* credit prev under sched_lock (reads cur_load_tsc) */
+  /* CRITICAL: reserve residency ATOMICALLY under sched_lock. Releasing prev
+   * (on_pcpu=-1) and claiming next (on_pcpu=this cpu) here — inside the same
+   * critical section that pick_next_locked ran in — is what prevents two cores
+   * from both selecting the same vCPU (a double-run). Without this, a second
+   * core could pick `next` in the window before we marked it resident. */
+  if (prev) {
+    prev->on_pcpu = -1;
+  }
   if (next) {
+    next->on_pcpu = (int)pc->cpu_id;  /* reserved: no other core can pick it */
     pcpu_idle_mask &= ~(1u << pc->cpu_id);
   } else {
     pcpu_idle_mask |= (1u << pc->cpu_id);
@@ -707,7 +716,9 @@ static void schedule(hyp_trap_frame_t *f) {
     hyp_con_end();
   }
 
-  /* Save prev while we still own it (on_pcpu unchanged until after the save). */
+  /* Save prev's context. on_pcpu is already -1, so a cross-core injector targeting
+   * prev now latches into its pending bitmap (drained when prev next loads). The
+   * vgic_lock orders our vgic_save against any concurrent vgic_inject into prev. */
   if (prev) {
     for (int i = 0; i < 31; i++) prev->gp.x[i] = f->regs[i];
     prev->gp.elr_el2 = f->elr;
@@ -716,33 +727,33 @@ static void schedule(hyp_trap_frame_t *f) {
     vcpu_save_fp(&prev->fp);
     uint64_t vl = hyp_lock_irqsave(&prev->vgic_lock);
     vgic_save(&prev->vgic);
-    prev->on_pcpu = -1; /* publish: not resident anywhere (AFTER save) */
     hyp_unlock_irqrestore(&prev->vgic_lock, vl);
   }
 
-  /* If nothing is claimable, idle: pc->current = NULL and wfi with IRQs unmasked
-   * until a CNTHP or reschedule-SGI wakes us; then re-pick. We do NOT return to
-   * the vector with a stale `f` (that would re-run the saved-away prev) — we only
-   * leave this function once we have a `next` and have rewritten `f`. */
+  /* If nothing was claimable, idle until woken, then re-reserve under sched_lock. */
   while (!next) {
     pc->current = (void *)0;
     uint64_t pstate;
     __asm__ __volatile__("mrs %0, daif" : "=r"(pstate));
-    __asm__ __volatile__("msr daifclr, #2\n\twfi\n\tisb" ::: "memory"); /* unmask I, wait, an IRQ handler may run */
+    __asm__ __volatile__("msr daifclr, #2\n\twfi\n\tisb" ::: "memory");
     __asm__ __volatile__("msr daif, %0" :: "r"(pstate) : "memory");
     uint64_t s2 = hyp_lock_irqsave(&sched_lock);
     next = pick_next_locked(pc);
     if (next) {
+      next->on_pcpu = (int)pc->cpu_id; /* reserve under the lock */
       pcpu_idle_mask &= ~(1u << pc->cpu_id);
     }
     hyp_unlock_irqrestore(&sched_lock, s2);
   }
 
+  /* next is already reserved (on_pcpu = us). Restore its context + drain any
+   * pending vIRQs latched while it was off-core. The vgic_lock orders the restore
+   * + drain against a concurrent injector (which, seeing on_pcpu==us, will send
+   * us a reschedule-SGI; we drain-on-load here so nothing is lost). */
   uint64_t vl2 = hyp_lock_irqsave(&next->vgic_lock);
   vcpu_load_hw(next);          /* sets pc->current = next (owner-only write) */
   vgic_restore(&next->vgic);
   vgic_drain_pending_locked(next);
-  next->on_pcpu = (int)pc->cpu_id; /* publish residency AFTER restore+drain */
   hyp_unlock_irqrestore(&next->vgic_lock, vl2);
 
   for (int i = 0; i < 31; i++) f->regs[i] = next->gp.x[i];

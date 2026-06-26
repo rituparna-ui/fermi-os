@@ -541,11 +541,13 @@ void hyp_main(void) {
                             __smp_blob_start, SMP_HOST_RAM_BASE, smp_size);
   smp0->ram_size = SMP_RAM_SIZE;
   vcpu_t *smp1 = vcpu_alloc_secondary(smp0, "smp-cpu1", 0x80000001ULL);
-  /* SMP Phase C: PIN both sibling vCPUs to pCPU0 so the guest-internal SGI
-   * ping-pong is still software-routed on one physical core (not yet cross-pCPU).
-   * Phase D unpins them so they run genuinely in parallel on two pCPUs. */
-  smp0->pin_pcpu = 0;
-  smp1->pin_pcpu = 0;
+  (void)smp1;
+  /* SMP Phase D: the two sibling vCPUs are UNPINNED (pin_pcpu = -1 from
+   * vcpu_alloc), so the scheduler may run them on DIFFERENT physical cores at the
+   * same time. Their guest-internal SGI ping-pong (ICC_SGI1R_EL1) then becomes a
+   * genuine cross-pCPU inter-processor interrupt: vcpu_sgi_route -> vgic_inject
+   * latches the target's pending bit + sends a physical reschedule SGI to the
+   * core the sibling is resident on, which drains it into live LRs. */
 
   /* balloonclient (id 14, VMID 14): drives the emulated virtio-mmio memory-
    * balloon device — inflate (donate+zero pages) and deflate, self-driven by

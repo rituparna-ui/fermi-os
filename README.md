@@ -39,7 +39,13 @@ Only five hand-written assembly files remain (everything else is Rust):
   preemptive scheduler** (idle + tasks, timer-driven), and a shared
   `SpinLock`-protected work queue is drained concurrently by **both cores**
   (verified: 8000 jobs, exact checksum, no loss/duplication). Cross-core
-  `kprintln!` is serialized by an IRQ-safe print lock.
+  `kprintln!` is serialized by an IRQ-safe print lock. On top of this is a
+  **symmetric task scheduler** (`smpsched`): a shared run queue of real
+  `Task`s that **both cores** pull from and run via `context_switch`, with
+  **cooperative cross-core migration** (a task can `pool_yield()`, be requeued,
+  and resume on the other core) and reclamation of finished tasks — verified
+  memory-stable under sustained load with an exactly-once pid checksum (e.g.
+  120 tasks → ~100 migrated across cores, no loss/duplication, heap flat).
 - **PCI & VirtIO** — PCI ECAM enumeration + BAR assignment, modern VirtIO PCI
   transport, split virtqueue, and drivers for **RNG, block, net, console, and
   balloon** (block I/O serialized by an IRQ-safe lock for SMP safety).

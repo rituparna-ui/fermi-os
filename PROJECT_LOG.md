@@ -269,3 +269,40 @@ is itself evidence the implementation is genuinely exercised end-to-end.
    → `smp-mmu` → `smp-print-lock` → `smp-tasks`.
 4. Trivial conflicts only: overlapping shell `dispatch` arms / help text, the
    `ps` renderer, and the `ProcKind` enum (`proc-cpuinfo` adds a variant).
+
+
+---
+
+## 13. SMP scheduler arc (post-consolidation, on `integration`)
+
+Built incrementally on the SMP foundation, each branch merged into `integration`
+and boot-verified under `-smp 2`:
+
+- `feat/smp-sched` — **symmetric run-to-completion scheduling**. A shared
+  `SpinLock` run queue of real `Task`s; both cores pop a task (removing it),
+  `context_switch` to it via a per-core scheduler context, run it to completion,
+  and switch back. Never requeued mid-flight → the "prev task on two cores'
+  stacks" race cannot occur. Pool tasks run non-preemptibly (a `pool_trampoline`
+  that never unmasks IRQs + `pool_run_one` masks around the nested switch) so
+  neither core's preemptive scheduler is corrupted. Verified: 120 tasks →
+  core0 16 + core1 104, pid checksum exact (each task once); split varies per
+  run (dynamic balancing).
+- `feat/smp-migrate` — **cooperative cross-core migration**. `pool_yield()` lets
+  a task give up its core mid-run: it saves its context and is requeued, so
+  either core can resume it. Safe because the task is fully saved before being
+  requeued. Verified: 100 tasks → 99 ran on *both* cores, checksum exact.
+- `feat/smp-pool-reclaim` — **resource reclamation + join**. Finished tasks'
+  stacks + structs are freed (`sched::free_pool_task`); `pool_join` waits for
+  completion; unique monotonic pids + cumulative checksum. Verified: 3× 60
+  tasks → heap free flat (no leak across 180 task lifecycles), checksums exact.
+
+Shell: `smpsched [k]` seeds k pooled tasks, drains them across both cores,
+joins, and reports per-core counts, migrations, heap reclamation, and the
+exactly-once pid checksum.
+
+**Remaining frontier:** *involuntary* (timer-driven) preemptive migration — a
+task forcibly moved between cores by a timer interrupt — which needs core 0's
+round-robin scheduler unified onto the shared run queue (scheduler lock held
+across `context_switch`, a lock-releasing/`finish_switch` trampoline, and
+IRQ-state handoff). The cooperative path above delivers real cross-core
+migration without that two-stack correctness landmine.

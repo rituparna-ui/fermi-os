@@ -502,7 +502,7 @@ fn dispatch(line: &str) {
     match cmd {
         "help" => {
             kprintln!("builtins: help uptime version uname date ps top sysinfo free meminfo");
-            kprintln!("  diag  : irqs traps cpuinfo heapstat memtest <kb> smp smptest");
+            kprintln!("  diag  : irqs traps cpuinfo heapstat memtest <kb> smp smptest smpsched [k]");
             kprintln!("  net   : ifconfig ping [n] arp [ip] resolve <host> http <host> ntp [host]");
             kprintln!("  files : ls [path] cat <path> grep <pat> <path> wc <path> stat <path>");
             kprintln!("          write <name> <text> cp <src> <dst> mv <old> <new> rm <path>");

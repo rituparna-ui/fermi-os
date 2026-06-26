@@ -79,7 +79,8 @@ never collides with pages the guest's PMM hands out, even with stage-2 off.
 | `ipc/` | EL1 guest run by 2 VMs (producer/consumer) for inter-VM shared memory |
 | `dom0/` | Privileged EL1 control guest driving the VMCTL management hypercall |
 | `smpguest/` | 2-vCPU SMP guest: primary `CPU_ON`s a secondary, they ping-pong an SGI |
-| `*_blob.S` (`guest`, `guest2`, `ipc`, `dom0`, `smpguest`, …) | Embed the flat guest images into the hyp |
+| `virtio/virtio_balloon.c` / `balloonclient/` | virtio-mmio memory balloon (inflate/deflate of donated PFNs) + its client |
+| `*_blob.S` (`guest`, `guest2`, `ipc`, `dom0`, `smpguest`, `balloonclient`, …) | Embed the flat guest images into the hyp |
 
 ## How key subsystems work
 
@@ -295,6 +296,39 @@ Command register enables Memory Space + Bus Master. Config reads honour
 byte/halfword/word widths via sub-word masking. The `pciclient/` guest runs the
 full flow (scan → size → assign → enable) and prints the result. This is the
 PCI-discovery counterpart to the fixed-window virtio-mmio devices.
+
+### virtio-mmio memory-balloon device
+
+A fourth virtio-mmio device (`virtio/virtio_balloon.c`, DeviceID 5) at
+`0x0A004000`, demonstrating cooperative guest↔hypervisor memory management. It
+has **two virtqueues** — inflateq (queue 0) and deflateq (queue 1) — and a
+device-config region exposing `num_pages` (the target balloon size, device-owned
+/ read-only to the guest) and `actual` (pages currently ballooned, driver-owned
+/ read-write). The driver puts **arrays of little-endian u32 PFNs** (4 KiB page
+frame numbers) on a queue; unlike the rng/blk/net buffers these are
+**device-READ** (no `DESC_F_WRITE`), the opposite direction. The device
+self-drives: on each write-side trap it runs a `CNTPCT` clock that retargets
+`num_pages` between an inflate goal (4 MiB) and 0 and raises a **config-change
+interrupt** (InterruptStatus bit 1, distinct from the used-buffer bit 0), bumping
+**ConfigGeneration** so the driver's `read-gen / read-num_pages / re-read-gen`
+snapshot is consistent — and the autopilot fires *only* on write traps, never on
+a config read, so the snapshot can never tear. The `balloonclient/` guest polls
+the target and inflates/deflates the difference, walking `balloon=` up to the
+goal and back to 0 forever, exercising **both** paths with no external trigger.
+
+The honest deviation (load-bearing): this hypervisor's stage-2 is a **fixed
+linear map built once at boot — there is no runtime unmap**, so a balloon cannot
+return pages to the host. "Inflation" therefore **zeroes** each donated page
+(proving the hyp legitimately reuses its contents) and counts it; the page stays
+mapped. Every inflate line prints `NOT host-unmapped; fixed stage-2` so the demo
+never overclaims. Everything else is virtio-1.x faithful. Security is taken
+seriously even for this toy: every donated PFN is bounds-checked via
+`vcpu_ipa_to_pa` before the hyp zeroes it (a PFN aimed at the MMIO window,
+another VM, or the hyp yields `pa==0` and is skipped — VM-escape defense), the
+PFN array is snapshotted whole before any zeroing (TOCTOU closed), and a hard
+per-notify page budget caps total zeroing work so a hostile driver cannot stall
+EL2. Four virtio devices (entropy + block + net + balloon) now coexist on the
+shared transport.
 
 ### Paravirtualized console (PV log)
 

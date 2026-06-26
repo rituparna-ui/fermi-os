@@ -17,7 +17,7 @@
  * so the same guest IPA maps to different host PAs — true memory isolation.
  * ------------------------------------------------------------------------- */
 
-#define MAX_VCPUS 14
+#define MAX_VCPUS 16
 
 static vcpu_t vcpus[MAX_VCPUS];
 static int    nr_vcpus;

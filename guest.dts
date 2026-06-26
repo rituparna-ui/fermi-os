@@ -120,4 +120,12 @@
 		reg = <0x0 0x0a000600 0x0 0x200>;
 		interrupts = <0 5 4>;
 	};
+
+	/* Emulated virtio-balloon (virtio-mmio, device id 5). The host inflates it
+	 * via vmctl; the guest hands pages back. IRQ SPI 6 => INTID 38. */
+	virtio_balloon@a000800 {
+		compatible = "virtio,mmio";
+		reg = <0x0 0x0a000800 0x0 0x200>;
+		interrupts = <0 6 4>;
+	};
 };

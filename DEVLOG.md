@@ -467,6 +467,18 @@ hypercall runs, so its struct holds an up-to-date context.)
 3092); `restore` → the RAM counter is back to `0x8ff` and the vCPU's HVC count
 drops to ~2391 — the guest literally rewound to the checkpoint. No anomalies.
 
+### Emulated virtio-balloon (memory reclaim)
+*Why:* a 5th virtio device (DeviceID 5) that lets the host reclaim guest memory.
+`vmctl balloon <pages>` writes the target into the device config and raises a
+**config-change interrupt** (`InterruptStatus` bit 1); the Linux guest's
+(built-in, `CONFIG_VIRTIO_BALLOON=y`) balloon driver allocates that many pages
+and hands their PFNs to the host on the inflate queue. The hypervisor walks the
+queue, counts the surrendered pages (now free for the host to reclaim), and
+reports `actual` back.
+*Verified:* `vmctl balloon 128` → `target set to 0x80 pages; config-change IRQ
+raised` → `guest inflated 0x80 pages (512 KiB given to host)`. Linux still boots
+to its ext4 root with the device present. No anomalies.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)

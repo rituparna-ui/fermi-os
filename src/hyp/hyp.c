@@ -1366,6 +1366,126 @@ static int hyp_emulate_vcon(uint64_t ipa, int is_write, uint64_t *val) {
   return 1;
 }
 
+/* ------------------------- emulated virtio-balloon ------------------------- */
+/* A virtio-mmio (version 2) memory balloon (DeviceID 5) for the Linux guest.
+ * The host sets a target (num_pages) and raises a config-change interrupt; the
+ * guest's balloon driver allocates that many pages and hands their PFNs to the
+ * host on the inflate queue. The hypervisor counts them (the pages are now free
+ * for the host to reclaim) and reports actual back. */
+#define VBLN_LO 0x0a000800ULL
+#define VBLN_HI 0x0a000a00ULL
+#define VBLN_INTID 38 /* DT: virtio_balloon interrupts = <0 6 4> => SPI 6 => 38 */
+
+__attribute__((section(".hyp_tables"))) static struct {
+  uint32_t status;
+  uint32_t dev_feat_sel, drv_feat_sel;
+  uint32_t int_status;
+  uint32_t q_sel;
+  struct vnet_q q[2]; /* 0 = inflateq, 1 = deflateq */
+  uint32_t num_pages; /* host target (config[0])  */
+  uint32_t actual;    /* guest-reported (config[4]) */
+  uint64_t inflated;  /* cumulative pages handed to the host */
+} g_vbln;
+
+/* Process the inflate queue: each buffer is an array of __le32 page frame
+ * numbers the guest is giving up. Count them. */
+static void hyp_vbln_inflate(void) {
+  struct vnet_q *q = &g_vbln.q[0];
+  if (!q->ready || !q->desc || !q->avail || !q->used || q->num == 0)
+    return;
+  struct vq_desc *desc = lx_gpa(q->desc);
+  volatile uint16_t *avail = lx_gpa(q->avail);
+  volatile uint16_t *used16 = lx_gpa(q->used);
+  if (!desc || !avail || !used16)
+    return;
+  uint16_t aidx = avail[1];
+  int worked = 0;
+  uint32_t pages = 0;
+  while (q->last_avail != aidx) {
+    uint16_t head = avail[2 + (q->last_avail % q->num)];
+    if (head >= q->num)
+      break;
+    struct vq_desc *d = &desc[head];
+    pages += d->len / 4; /* each PFN is a __le32 */
+    volatile uint32_t *ur = (volatile uint32_t *)(used16 + 2);
+    uint16_t uidx = used16[1];
+    uint16_t us = uidx % q->num;
+    ur[us * 2 + 0] = head;
+    ur[us * 2 + 1] = d->len;
+    __asm__ __volatile__("dsb ish");
+    used16[1] = uidx + 1;
+    q->last_avail++;
+    worked = 1;
+  }
+  if (worked) {
+    g_vbln.actual += pages;
+    g_vbln.inflated += pages;
+    __asm__ __volatile__("dsb ish");
+    g_vbln.int_status |= 1;
+    hyp_vgic_inject_ex(1 /* Linux */, VBLN_INTID, 0 /* SW */);
+    hyp_puts("[HYP] virtio-balloon: guest inflated ");
+    hyp_puthex((uint64_t)pages);
+    hyp_puts(" pages (total ");
+    hyp_puthex(g_vbln.inflated);
+    hyp_puts(" pages = ");
+    hyp_puthex(g_vbln.inflated * 4);
+    hyp_puts(" KiB given to host)\n");
+  }
+}
+
+static int hyp_emulate_vbln(uint64_t ipa, int is_write, uint64_t *val) {
+  uint64_t off = ipa - VBLN_LO;
+  uint32_t s = g_vbln.q_sel < 2 ? g_vbln.q_sel : 0;
+  if (is_write) {
+    switch (off) {
+    case 0x014: g_vbln.dev_feat_sel = (uint32_t)*val; break;
+    case 0x024: g_vbln.drv_feat_sel = (uint32_t)*val; break;
+    case 0x030: g_vbln.q_sel = (uint32_t)*val; break;
+    case 0x038: g_vbln.q[s].num = (uint32_t)*val; break;
+    case 0x044: g_vbln.q[s].ready = (uint32_t)*val; break;
+    case 0x050: if ((uint32_t)*val == 0) hyp_vbln_inflate(); break; /* notify inflateq */
+    case 0x064: g_vbln.int_status &= ~(uint32_t)*val; break;
+    case 0x070: g_vbln.status = (uint32_t)*val; break;
+    case 0x080: g_vbln.q[s].desc = (g_vbln.q[s].desc & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x084: g_vbln.q[s].desc = (g_vbln.q[s].desc & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    case 0x090: g_vbln.q[s].avail = (g_vbln.q[s].avail & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x094: g_vbln.q[s].avail = (g_vbln.q[s].avail & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    case 0x0a0: g_vbln.q[s].used = (g_vbln.q[s].used & ~0xFFFFFFFFULL) | (uint32_t)*val; break;
+    case 0x0a4: g_vbln.q[s].used = (g_vbln.q[s].used & 0xFFFFFFFFULL) | ((uint64_t)*val << 32); break;
+    default: break;
+    }
+    return 1;
+  }
+  switch (off) {
+  case 0x000: *val = 0x74726976; break;       /* Magic                       */
+  case 0x004: *val = 2; break;                /* Version 2                   */
+  case 0x008: *val = 5; break;                /* DeviceID 5 = balloon        */
+  case 0x00c: *val = 0x554d4551; break;       /* VendorID                    */
+  case 0x010: *val = (g_vbln.dev_feat_sel == 1) ? (1u << 0) : 0; break; /* VERSION_1 */
+  case 0x034: *val = 256; break;              /* QueueNumMax                 */
+  case 0x044: *val = g_vbln.q[s].ready; break;
+  case 0x060: *val = g_vbln.int_status; break;
+  case 0x070: *val = g_vbln.status; break;
+  case 0x0fc: *val = 0; break;                /* ConfigGeneration            */
+  case 0x100: *val = g_vbln.num_pages; break; /* config: num_pages (target)  */
+  case 0x104: *val = g_vbln.actual; break;    /* config: actual              */
+  default: *val = 0; break;
+  }
+  return 1;
+}
+
+/* Set the balloon target and raise a config-change interrupt so the guest
+ * inflates toward it. Called from the vmctl control hypercall. */
+static void hyp_balloon_set(uint32_t pages) {
+  g_vbln.num_pages = pages;
+  __asm__ __volatile__("dsb ish");
+  g_vbln.int_status |= 2; /* VIRTIO_MMIO_INT_CONFIG (config changed) */
+  hyp_vgic_inject_ex(1 /* Linux */, VBLN_INTID, 0 /* SW */);
+  hyp_puts("[HYP] virtio-balloon: target set to ");
+  hyp_puthex((uint64_t)pages);
+  hyp_puts(" pages; config-change IRQ raised\n");
+}
+
 /* ------------------------------- traps ------------------------------------ */
 
 static const char *ec_name(uint64_t ec) {
@@ -1506,6 +1626,7 @@ static void hyp_handle_hvc(el2_frame_t *f) {
   uint64_t fn = f->x[0];
   uint64_t a1 = f->x[1];
   uint64_t a2 = f->x[2];
+  uint64_t a3 = f->x[3];
   uint64_t ret;
   vcpu_t *cur = &vcpus[current_vcpu];
 
@@ -1614,6 +1735,13 @@ static void hyp_handle_hvc(el2_frame_t *f) {
       } else {
         ret = HVC_ERR_BADCALL;
       }
+      break;
+    case VMCTL_BALLOON:
+      /* Inflate the Linux guest's balloon to a3 pages. */
+      if (id == 1)
+        hyp_balloon_set((uint32_t)a3);
+      else
+        ret = HVC_ERR_BADCALL;
       break;
     default:
       ret = HVC_ERR_BADCALL;
@@ -1996,12 +2124,14 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
        (ipa >= VIRTIO_LO && ipa < VIRTIO_HI) ||
        (ipa >= VBLK_LO && ipa < VBLK_HI) ||
        (ipa >= VNET_LO && ipa < VNET_HI) ||
-       (ipa >= VCON_LO && ipa < VCON_HI))) {
+       (ipa >= VCON_LO && ipa < VCON_HI) ||
+       (ipa >= VBLN_LO && ipa < VBLN_HI))) {
     int is_uart = (ipa >= PL011_LO && ipa < PL011_HI);
     int is_virtio = (ipa >= VIRTIO_LO && ipa < VIRTIO_HI);
     int is_vblk = (ipa >= VBLK_LO && ipa < VBLK_HI);
     int is_vnet = (ipa >= VNET_LO && ipa < VNET_HI);
     int is_vcon = (ipa >= VCON_LO && ipa < VCON_HI);
+    int is_vbln = (ipa >= VBLN_LO && ipa < VBLN_HI);
     vcpus[current_vcpu].mmio_emulated++;
     uint64_t isv = (esr >> 24) & 1;
     uint64_t sas = (esr >> 22) & 3;
@@ -2021,6 +2151,8 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
           hyp_emulate_vnet(ipa, 1, &v);
         else if (is_vcon)
           hyp_emulate_vcon(ipa, 1, &v);
+        else if (is_vbln)
+          hyp_emulate_vbln(ipa, 1, &v);
         else
           hyp_emulate_gic(ipa, 1, &v);
       } else {
@@ -2034,6 +2166,8 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
           hyp_emulate_vnet(ipa, 0, &v);
         else if (is_vcon)
           hyp_emulate_vcon(ipa, 0, &v);
+        else if (is_vbln)
+          hyp_emulate_vbln(ipa, 0, &v);
         else
           hyp_emulate_gic(ipa, 0, &v);
         if (sas == 0)

@@ -301,6 +301,7 @@ static int write_vmctl(struct vnode *n, file_t *f, const void *buf,
   struct { const char *w; uint64_t op; } cmds[] = {
     {"pause", VMCTL_PAUSE}, {"resume", VMCTL_RESUME}, {"migrate", VMCTL_MIGRATE},
     {"snapshot", VMCTL_SNAPSHOT}, {"restore", VMCTL_RESTORE},
+    {"balloon", VMCTL_BALLOON},
   };
   uint64_t op = (uint64_t)-1;
   for (unsigned c = 0; c < sizeof(cmds) / sizeof(cmds[0]); c++) {
@@ -309,12 +310,14 @@ static int write_vmctl(struct vnode *n, file_t *f, const void *buf,
     while (w[i] && i < count && p[i] == w[i]) i++;
     if (w[i] == 0) { op = cmds[c].op; break; } /* full word matched */
   }
-  uint64_t id = 0;
+  uint64_t num = 0;
   int seen = 0;
   for (size_t i = 0; i < count; i++)
-    if (p[i] >= '0' && p[i] <= '9') { id = id * 10 + (p[i] - '0'); seen = 1; }
-  if (op != (uint64_t)-1 && seen)
-    hvc_call(HVC_VM_CTL, op, id, 0);
+    if (p[i] >= '0' && p[i] <= '9') { num = num * 10 + (p[i] - '0'); seen = 1; }
+  if (op == VMCTL_BALLOON && seen)
+    hvc_call(HVC_VM_CTL, op, 1 /* Linux */, num); /* num = #pages in a3 */
+  else if (op != (uint64_t)-1 && seen)
+    hvc_call(HVC_VM_CTL, op, num /* id */, 0);
   return (int)count;
 }
 

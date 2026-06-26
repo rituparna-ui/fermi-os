@@ -35,6 +35,7 @@
 #define VMCTL_MIGRATE 2  /* arm a live migration of a vCPU       */
 #define VMCTL_SNAPSHOT 3 /* checkpoint a vCPU's state            */
 #define VMCTL_RESTORE 4  /* restore a vCPU to its checkpoint     */
+#define VMCTL_BALLOON 5  /* (a3 = #pages) inflate the Linux guest's balloon */
 
 /* Field selectors for HVC_VM_STAT. */
 #define VMSTAT_ID 0

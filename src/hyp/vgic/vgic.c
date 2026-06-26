@@ -257,6 +257,33 @@ void vgic_inject_ppi(uint32_t intid) {
   /* No free LR: guest is behind on this periodic IRQ; drop silently. */
 }
 
+/* Inject an SPI into the current guest's live List Registers, reporting success.
+ * Returns 1 if the INTID was enqueued (or already pending — coalesced), 0 if
+ * there was no free LR (the caller may keep it pending) OR the INTID is outside
+ * the SPI range. The INTID gate (32..1019) is defense-in-depth so a caller that
+ * derives an INTID from guest-programmed data (MSI-X Msg Data) can never enqueue
+ * an SGI/PPI (incl. the EL2 timer PPI 26 or guest timer PPI 30) or a reserved
+ * INTID into a List Register — it is NOT the only barrier (the MSI-X device also
+ * clamps to its own SPI range), but it ensures the LR can only ever hold a SPI.
+ * Distinct from vgic_inject_ppi (which stays ungated so the vtimer PPI 30 path
+ * is unaffected). */
+int vgic_inject_spi_try(uint32_t intid) {
+  if (intid < 32 || intid > 1019) {
+    return 0; /* reject SGI/PPI/reserved — SPIs only */
+  }
+  for (uint32_t i = 0; i < vgic_nr_lr; i++) {
+    uint64_t lr = lr_read(i);
+    if ((lr & ICH_LR_STATE_MASK) == 0) {
+      lr_write(i, lr_pending(intid));
+      return 1;
+    }
+    if ((uint32_t)(lr & 0xFFFFFFFFULL) == intid) {
+      return 1; /* already pending/active for this INTID (edge coalesced) */
+    }
+  }
+  return 0; /* no free LR */
+}
+
 /* Enable SGI trapping (ICH_HCR_EL2.TC) for THIS vCPU's vGIC state. Only SMP
  * vCPUs set this: TC traps the whole common ICC group (so the hyp can software-
  * route ICC_SGI1R_EL1 to sibling vCPUs), which also catches ICC_PMR_EL1 — hence

@@ -45,6 +45,14 @@ void vgic_restore(const struct vcpu_vgic *g); /* g -> live HW interface (entry) 
  * pending Group1 interrupt, written directly to a free live List Register. */
 void vgic_inject_ppi(uint32_t intid);
 
+/* Like vgic_inject_ppi but (a) reports whether the INTID was actually enqueued
+ * (returns 0 = no free List Register, so the caller may keep it pending) and
+ * (b) gates the INTID to the SPI range 32..1019 (defense-in-depth for callers
+ * that derive the INTID from guest-supplied data, e.g. MSI-X Msg Data). Use this
+ * — NOT vgic_inject_ppi — for any SPI whose number a guest can influence;
+ * vgic_inject_ppi stays ungated so the vtimer PPI 30 path is unaffected. */
+int vgic_inject_spi_try(uint32_t intid);
+
 /* Inject into a NON-current vCPU's SAVED vGIC state (its lr[] array), so the
  * interrupt is present when that vCPU is next restored. Used to wake a blocked
  * vCPU on its timer deadline while another VM is running. */

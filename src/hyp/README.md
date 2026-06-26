@@ -297,6 +297,39 @@ byte/halfword/word widths via sub-word masking. The `pciclient/` guest runs the
 full flow (scan → size → assign → enable) and prints the result. This is the
 PCI-discovery counterpart to the fixed-window virtio-mmio devices.
 
+#### MSI-X (message-signaled interrupts)
+
+The vPCI device also exposes an **MSI-X capability** (cap ID `0x11`), the modern
+PCIe interrupt model: instead of a wired INTx line, the device "signals" by a
+memory write that a GICv3 turns into an INTID. The capability advertises a
+2-vector table + PBA living in **BAR1** — a *fixed-base* memory BAR pinned to a
+dedicated trapping window (`0x0A005000`), so guest reads/writes of the table trap
+to EL2 and the authoritative table/PBA stay in an EL2-local struct (a guest-chosen
+BAR base couldn't be left stage-2-invalid, so BAR1 reports its size to the sizing
+probe but ignores base writes). Each 16-byte table entry is `{Msg Addr Lo, Hi,
+Msg Data, Vector Control}`; the driver finds the cap by walking the capability
+list, programs entries, unmasks, and sets MSI-X Enable.
+
+Two honest deviations from real MSI-X (no ITS model, single PE): (1) a real
+device signals by writing `Msg Data` to `Msg Addr` (a GIC doorbell PA) — here the
+guest writes a **doorbell register** (window `+0xC00`) naming the vector to fire,
+and the hyp injects the vINTID directly; the programmed `Msg Addr` is *recorded
+but never dereferenced*. (2) `Msg Data` is programmed as the SPI INTID directly
+(45/46), **clamped** to the device's own SPI range so a guest can never inject a
+foreign or hypervisor INTID — and `vgic_inject_spi_try` independently rejects
+anything outside the SPI range `32..1019` (defense-in-depth; kept separate from
+`vgic_inject_ppi` so the vtimer's PPI 30 path is unaffected).
+
+The **mask / PBA / deferred-delivery state machine** is spec-faithful: ringing a
+*masked* (or function-masked, or MSI-X-disabled) vector sets its **Pending Bit
+Array** bit and injects nothing; on any delivery-enabling edge (per-vector unmask,
+Function Mask clear, or MSI-X Enable) a single PBA consumer delivers the pending
+vector and clears its PBA bit **only on confirmed List-Register enqueue** (a
+full-LR condition leaves it pending — no lost interrupt). The `pciclient/` guest
+demonstrates all three: immediate delivery (ring unmasked vector 0 → INTID 45),
+the mask path (ring masked vector 1 → `PBA=0x2`, no IRQ), and deferred delivery
+(unmask vector 1 → INTID 46 fires, `PBA=0x0`).
+
 ### virtio-mmio memory-balloon device
 
 A fourth virtio-mmio device (`virtio/virtio_balloon.c`, DeviceID 5) at

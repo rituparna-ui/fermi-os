@@ -29,4 +29,31 @@ int  vpci_mmio_is_target(uint64_t ipa);
 void vpci_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
                        int size_bytes);
 
+/* ---------------------------------------------------------------------------
+ * MSI-X (message-signaled interrupts) for the vPCI device.
+ *
+ * The device advertises an MSI-X capability (cap ID 0x11) whose Table + PBA live
+ * in BAR1 — a FIXED-base memory BAR pinned to this dedicated trapping window, so
+ * guest accesses of the table trap to EL2 (a guest-chosen base could not be left
+ * stage-2-invalid). The authoritative table/PBA are kept in an EL2-local struct.
+ *
+ * Honest-model deviations from real MSI-X (no ITS, single PE):
+ *   - A real device "sends a message" by writing Msg Data to Msg Addr (a GIC
+ *     doorbell PA). Here the guest writes a doorbell register (window + 0xC00)
+ *     naming the vector to fire; the hyp injects the vINTID directly. The table's
+ *     Msg Addr is RECORDED but never dereferenced.
+ *   - Msg Data is programmed as the SPI INTID directly (45/46), clamped to the
+ *     device's own SPI range so a guest can never inject a foreign/hyp INTID.
+ * The mask/PBA/Function-Mask/Enable state machine and capability/table layout are
+ * virtio... PCI-spec-faithful.
+ * ------------------------------------------------------------------------- */
+#define VPCI_MSIX_BASE     0x0A005000ULL /* BAR1: MSI-X table/PBA/doorbell window */
+#define VPCI_MSIX_SIZE     0x1000ULL
+#define VPCI_MSIX_SPI_BASE 45            /* vector V -> SPI (45, 46); next free SPI */
+#define VPCI_MSIX_NVEC     2             /* MSI-X table size */
+
+int  vpci_msix_mmio_is_target(uint64_t ipa);
+void vpci_msix_mmio_emulate(uint64_t ipa, int is_write, uint64_t *val,
+                            int size_bytes);
+
 #endif /* HYP_VPCI_H */

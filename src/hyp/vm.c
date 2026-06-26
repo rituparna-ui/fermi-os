@@ -136,7 +136,9 @@ static void handle_data_abort(uint64_t type, hyp_trap_frame_t *f) {
   int is_vnet = virtio_net_mmio_is_target(ipa);
   int is_vballoon = virtio_balloon_mmio_is_target(ipa);
   int is_vpci = vpci_mmio_is_target(ipa);
-  if (!is_vgic && !is_virtio && !is_vblk && !is_vnet && !is_vballoon && !is_vpci) {
+  int is_vmsix = vpci_msix_mmio_is_target(ipa);
+  if (!is_vgic && !is_virtio && !is_vblk && !is_vnet && !is_vballoon &&
+      !is_vpci && !is_vmsix) {
     hyp_puts("\n[HYP] stage-2 data abort outside emulated MMIO, IPA=");
     hyp_puthex(ipa);
     hyp_putc('\n');
@@ -166,14 +168,16 @@ static void handle_data_abort(uint64_t type, hyp_trap_frame_t *f) {
   if (is_write) {
     /* xzr (reg 31) reads as 0. */
     val = (srt == 31) ? 0 : f->regs[srt];
-    if (is_vpci)          vpci_mmio_emulate(ipa, 1, &val, size_bytes);
+    if (is_vmsix)         vpci_msix_mmio_emulate(ipa, 1, &val, size_bytes);
+    else if (is_vpci)     vpci_mmio_emulate(ipa, 1, &val, size_bytes);
     else if (is_vballoon) virtio_balloon_mmio_emulate(ipa, 1, &val, size_bytes);
     else if (is_vnet)     virtio_net_mmio_emulate(ipa, 1, &val, size_bytes);
     else if (is_vblk)     virtio_blk_mmio_emulate(ipa, 1, &val, size_bytes);
     else if (is_virtio)   virtio_mmio_emulate(ipa, 1, &val, size_bytes);
     else                  vgic_mmio_emulate(ipa, 1, &val, size_bytes);
   } else {
-    if (is_vpci)          vpci_mmio_emulate(ipa, 0, &val, size_bytes);
+    if (is_vmsix)         vpci_msix_mmio_emulate(ipa, 0, &val, size_bytes);
+    else if (is_vpci)     vpci_mmio_emulate(ipa, 0, &val, size_bytes);
     else if (is_vballoon) virtio_balloon_mmio_emulate(ipa, 0, &val, size_bytes);
     else if (is_vnet)     virtio_net_mmio_emulate(ipa, 0, &val, size_bytes);
     else if (is_vblk)     virtio_blk_mmio_emulate(ipa, 0, &val, size_bytes);

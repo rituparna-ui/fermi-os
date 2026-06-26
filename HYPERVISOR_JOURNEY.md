@@ -366,7 +366,9 @@ interactive per-guest consoles; PSCI (incl. SMP CPU_ON); inter-VM shared memory
 + interrupt doorbells; a unified hypercall ABI; an audited guest→host boundary;
 paravirt disk + network with safe IPA translation; leak-free dynamic VM
 lifecycle; a generic DTB-booted foreign guest with an OS-grade device tree; SMP
-(multi-vCPU) guests; and runtime fault isolation (a bad guest is contained).
+(multi-vCPU) guests; and runtime fault isolation (a bad guest is contained). A
+single regression script (`src/hyp/run-demos.sh`, M26) boots the whole M1-M25
+suite in one QEMU run and asserts every milestone passes ("ALL MILESTONES PASS").
 Further work would be breadth (booting a real OS binary, more emulated devices)
 rather than missing fundamentals.
 

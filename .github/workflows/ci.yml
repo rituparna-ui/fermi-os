@@ -53,3 +53,9 @@ jobs:
 
       - name: QEMU boot smoke-test (release)
         run: ./ci/smoke-test.sh target/aarch64-unknown-none/release/kernel
+
+      # Hypervisor (EL2) boot test. Needs QEMU >= 8 for TCG stage-2; ubuntu's
+      # apt qemu-system-arm is 8.x, so hyp-smoke-test.sh runs it natively (its
+      # host-qemu>=8 branch). It SKIPs cleanly if the runner's QEMU is too old.
+      - name: QEMU hypervisor (EL2) smoke-test (debug)
+        run: ./ci/hyp-smoke-test.sh target/aarch64-unknown-none/debug/kernel

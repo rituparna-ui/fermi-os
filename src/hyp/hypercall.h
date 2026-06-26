@@ -27,6 +27,14 @@
 #define HVC_LCON_LEN 8 /* () -> bytes captured in the Linux console buffer     */
 #define HVC_LCON_GET 9 /* (offset in x1) -> up to 8 console bytes, packed LE   */
 #define HVC_LCON_PUT 10 /* (byte in x1) -> push one input byte to Linux's UART RX */
+#define HVC_VM_CTL 11   /* (op in x1, id in x2) -> 0 / -1 ; guest lifecycle control */
+
+/* Operation codes for HVC_VM_CTL. */
+#define VMCTL_PAUSE 0    /* pause (deschedule) a vCPU            */
+#define VMCTL_RESUME 1   /* resume a paused vCPU                 */
+#define VMCTL_MIGRATE 2  /* arm a live migration of a vCPU       */
+#define VMCTL_SNAPSHOT 3 /* checkpoint a vCPU's state            */
+#define VMCTL_RESTORE 4  /* restore a vCPU to its checkpoint     */
 
 /* Field selectors for HVC_VM_STAT. */
 #define VMSTAT_ID 0

@@ -112,6 +112,7 @@ __attribute__((section(".hyp_tables"))) static uint64_t g_wfi_count;
 __attribute__((section(".hyp_tables"))) static uint64_t g_midr;
 /* Migration bookkeeping. */
 __attribute__((section(".hyp_tables"))) static int g_mig_state;
+__attribute__((section(".hyp_tables"))) static int g_mig_armed;
 __attribute__((section(".hyp_tables"))) static uint64_t g_mig_live_ticks;
 __attribute__((section(".hyp_tables"))) static uint64_t g_mig_round;
 __attribute__((section(".hyp_tables"))) static uint64_t g_mig_post_logs;
@@ -507,11 +508,11 @@ static void hyp_restore_vgic(vcpu_t *v) {
   __asm__ __volatile__("isb");
 }
 
-/* Round-robin to the next non-unused vCPU after `from`. */
+/* Round-robin to the next schedulable vCPU after `from` (skips UNUSED/PAUSED). */
 static int hyp_pick_next(int from) {
   for (int i = 1; i <= NUM_VCPUS; i++) {
     int idx = (from + i) % NUM_VCPUS;
-    if (vcpus[idx].state != VCPU_UNUSED)
+    if (vcpus[idx].state == VCPU_READY || vcpus[idx].state == VCPU_RUNNING)
       return idx;
   }
   return from;
@@ -1554,6 +1555,39 @@ static void hyp_handle_hvc(el2_frame_t *f) {
     ret = 0;
     break;
   }
+  case HVC_VM_CTL: {
+    /* Guest lifecycle control (a1 = op, a2 = target vCPU id). */
+    uint64_t op = a1, id = a2;
+    if (id >= NUM_VCPUS || id == 0) { /* never touch the primary guest */
+      ret = HVC_ERR_BADCALL;
+      break;
+    }
+    ret = 0;
+    switch (op) {
+    case VMCTL_PAUSE:
+      if (vcpus[id].state == VCPU_READY || vcpus[id].state == VCPU_RUNNING)
+        vcpus[id].state = VCPU_PAUSED;
+      else
+        ret = HVC_ERR_BADCALL;
+      break;
+    case VMCTL_RESUME:
+      if (vcpus[id].state == VCPU_PAUSED)
+        vcpus[id].state = VCPU_READY;
+      else
+        ret = HVC_ERR_BADCALL;
+      break;
+    case VMCTL_MIGRATE:
+      if (id == 3 && g_mig_state == MIGS_NONE)
+        g_mig_armed = 1; /* the tick-driven state machine starts the migration */
+      else
+        ret = HVC_ERR_BADCALL;
+      break;
+    default:
+      ret = HVC_ERR_BADCALL;
+      break;
+    }
+    break;
+  }
   case HVC_LCON_GET: {
     /* Return up to 8 console bytes starting at offset a1, packed little-endian
      * (bytes past the end read as 0). */
@@ -2132,8 +2166,8 @@ static void hyp_migration_step(void) {
   uint64_t other = (g_mig_cur == MIG_SRC) ? MIG_DEST : MIG_SRC;
 
   if (g_mig_state == MIGS_NONE) {
-    if (vcpus[3].state == VCPU_UNUSED || vcpus[3].hvc_count <= 60)
-      return; /* wait until the guest has been running for a while */
+    if (!g_mig_armed || vcpus[3].state != VCPU_READY || vcpus[3].hvc_count <= 60)
+      return; /* armed on demand via vmctl 'migrate'; wait until the guest is up */
     uint64_t pre = *(volatile uint64_t *)(g_mig_cur + MIG_COUNTER_OFF);
     hyp_puts("[HYP] === PRE-COPY migration (way out) ===; counter=");
     hyp_puthex(pre);

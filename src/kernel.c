@@ -336,6 +336,20 @@ static void sh_cat(const char *path) {
   sys_close(fd);
 }
 
+/* vmctl <args> — write a control command (e.g. "pause 3") to /proc/vmctl. */
+static void sh_vmctl(const char *args) {
+  int fd = sys_open("/proc/vmctl");
+  if (fd < 0) {
+    sh_print("vmctl: cannot open /proc/vmctl\n");
+    return;
+  }
+  uint64_t len = 0;
+  while (args[len]) len++;
+  sys_write(fd, args, len);
+  sys_close(fd);
+  sh_print("vmctl: ok (see 'vms')\n");
+}
+
 static void task_shell(void) {
   sh_print("\nWelcome to the Fermi shell. Type 'help' to start.\n");
   while (1) {
@@ -364,6 +378,10 @@ static void task_shell(void) {
       sh_cat("/proc/cpuinfo");
     } else if (u_streq(line, "version")) {
       sh_cat("/proc/version");
+    } else if (u_streq(line, "vms")) {
+      sh_cat("/proc/vms");
+    } else if (u_starts_with(line, "vmctl ")) {
+      sh_vmctl(line + 6);
     } else if (u_streq(line, "ping")) {
       /* One-shot ICMP echo to slirp gateway via SYS_NET_PING. */
       static uint16_t shell_ping_seq = 100; /* avoid colliding with netd */

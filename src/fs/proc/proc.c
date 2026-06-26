@@ -179,7 +179,8 @@ static int gen_vms(char *buf, size_t buflen) {
 
   for (uint64_t i = 0; i < count && pos < buflen; i++) {
     uint64_t st = hvc_call(HVC_VM_STAT, i, VMSTAT_STATE, 0);
-    const char *sn = (st == 2) ? "RUNNING" : (st == 1) ? "READY  " : "UNUSED ";
+    const char *sn = (st == 2) ? "RUNNING" : (st == 1) ? "READY  "
+                     : (st == 3) ? "PAUSED " : "UNUSED ";
     const char *name = (i == 0) ? "Fermi " : (i == 1) ? "Lin#0 "
                        : (i == 2) ? "Lin#1 " : "Migr8 ";
     int w = ksnprintf(buf + pos, buflen - pos,
@@ -288,6 +289,28 @@ static int write_linux_console(struct vnode *n, file_t *f, const void *buf,
   return (int)count;
 }
 
+/* /proc/vmctl — write "pause N", "resume N", or "migrate N" to drive a guest
+ * vCPU's lifecycle via the HVC_VM_CTL control hypercall. (cat /proc/vms shows
+ * the resulting state.) */
+static int write_vmctl(struct vnode *n, file_t *f, const void *buf,
+                       size_t count) {
+  (void)n;
+  (void)f;
+  const char *p = (const char *)buf;
+  /* parse a leading word + a trailing decimal id */
+  uint64_t op = (uint64_t)-1;
+  if (count >= 5 && p[0] == 'p') op = VMCTL_PAUSE;        /* pause   */
+  else if (count >= 6 && p[0] == 'r') op = VMCTL_RESUME;  /* resume  */
+  else if (count >= 7 && p[0] == 'm') op = VMCTL_MIGRATE; /* migrate */
+  uint64_t id = 0;
+  int seen = 0;
+  for (size_t i = 0; i < count; i++)
+    if (p[i] >= '0' && p[i] <= '9') { id = id * 10 + (p[i] - '0'); seen = 1; }
+  if (op != (uint64_t)-1 && seen)
+    hvc_call(HVC_VM_CTL, op, id, 0);
+  return (int)count;
+}
+
 static file_operations_t uptime_ops  = {.read = read_uptime,  .write = 0};
 static file_operations_t meminfo_ops = {.read = read_meminfo, .write = 0};
 static file_operations_t tasks_ops   = {.read = read_tasks,   .write = 0};
@@ -305,6 +328,7 @@ static file_operations_t cpuinfo_ops = {.read = read_cpuinfo, .write = 0};
 static file_operations_t version_ops = {.read = read_version, .write = 0};
 static file_operations_t vms_ops = {.read = read_vms, .write = 0};
 static file_operations_t linux_console_ops = {.read = read_linux_console, .write = write_linux_console};
+static file_operations_t vmctl_ops = {.read = 0, .write = write_vmctl};
 
 /* ------------------------------------------------------------------ */
 /* Init                                                                */
@@ -344,6 +368,7 @@ void proc_init(void) {
   register_file(proc, "version", &version_ops);
   register_file(proc, "vms",     &vms_ops);
   register_file(proc, "linux_console", &linux_console_ops);
+  register_file(proc, "vmctl", &vmctl_ops);
 
   uart_println("[PROC] Mounted at /proc with uptime, meminfo, tasks, interrupts, netinfo, cmdline, version, balloon, cpuinfo, vms");
 }

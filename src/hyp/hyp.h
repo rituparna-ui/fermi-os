@@ -69,6 +69,7 @@
 #define VCPU_UNUSED 0
 #define VCPU_READY 1
 #define VCPU_RUNNING 2
+#define VCPU_PAUSED 3 /* administratively paused (vmctl) — not scheduled */
 
 #define NUM_VCPUS 4 /* 0=Fermi, 1=Linux core0, 2=Linux core1, 3=migratable guest */
 

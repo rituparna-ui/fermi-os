@@ -519,9 +519,44 @@ secondary `CPU_OFF`s itself; the primary polls `AFFINITY_INFO`, sees it go OFF,
 counts a hotplug cycle, `CPU_ON`s it again, and the cycle repeats forever — a
 self-sustaining online→offline→online hotplug loop.
 
+### Multicore hypervisor (true SMP)
+
+The hypervisor itself runs on **4 physical cores** (`-smp 4`), scheduling vCPUs
+in genuine parallel — not time-sliced on one core. pCPU0 boots, does the
+one-time global init, then PSCI-`CPU_ON`s the other 3 physical cores (via the SMC
+conduit — verified to work from EL2 with no EL3 on QEMU virt) into a hyp
+secondary entry; each core sets up its own EL2 state and enters the same locked
+scheduler. Foundations:
+
+- **EL2 stage-1 MMU.** A minimal identity MMU (`TTBR0_EL2`) maps EL2 RAM as
+  Normal-WB **Inner-Shareable** so spinlocks/atomics are inter-PE correct — on
+  the old MMU-off Normal **Non-cacheable** memory, exclusives/LSE atomics have no
+  guaranteed global monitor (ARM DDI 0487; QEMU TCG hides this, real silicon
+  wedges). This was the make-or-break design call.
+- **Per-pCPU state** via `TPIDR_EL2`: `cur_vcpu`, the slice deadline, and the
+  CPU-time stamp are per-core; each core arms its own CNTHP and runs its own
+  redistributor (discovered by `GICR_TYPER` affinity match).
+- **Locked scheduler.** A global `sched_lock` protects the run-queue; a vCPU's
+  residency (`on_pcpu`) is reserved **atomically inside the same critical
+  section** as the pick, so two cores can never run the same vCPU (no double-run).
+  Per-device locks (rng/blk/net/balloon/vPCI) + per-vCPU `vgic_lock`; all
+  IRQ-save so a CNTHP can't self-deadlock on a held lock. A recursive console
+  lock keeps log lines from interleaving mid-token.
+- **Cross-core interrupt injection.** `vgic_inject` routes any vIRQ (timer,
+  doorbell, guest SGI, device SPI) by residency: live List Register if the target
+  runs on the calling core, else latched in the target's pending bitmap + a
+  physical reschedule-SGI to the core it runs on (drained into live LRs on entry)
+  — never lost, never double-delivered. The SMP guest's two vCPUs now run on two
+  physical cores and ping-pong an SGI as a true cross-pCPU inter-processor
+  interrupt.
+
+The conversion was done in verified phases (EL2 MMU → per-pCPU bring-up →
+locking → parallel scheduling → unpinned cross-core SGI), each booting the full
+14-VM workload with zero regression.
+
 ## Known limitations / future work
 
-- One physical CPU: guest vCPUs (including SMP siblings) are time-sliced, not
-  run in parallel.
-- The scheduler is weighted round-robin with block-on-WFI; there is no priority
-  inheritance or gang-scheduling of an SMP VM's vCPUs.
+- The scheduler is global weighted round-robin; there is no NUMA/affinity-aware
+  placement, priority inheritance, or gang-scheduling of an SMP VM's vCPUs.
+- A guest can have more vCPUs than there are physical cores (they time-slice the
+  4 pCPUs); there is no vCPU-overcommit fairness tuning.

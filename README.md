@@ -14,6 +14,16 @@ Fermi OS is a bare-metal `aarch64 (ARMv8-A)` kernel built from scratch in **pure
 > FAT32 files read through the VFS, and demand-paged/kill-on-fault handling
 > works. Module layout mirrors the original tree: `src/{arch,klib,mm,exception,
 > sched,syscall,drivers,fs,user}`.
+>
+> It also doubles as a minimal **Type-1 (bare-metal) hypervisor**: when launched
+> with QEMU's `virtualization=on`, Fermi boots at **EL2**, sets up stage-2
+> translation, and runs *itself* as a stage-2-translated EL1 guest alongside a
+> second isolated guest — with virtual interrupts, preemptive EL2 scheduling,
+> per-guest context switching, and PSCI-based guest lifecycle. Without
+> `virtualization=on` the image boots straight at EL1 as a plain kernel, so the
+> EL2 layer is fully backwards-compatible. See **Hypervisor (EL2)** below.
+> The EL2 layer (`src/hyp/`) was added in a second porting phase mirroring the
+> C original's M1–M13 milestones.
 
 
 ---
@@ -68,6 +78,18 @@ Fermi OS is a bare-metal `aarch64 (ARMv8-A)` kernel built from scratch in **pure
 ### EL0 Shell (interactive)
 - **`task_shell`** — An EL0 task that loops reading lines from `/dev/console` (with backspace/DEL editing and echo) and dispatches built-ins. Pure user-space — talks to the kernel only via `svc`. Built-ins: `help`, `pid`, `uptime`, `ps`, `free`, `ifconfig`, `irqs`, `version`, `cat <path>`, `kill <pid>`, `top` (5× refresh tasks/mem/net), `ping`, `sleep <ms>`, `clear`, `exit`
 
+### Hypervisor (EL2 Type-1 VMM)
+> Requires QEMU `virt,gic-version=3,virtualization=on` (and `-m 10G` for the Linux slot). Without `virtualization=on` the image boots straight at EL1 as a plain kernel — the EL2 layer is skipped cleanly, and the standard smoke-test still passes. Stage-2 translation needs **QEMU ≥ 8** (the host's 3.1.0 faults at stage-2 level 0 — an emulator limitation); `ci/hyp-smoke-test.sh` runs it under QEMU 8.x.
+- **EL2 bring-up** — `boot.S` detects entry at EL2 via `CurrentEL`, configures the hypervisor, then `eret`s to EL1. A dedicated EL2 vector table (`VBAR_EL2`) + private EL2 stack handle all guest traps; the EL2-vs-EL1 entry decision is threaded through a callee-saved register so it survives `zero_bss`
+- **Stage-2 translation** — Per-guest second-stage (IPA→PA) page tables via `VTTBR_EL2`/`VTCR_EL2` with distinct VMIDs (no TLB flush on switch). The primary guest gets a 1 TiB identity map (1 GiB blocks); the hypervisor's own RAM is split to 4 KiB granularity and **unmapped** from every guest
+- **Hypervisor isolation** — A guest read/write to hypervisor-private memory faults to EL2, is reported, poisoned, and stepped over — the guest can never see or corrupt VMM state
+- **Hypercall ABI** — SMCCC-style `HVC` interface (function ID in `x0`, args `x1`–`x3`, result in `x0`): `VERSION`, `PUTC` (paravirt console), `PING`, `YIELD`, `VM_INFO`, `HYP_BASE`, plus introspection (`VM_COUNT`/`VM_STAT`)
+- **Trap-and-emulate** — `HCR_EL2.TID3` can trap guest `ID_AA64*` reads; the handler decodes `ESR_EL2` and emulates them, stepping the guest PC past the trapped instruction
+- **Virtual interrupts (vGIC)** — Physical IRQs are routed to EL2 (`HCR_EL2.IMO`) and re-injected as hardware-linked virtual interrupts via the GICv3 list registers (`ICH_LR<n>_EL2`, HW=1), so the guest's unmodified IRQ handler runs on the virtual CPU interface and its EOI auto-deactivates the physical interrupt. Interrupts are routed to their owning vCPU
+- **Preemptive scheduler** — The EL2 physical timer (`CNTHP_EL2`, PPI 26) drives a 100 ms quantum; on each tick the hypervisor world-switches between vCPUs round-robin. No guest cooperation required. Per-guest EL1 sysregs, vGIC state, and full FP/SIMD (q0–q31) are saved/restored across switches
+- **Guest lifecycle** — `/proc/vms` exposes live vCPU state over the hypercall ABI; a guest can power itself off via PSCI `SYSTEM_OFF`, after which the hypervisor reaps the vCPU
+- **Linux-guest slot** — A 1 GiB guest RAM window at IPA `0x40000000` backed by host-invisible high RAM, emulated GICv3 distributor/redistributor MMIO, and CNTV virtual-timer routing, set up to boot a real arm64 Linux Image per the boot protocol (PC = Image, `x0` = DTB). The Image/initramfs are external assets (not committed); without one the slot faults and is reaped gracefully while the primary guest keeps running. See [`docs/PORT-NOTES.md`](docs/PORT-NOTES.md) §6 for how to stage real assets
+
 ---
 
 ## Prerequisites
@@ -102,6 +124,15 @@ The QEMU invocation lives in `run.sh` (wired up as the Cargo `runner`).
 
 To exit QEMU: `Ctrl-A` then `X`
 
+To boot it **as a hypervisor** (EL2), add `virtualization=on` and bump RAM so
+the Linux-guest slot at 9 GiB fits (needs QEMU ≥ 8 for stage-2):
+
+```bash
+qemu-system-aarch64 -machine virt,gic-version=3,virtualization=on \
+    -cpu cortex-a72 -m 10G -nographic \
+    -kernel target/aarch64-unknown-none/debug/kernel
+```
+
 ## Testing
 
 A headless boot smoke-test builds a FAT32 disk, boots the kernel under QEMU,
@@ -113,8 +144,22 @@ cargo build
 ./ci/smoke-test.sh
 ```
 
+A second smoke-test boots the kernel **as a hypervisor** (`virtualization=on`,
+entering at EL2) and asserts the EL2 milestones — stage-2 enabled, the isolation
+boundary blocks a guest read of hyp memory, a virtual IRQ is injected, the
+second guest is created and scheduled, `/proc/vms` reports both vCPUs — then the
+full EL1 guest reaching `Ready`:
+
+```bash
+./ci/hyp-smoke-test.sh
+```
+
+Stage-2 translation needs QEMU ≥ 8; the script uses the host QEMU if it's new
+enough, else the `osdev:dev` Docker image, else SKIPs cleanly.
+
 CI (`.github/workflows/ci.yml`) runs `clippy -D warnings`, builds debug +
-release, and runs the smoke-test against both on every push/PR.
+release, runs the EL1 smoke-test against both, and runs the EL2 hypervisor
+smoke-test on every push/PR.
 
 ## Documentation
 

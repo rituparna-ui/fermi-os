@@ -55,22 +55,35 @@ via `run.sh`). Test: `./ci/smoke-test.sh`.
 | `fs/vfs.rs` | vnode tree, path resolution, fd tables, `FileOperations` vtables |
 | `fs/devices.rs` | `/dev/{console,null,zero,rng,vcons,blk}` |
 | `fs/fat32.rs` | FAT32 read + write, VFS-backed via lazy directory lookup |
-| `fs/proc.rs` | `/proc/{uptime,meminfo,tasks,interrupts,netinfo,cmdline,version,balloon,cpuinfo}` |
+| `fs/proc.rs` | `/proc/{uptime,meminfo,tasks,interrupts,netinfo,cmdline,version,balloon,cpuinfo,vms}` |
 | `user/mod.rs` | EL0 programs that live in the kernel image: the shell, demo/crash/noop tasks |
+| `hyp/mod.rs` | EL2 Type-1 hypervisor: `hyp_init`, stage-2 build + isolation, world-switch, trap dispatch (HVC/sysreg/abort/IRQ), vGIC injection, emulated GICv3 MMIO, PSCI, Linux-slot guest |
+| `hyp/hypercall.rs` | SMCCC-style HVC ABI shared by guest (EL1) and hypervisor (EL2): function IDs + `hvc_call` trampoline |
+| `hyp/vector_el2.S` | EL2 exception vector table + `el2_common` save/restore/eret trampoline (256-byte x0..x30 frame) |
+| `hyp/linux_stub.S` | M10 position-independent guest stand-in (writes `L` via the guest's stage-2 UART mapping); retained as a fallback |
 
 ---
 
 ## Boot flow
 
 ```
-QEMU loads the ELF at PA 0x4000_0000 and enters _start (EL1, MMU off)
+QEMU loads the ELF at PA 0x4000_0000 and enters _start
+  (EL1 by default, or EL2 if launched with virtualization=on)
   │
 arch/boot.S:_start
+  ├─ x28 := 0                               (entry-EL indicator, callee-saved)
   ├─ park secondary CPUs (MPIDR Aff0 != 0)
-  ├─ SP := __stack_top − KERNEL_VA_OFFSET   (physical stack)
-  ├─ zero .bss (physical addresses)
-  ├─ bl early_init                          (PC-relative → physical)
+  ├─ SP := __stack_top − KERNEL_VA_OFFSET   (physical stack, for the entry EL)
+  ├─ if CurrentEL == EL2:                    (only with virtualization=on)
+  │     ├─ x28 := 1
+  │     ├─ bl hyp_init                       (configure EL2; see Hypervisor §)
+  │     ├─ SP_EL2 := el2_stack top          (dedicated EL2 trap stack)
+  │     └─ eret → el1_entry (EL1h)          (drop to the guest)
+  ├─ el1_entry: SP := __stack_top − KERNEL_VA_OFFSET
+  ├─ zero .bss (physical addresses)         (x28 survives — only x0-x2 touched)
+  ├─ bl early_init(x28)                     (PC-relative → physical)
   │     main.rs::early_init  (runs physically, MMU off)
+  │       ├─ hyp::set_booted_via_el2(x28)   (durable post-zero_bss)
   │       ├─ cpu::enable_fp_simd            (core::fmt uses SIMD)
   │       ├─ uart::init
   │       ├─ pmm::init(0x4000_0000, 8 GiB)  (logging via aligned UART helpers)
@@ -166,6 +179,16 @@ callee-saved and preserved by `context_switch`, not the trap frame.
 `Task.ttbr0` at offset 40 (`TASK_TTBR0`) — both asserted via `offset_of!`.
 `fork_return` restores a 288-byte slice (GPRs + ELR + SPSR + SP_EL0).
 
+### EL2 trap frame (`vector_el2.S` ⇄ `hyp::El2Frame`)
+
+The EL2 vector stub pushes only the GP registers: `x[31]` = x0..x30 (248 bytes),
+in a 256-byte stack reservation (16-byte alignment). PC/PSTATE come from
+`ELR_EL2`/`SPSR_EL2`; everything else a guest needs (EL1 sysregs, vGIC, FP) is
+saved into the `Vcpu` block by the world-switch, not the frame. Each of the 16
+vector slots is ≤ 0x80 bytes (table 0x800-aligned); the stub records the slot
+index and branches to `el2_common`, which saves x2–x30, calls `el2_dispatch`,
+restores, and `eret`s. Slot kind = `index & 3` (0=sync, 1=IRQ).
+
 ### Syscall ABI (`user` ⇄ `exception` ⇄ `syscall`)
 
 `SVC #0`, `x8` = number, `x0..x7` = args, return in `x0`. Numbers:
@@ -208,6 +231,71 @@ Single core. Shared mutable state is guarded one of four ways:
 The scheduler run queue is intentionally lock-free (mutated only IRQ-masked) so
 the timer-IRQ `schedule()` path can't deadlock on a lock.
 
+The EL2 hypervisor's mutable state (`VCPUS[2]`, `CURRENT_VCPU`, switch/quantum
+counters, the stage-2 tables, the emulated-GIC state) lives in `SyncUnsafeCell`
+statics in the `.hyp_tables` section. It is touched only from EL2 trap context,
+which cannot re-enter on a single core, so no lock is needed; each access is
+`unsafe` with a `// SAFETY (single-core)` note.
+
+---
+
+## Hypervisor (EL2 Type-1 VMM)
+
+Launched with QEMU `virtualization=on`, the image enters at **EL2**. `boot.S`
+detects this, calls `hyp::hyp_init`, and `eret`s to EL1 where the rest of the
+kernel runs unchanged as a **stage-2-translated guest** (vCPU 0). Entered at EL1
+(no `virtualization=on`), the entire EL2 layer is skipped — fully backwards
+compatible. `early_init` records the entry EL (`hyp::set_booted_via_el2`) so the
+EL1 guest knows whether issuing an `HVC` is safe.
+
+Everything in `hyp_init` runs at EL2 with the **EL2 MMU off**: all addresses are
+physical (PC-relative), and it logs via a self-contained PL011 writer — never
+`core::fmt`, which would materialize an unmapped upper-half VA. The hypervisor's
+own RAM lives in a NOLOAD `.hyp` linker section placed *after* `__bss_end` (so
+the guest's `zero_bss` can't wipe the live stage-2 tables) and *before*
+`__kernel_end` (so the guest PMM reserves, not reuses, those pages).
+
+**Stage-2 & isolation.** Per-guest IPA→PA tables via `VTTBR_EL2`/`VTCR_EL2`
+(4 KiB granule, 48-bit IPA, 40-bit PA), distinct VMIDs so no TLB flush on a
+VTTBR swap. vCPU 0 gets a 1 TiB identity map (1 GiB blocks); the one block
+holding `[__hyp_start, __hyp_end)` is split to 4 KiB and the hyp pages left
+invalid. A guest touch of hyp memory faults to EL2, is reported, the read is
+poisoned to 0, and the instruction is stepped over.
+
+**Trap dispatch** (`el2_dispatch`): slot kind 1 = IRQ → `hyp_handle_irq`; kind 0
+= sync, decoded by `ESR_EL2.EC`: HVC (hypercall — ELR already past it), trapped
+MSR/MRS (`HCR_EL2.TID3`, emulate + ELR+=4), or a lower-EL data/instruction abort
+(isolation / emulated-GIC / reap, ELR+=4 where serviced).
+
+**Virtual interrupts.** Physical IRQs route to EL2 (`HCR_EL2.IMO`); each is
+acked, re-injected to its owning vCPU as a hardware-linked vIRQ via an
+`ICH_LR<n>_EL2` list register (HW=1, so the guest's own EOI deactivates the
+physical interrupt), then priority-dropped (`EOImode=1`). The hypervisor's own
+scheduler tick (CNTHP, INTID 26) is the exception: it fully EOI+deactivates and
+is never injected. Per-guest `ICH_LR`/`VMCR`/`AP1R0` are saved/restored across
+switches; CNTV (PPI 27) routes to the Linux vCPU.
+
+**Preemptive world-switch.** `CNTHP_EL2` fires a 100 ms quantum; each tick
+round-robins the vCPUs. A switch saves the outgoing guest's GP regs (from the
+EL2 frame), PC/PSTATE/VTTBR, the full EL1 sysreg set, vGIC state, and FP/SIMD
+(q0–q31 + FPSR/FPCR) into its `Vcpu`, then loads the next — FP saved *first*
+(guest FP still live) and restored *last* (nothing after touches SIMD).
+
+**Hypercall ABI & lifecycle.** SMCCC-style `HVC` (fn in x0, args x1–x3, result
+x0): VERSION / PUTC / PING / VM_INFO / YIELD / HYP_BASE / VM_COUNT / VM_STAT.
+PSCI `SYSTEM_OFF`/`RESET` reaps the calling vCPU. `/proc/vms` cats live vCPU
+state over VM_COUNT/VM_STAT.
+
+**Linux slot (vCPU 1).** A 1 GiB RAM window at IPA `0x40000000` backed by
+host-invisible RAM at 9 GiB; the GIC window is intentionally unmapped so guest
+GICD/GICR MMIO traps to EL2 and is emulated (`hyp_emulate_gic`) enough for
+Linux's gic-v3 probe. Entry follows the arm64 boot protocol (PC = Image base,
+x0 = DTB). The Image/initramfs are external (uncommitted) assets; without one
+the slot faults immediately and is reaped, leaving the primary guest running.
+
+Stage-2 needs QEMU ≥ 8 (the host's 3.1.0 faults at stage-2 level 0 — an emulator
+limitation). `ci/hyp-smoke-test.sh` runs it under QEMU 8.x.
+
 ---
 
 ## Test matrix
@@ -239,3 +327,16 @@ kernel headless under QEMU and asserts:
 
 Built-in self-tests (`mmu::run_tests`, `heap::run_tests`, the BRK probe, and the
 per-driver smoke reads) run on every boot regardless of CI.
+
+`ci/hyp-smoke-test.sh` (also CI-gated) boots the kernel **as a hypervisor**
+(`virtualization=on`, entering at EL2, under QEMU ≥ 8) and additionally asserts:
+
+| Area | Assertion |
+|------|-----------|
+| EL2 bring-up | `Fermi hypervisor online at EL2` + `stage-2 enabled … dropping to EL1 guest` |
+| Isolation | `ISOLATION: blocked guest read from hyp memory` + `stage-2 isolation held` (poisoned to 0) |
+| Virtual IRQ | `injected hw vIRQ intid=` (physical IRQ re-injected to a vCPU) |
+| Second guest | `created Linux-slot guest (vCPU 1)` + `preemptive scheduler armed (CNTHP tick)` |
+| Introspection | `/proc/vms` reports `2 vCPUs` with live per-vCPU stats |
+| Lifecycle | Linux slot faults without an Image and is reaped; primary guest survives |
+| Guest liveness | the EL1 guest still reaches `KERNEL Ready!` and passes its stress tests under stage-2 + preemption, with no EL2 trap |

@@ -185,6 +185,7 @@ static void hyp_uart_rx_kick(void);
 #define HYP_QUANTUM_MS 10    /* preemption time-slice (short: keeps cross-vCPU
                               * IPI / stop_machine latency low for SMP guests) */
 __attribute__((section(".hyp_tables"))) static uint64_t g_quantum_ticks;
+__attribute__((section(".hyp_tables"))) static uint64_t g_quanta_left; /* weighted budget for the running vCPU */
 
 static void hyp_create_linux_guest(void);
 static void hyp_create_linux_secondary(void);
@@ -408,6 +409,12 @@ void hyp_init(void) {
   hyp_create_mig_guest();
   hyp_puts("[HYP] created migratable guest (vCPU 3): 2 MiB @ live-migration demo\n");
 
+  /* Default proportional-share weight = 1 for every vCPU (.hyp_tables is
+   * NOLOAD, so set it explicitly). g_quanta_left seeds the running vCPU. */
+  for (int i = 0; i < NUM_VCPUS; i++)
+    vcpus[i].weight = 1;
+  g_quanta_left = vcpus[current_vcpu].weight;
+
   /* Start the preemptive scheduling tick (CNTHP / PPI 26). */
   hyp_tick_init();
   hyp_tick_start();
@@ -548,6 +555,7 @@ static void hyp_world_switch(el2_frame_t *f) {
   int next = hyp_pick_next(current_vcpu);
   if (next == current_vcpu) {
     cur->state = VCPU_RUNNING; /* nobody else runnable: keep going */
+    g_quanta_left = vcpus[current_vcpu].weight;
     return;
   }
 
@@ -555,6 +563,7 @@ static void hyp_world_switch(el2_frame_t *f) {
   current_vcpu = next;
   nv->state = VCPU_RUNNING;
   g_switch_count++;
+  g_quanta_left = nv->weight; /* the new vCPU gets `weight` consecutive quanta */
 
   for (int i = 0; i < 31; i++)
     f->x[i] = nv->regs[i];
@@ -1600,6 +1609,7 @@ static int hyp_handle_psci(el2_frame_t *f, uint64_t fn) {
       v->pc = entry;          /* PSCI entry point (IPA), MMU off */
       v->regs[0] = ctx;       /* context_id passed in x0 */
       v->pstate = 0x3c5;      /* EL1h, DAIF masked */
+      v->weight = 1;          /* default proportional-share weight */
       __asm__ __volatile__("dsb ish");
       v->state = VCPU_READY;  /* scheduler will run it on the next tick */
       hyp_puts("[HYP] PSCI CPU_ON: started vCPU ");
@@ -1691,8 +1701,8 @@ static void hyp_handle_hvc(el2_frame_t *f) {
   case HVC_VM_CTL: {
     /* Guest lifecycle control (a1 = op, a2 = target vCPU id). */
     uint64_t op = a1, id = a2;
-    if (id >= NUM_VCPUS || id == 0) { /* never touch the primary guest */
-      ret = HVC_ERR_BADCALL;
+    if (id >= NUM_VCPUS || (id == 0 && op != VMCTL_WEIGHT)) {
+      ret = HVC_ERR_BADCALL; /* never pause/migrate/etc. the primary guest */
       break;
     }
     ret = 0;
@@ -1752,6 +1762,13 @@ static void hyp_handle_hvc(el2_frame_t *f) {
       else
         ret = HVC_ERR_BADCALL;
       break;
+    case VMCTL_WEIGHT:
+      /* Set the proportional-share weight of vCPU `id` (clamped to 1..16). */
+      if (a3 >= 1 && a3 <= 16)
+        vcpus[id].weight = a3;
+      else
+        ret = HVC_ERR_BADCALL;
+      break;
     default:
       ret = HVC_ERR_BADCALL;
       break;
@@ -1785,6 +1802,8 @@ static void hyp_handle_hvc(el2_frame_t *f) {
     case VMSTAT_MMIO:     ret = t->mmio_emulated; break;
     case VMSTAT_SWITCHES: ret = g_switch_count; break;
     case VMSTAT_WFI:      ret = g_wfi_count; break;
+    case VMSTAT_WEIGHT:   ret = t->weight; break;
+    case VMSTAT_CPUTICKS: ret = t->cpu_ticks; break;
     default:              ret = (uint64_t)-1; break;
     }
     break;
@@ -2511,7 +2530,11 @@ static void hyp_handle_irq(el2_frame_t *frame) {
     __asm__ __volatile__("msr icc_dir_el1, %0" ::"r"(iar));   /* deactivate */
     hyp_uart_rx_kick(); /* deliver any pending Linux console input */
     hyp_migration_step(); /* advance the live-migration demo */
-    hyp_world_switch(frame);
+    vcpus[current_vcpu].cpu_ticks++; /* CPU accounting: this vCPU ran this quantum */
+    if (g_quanta_left > 0)
+      g_quanta_left--;
+    if (g_quanta_left == 0) /* weighted budget spent -> switch (resets budget) */
+      hyp_world_switch(frame);
     return;
   }
 

@@ -494,6 +494,20 @@ initializers are never loaded. All hypervisor globals must be set explicitly in
 boots all the way to its ext4 root with only ~32 of 512 blocks (~64 MiB of
 1 GiB) ever mapped — the rest stays unmapped. No anomalies.
 
+### Weighted scheduler + per-guest CPU accounting
+*Why:* replace flat round-robin with proportional shares, and account CPU time
+per guest. Each vCPU gains a `weight` and a `cpu_ticks` counter. The scheduler
+becomes weighted round-robin: a freshly-scheduled vCPU gets `weight` consecutive
+10 ms quanta (`g_quanta_left` budget) before the picker rotates; each tick
+charges `cpu_ticks` to the running vCPU. `vmctl weight <id> <w>` sets a weight;
+`/proc/vms` gains `WGT` and `TICKS` columns.
+*Verified:* `/proc/vms` shows live CPU accounting (Fermi busy at ~9100 ticks,
+the idle Linux cores at ~217/71, the WFI-light migratable guest at ~2), and
+`vmctl weight 1 6` updates the weight column. (The proportional *effect*
+redistributes CPU only among CPU-bound competitors — an idle, WFI-yielding guest
+doesn't consume its larger budget.) Also fixed a bug where PSCI `CPU_ON`'s memset
+zeroed a secondary's weight. No anomalies.
+
 ---
 
 ## 2. The recurring debugging pattern (why it worked)

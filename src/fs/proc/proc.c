@@ -172,8 +172,8 @@ static int gen_vms(char *buf, size_t buflen) {
   int n = ksnprintf(buf, buflen,
                     "Fermi hypervisor (EL2): %u vCPUs, %u world-switches, "
                     "%u idle-yields\n"
-                    "VCPU NAME   STATE    HVC    SYSREG ABORT VIRQ   MMIO\n"
-                    "---- ------ -------- ------ ------ ----- ------ ------\n",
+                    "VCPU NAME   STATE    WGT TICKS  HVC    VIRQ   MMIO\n"
+                    "---- ------ -------- --- ------ ------ ------ ------\n",
                     count, switches, wfi);
   pos += (n < 0) ? 0 : (size_t)n;
 
@@ -185,9 +185,9 @@ static int gen_vms(char *buf, size_t buflen) {
                        : (i == 2) ? "Lin#1 " : "Migr8 ";
     int w = ksnprintf(buf + pos, buflen - pos,
                       "%u    %s %s %u %u %u %u %u\n", i, name, sn,
+                      hvc_call(HVC_VM_STAT, i, VMSTAT_WEIGHT, 0),
+                      hvc_call(HVC_VM_STAT, i, VMSTAT_CPUTICKS, 0),
                       hvc_call(HVC_VM_STAT, i, VMSTAT_HVC, 0),
-                      hvc_call(HVC_VM_STAT, i, VMSTAT_SYSREG, 0),
-                      hvc_call(HVC_VM_STAT, i, VMSTAT_ABORT, 0),
                       hvc_call(HVC_VM_STAT, i, VMSTAT_VIRQ, 0),
                       hvc_call(HVC_VM_STAT, i, VMSTAT_MMIO, 0));
     if (w > 0) {
@@ -301,7 +301,7 @@ static int write_vmctl(struct vnode *n, file_t *f, const void *buf,
   struct { const char *w; uint64_t op; } cmds[] = {
     {"pause", VMCTL_PAUSE}, {"resume", VMCTL_RESUME}, {"migrate", VMCTL_MIGRATE},
     {"snapshot", VMCTL_SNAPSHOT}, {"restore", VMCTL_RESTORE},
-    {"balloon", VMCTL_BALLOON},
+    {"balloon", VMCTL_BALLOON}, {"weight", VMCTL_WEIGHT},
   };
   uint64_t op = (uint64_t)-1;
   for (unsigned c = 0; c < sizeof(cmds) / sizeof(cmds[0]); c++) {
@@ -310,14 +310,24 @@ static int write_vmctl(struct vnode *n, file_t *f, const void *buf,
     while (w[i] && i < count && p[i] == w[i]) i++;
     if (w[i] == 0) { op = cmds[c].op; break; } /* full word matched */
   }
-  uint64_t num = 0;
-  int seen = 0;
-  for (size_t i = 0; i < count; i++)
-    if (p[i] >= '0' && p[i] <= '9') { num = num * 10 + (p[i] - '0'); seen = 1; }
-  if (op == VMCTL_BALLOON && seen)
-    hvc_call(HVC_VM_CTL, op, 1 /* Linux */, num); /* num = #pages in a3 */
-  else if (op != (uint64_t)-1 && seen)
-    hvc_call(HVC_VM_CTL, op, num /* id */, 0);
+  /* collect up to two decimal numbers from the rest of the line */
+  uint64_t nums[2] = {0, 0};
+  int cnt = 0, indig = 0;
+  for (size_t i = 0; i < count; i++) {
+    char c = p[i];
+    if (c >= '0' && c <= '9') {
+      if (!indig && cnt < 2) { cnt++; indig = 1; }
+      if (cnt >= 1 && cnt <= 2) nums[cnt - 1] = nums[cnt - 1] * 10 + (c - '0');
+    } else {
+      indig = 0;
+    }
+  }
+  if (op == VMCTL_WEIGHT && cnt >= 2)
+    hvc_call(HVC_VM_CTL, op, nums[0] /* id */, nums[1] /* weight */);
+  else if (op == VMCTL_BALLOON && cnt >= 1)
+    hvc_call(HVC_VM_CTL, op, 1 /* Linux */, nums[0] /* #pages */);
+  else if (op != (uint64_t)-1 && cnt >= 1)
+    hvc_call(HVC_VM_CTL, op, nums[0] /* id */, 0);
   return (int)count;
 }
 

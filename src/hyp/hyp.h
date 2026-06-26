@@ -84,6 +84,8 @@ typedef struct {
   uint64_t id;
   int state;
   uint64_t mpidr; /* value the guest reads as MPIDR_EL1 (VMPIDR_EL2)          */
+  uint64_t weight;    /* proportional-share scheduler weight (consecutive quanta) */
+  uint64_t cpu_ticks; /* scheduler ticks (10 ms quanta) consumed — CPU accounting */
 
   /* Statistics. */
   uint64_t hvc_count;

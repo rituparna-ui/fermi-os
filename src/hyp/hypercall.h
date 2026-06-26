@@ -36,6 +36,7 @@
 #define VMCTL_SNAPSHOT 3 /* checkpoint a vCPU's state            */
 #define VMCTL_RESTORE 4  /* restore a vCPU to its checkpoint     */
 #define VMCTL_BALLOON 5  /* (a3 = #pages) inflate the Linux guest's balloon */
+#define VMCTL_WEIGHT 6   /* (a3 = weight) set a vCPU's scheduler weight    */
 
 /* Field selectors for HVC_VM_STAT. */
 #define VMSTAT_ID 0
@@ -47,6 +48,8 @@
 #define VMSTAT_SWITCHES 6  /* global world-switch count (same for all ids) */
 #define VMSTAT_MMIO 7      /* emulated guest MMIO accesses */
 #define VMSTAT_WFI 8       /* global WFI idle-yield count (same for all ids) */
+#define VMSTAT_WEIGHT 9    /* per-vCPU scheduler weight */
+#define VMSTAT_CPUTICKS 10 /* per-vCPU CPU-time accounting (10 ms quanta) */
 
 #define HYP_ABI_VERSION 0x00010000ULL      /* 1.0 */
 #define HVC_ERR_BADCALL ((uint64_t)-1)     /* unknown function ID */

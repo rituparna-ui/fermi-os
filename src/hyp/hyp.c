@@ -1,5 +1,6 @@
 #include "hyp.h"
 #include "hyp_alloc.h"
+#include "hyp_mmu_el2.h"
 #include "hyp_gic.h"
 #include "hyp_sysregs.h"
 #include "snapshot.h"
@@ -176,6 +177,32 @@ void hyp_main(void) {
   hyp_puts("  CPTR_EL2 = ");
   hyp_puthex(cptr);
   hyp_putc('\n');
+
+  /* SMP Phase 0: turn on a minimal EL2 stage-1 MMU so EL2 RAM is Normal-WB
+   * Inner-Shareable. This is the foundation for multicore: spinlocks/atomics are
+   * only inter-PE correct on cacheable IS memory (NOT on the MMU-off Normal
+   * Non-cacheable memory used until now). Build (CPU0 only) then enable. */
+  hyp_mmu_el2_build();
+  hyp_mmu_el2_enable();
+  hyp_puts("[EL2MMU] enabled (SCTLR_EL2.M|C|I); EL2 RAM now cacheable IS\n");
+
+  /* Gate (the single most important Phase-0 check): a CAS to a cacheable-arena
+   * word must execute without a Data Abort, proving exclusives/atomics are now
+   * usable for the spinlock primitive. With the MMU off this would have been
+   * CONSTRAINED UNPREDICTABLE. */
+  {
+    static volatile uint32_t probe_word; /* lives in .bss -> now cacheable IS */
+    uint32_t tmp, fail;
+    __asm__ __volatile__(
+        "1: ldaxr %w0, [%2]\n\t"   /* load-acquire exclusive */
+        "   stlxr %w1, %w3, [%2]\n\t" /* store-release exclusive; %w1=0 on success */
+        "   cbnz  %w1, 1b\n\t"
+        "   dmb   ish"
+        : "=&r"(tmp), "=&r"(fail) : "r"(&probe_word), "r"(0xABCDu) : "memory");
+    hyp_puts("[EL2MMU] atomic probe: ldaxr/stlxr ok, word=");
+    hyp_puthex(probe_word);
+    hyp_putc('\n');
+  }
 
   /* Place each guest image at its host PA. The IPC producer + consumer run the
    * SAME image (role chosen by x0) but at separate private host RAM regions. */

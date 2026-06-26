@@ -222,6 +222,10 @@ pub fn list_dir(dir_cluster: u32) -> alloc::string::String {
                         if c != b' ' { name.push(c as char); }
                     }
                 }
+                if name == "." || name == ".." {
+                    off += DIR_ENTRY_SIZE;
+                    continue;
+                }
                 let is_dir = e[11] & ATTR_DIRECTORY != 0;
                 let size = u32::from_le_bytes([e[28], e[29], e[30], e[31]]);
                 if is_dir {

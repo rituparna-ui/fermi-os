@@ -38,6 +38,9 @@ $(DISK): build/hello.elf build/echo.elf
 	mcopy -o -i $(DISK) build/HELLO.TXT ::HELLO.TXT
 	mcopy -o -i $(DISK) build/hello.elf ::HELLO.ELF
 	mcopy -o -i $(DISK) build/echo.elf ::ECHO.ELF
+	mmd -o -i $(DISK) ::DOCS
+	printf 'Subdirectory file read via nested FAT32 traversal.\n' > build/SUB.TXT
+	mcopy -o -i $(DISK) build/SUB.TXT ::DOCS/SUB.TXT
 
 clean:
 	cargo clean

@@ -260,11 +260,9 @@ static void balloon_process_queue(int qidx) {
     __asm__ __volatile__("dsb ish" ::: "memory");
 
     vbln.int_status |= INT_VRING;
-    /* Owner-guard: vgic_inject_ppi targets the LIVE List Register of cur_vcpu,
-     * correct only when cur_vcpu IS the owner. It always is here (only the
-     * owner's stage-2 traps this window), but guard explicitly. */
+    /* Inject into the trapping (owner) vCPU; vgic_inject routes by residency. */
     if (cur_vcpu && (int)cur_vcpu->id == vbln.owner_id) {
-      vgic_inject_ppi(VIRTIO_BALLOON_SPI);
+      vgic_inject(cur_vcpu, VIRTIO_BALLOON_SPI);
     }
 
     hyp_puts(qidx == BALLOON_INFLATEQ ? "[VBALLOON] inflate: zeroed "
@@ -306,7 +304,7 @@ static void balloon_autopilot(void) {
    * publish discipline, so a relaxed core can't deliver the IRQ early. */
   __asm__ __volatile__("dsb ish" ::: "memory");
   if (cur_vcpu && (int)cur_vcpu->id == vbln.owner_id) {
-    vgic_inject_ppi(VIRTIO_BALLOON_SPI);
+    vgic_inject(cur_vcpu, VIRTIO_BALLOON_SPI);
   }
 
   hyp_puts("[VBALLOON] config-change: num_pages -> ");

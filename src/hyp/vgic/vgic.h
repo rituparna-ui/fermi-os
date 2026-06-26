@@ -58,6 +58,14 @@ void vgic_inject_ppi(uint32_t intid);
  * vgic_inject_ppi stays ungated so the vtimer PPI 30 path is unaffected. */
 int vgic_inject_spi_try(uint32_t intid);
 
+/* SMP: try to inject any (trusted) INTID into a free live List Register of the
+ * current guest on THIS pCPU; returns 1 if enqueued/coalesced, 0 if LRs full. */
+int vgic_try_inject_live(uint32_t intid);
+
+/* SMP: latch INTID (0..63) in a vCPU's cross-core pending bitmap. Caller holds
+ * the vCPU's vgic_lock. */
+void vgic_set_pending(struct vcpu_vgic *g, uint32_t intid);
+
 /* Inject into a NON-current vCPU's SAVED vGIC state (its lr[] array), so the
  * interrupt is present when that vCPU is next restored. Used to wake a blocked
  * vCPU on its timer deadline while another VM is running. */

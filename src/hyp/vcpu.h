@@ -2,7 +2,8 @@
 #define HYP_VCPU_H
 
 #include <stdint.h>
-#include "vm.h" /* hyp_trap_frame_t */
+#include "vm.h"   /* hyp_trap_frame_t */
+#include "lock.h" /* hyp_spinlock_t  */
 
 /* ---------------------------------------------------------------------------
  * Per-virtual-CPU state for a multi-VM type-1 hypervisor.
@@ -75,6 +76,13 @@ typedef struct vcpu_vgic {
   uint32_t gicr_igroupr0;
   uint32_t gicr_igrpmodr0;
   uint32_t gicr_isenabler0;
+  /* SMP: a cross-core injector that cannot reach the live List Registers (the
+   * target vCPU is running on a different pCPU, or not running) latches the
+   * pending vINTID here; it is drained into the live LRs when the vCPU next
+   * loads on its core. Covers INTIDs 0..63 (SGIs 0-15, vtimer PPI 30, doorbell
+   * 40, virtio/MSI-X SPIs 41..46). */
+  volatile uint32_t pending_lo; /* INTIDs 0..31  */
+  volatile uint32_t pending_hi; /* INTIDs 32..63 */
 } vcpu_vgic_t;
 
 /* Per-vCPU exit statistics (xentop-style observability). Bumped by the EL2
@@ -108,6 +116,18 @@ typedef struct vcpu {
   uint32_t vmid;
   uint32_t id;        /* 0, 1, ... */
   const char *name;
+
+  /* SMP: serializes this vCPU's vgic state (lr[], pending bitmaps) AND owns the
+   * authoritative writes to on_pcpu (the residency publish/observe variable). */
+  hyp_spinlock_t vgic_lock;
+  /* Which physical core this vCPU is currently resident on, or -1 if not running
+   * anywhere. WRITTEN ONLY under vgic_lock: cleared (-1) AFTER its context is
+   * saved, set (= pCPU id) AFTER its context is restored + pending drained — so a
+   * cross-core injector that reads on_pcpu can decide live-LR vs saved-bitmap
+   * race-free. Read as a hint under sched_lock. */
+  int      on_pcpu;
+  int      pin_pcpu;  /* -1 = unpinned; else only schedulable on this pCPU
+                       * (used to pin the SMP-guest vCPUs in Phase C). */
 
   /* SMP: sibling vCPUs of one VM share group_id + vttbr_el2 + vmid but each has
    * a distinct mpidr (affinity). A secondary starts powered OFF (online=0) and
@@ -215,9 +235,15 @@ void vcpu_wdog_arm(uint64_t period);
  * `f` is rewritten so the vector exit erets into the rebooted guest. */
 void vcpu_check_watchdogs(hyp_trap_frame_t *f);
 
+/* SMP: inject a virtual interrupt `intid` (0..63) into target vCPU `t`, routed
+ * race-free by residency — live List Register if t runs on the calling pCPU,
+ * else latched in t's pending bitmap with a reschedule-IPI to its core / an idle
+ * core. Use this for ALL cross-core-capable injection (timer, doorbell, SGI,
+ * device SPIs). */
+void vgic_inject(vcpu_t *t, uint32_t intid);
+
 /* Ring the doorbell from `from` to its configured peer: inject DOORBELL_INTID
- * into the peer (live List Register if it is current, saved state otherwise)
- * and mark it runnable. Returns 0 on success, -1 if `from` has no peer. */
+ * into the peer and mark it runnable. Returns 0 on success, -1 if no peer. */
 int vcpu_ring_doorbell(vcpu_t *from);
 
 /* Look up a vCPU by id (for wiring peers). */

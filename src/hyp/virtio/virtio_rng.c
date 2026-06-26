@@ -210,7 +210,7 @@ static void virtio_process_queue(void) {
     vrng.int_status |= INT_VRING;
     /* Inject the device SPI into the owner. cur_vcpu IS the owner (only its
      * stage-2 traps this window), so use the live List Register path. */
-    vgic_inject_ppi(VIRTIO_RNG_SPI);
+    vgic_inject(cur_vcpu, VIRTIO_RNG_SPI);
   }
 }
 

@@ -9,7 +9,20 @@
 #include "virtio/virtio_balloon.h"
 #include "vpci/vpci.h"
 #include "vcpu.h"
+#include "lock.h"
 #include <stdint.h>
+
+/* SMP: one lock per emulated-device singleton. A device's state (vrng/vblk/...
+ * /vpci incl. the MSI-X table) is global, so two physical cores trapping on the
+ * same device window must serialize. Taken in handle_data_abort AFTER the
+ * fatal-vs-emulate decision (lock-ordering rule: never take a device lock on a
+ * path that may then fault-isolate). The vGIC GICD/GICR model is PER-vCPU state,
+ * not a singleton, so it is covered by the per-vCPU vgic.lock, not here. */
+static hyp_spinlock_t vrng_lock = HYP_SPINLOCK_INIT;
+static hyp_spinlock_t vblk_lock = HYP_SPINLOCK_INIT;
+static hyp_spinlock_t vnet_lock = HYP_SPINLOCK_INIT;
+static hyp_spinlock_t vbln_lock = HYP_SPINLOCK_INIT;
+static hyp_spinlock_t vpci_lock = HYP_SPINLOCK_INIT; /* vPCI config + MSI-X table */
 
 /* ---------------------------------------------------------------------------
  * EL2 trap-and-emulate dispatcher. Entered from hyp_vectors.S with the guest
@@ -164,6 +177,19 @@ static void handle_data_abort(uint64_t type, hyp_trap_frame_t *f) {
   int sas = (int)ISS_SAS(esr);
   int size_bytes = 1 << sas;
 
+  /* Select the per-device lock for this window (NULL for the per-vCPU vGIC
+   * model, which is serialized differently). Held across the emulate call so a
+   * concurrent core on the same device serializes. */
+  hyp_spinlock_t *dlock = is_vmsix    ? &vpci_lock
+                        : is_vpci     ? &vpci_lock
+                        : is_vballoon ? &vbln_lock
+                        : is_vnet     ? &vnet_lock
+                        : is_vblk     ? &vblk_lock
+                        : is_virtio   ? &vrng_lock
+                                      : (hyp_spinlock_t *)0; /* vGIC: per-vCPU */
+  uint64_t lf = 0;
+  if (dlock) lf = hyp_lock_irqsave(dlock);
+
   uint64_t val = 0;
   if (is_write) {
     /* xzr (reg 31) reads as 0. */
@@ -189,6 +215,8 @@ static void handle_data_abort(uint64_t type, hyp_trap_frame_t *f) {
       f->regs[srt] = ISS_SF(esr) ? val : (val & 0xFFFFFFFFULL);
     }
   }
+
+  if (dlock) hyp_unlock_irqrestore(dlock, lf);
   advance_elr(f);
 }
 

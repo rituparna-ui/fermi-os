@@ -5,6 +5,9 @@
 #include "snapshot.h"
 #include "vgic/vgic.h"
 #include "timer/vtimer.h"
+#include "pcpu.h"
+#include "lock.h"
+#include "hyp_gic.h"
 #include <stdint.h>
 
 /* ---------------------------------------------------------------------------
@@ -27,14 +30,29 @@ static int    nr_vcpus;
 #define cur_load_tsc   (this_pcpu()->cur_load_tsc)
 #define sched_deadline (this_pcpu()->sched_deadline)
 
+/* SMP scheduler lock: protects the run-queue scan (vcpus[] scheduler-visible
+ * fields runnable/online/dead/paused/weight), CPU-time accounting, and the
+ * pcpu_idle_mask. It does NOT own the authoritative on_pcpu write (that is each
+ * vCPU's vgic_lock). Taken irqsave (the CNTHP IRQ handler also takes it). */
+static hyp_spinlock_t sched_lock = HYP_SPINLOCK_INIT;
+/* Bit n set = pCPU n is idle (no runnable vCPU); used to wake an idle core when
+ * a vCPU becomes runnable. Written under sched_lock. */
+static volatile uint32_t pcpu_idle_mask;
+/* Physical SGI INTID the hyp sends core-to-core to force a reschedule / pending
+ * drain. SGI 0 in the EL2 (physical) GIC. */
+#define HYP_RESCHED_SGI 0
+
 /* Implemented in vcpu_switch.S — load gp->x[]/elr/spsr and eret (no return). */
 extern void vcpu_first_entry(vcpu_gp_t *gp) __attribute__((noreturn));
 
 /* Forward decls (definitions appear later in this file). */
-static vcpu_t *pick_next(vcpu_t *cur);
+static vcpu_t *pick_next_locked(hyp_pcpu_t *pc);
 static uint64_t read_cntpct(void);
-static void switch_to(vcpu_t *next, hyp_trap_frame_t *f);
-static void vcpu_load(vcpu_t *v);
+static void schedule(hyp_trap_frame_t *f);
+static void vcpu_load_hw(vcpu_t *v);
+static void sched_arm_slice_for(const vcpu_t *v);
+static void vgic_drain_pending_locked(vcpu_t *v);
+static void hyp_send_resched_sgi(int cpu);
 
 /* Capture the current (QEMU reset) EL1 sysregs as a valid baseline both VMs
  * start from. Called once at boot before any guest runs. */
@@ -83,13 +101,16 @@ static void vcpu_init_state(vcpu_t *v) {
 int vcpu_is_dead(const vcpu_t *v) { return v->dead; }
 
 void vcpu_poweroff_current(hyp_trap_frame_t *f) {
-  cur_vcpu->dead = 1;
-  cur_vcpu->runnable = 0;
-  vcpu_t *next = pick_next(cur_vcpu);
-  if (next == cur_vcpu) {
-    hyp_panic("last VM powered off — nothing left to run");
-  }
-  switch_to(next, f);
+  vcpu_t *me = cur_vcpu;
+  uint64_t sl = hyp_lock_irqsave(&sched_lock);
+  me->dead = 1;
+  me->runnable = 0;
+  hyp_unlock_irqrestore(&sched_lock, sl);
+  /* schedule() picks another vCPU for this pCPU and rewrites f; if none is
+   * claimable it leaves this (now-dead) vCPU as current with f unchanged — the
+   * pCPU then idles. With 14 other VMs that does not happen in practice. */
+  schedule(f);
+  sched_arm_slice_for(cur_vcpu);
 }
 
 void vcpu_fault_isolate(hyp_trap_frame_t *f) {
@@ -241,36 +262,32 @@ int64_t vcpu_psci_affinity_info(uint64_t target_mpidr) {
  * the next vCPU's x0). Only the failure path (PSCI_DENIED) returns a value to
  * the still-running caller. */
 int64_t vcpu_psci_cpu_off(hyp_trap_frame_t *f) {
-  if (!cur_vcpu->is_smp || (cur_vcpu->mpidr & 0xFFULL) == 0) {
+  vcpu_t *me = cur_vcpu;
+  if (!me->is_smp || (me->mpidr & 0xFFULL) == 0) {
     return PSCI_DENIED; /* primary / UP VM: use SYSTEM_OFF, not CPU_OFF */
   }
 
+  hyp_con_begin();
   hyp_puts("[SMP] CPU_OFF: '");
-  hyp_puts(cur_vcpu->name);
+  hyp_puts(me->name);
   hyp_puts("' offlining (Aff0=");
-  hyp_puthex(cur_vcpu->mpidr & 0xFF);
+  hyp_puthex(me->mpidr & 0xFF);
   hyp_puts(")\n");
+  hyp_con_end();
 
-  cur_vcpu->online = 0;
-  cur_vcpu->runnable = 0;
-  /* Defensive: drop any armed vtimer deadline so no vCPU-iterating site can fold
-   * a stale cval (vcpu_init_state re-clears these on the next CPU_ON anyway). */
-  cur_vcpu->vtimer.ctl = 0;
-  cur_vcpu->vtimer.pending = 0;
+  uint64_t sl = hyp_lock_irqsave(&sched_lock);
+  me->online = 0;
+  me->runnable = 0;
+  me->vtimer.ctl = 0;      /* drop armed vtimer so no iterator folds a stale cval */
+  me->vtimer.pending = 0;
+  hyp_unlock_irqrestore(&sched_lock, sl);
 
-  vcpu_t *next = pick_next(cur_vcpu);
-  if (next == cur_vcpu) {
-    /* Unreachable in this design (the primary sibling + other VMs stay
-     * runnable), but switching to self would re-run the vCPU we just offlined.
-     * Re-online and refuse rather than corrupt state. */
-    cur_vcpu->online = 1;
-    cur_vcpu->runnable = 1;
-    return PSCI_DENIED;
-  }
-  /* account_cpu_time() inside switch_to credits the offlining vCPU (cur_vcpu is
-   * still it until vcpu_load) — do not reorder. */
-  switch_to(next, f); /* rewrites f; the vector exit erets into `next` */
-  return PSCI_SUCCESS; /* MUST NOT be written into f — the frame is now next's */
+  /* schedule() picks another vCPU for this pCPU and rewrites f (it will not pick
+   * `me` — online=0). On PSCI_SUCCESS f now belongs to the next vCPU, so the
+   * caller MUST NOT write f->regs[0]. */
+  schedule(f);
+  sched_arm_slice_for(cur_vcpu);
+  return PSCI_SUCCESS;
 }
 
 void vcpu_sgi_route(uint64_t sgi1r) {
@@ -300,14 +317,10 @@ void vcpu_sgi_route(uint64_t sgi1r) {
       if (t_aff0 > 15 || !((target_list >> t_aff0) & 1)) continue;
     }
 
-    /* Deliver like the doorbell: live LR if it's the current vCPU, else its
-     * saved LR; wake it if blocked. */
-    if (t == cur_vcpu) {
-      vgic_inject_ppi(intid);
-    } else {
-      vgic_inject_to(&t->vgic, intid);
-      t->runnable = 1;
-    }
+    /* Route the SGI to the target sibling via the unified injector: live LR if
+     * it runs on this pCPU, else latch + reschedule-IPI its core (the cross-core
+     * inter-processor SGI path — the SMP guest's ping-pong rides this). */
+    vgic_inject(t, intid);
   }
 }
 
@@ -416,12 +429,7 @@ int vcpu_ring_doorbell(vcpu_t *from) {
   if (!peer || peer->dead) {
     return -1;
   }
-  if (peer == cur_vcpu) {
-    vgic_inject_ppi(DOORBELL_INTID);      /* live LR (peer is running) */
-  } else {
-    vgic_inject_to(&peer->vgic, DOORBELL_INTID); /* saved LR, presented on entry */
-  }
-  peer->runnable = 1; /* wake it if it was blocked on WFI */
+  vgic_inject(peer, DOORBELL_INTID); /* routes by residency; marks runnable + kicks */
   return 0;
 }
 
@@ -447,6 +455,11 @@ vcpu_t *vcpu_alloc(const char *name, uint64_t entry_ipa, uint64_t vttbr,
   v->mpidr = 0x80000000ULL;
   v->is_smp = 0; /* upgraded to 1 by vcpu_alloc_secondary for SMP VMs */
   v->online = 1;
+  /* SMP residency: not running on any pCPU yet; unpinned. The vgic_lock starts
+   * free. pending bitmaps start clear (struct is zero-initialised in .bss). */
+  v->on_pcpu = -1;
+  v->pin_pcpu = -1;
+  v->vgic_lock = (hyp_spinlock_t)HYP_SPINLOCK_INIT;
 
   vcpu_init_state(v);
 
@@ -471,9 +484,14 @@ void vcpu_reset(vcpu_t *v, hyp_trap_frame_t *f) {
   s2_tlb_flush_all();
 
   if (v == cur_vcpu) {
-    /* Reset-in-place: reload state into hardware and rewrite the live trap
-     * frame so the vector exit erets into the fresh guest. */
-    vcpu_load(v);
+    /* Reset-in-place: reload state into hardware and rewrite the live trap frame
+     * so the vector exit erets into the fresh guest. v is resident on THIS pCPU
+     * (on_pcpu == us, unchanged), so just reload HW + its (freshly reset) vgic. */
+    uint64_t vl = hyp_lock_irqsave(&v->vgic_lock);
+    vcpu_load_hw(v);
+    vgic_restore(&v->vgic);
+    vgic_drain_pending_locked(v);
+    hyp_unlock_irqrestore(&v->vgic_lock, vl);
     for (int i = 0; i < 31; i++) f->regs[i] = v->gp.x[i];
     f->elr = v->gp.elr_el2;
     f->spsr = v->gp.spsr_el2;
@@ -497,28 +515,46 @@ static void account_cpu_time(void) {
   }
 }
 
-/* Restore the full guest context for `v` into the hardware. */
-static void vcpu_load(vcpu_t *v) {
-  cur_vcpu = v;
+/* Restore `v`'s hardware context onto THIS pCPU and make it current. Does NOT
+ * touch v->vgic save state / on_pcpu — vgic_restore + pending drain + the
+ * on_pcpu publish are sequenced by the caller (schedule / vcpu_run_first) under
+ * v->vgic_lock, per the residency-ordering rule. */
+static void vcpu_load_hw(vcpu_t *v) {
+  cur_vcpu = v;            /* per-pCPU: this_pcpu()->current */
   cur_load_tsc = read_cntpct();
   v->run_count++;
   vcpu_restore_sysregs(&v->sys);
   vcpu_restore_fp(&v->fp);
-  vgic_restore(&v->vgic);
   __asm__ __volatile__("msr vttbr_el2, %0\n\tisb" ::"r"(v->vttbr_el2));
   /* Per-vCPU MPIDR: the guest reads its own affinity via MPIDR_EL1 (= VMPIDR_EL2
-   * at EL1). Set ONCE at boot today, so it MUST be reloaded per world switch or
-   * SMP siblings would all read the same affinity. */
+   * at EL1). Reloaded per world switch so SMP siblings read distinct affinities. */
   __asm__ __volatile__("msr vmpidr_el2, %0" ::"r"(v->mpidr));
-  /* Re-arm the EL2 physical timer (CNTHP) to this guest's shadow deadline. */
-  vtimer_reprogram_current();
+  vtimer_reprogram_current(); /* re-arm CNTHP to this guest's shadow deadline */
 }
 
-/* First-ever entry into vcpus[0]. Does not return. */
+/* First-ever entry on a pCPU. On pCPU0 this loads vcpus[0] (dom0/FermiOS order);
+ * on a secondary it claims a distinct runnable vCPU. Does not return. */
 __attribute__((noreturn)) void vcpu_run_first(void) {
-  cur_vcpu = &vcpus[0];
-  vcpu_load(&vcpus[0]);
-  vcpu_first_entry(&vcpus[0].gp);
+  hyp_pcpu_t *pc = this_pcpu();
+  uint64_t sl = hyp_lock_irqsave(&sched_lock);
+  vcpu_t *v = pick_next_locked(pc);
+  if (!v) {
+    /* No claimable vCPU for this core — should not happen for pCPU0. */
+    hyp_unlock_irqrestore(&sched_lock, sl);
+    hyp_panic("vcpu_run_first: no runnable vCPU");
+  }
+  pcpu_idle_mask &= ~(1u << pc->cpu_id);
+  sched_arm_slice_for(v);
+  hyp_unlock_irqrestore(&sched_lock, sl);
+
+  uint64_t vl = hyp_lock_irqsave(&v->vgic_lock);
+  vcpu_load_hw(v);
+  vgic_restore(&v->vgic);
+  vgic_drain_pending_locked(v);
+  v->on_pcpu = (int)pc->cpu_id;
+  hyp_unlock_irqrestore(&v->vgic_lock, vl);
+
+  vcpu_first_entry(&v->gp);
 }
 
 /* --- EL2 scheduler tick via the EL2 PHYSICAL timer (CNTHP_EL2, PPI 26) -----
@@ -539,19 +575,29 @@ static int vtimer_armed(const vcpu_t *v) {
          !(v->vtimer.ctl & 2ULL) /*IMASK*/ && !v->vtimer.pending;
 }
 
-/* Arm CNTHP to the soonest of: the scheduler slice deadline, and EVERY vCPU's
- * armed vtimer deadline. Folding in non-current vCPUs is what lets a blocked,
- * idle guest be woken precisely on its own timer while another VM runs. */
+/* Arm THIS pCPU's CNTHP to the soonest of: this core's scheduler slice deadline,
+ * and the armed vtimer deadline of vCPUs RESIDENT ON or CLAIMABLE BY this core.
+ *
+ * SMP change: each pCPU folds in ONLY the vtimers relevant to it — its resident
+ * vCPU, plus parked (on_pcpu<0) claimable vCPUs (whose timer wake this core may
+ * service). It must NOT fold in vCPUs resident on OTHER pCPUs (their own core
+ * handles their timer) — doing so caused an N-way cross-core CNTHP re-fire
+ * storm. The online gate is still mandatory (an OFF secondary's stale timer). */
 void hyp_cnthp_arm(void) {
+  hyp_pcpu_t *pc = this_pcpu();
   uint64_t deadline = sched_deadline;
   for (int i = 0; i < nr_vcpus; i++) {
-    /* online gate is MANDATORY: an OFF (CPU_OFF'd) secondary with a stale armed
-     * vtimer would otherwise pull CNTHP to a past deadline, which fires ->
-     * vcpu_wake_expired skips it (!online) -> re-arm to the same past deadline
-     * -> a tight CNTHP re-fire livelock. */
-    if (vcpus[i].online && !vcpus[i].dead && !vcpus[i].paused &&
-        vtimer_armed(&vcpus[i]) && vcpus[i].vtimer.cval < deadline) {
-      deadline = vcpus[i].vtimer.cval;
+    vcpu_t *v = &vcpus[i];
+    if (!v->online || v->dead || v->paused || !vtimer_armed(v)) {
+      continue;
+    }
+    /* Only this core's resident vCPU, or a parked (unowned) one this core could
+     * run. Pinned-to-another-core vCPUs are also skipped. */
+    int mine = (v->on_pcpu == (int)pc->cpu_id) ||
+               (v->on_pcpu < 0 &&
+                (v->pin_pcpu < 0 || v->pin_pcpu == (int)pc->cpu_id));
+    if (mine && v->vtimer.cval < deadline) {
+      deadline = v->vtimer.cval;
     }
   }
   __asm__ __volatile__("msr cnthp_cval_el2, %0" ::"r"(deadline));
@@ -580,110 +626,229 @@ void vcpu_sched_init(void) {
   hyp_puts("[SCHED] EL2 weighted scheduler armed (CNTHP PPI 26, 10ms base slice)\n");
 }
 
-/* Pick the next runnable (non-dead) vCPU round-robin after `cur`. Returns `cur`
- * if no other vCPU is runnable. */
-static vcpu_t *pick_next(vcpu_t *cur) {
+/* Pick a runnable vCPU for pCPU `pc`, round-robin after its current. Caller
+ * holds sched_lock. Returns NULL if nothing is claimable (the core should idle).
+ * A vCPU resident on another pCPU (on_pcpu >= 0 and != us) is skipped — a vCPU
+ * runs on at most one pCPU at a time (no double-run). pin_pcpu restricts a vCPU
+ * to one core (used to pin the SMP guest in Phase C). */
+static vcpu_t *pick_next_locked(hyp_pcpu_t *pc) {
+  vcpu_t *cur = pc->current;
+  int start = cur ? (int)cur->id : 0;
   for (int i = 1; i <= nr_vcpus; i++) {
-    vcpu_t *cand = &vcpus[(cur->id + i) % nr_vcpus];
-    /* online: a PSCI-OFF secondary (online=0) must never be scheduled until
-     * CPU_ON, even though its runnable flag may be set by vcpu_init_state. */
-    if (cand->runnable && cand->online && !cand->dead && !cand->paused)
-      return cand;
+    vcpu_t *c = &vcpus[(start + i) % nr_vcpus];
+    if (c->runnable && c->online && !c->dead && !c->paused &&
+        (c->pin_pcpu < 0 || c->pin_pcpu == (int)pc->cpu_id) &&
+        (c->on_pcpu < 0 || c == cur)) {
+      return c;
+    }
   }
-  return cur;
+  /* Keep running cur if it is still claimable by us. */
+  if (cur && cur->runnable && cur->online && !cur->dead && !cur->paused) {
+    return cur;
+  }
+  return (vcpu_t *)0;
 }
 
-/* Switch the running guest to `next`: save prev's context out of the trap
- * frame + hardware, restore next's into hardware + the frame (so the vector
- * exit erets into next). No-op if next == prev. */
-static void switch_to(vcpu_t *next, hyp_trap_frame_t *f) {
-  vcpu_t *prev = cur_vcpu;
+/* The one true reschedule path. Picks the next vCPU for THIS pCPU under
+ * sched_lock, then hands off: saves prev WHILE STILL OWNING IT (clearing
+ * on_pcpu only AFTER the save, under prev's vgic_lock), claims next (setting
+ * on_pcpu only AFTER restore+drain, under next's vgic_lock). This ordering is
+ * what makes cross-core injection race-free. Rewrites the trap frame `f` so the
+ * vector exit erets into next. If no vCPU is claimable, the pCPU goes idle. */
+static void schedule(hyp_trap_frame_t *f) {
+  hyp_pcpu_t *pc = this_pcpu();
+
+  uint64_t sl = hyp_lock_irqsave(&sched_lock);
+  vcpu_t *prev = pc->current;
+  vcpu_t *next = pick_next_locked(pc);
   if (next == prev) {
+    hyp_unlock_irqrestore(&sched_lock, sl);
+    return; /* nothing to do (also the common single-runnable case) */
+  }
+  account_cpu_time(); /* credit prev under sched_lock (reads cur_load_tsc) */
+  if (next) {
+    pcpu_idle_mask &= ~(1u << pc->cpu_id);
+  } else {
+    pcpu_idle_mask |= (1u << pc->cpu_id);
+  }
+  static uint64_t nswitch;
+  uint64_t n = nswitch++;
+  hyp_unlock_irqrestore(&sched_lock, sl);
+
+  if ((n % 200) == 0) {
+    hyp_con_begin();
+    hyp_puts("[SCHED][cpu");
+    hyp_puthex(pc->cpu_id);
+    hyp_puts("] world switches: ");
+    hyp_puthex(n);
+    hyp_putc('\n');
+    hyp_con_end();
+  }
+
+  /* Save prev while we still own it (on_pcpu unchanged until after the save). */
+  if (prev) {
+    for (int i = 0; i < 31; i++) prev->gp.x[i] = f->regs[i];
+    prev->gp.elr_el2 = f->elr;
+    prev->gp.spsr_el2 = f->spsr;
+    vcpu_save_sysregs(&prev->sys);
+    vcpu_save_fp(&prev->fp);
+    uint64_t vl = hyp_lock_irqsave(&prev->vgic_lock);
+    vgic_save(&prev->vgic);
+    prev->on_pcpu = -1; /* publish: not resident anywhere (AFTER save) */
+    hyp_unlock_irqrestore(&prev->vgic_lock, vl);
+  }
+
+  if (!next) {
+    /* No claimable vCPU: go idle. cur_vcpu (== pc->current) becomes NULL; the
+     * core wfi's and is woken by CNTHP or a reschedule SGI, then re-runs
+     * schedule() from the IRQ return path. */
+    pc->current = (void *)0;
     return;
   }
-  account_cpu_time(); /* credit prev with the time it just ran */
-  static uint64_t nswitch;
-  if ((nswitch++ % 200) == 0) {
-    hyp_puts("[SCHED] world switches: ");
-    hyp_puthex(nswitch - 1);
-    hyp_putc('\n');
-  }
 
-  /* Save prev: GP from frame, then EL1/FP/vGIC from hardware. */
-  for (int i = 0; i < 31; i++) prev->gp.x[i] = f->regs[i];
-  prev->gp.elr_el2 = f->elr;
-  prev->gp.spsr_el2 = f->spsr;
-  vcpu_save_sysregs(&prev->sys);
-  vcpu_save_fp(&prev->fp);
-  vgic_save(&prev->vgic);
-
-  vcpu_load(next);
+  uint64_t vl2 = hyp_lock_irqsave(&next->vgic_lock);
+  vcpu_load_hw(next);          /* sets pc->current = next (owner-only write) */
+  vgic_restore(&next->vgic);
+  vgic_drain_pending_locked(next);
+  next->on_pcpu = (int)pc->cpu_id; /* publish residency AFTER restore+drain */
+  hyp_unlock_irqrestore(&next->vgic_lock, vl2);
 
   for (int i = 0; i < 31; i++) f->regs[i] = next->gp.x[i];
   f->elr = next->gp.elr_el2;
   f->spsr = next->gp.spsr_el2;
 }
 
-/* Inject the timer IRQ into any vCPU whose vtimer deadline has elapsed and mark
- * it runnable — including non-current, blocked ones (so a blocked idle guest
- * wakes on its own timer while another VM runs). Returns 1 if the CURRENT vCPU
- * is blocked and a different vCPU is now runnable (caller should switch). */
+/* --- SMP: cross-core vGIC injection + reschedule IPI ---------------------- */
+
+/* Send a physical reschedule SGI (HYP_RESCHED_SGI) to physical core `cpu` so it
+ * re-evaluates: drains its current vCPU's pending vIRQ bitmap into live LRs, or
+ * (if idle) breaks its wfi and re-runs schedule(). */
+static void hyp_send_resched_sgi(int cpu) {
+  uint64_t aff0 = hyp_pcpus[cpu].mpidr & 0xFF;
+  /* ICC_SGI1R_EL1: INTID[27:24], TargetList[15:0]; Aff1/2/3 = 0 on QEMU virt. */
+  uint64_t sgi1r = ((uint64_t)HYP_RESCHED_SGI << 24) | (1ULL << aff0);
+  __asm__ __volatile__("msr icc_sgi1r_el1, %0\n\tisb" ::"r"(sgi1r) : "memory");
+}
+
+/* Drain a vCPU's pending bitmap into the LIVE List Registers. Caller holds
+ * v->vgic_lock and v is resident on THIS pCPU (so the live LRs are its). If an
+ * LR is full the bit is kept pending (re-set) so the interrupt is not lost. */
+static void vgic_drain_pending_locked(vcpu_t *v) {
+  uint32_t lo = v->vgic.pending_lo, hi = v->vgic.pending_hi;
+  v->vgic.pending_lo = 0;
+  v->vgic.pending_hi = 0;
+  for (uint32_t i = 0; i < 32; i++) {
+    if ((lo & (1u << i)) && !vgic_try_inject_live(i)) {
+      v->vgic.pending_lo |= (1u << i); /* LR full -> keep pending (not lost) */
+    }
+  }
+  for (uint32_t i = 0; i < 32; i++) {
+    if ((hi & (1u << i)) && !vgic_try_inject_live(i + 32)) {
+      v->vgic.pending_hi |= (1u << i);
+    }
+  }
+}
+
+/* Unified vIRQ injection into target vCPU `t` (any INTID 0..63). Routes by
+ * residency, race-free via on_pcpu published under t->vgic_lock:
+ *  - resident on THIS pCPU -> write its live LR now;
+ *  - resident on ANOTHER pCPU -> latch in its pending bitmap + reschedule-SGI
+ *    that core so it drains into its live LRs;
+ *  - not running -> latch in the bitmap, mark runnable (under sched_lock), and
+ *    kick an idle pCPU to pick it up. Never drops (overflow stays pending). */
+void vgic_inject(vcpu_t *t, uint32_t intid) {
+  hyp_pcpu_t *pc = this_pcpu();
+  uint64_t fl = hyp_lock_irqsave(&t->vgic_lock);
+  if (t->on_pcpu == (int)pc->cpu_id) {
+    /* Resident here: straight to the live LRs (fall back to bitmap if full). */
+    if (!vgic_try_inject_live(intid)) {
+      vgic_set_pending(&t->vgic, intid);
+    }
+    hyp_unlock_irqrestore(&t->vgic_lock, fl);
+    return;
+  }
+  vgic_set_pending(&t->vgic, intid);
+  int resident = t->on_pcpu;
+  hyp_unlock_irqrestore(&t->vgic_lock, fl);
+
+  /* Mark runnable (sched_lock owns it) + decide who to kick. */
+  uint64_t sl = hyp_lock_irqsave(&sched_lock);
+  t->runnable = 1;
+  int idle = -1;
+  if (resident < 0) {
+    for (int c = 0; c < HYP_MAX_PCPUS; c++) {
+      if (pcpu_idle_mask & (1u << c)) { idle = c; break; }
+    }
+  }
+  hyp_unlock_irqrestore(&sched_lock, sl);
+
+  if (resident >= 0)   hyp_send_resched_sgi(resident); /* poke its core to drain */
+  else if (idle >= 0)  hyp_send_resched_sgi(idle);     /* wake an idle core */
+}
+
+/* Inject the timer IRQ into any vCPU whose vtimer deadline elapsed. SMP: this
+ * pCPU services ONLY vCPUs it could run — its resident one (live LR) and parked
+ * (on_pcpu<0) ones (via vgic_inject, which latches + kicks). vCPUs resident on
+ * OTHER pCPUs are skipped (their own core's CNTHP handles their timer). Returns
+ * 1 if THIS core's current vCPU is blocked and should reschedule. */
 int vcpu_wake_expired(void) {
+  hyp_pcpu_t *pc = this_pcpu();
   uint64_t now;
   __asm__ __volatile__("mrs %0, cntpct_el0" : "=r"(now));
 
   for (int i = 0; i < nr_vcpus; i++) {
     vcpu_t *v = &vcpus[i];
-    if (v->dead || v->paused || !v->online) continue; /* off/paused don't wake */
+    if (v->dead || v->paused || !v->online) continue;
+    /* Only my resident vCPU or a parked one I could run. */
+    int mine = (v->on_pcpu == (int)pc->cpu_id) ||
+               (v->on_pcpu < 0 &&
+                (v->pin_pcpu < 0 || v->pin_pcpu == (int)pc->cpu_id));
+    if (!mine) continue;
     if (vtimer_armed(v) && now >= v->vtimer.cval) {
-      v->vtimer.pending = 1; /* latch ISTATUS; cleared on guest re-arm */
-      if (v == cur_vcpu) {
-        vgic_inject_ppi(VTIMER_GUEST_PPI);     /* live LR */
-      } else {
-        vgic_inject_to(&v->vgic, VTIMER_GUEST_PPI); /* saved LR */
-      }
-      v->runnable = 1; /* a pending IRQ makes a blocked guest runnable again */
+      v->vtimer.pending = 1;       /* latch ISTATUS; cleared on guest re-arm */
+      vgic_inject(v, VTIMER_GUEST_PPI);
+      v->runnable = 1;
     }
   }
 
-  if (!cur_vcpu->runnable) {
+  vcpu_t *me = cur_vcpu;
+  if (me && !me->runnable) {
+    uint64_t sl = hyp_lock_irqsave(&sched_lock);
+    int other = 0;
     for (int i = 0; i < nr_vcpus; i++) {
-      /* online gate: an OFF vCPU must not count as "someone else can run" even
-       * if a stale runnable flag lingers. */
-      if (vcpus[i].runnable && vcpus[i].online) return 1;
+      if (vcpus[i].runnable && vcpus[i].online && vcpus[i].on_pcpu < 0) { other = 1; break; }
     }
+    hyp_unlock_irqrestore(&sched_lock, sl);
+    return other;
   }
   return 0;
 }
 
-/* Periodic scheduler tick (CNTHP slice elapsed): round-robin to the next
- * runnable guest and size the new slice by THAT guest's weight. */
+/* Periodic scheduler tick (this pCPU's CNTHP slice elapsed): reschedule + arm
+ * the next slice. Watchdog liveness check first. */
 void vcpu_sched_tick(hyp_trap_frame_t *f) {
-  /* Liveness check first: reboot any VM whose watchdog expired (hung). For a
-   * non-current expired VM this just resets its struct (takes effect when it is
-   * next loaded); for the current one it reloads HW + rewrites f in place. */
   vcpu_check_watchdogs(f);
-
-  vcpu_t *next = pick_next(cur_vcpu);
-  sched_arm_slice_for(next); /* weighted slice for whoever runs next */
-  switch_to(next, f);
+  schedule(f);
+  sched_arm_slice_for(cur_vcpu); /* arm slice for whoever now runs here (may be NULL) */
 }
 
-/* Current guest did WFI/WFE — block it and switch to another runnable guest.
- * If none is runnable, leave it running (it re-checks WFI); its own timer will
- * fire and wake it. The blocked guest is re-armed via hyp_cnthp_arm folding in
- * all vCPUs' deadlines, and woken by vcpu_wake_expired on the CNTHP fire. */
+/* Current guest did WFI/WFE — block it and reschedule. If nothing else is
+ * claimable on this pCPU, schedule() leaves it running (pick keeps cur) — its
+ * own timer wakes it. */
 void vcpu_block_current(hyp_trap_frame_t *f) {
-  cur_vcpu->runnable = 0;
-  vcpu_t *next = pick_next(cur_vcpu);
-  if (next == cur_vcpu) {
-    /* Nobody else runnable. Keep this vCPU live (un-block) so it can take its
-     * own timer IRQ on the next CNTHP fire. */
-    cur_vcpu->runnable = 1;
-    return;
+  vcpu_t *me = cur_vcpu;
+  if (me) {
+    uint64_t sl = hyp_lock_irqsave(&sched_lock);
+    me->runnable = 0;
+    hyp_unlock_irqrestore(&sched_lock, sl);
   }
-  /* Give the VM we switch to its own weighted slice (also re-arms CNTHP, which
-   * folds in the blocking guest's vtimer deadline so it still wakes on time). */
-  sched_arm_slice_for(next);
-  switch_to(next, f);
+  schedule(f);
+  /* If schedule() found nothing else, cur is still `me` and we re-mark it
+   * runnable so it can take its own timer IRQ. */
+  if (cur_vcpu == me && me) {
+    uint64_t sl = hyp_lock_irqsave(&sched_lock);
+    me->runnable = 1;
+    hyp_unlock_irqrestore(&sched_lock, sl);
+  }
+  sched_arm_slice_for(cur_vcpu);
 }

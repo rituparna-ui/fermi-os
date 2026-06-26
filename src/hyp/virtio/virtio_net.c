@@ -148,7 +148,7 @@ static void virtio_net_process_tx(void) {
 
   if (rx_delivered) {
     vnet.int_status |= INT_VRING;
-    vgic_inject_ppi(VIRTIO_NET_SPI);
+    vgic_inject(cur_vcpu, VIRTIO_NET_SPI);
   }
 }
 

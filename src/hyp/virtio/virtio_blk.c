@@ -196,7 +196,7 @@ static void virtio_blk_process_queue(void) {
     gwrite(vblk.device_ipa + 2, &vblk.used_idx, 2);
     __asm__ __volatile__("dsb ish" ::: "memory");
     vblk.int_status |= INT_VRING;
-    vgic_inject_ppi(VIRTIO_BLK_SPI);
+    vgic_inject(cur_vcpu, VIRTIO_BLK_SPI);
   }
 }
 

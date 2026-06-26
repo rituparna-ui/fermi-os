@@ -264,6 +264,35 @@ static uint64_t lr_pending(uint32_t intid) {
          (0xA0ULL << ICH_LR_PRIO_SHIFT) | (uint64_t)intid;
 }
 
+/* Try to inject `intid` (any INTID) into a free LIVE List Register of the CURRENT
+ * guest on THIS pCPU. Returns 1 if enqueued (or already pending — coalesced), 0
+ * if no free LR (caller may keep it pending). The internal SMP injector trusts
+ * the INTID (timer PPI 30, doorbell 40, SGIs); the MSI-X device path uses the
+ * gated vgic_inject_spi_try instead. */
+int vgic_try_inject_live(uint32_t intid) {
+  for (uint32_t i = 0; i < vgic_nr_lr; i++) {
+    uint64_t lr = lr_read(i);
+    if ((lr & ICH_LR_STATE_MASK) == 0) {
+      lr_write(i, lr_pending(intid));
+      return 1;
+    }
+    if ((uint32_t)(lr & 0xFFFFFFFFULL) == intid) {
+      return 1; /* already pending/active — coalesced */
+    }
+  }
+  return 0; /* no free LR */
+}
+
+/* Set INTID `intid` (0..63) in a vCPU's pending bitmap (cross-core latch).
+ * Caller holds the vCPU's vgic_lock. */
+void vgic_set_pending(struct vcpu_vgic *g, uint32_t intid) {
+  if (intid < 32) {
+    g->pending_lo |= (1u << intid);
+  } else if (intid < 64) {
+    g->pending_hi |= (1u << (intid - 32));
+  }
+}
+
 void vgic_inject_ppi(uint32_t intid) {
   /* Inject into a free LIVE List Register (current guest). */
   for (uint32_t i = 0; i < vgic_nr_lr; i++) {

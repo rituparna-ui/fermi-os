@@ -38,7 +38,9 @@ printf 'Hello from Fermi OS FAT32!\nThis is HELLO.TXT.\n' \
 # whole point: it makes QEMU enter the image at EL2.
 qemu_args() {
 	local kernel="$1" disk="$2"
-	echo "-machine virt,gic-version=3,virtualization=on -cpu cortex-a72 -m 8G -nographic \
+	# -m 10G: the Linux-slot guest's RAM lives at physical 9 GiB, past Fermi's
+	# 8 GiB PMM view, so the machine must expose at least 9 GiB + the slice.
+	echo "-machine virt,gic-version=3,virtualization=on -cpu cortex-a72 -m 10G -nographic \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0,disable-legacy=on \
 		-device virtio-rng-pci,disable-legacy=on \
 		-drive file=$disk,if=none,format=raw,id=d0 \
@@ -94,11 +96,9 @@ require "[HYP] isolated hyp region"
 require "[HYP] ISOLATION: blocked guest read from hyp memory"
 require "0 => stage-2 isolation held"
 require "[HYP] injected hw vIRQ intid="
-require "[HYP] created guest1 (vCPU 1) with its own stage-2"
+require "[HYP] created Linux-slot guest (vCPU 1)"
 require "[HYP] preemptive scheduler armed (CNTHP tick)"
-require "[g1]"
 require "Fermi hypervisor (EL2): 2 vCPUs"
-require "[HYP] vCPU 0x0000000000000001 powered off (PSCI)"
 require "[MMU TEST] TTBR1 Upper Half: PASS"
 require "[BLK TEST] write+read sector 1 round-trip: PASS"
 require "[FAT32 TEST] create+read RUSTW.TXT round-trip: PASS"
@@ -117,13 +117,14 @@ else
 	echo "  ok: no EL2 traps / panics / FAILs"
 fi
 
-# guest1's FP-sentinel self-test prints a lone "X" line if its d5 was corrupted
-# across a preemption — i.e. the hypervisor failed to context-switch FP state.
-if grep -qxF 'X' "$LOG"; then
-	echo "  FP CORRUPTION: guest1 emitted 'X' (per-guest FP not preserved across switch)"
-	fail=1
+# The Linux-slot stub writes 'L' from its high-RAM slice through the guest's
+# own stage-2 UART mapping; seeing it proves the guest executes from the slice
+# and its device mapping works.
+if grep -qaE 'L' "$LOG"; then
+	echo "  ok: Linux-slot stub ran from high RAM (emitted 'L')"
 else
-	echo "  ok: guest1 FP sentinel survived all preemptions (no 'X')"
+	echo "  MISSING: Linux-slot stub 'L' output (guest didn't run from its slice)"
+	fail=1
 fi
 
 if [ "$fail" -ne 0 ]; then

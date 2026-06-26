@@ -27,8 +27,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 // EL2 exception vector table + el2_common save/restore trampoline.
 global_asm!(include_str!("vector_el2.S"));
-// Tiny second guest payload (M5a), copied into guest 1's RAM slice.
-global_asm!(include_str!("guest1.S"));
+// Linux-slot guest bring-up stub (M10), copied into the guest's high RAM.
+global_asm!(include_str!("linux_stub.S"));
 
 // --- Stage-2 (VMSAv8-64) descriptor bits ------------------------------------
 // These differ from stage-1: no MAIR indirection (MemAttr[5:2] encodes the type
@@ -281,29 +281,25 @@ fn gic_write32(addr: usize, val: u32) {
     unsafe { write_volatile(addr as *mut u32, val) }
 }
 
-// --- Guest 1: a tiny second guest with its own stage-2 + RAM slice -----------
-// The hole-punch in hyp_build_stage2 keeps this region invisible to guest 0.
-// Guest 1 runs with its stage-1 MMU off, so it sees IPA == PA over just this
-// slice; every other IPA is unmapped, sandboxing it.
-const GUEST1_RAM_SIZE: usize = 16 * 1024;
+// --- Linux-slot guest (vCPU 1) -----------------------------------------------
+// Its RAM lives in a Fermi-invisible high physical region (just past Fermi's
+// 8 GiB PMM view); stage-2 maps the guest's IPA window there, plus the PL011
+// UART so the guest can drive earlycon. Requires QEMU `-m 10G`.
+const LINUX_PHYS_BASE: u64 = 0x2_4000_0000; // 9 GiB: past Fermi's 8 GiB view
+const LINUX_IPA_BASE: u64 = 0x4000_0000; // arm64 RAM base the guest sees
+const LINUX_RAM_SIZE: u64 = 256 * 1024 * 1024;
 #[link_section = ".hyp_tables"]
-static G1_L0: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
+static LX_L0: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
 #[link_section = ".hyp_tables"]
-static G1_L1: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
+static LX_L1: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
 #[link_section = ".hyp_tables"]
-static G1_L2: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
+static LX_L2_RAM: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512])); // IPA 1-2 GiB
 #[link_section = ".hyp_tables"]
-static G1_L3: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512]));
-
-/// Guest 1's RAM slice. 4 KiB-aligned so its stage-2 maps it cleanly.
-#[repr(C, align(4096))]
-struct Guest1Ram([u8; GUEST1_RAM_SIZE]);
-#[link_section = ".hyp_tables"]
-static GUEST1_RAM: SyncUnsafeCell<Guest1Ram> = SyncUnsafeCell::new(Guest1Ram([0; GUEST1_RAM_SIZE]));
+static LX_L2_DEV: SyncUnsafeCell<PageTable> = SyncUnsafeCell::new(PageTable([0; 512])); // IPA 0-1 GiB
 
 extern "C" {
-    static guest1_payload: u8;
-    static guest1_payload_end: u8;
+    static linux_stub: u8;
+    static linux_stub_end: u8;
 }
 
 /// Accessor for the running vCPU (mutable pointer). Single-core: only ever used
@@ -581,8 +577,8 @@ pub extern "C" fn hyp_init() {
         v0.vttbr = phys_of(S2_L0.get()); // VMID 0
         *CURRENT_VCPU.get() = 0;
     }
-    hyp_create_guest1();
-    hyp_puts("[HYP] created guest1 (vCPU 1) with its own stage-2\n");
+    hyp_create_linux_guest();
+    hyp_puts("[HYP] created Linux-slot guest (vCPU 1): 256 MiB @ IPA 0x40000000\n");
 
     // Start the preemptive scheduling tick (CNTHP / PPI 26).
     hyp_tick_init();
@@ -830,62 +826,64 @@ fn hyp_world_switch(frame: *mut El2Frame) {
     }
 }
 
-/// Build guest 1's stage-2: identity-map ONLY its RAM slice (IPA == PA over the
-/// slice), leaving every other IPA unmapped so the guest is sandboxed.
-fn hyp_build_guest1_stage2() {
-    let base = phys_of(GUEST1_RAM.get()); // physical == guest IPA
-    let pages = GUEST1_RAM_SIZE as u64 / PAGE_SIZE;
-    let gb = base / SIZE_1G;
-    let mb = (base % SIZE_1G) / SIZE_2M;
-    let first_page = (base % SIZE_2M) / PAGE_SIZE;
-
-    let l0 = G1_L0.get();
-    let l1 = G1_L1.get();
-    let l2 = G1_L2.get();
-    let l3 = G1_L3.get();
+/// Build the Linux-slot guest's stage-2: a 256 MiB RAM window at IPA 0x40000000
+/// backed by Fermi-invisible physical RAM, plus the PL011 UART.
+fn hyp_build_linux_stage2() {
+    let l0 = LX_L0.get();
+    let l1 = LX_L1.get();
+    let l2_ram = LX_L2_RAM.get();
+    let l2_dev = LX_L2_DEV.get();
 
     // SAFETY (single-core, pre-guest): hypervisor-private tables.
     unsafe {
         for i in 0..512 {
             (*l0).0[i] = 0;
             (*l1).0[i] = 0;
-            (*l2).0[i] = 0;
-            (*l3).0[i] = 0;
+            (*l2_ram).0[i] = 0;
+            (*l2_dev).0[i] = 0;
         }
         (*l0).0[0] = phys_of(l1) | S2_TABLE | S2_VALID;
-        (*l1).0[gb as usize] = phys_of(l2) | S2_TABLE | S2_VALID;
-        (*l2).0[mb as usize] = phys_of(l3) | S2_TABLE | S2_VALID;
-        for p in 0..pages {
-            let pa = base + p * PAGE_SIZE;
-            (*l3).0[(first_page + p) as usize] =
-                pa | S2_TABLE | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
+        (*l1).0[0] = phys_of(l2_dev) | S2_TABLE | S2_VALID; // IPA 0..1 GiB
+        (*l1).0[1] = phys_of(l2_ram) | S2_TABLE | S2_VALID; // IPA 1..2 GiB
+
+        // RAM: IPA [0x40000000, +256 MiB) -> phys [LINUX_PHYS_BASE, +256 MiB).
+        let blocks = LINUX_RAM_SIZE / SIZE_2M;
+        let base_idx = (LINUX_IPA_BASE % SIZE_1G) / SIZE_2M; // = 0
+        for i in 0..blocks {
+            let pa = LINUX_PHYS_BASE + i * SIZE_2M;
+            (*l2_ram).0[(base_idx + i) as usize] =
+                pa | S2_VALID | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
         }
+
+        // PL011 UART: IPA 0x09000000 -> phys 0x09000000 (Device).
+        let uart_idx = (0x0900_0000u64 % SIZE_1G) / SIZE_2M; // = 72
+        (*l2_dev).0[uart_idx as usize] = 0x0900_0000 | S2_VALID | S2_AF | S2_AP_RW | S2_MEM_DEVICE;
+
         core::arch::asm!("dsb ish");
     }
 }
 
-fn hyp_create_guest1() {
-    hyp_build_guest1_stage2();
+fn hyp_create_linux_guest() {
+    hyp_build_linux_stage2();
 
-    let payload = core::ptr::addr_of!(guest1_payload) as *const u8;
-    let payload_end = core::ptr::addr_of!(guest1_payload_end) as *const u8;
-    let base = phys_of(GUEST1_RAM.get());
-    // SAFETY (single-core, pre-guest): copy the PIC payload into guest 1's RAM
-    // slice; len is the linker-bounded payload size and fits in GUEST1_RAM_SIZE.
+    let stub = core::ptr::addr_of!(linux_stub) as *const u8;
+    let stub_end = core::ptr::addr_of!(linux_stub_end) as *const u8;
+    // SAFETY (single-core, pre-guest): copy the bring-up stub into the guest's
+    // high RAM (physical, MMU off). len is the linker-bounded stub size.
     unsafe {
-        let len = payload_end as usize - payload as usize;
-        core::ptr::copy_nonoverlapping(payload, GUEST1_RAM.get() as *mut u8, len);
+        let len = stub_end as usize - stub as usize;
+        core::ptr::copy_nonoverlapping(stub, LINUX_PHYS_BASE as *mut u8, len);
 
+        // sctlr_el1 left 0 => stage-1 MMU off, as the stub and Linux's early
+        // entry both expect.
         let v = &mut (*VCPUS.get())[1];
         *v = Vcpu::zeroed();
         v.id = 1;
         v.state = VCPU_READY;
-        v.pc = base; // entry (IPA == PA)
+        v.pc = LINUX_IPA_BASE; // entry (IPA) -> high RAM
         v.pstate = 0x3c5; // EL1h, DAIF masked
-        v.sp_el1 = base + GUEST1_RAM_SIZE as u64;
-        v.vttbr = phys_of(G1_L0.get()) | (1 << 48); // VMID 1
-        v.cpacr_el1 = 3 << 20; // CPACR_EL1.FPEN=11 => guest 1 may use FP
-                               // Other EL1 sysregs left 0 => guest 1 runs with its stage-1 MMU off.
+        v.sp_el1 = LINUX_IPA_BASE + LINUX_RAM_SIZE;
+        v.vttbr = phys_of(LX_L0.get()) | (1 << 48); // VMID 1
     }
 }
 

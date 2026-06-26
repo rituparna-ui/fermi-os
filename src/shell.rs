@@ -537,11 +537,13 @@ fn dispatch(line: &str) {
         "version" => kprintln!("Fermi OS (Rust) — aarch64, rustc 1.85.0"),
         "smpsched" => {
             let k = parse_u64(arg1).unwrap_or(120).max(1);
-            crate::smp::pool_seed(k);
+            let free_before = crate::mm::heap::free_bytes();
+            let _run_sum = crate::smp::pool_seed(k);
             kprintln!("seeded {} pooled tasks; draining on both cores...", k);
-            sched::sleep_ms(1500);
-            let (r0, r1, s0, s1, seeded, rem, mig) = crate::smp::pool_stats();
-            let expect = (1000..1000 + seeded).sum::<u64>();
+            let done = crate::smp::pool_join(8000);
+            let (r0, r1, s0, s1, seeded, rem, mig, expect) = crate::smp::pool_stats();
+            let free_after = crate::mm::heap::free_bytes();
+            kprintln!("  join: {} | heap free {} -> {} bytes (reclaimed)", if done {"complete"} else {"timeout"}, free_before, free_after);
             kprintln!("  core0 ran {} tasks (pid-sum {})", r0, s0);
             kprintln!("  core1 ran {} tasks (pid-sum {})", r1, s1);
             kprintln!("  total {}/{} run, {} remaining, {} migrated cores, checksum {} (expect {}) -> {}",

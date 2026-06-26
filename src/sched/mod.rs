@@ -168,6 +168,18 @@ pub fn make_kernel_task(name: &str, pid: u64, entry: TaskEntry) -> *mut Task {
 
 /// Like make_kernel_task but uses pool_trampoline (task runs without
 /// unmasking IRQs) — for the symmetric run-to-completion pool scheduler.
+/// Free a completed pool/kernel task: its kernel stack + the Task struct.
+/// Safe to call only once the task is DEAD and not running on any core.
+pub fn free_pool_task(t: *mut Task) {
+    if t.is_null() { return; }
+    unsafe {
+        if (*t).stack_phys != 0 {
+            pmm::free_pages((*t).stack_phys, TASK_STACK_PAGES);
+        }
+    }
+    kfree(t as usize);
+}
+
 pub fn make_pool_task(name: &str, pid: u64, entry: TaskEntry) -> *mut Task {
     let t = kmalloc(core::mem::size_of::<Task>()) as *mut Task;
     if t.is_null() {

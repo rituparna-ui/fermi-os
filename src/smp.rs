@@ -229,6 +229,8 @@ static mut POOL_CUR: [u64; 2] = [0, 0];
 static POOL_RAN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 static POOL_SUM: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 static POOL_MIGRATIONS: AtomicU64 = AtomicU64::new(0);
+static POOL_NEXT_PID: AtomicU64 = AtomicU64::new(1000);
+static POOL_EXPECT: AtomicU64 = AtomicU64::new(0);
 
 /// Allocate the per-core scheduler save-contexts. Call once, single-threaded.
 pub fn pool_init() {
@@ -249,14 +251,21 @@ fn pool_pop() -> *mut Task {
 }
 
 /// Seed `k` pooled tasks (distinct pids) into the shared queue.
-pub fn pool_seed(k: u64) {
-    for i in 0..k {
-        let t = sched::make_pool_task("pool", 1000 + i, pool_task_body);
+/// Seed `k` pooled tasks with globally-unique pids; returns the pid checksum
+/// (sum of the new tasks' pids) so callers can verify exactly-once completion.
+pub fn pool_seed(k: u64) -> u64 {
+    let mut sum = 0u64;
+    for _ in 0..k {
+        let pid = POOL_NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        let t = sched::make_pool_task("pool", pid, pool_task_body);
         if !t.is_null() {
+            sum += pid;
+            POOL_EXPECT.fetch_add(pid, Ordering::Relaxed);
             pool_push(t);
             POOLQ.lock_irqsave().seeded += 1;
         }
     }
+    sum
 }
 
 extern "C" fn pool_task_body() {
@@ -321,10 +330,12 @@ pub fn pool_run_one(core: usize) -> bool {
         sched::raw_context_switch(ctx, t); // run task; returns when it yields or finishes
         core::arch::asm!("msr daif, {}", in(reg) daif, options(nomem, nostack));
     }
-    // If the task yielded (still READY) rather than finishing (DEAD), requeue
-    // it so either core can resume it — enabling cross-core migration.
-    if unsafe { (*t).state } == TASK_READY {
-        pool_push(t);
+    // After the switch: requeue if it yielded (READY) so either core can resume
+    // it (migration); reclaim its stack + struct if it finished (DEAD).
+    match unsafe { (*t).state } {
+        TASK_READY => pool_push(t),
+        crate::sched::TASK_DEAD => sched::free_pool_task(t),
+        _ => {}
     }
     true
 }
@@ -338,12 +349,23 @@ pub extern "C" fn pool_sched_core0() {
     }
 }
 
-/// (ran0, ran1, sum0, sum1, seeded, remaining, migrations)
-pub fn pool_stats() -> (u64, u64, u64, u64, u64, usize, u64) {
+/// Wait (bounded) until all seeded pool tasks have completed.
+pub fn pool_join(timeout_ms: u64) -> bool {
+    let deadline = crate::exception::timer::uptime_ms() + timeout_ms;
+    loop {
+        let (r0, r1, _, _, seeded, _, _, _) = pool_stats();
+        if r0 + r1 >= seeded { return true; }
+        if crate::exception::timer::uptime_ms() >= deadline { return false; }
+        sched::sleep_ms(10);
+    }
+}
+
+/// (ran0, ran1, sum0, sum1, seeded, remaining, migrations, expect_sum)
+pub fn pool_stats() -> (u64, u64, u64, u64, u64, usize, u64, u64) {
     let q = POOLQ.lock_irqsave();
     (POOL_RAN[0].load(Ordering::Relaxed), POOL_RAN[1].load(Ordering::Relaxed),
      POOL_SUM[0].load(Ordering::Relaxed), POOL_SUM[1].load(Ordering::Relaxed),
-     q.seeded, q.len, POOL_MIGRATIONS.load(Ordering::Relaxed))
+     q.seeded, q.len, POOL_MIGRATIONS.load(Ordering::Relaxed), POOL_EXPECT.load(Ordering::Relaxed))
 }
 
 #[no_mangle]

@@ -46,8 +46,9 @@
 #define RMI_REC_ENTER          (RMI_BASE + 0x32) /* (rec) -> REC_EXIT_* reason  */
 
 /* REC exit reasons returned by RMI_REC_ENTER. */
-#define REC_EXIT_RSI           1ULL  /* realm issued an RSI call (HVC)         */
-#define REC_EXIT_ABORT         2ULL  /* realm took an abort / other trap       */
+#define REC_EXIT_HOST_CALL     1ULL  /* realm issued RSI_HOST_CALL             */
+#define REC_EXIT_ABORT         2ULL  /* realm took an abort / unexpected trap  */
+#define REC_EXIT_DONE          3ULL  /* realm issued RSI_EXIT (finished)       */
 
 #define RMI_ABI_VERSION      0x00010000ULL    /* 1.0 */
 

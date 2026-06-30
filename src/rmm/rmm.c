@@ -1,5 +1,6 @@
 #include "rmm.h"
 #include "rmm/rmi.h" /* RMI_* host ABI */
+#include "rmm/rsi.h" /* RSI_* realm ABI */
 #include "mm/mmu/mmu.h" /* _1GB, _512GB */
 #include "mm/pmm/pmm.h" /* MEM_START, MEM_SIZE */
 #include "strings/strings.h" /* memset, memcpy */
@@ -789,14 +790,67 @@ static void rmi_rec_enter(el2_frame_t *f, uint64_t rec_pa) {
   rmm_puts("\n");
 }
 
-/* Realm exit: a trap arrived while a realm was running. Save the REC, restore
- * the host, and hand RMI_REC_ENTER back to the host with an exit reason. */
-static void rmm_handle_realm_exit(el2_frame_t *f) {
+/* Service an RSI call from the realm. Returns 1 if handled in place (the realm
+ * should be resumed immediately) or 0 if the call requires returning to the
+ * Normal-world host. The result is written into the realm's x0 either way. */
+static int rsi_service(rec_t *rec, el2_frame_t *f, uint64_t *host_reason) {
+  uint64_t fn = f->x[0];
+  switch (fn) {
+  case RSI_VERSION:
+    f->x[0] = RSI_ABI_VERSION;
+    return 1;
+  case RSI_REALM_CONFIG:
+    f->x[0] = rec->realm->vmid; /* minimal config: the realm's VMID */
+    return 1;
+  case RSI_PUTC:
+    rmm_putc((char)f->x[1]); /* realm paravirt console via the RMM */
+    f->x[0] = 0;
+    return 1;
+  case RSI_HOST_CALL:
+    rmm_puts("[RMM] realm RSI_HOST_CALL arg=");
+    rmm_puthex(f->x[1]);
+    rmm_puts(" -> exit to host\n");
+    *host_reason = REC_EXIT_HOST_CALL;
+    return 0;
+  case RSI_EXIT:
+    rmm_puts("[RMM] realm RSI_EXIT -> realm finished\n");
+    *host_reason = REC_EXIT_DONE;
+    return 0;
+  default:
+    rmm_puts("[RMM] unknown RSI fn=");
+    rmm_puthex(fn);
+    rmm_puts("\n");
+    f->x[0] = (uint64_t)-1;
+    return 1; /* resume the realm with an error result */
+  }
+}
+
+/* A trap arrived while a realm was running. If it is an RSI call we can serve
+ * in place, handle it and resume the realm (no host involvement). Otherwise
+ * (RSI_HOST_CALL / RSI_EXIT, or a fault) save the REC, restore the host, and
+ * return an exit reason from RMI_REC_ENTER. */
+static void rmm_handle_realm_trap(el2_frame_t *f) {
   rec_t *rec = g_running_rec;
   uint64_t ec = (MRS(esr_el2) >> ESR_EC_SHIFT) & ESR_EC_MASK;
+  uint64_t reason = REC_EXIT_ABORT;
 
-  /* Save realm context (resume PC already past the trapping instruction for
-   * HVC; for an abort ELR points at it). */
+  if (ec == EC_HVC64) {
+    if (rsi_service(rec, f, &reason)) {
+      /* Serviced in place: leave the realm context live (VTTBR, EL1 sysregs,
+       * ELR_EL2 already past the HVC) and just resume — el2_common restores
+       * the frame (with the RSI result in x0) and erets back into the realm. */
+      return;
+    }
+    /* else: fall through to the world switch back to the host. */
+  } else {
+    rmm_puts("[RMM] realm fault EC=");
+    rmm_puthex(ec);
+    rmm_puts(" FAR_EL2=");
+    rmm_puthex(MRS(far_el2));
+    rmm_puts("\n");
+  }
+
+  /* World switch out: save the REC, restore the host, return the reason. */
   for (int i = 0; i < 31; i++)
     rec->ctx.regs[i] = f->x[i];
   rec->ctx.pc = MRS(elr_el2);
@@ -805,22 +859,6 @@ static void rmm_handle_realm_exit(el2_frame_t *f) {
   rmm_save_el1(&rec->ctx);
   rec->exits++;
 
-  uint64_t reason;
-  if (ec == EC_HVC64) {
-    reason = REC_EXIT_RSI; /* realm made an RSI call (serviced in R4b/R5) */
-    rmm_puts("[RMM] realm EXIT: RSI/HVC, realm x0=");
-    rmm_puthex(rec->ctx.regs[0]);
-    rmm_puts("\n");
-  } else {
-    reason = REC_EXIT_ABORT;
-    rmm_puts("[RMM] realm EXIT: fault EC=");
-    rmm_puthex(ec);
-    rmm_puts(" FAR_EL2=");
-    rmm_puthex(MRS(far_el2));
-    rmm_puts("\n");
-  }
-
-  /* Restore the host and return to it. */
   for (int i = 0; i < 31; i++)
     f->x[i] = g_vcpu.regs[i];
   MSR(elr_el2, g_vcpu.pc);
@@ -1005,7 +1043,7 @@ void el2_dispatch(uint64_t index, el2_frame_t *frame) {
   /* If a realm is currently running, any trap is a realm exit, not a host
    * RMI call. Hand it to the world-switch-out path. */
   if (g_running_rec) {
-    rmm_handle_realm_exit(frame);
+    rmm_handle_realm_trap(frame);
     return;
   }
 

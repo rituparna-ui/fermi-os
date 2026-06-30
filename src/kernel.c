@@ -131,10 +131,20 @@ void early_init() {
                         (uint64_t)realm_payload));
   uart_printf("[BOOT] RMI_REC_CREATE(entry %x) -> %u\n", entry_ipa,
               rmi_call(RMI_REC_CREATE, rd, rec, entry_ipa));
-  uint64_t exit_reason = rmi_call(RMI_REC_ENTER, rec, 0, 0);
-  uart_printf("[BOOT] RMI_REC_ENTER -> realm exited, reason %u "
-              "(1=RSI/HVC, 2=abort)\n",
-              exit_reason);
+  uart_println("[BOOT] entering realm (run loop until it finishes)...");
+  for (int iter = 0; iter < 8; iter++) {
+    uint64_t reason = rmi_call(RMI_REC_ENTER, rec, 0, 0);
+    if (reason == REC_EXIT_HOST_CALL) {
+      uart_println("[BOOT]   host: serviced realm HOST_CALL, re-entering");
+      continue;
+    } else if (reason == REC_EXIT_DONE) {
+      uart_println("[BOOT]   host: realm finished (RSI_EXIT)");
+      break;
+    }
+    uart_printf("[BOOT]   host: realm exited with reason %u; stopping\n",
+                reason);
+    break;
+  }
 
   exceptions_init();
 

@@ -75,6 +75,28 @@ void early_init() {
   volatile uint64_t leaked = *(volatile uint64_t *)mon_base;
   uart_printf("[BOOT]   read back %x (0 => stage-2 isolation held)\n", leaked);
 
+  /* Granule lifecycle demo (R2): hand a host-owned page to the RMM, prove the
+   * Normal world loses access while it is DELEGATED, then reclaim it and see
+   * the RMM has scrubbed it. demo_granule is page-aligned. This runs in
+   * early_init with the stage-1 MMU still OFF, so the symbol's address is
+   * already physical (== IPA under the identity stage-2) — no VIRT_TO_PHYS. */
+  static uint8_t __attribute__((aligned(4096))) demo_granule[4096];
+  uint64_t g_pa = (uint64_t)demo_granule;
+  demo_granule[0] = 0xAB; /* mark it while we still own it */
+  uart_printf("[BOOT] granule %x owned by host, [0]=%x\n", g_pa,
+              (uint64_t)demo_granule[0]);
+  uart_printf("[BOOT]   RMI_GRANULE_DELEGATE -> %u\n",
+              rmi_call(RMI_GRANULE_DELEGATE, g_pa, 0, 0));
+  uart_println("[BOOT]   reading DELEGATED granule (host must be blocked)...");
+  volatile uint8_t gv = *(volatile uint8_t *)demo_granule;
+  uart_printf("[BOOT]   read back %x (0 => host lost access)\n", (uint64_t)gv);
+  uart_printf("[BOOT]   RMI_GRANULE_UNDELEGATE -> %u\n",
+              rmi_call(RMI_GRANULE_UNDELEGATE, g_pa, 0, 0));
+  uint8_t gv2 = demo_granule[0];
+  uart_printf("[BOOT]   [0]=%x after undelegate (0 => RMM scrubbed it; "
+              "access restored)\n",
+              (uint64_t)gv2);
+
   exceptions_init();
 
   pmm_init(MEM_START, MEM_SIZE);

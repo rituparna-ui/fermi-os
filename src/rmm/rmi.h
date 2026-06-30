@@ -30,11 +30,17 @@
 #define RMI_MONITOR_INFO     (RMI_BASE + 0x4) /* () -> # RMI commands serviced  */
 #define RMI_MONITOR_BASE     (RMI_BASE + 0x5) /* () -> base IPA of RMM-private  */
 
+/* Granule lifecycle (R2). The host moves a 4 KiB page between the Normal world
+ * and the RMM. A DELEGATED granule is unmapped from the host's stage-2. */
+#define RMI_GRANULE_DELEGATE   (RMI_BASE + 0x10) /* (pa) -> status; host->RMM   */
+#define RMI_GRANULE_UNDELEGATE (RMI_BASE + 0x11) /* (pa) -> status; RMM->host   */
+
 #define RMI_ABI_VERSION      0x00010000ULL    /* 1.0 */
 
 /* RMI status codes. The real RMM defines a richer enum (RMI_ERROR_INPUT,
  * RMI_ERROR_REALM, RMI_ERROR_REC, ...); we grow this set as commands land. */
 #define RMI_SUCCESS              0ULL
+#define RMI_ERROR_INPUT          1ULL          /* bad argument / wrong state    */
 #define RMI_ERROR_NOT_SUPPORTED  ((uint64_t)-1)
 
 #ifndef __ASSEMBLER__

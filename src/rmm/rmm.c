@@ -66,6 +66,47 @@ extern uint8_t __hyp_end[];
  * initialise its fields explicitly in rmm_init(). */
 __attribute__((section(".hyp_tables"))) static vcpu_t g_vcpu;
 
+/* ---------------------------------------------------------------------------
+ * Granule state machine (R2)
+ *
+ * A "granule" is one 4 KiB physical page. In Arm CCA every page of delegable
+ * RAM has a state the RMM tracks in the Granule State Table; the host moves a
+ * page UNDELEGATED -> DELEGATED via RMI before the RMM can repurpose it as a
+ * Realm Descriptor / RTT / REC / DATA page. Delegation is enforced by stage-2:
+ * a DELEGATED granule is unmapped from the Normal world's IPA space, so the
+ * host physically cannot read or write it while the monitor owns it.
+ *
+ * This minimal table tracks a bounded set of granules; entries are created
+ * lazily the first time the host references a page. The table itself lives in
+ * RMM-private .hyp_tables, so the host can neither see nor forge it. The
+ * RD/RTT/REC/DATA sub-states arrive in later milestones. */
+typedef enum {
+  GRANULE_UNDELEGATED = 0, /* owned by the Normal-world host               */
+  GRANULE_DELEGATED = 1,   /* owned by the RMM; removed from host stage-2  */
+} granule_state_t;
+
+#define MAX_GRANULES 64
+typedef struct {
+  uint64_t pa;            /* page-aligned physical address (== IPA)         */
+  granule_state_t state;
+} granule_t;
+__attribute__((section(".hyp_tables"))) static granule_t g_granules[MAX_GRANULES];
+__attribute__((section(".hyp_tables"))) static uint64_t g_granule_count;
+
+/* Pool of L3 tables used to split a 2 MiB stage-2 block down to 4 KiB pages
+ * on demand, so an arbitrary host page can be unmapped (delegated). Each pool
+ * entry backs one 2 MiB block. */
+#define MAX_L3_POOL 8
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t s2_l3_pool[MAX_L3_POOL][512];
+__attribute__((section(".hyp_tables"))) static uint64_t s2_l3_block[MAX_L3_POOL]; /* 2 MiB base each entry backs; 0 = free */
+__attribute__((section(".hyp_tables"))) static uint64_t s2_l3_used;
+
+/* Captured in rmm_build_stage2(): the single 1 GiB region that is L2-split to
+ * 2 MiB blocks, and the 2 MiB block already split to 4 KiB for the monitor's
+ * own hole (which reuses the static s2_l3_split table). */
+__attribute__((section(".hyp_tables"))) static uint64_t g_split_gb;
+__attribute__((section(".hyp_tables"))) static uint64_t g_mon_mb_base;
+
 /* --- self-contained PL011 output (no driver state, safe pre-uart_init) --- */
 static void rmm_putc(char c) {
   volatile uint32_t *fr = (volatile uint32_t *)UART_FR;
@@ -161,6 +202,12 @@ static void rmm_build_stage2(void) {
   s2_l2_split[mb_idx] = ((uint64_t)s2_l3_split) | S2_TABLE | S2_VALID;
   s2_l1_low[gb_idx] = ((uint64_t)s2_l2_split) | S2_TABLE | S2_VALID;
 
+  /* Remember the split region so on-demand granule delegation (R2) can split
+   * additional 2 MiB blocks within it and reuse s2_l3_split for the monitor's
+   * own block. */
+  g_split_gb = gb_idx;
+  g_mon_mb_base = mb_base;
+
   __asm__ __volatile__("dsb ish");
 }
 
@@ -242,6 +289,126 @@ static const char *ec_name(uint64_t ec) {
   }
 }
 
+/* ----------------------- granule / stage-2 (R2) --------------------------- */
+
+/* Broadcast stage-2 TLB invalidation for the current VMID. */
+static void s2_tlbi_all(void) {
+  __asm__ __volatile__("dsb ish; tlbi vmalls12e1is; dsb ish; isb");
+}
+
+/* Return the L3 (4 KiB) stage-2 table covering `pa`, splitting its 2 MiB
+ * block on demand. Only the single L2-split 1 GiB region is supported (that's
+ * where RAM and the host live). Returns 0 if `pa` is outside that region or
+ * the L3 pool is exhausted. */
+static uint64_t *s2_l3_table_for(uint64_t pa) {
+  uint64_t gb = pa / _1GB;
+  if (gb != g_split_gb)
+    return 0; /* outside the split arena */
+  uint64_t region_base = gb * _1GB;
+  uint64_t mb_idx = (pa - region_base) / _2MB;
+  uint64_t mb_base = region_base + mb_idx * _2MB;
+
+  if (mb_base == g_mon_mb_base)
+    return s2_l3_split; /* monitor's block: already split at boot */
+
+  for (uint64_t i = 0; i < s2_l3_used; i++)
+    if (s2_l3_block[i] == mb_base)
+      return s2_l3_pool[i]; /* this block was split earlier */
+
+  if (s2_l3_used >= MAX_L3_POOL)
+    return 0; /* pool exhausted */
+
+  /* Split this 2 MiB block: populate a fresh L3 with identity 4 KiB pages,
+   * then splice it into the L2 table in place of the 2 MiB block. */
+  uint64_t *l3 = s2_l3_pool[s2_l3_used];
+  for (uint64_t p = 0; p < 512; p++) {
+    uint64_t ppa = mb_base + p * 4096ULL;
+    l3[p] = ppa | S2_TABLE | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
+  }
+  s2_l2_split[mb_idx] = ((uint64_t)l3) | S2_TABLE | S2_VALID;
+  s2_l3_block[s2_l3_used] = mb_base;
+  s2_l3_used++;
+  __asm__ __volatile__("dsb ish");
+  s2_tlbi_all();
+  return l3;
+}
+
+/* Map (mapped=1) or unmap (mapped=0) a single 4 KiB page in the host's
+ * stage-2 view. Returns 0 on success, -1 if the page is unsupported. */
+static int s2_set_page(uint64_t pa, int mapped) {
+  uint64_t *l3 = s2_l3_table_for(pa);
+  if (!l3)
+    return -1;
+  uint64_t region_base = g_split_gb * _1GB;
+  uint64_t mb_base = region_base + ((pa - region_base) / _2MB) * _2MB;
+  uint64_t p = (pa - mb_base) / 4096ULL;
+  l3[p] = mapped ? (pa | S2_TABLE | S2_AF | S2_SH_INNER | S2_AP_RW |
+                    S2_MEM_NORMAL)
+                 : 0;
+  s2_tlbi_all();
+  return 0;
+}
+
+/* Look up (or lazily create) the granule entry for a page-aligned PA. */
+static granule_t *granule_find(uint64_t pa) {
+  for (uint64_t i = 0; i < g_granule_count; i++)
+    if (g_granules[i].pa == pa)
+      return &g_granules[i];
+  return 0;
+}
+
+static granule_t *granule_intern(uint64_t pa) {
+  granule_t *g = granule_find(pa);
+  if (g)
+    return g;
+  if (g_granule_count >= MAX_GRANULES)
+    return 0;
+  g = &g_granules[g_granule_count++];
+  g->pa = pa;
+  g->state = GRANULE_UNDELEGATED;
+  return g;
+}
+
+/* RMI_GRANULE_DELEGATE: the host gives a page to the RMM. We unmap it from the
+ * host's stage-2 (so the Normal world loses all access) and mark it
+ * DELEGATED. */
+static uint64_t rmi_granule_delegate(uint64_t pa) {
+  pa &= ~0xFFFULL;
+  if (pa >= (uint64_t)__hyp_start && pa < (uint64_t)__hyp_end)
+    return RMI_ERROR_INPUT; /* monitor memory is never delegable */
+  granule_t *g = granule_intern(pa);
+  if (!g || g->state != GRANULE_UNDELEGATED)
+    return RMI_ERROR_INPUT;
+  if (s2_set_page(pa, 0) != 0)
+    return RMI_ERROR_INPUT;
+  g->state = GRANULE_DELEGATED;
+  rmm_puts("[RMM] granule ");
+  rmm_puthex(pa);
+  rmm_puts(" DELEGATED (unmapped from host stage-2)\n");
+  return RMI_SUCCESS;
+}
+
+/* RMI_GRANULE_UNDELEGATE: the host reclaims a page. The RMM scrubs it first
+ * (so no Realm/monitor data leaks back to the Normal world) and remaps it. */
+static uint64_t rmi_granule_undelegate(uint64_t pa) {
+  pa &= ~0xFFFULL;
+  granule_t *g = granule_find(pa);
+  if (!g || g->state != GRANULE_DELEGATED)
+    return RMI_ERROR_INPUT;
+  /* EL2 runs with its MMU off, so the RMM addresses the page physically and
+   * can scrub it before handing it back. */
+  volatile uint64_t *p = (volatile uint64_t *)pa;
+  for (uint64_t i = 0; i < 4096 / sizeof(uint64_t); i++)
+    p[i] = 0;
+  if (s2_set_page(pa, 1) != 0)
+    return RMI_ERROR_INPUT;
+  g->state = GRANULE_UNDELEGATED;
+  rmm_puts("[RMM] granule ");
+  rmm_puthex(pa);
+  rmm_puts(" UNDELEGATED (scrubbed + remapped to host)\n");
+  return RMI_SUCCESS;
+}
+
 /* RMI command: FID in x0, args in x1..x3, status/result back in x0.
  * ELR_EL2 already points past the HVC, so no PC adjustment is needed. This is
  * the Normal-world host driving the monitor. */
@@ -274,6 +441,12 @@ static void rmm_handle_rmi(el2_frame_t *f) {
     /* Introspection probe: expose the monitor-private base IPA so the host
      * can attempt — and be denied by stage-2 — an access to RMM memory. */
     ret = (uint64_t)__hyp_start;
+    break;
+  case RMI_GRANULE_DELEGATE:
+    ret = rmi_granule_delegate(a1);
+    break;
+  case RMI_GRANULE_UNDELEGATE:
+    ret = rmi_granule_undelegate(a1);
     break;
   default:
     rmm_puts("[RMM] unknown RMI command=");
@@ -346,14 +519,18 @@ static void rmm_handle_abort(uint64_t index, el2_frame_t *frame) {
   uint64_t hs = (uint64_t)__hyp_start;
   uint64_t he = (uint64_t)__hyp_end;
 
-  if (ipa_page >= (hs & ~0xFFFULL) && ipa_page < he) {
+  int in_monitor = (ipa_page >= (hs & ~0xFFFULL) && ipa_page < he);
+  granule_t *g = granule_find(ipa_page);
+  int delegated = (g && g->state == GRANULE_DELEGATED);
+
+  if (in_monitor || delegated) {
     uint64_t isv = (esr >> 24) & 1; /* instruction syndrome valid */
     uint64_t srt = (esr >> 16) & 0x1F; /* destination register      */
     uint64_t wnr = (esr >> 6) & 1;  /* write (1) vs read (0)         */
 
-    rmm_puts("\n[RMM] ISOLATION: blocked guest ");
+    rmm_puts("\n[RMM] ISOLATION: blocked host ");
     rmm_puts(wnr ? "write to" : "read from");
-    rmm_puts(" hyp memory IPA=");
+    rmm_puts(in_monitor ? " monitor memory IPA=" : " delegated granule IPA=");
     rmm_puthex(ipa);
     rmm_puts("\n");
 

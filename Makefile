@@ -68,7 +68,7 @@ QEMU_BASE := qemu-system-aarch64 -machine $(QEMU_MACHINE) -nographic -cpu $(QEMU
 QEMU_FLAGS_RUN   := -kernel $(TARGET)
 QEMU_FLAGS_DEBUG := -kernel $(TARGET) -s -S
 
-.PHONY: all run debug clean gdb tmux disk dump_dts compile_commands.json
+.PHONY: all run rmm-demo debug clean gdb tmux disk dump_dts compile_commands.json
 
 
 all: $(TARGET)
@@ -126,6 +126,16 @@ user_bins: $(USER_BINS)
 
 # Run QEMU
 run: all disk
+	@$(QEMU_BASE) $(QEMU_FLAGS_RUN)
+
+# Run the RMM realm demo. Identical QEMU config to `run`, named for clarity:
+# the image boots the EL2 Realm Management Monitor, which drives the full
+# realm lifecycle early in boot (granule delegate -> REALM_CREATE -> RTT/DATA
+# -> REC enter/exit -> RSI run loop -> attestation) before the Fermi host
+# continues booting. Requires a QEMU with `virt,virtualization=on` so the
+# image is entered at EL2. Press Ctrl-A then X to quit QEMU.
+rmm-demo: all disk
+	@echo "== Fermi-RMM: EL2 monitor + realm lifecycle demo (Ctrl-A X to quit) =="
 	@$(QEMU_BASE) $(QEMU_FLAGS_RUN)
 
 debug: all disk

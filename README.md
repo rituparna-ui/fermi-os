@@ -1,5 +1,10 @@
 # Fermi OS
 
+> **This branch is Fermi-RMM** — a fork that turns the EL2 layer into a minimal
+> Arm CCA-style **Realm Management Monitor**. The Fermi kernel below now boots as
+> the Normal-world *host* that drives the monitor. See **[RMM.md](RMM.md)** for
+> the RMM design, ABI, and `make rmm-demo`.
+
 Fermi OS is a bare-metal `aarch64 (ARMv8-A)` kernel built from scratch in `C` and assembly, targeting QEMU's `virt` machine with a Cortex-A72 processor.
 
 

@@ -25,6 +25,71 @@ __attribute__((aligned(16), section(".hyp_tables"))) uint8_t el3_stack[8192];
     _v;                                                                        \
   })
 
+#define MSR(reg, val)                                                          \
+  do {                                                                         \
+    uint64_t _v = (val);                                                       \
+    __asm__ __volatile__("msr " #reg ", %0" ::"r"(_v));                        \
+  } while (0)
+
+/* --- FEAT_RME Granule Protection Table (E0b) ----------------------------- *
+ * The GPT tags every physical granule with a Granule Protection Information
+ * (GPI) value naming which PAS may access it. The hardware GPC checks every
+ * access against it. We use a single-level (L0) GPT with each entry a "block
+ * descriptor" covering one L0GPTSZ region. With L0GPTSZ=1GB and PPS=1TB that
+ * is 1024 entries (8 KiB). All entries start as GPI_ANY (all worlds), so
+ * enabling GPC changes nothing yet — delegation (flipping entries to Realm)
+ * comes in E2. Field layout / encodings follow the Arm ARM (as used by TF-A).
+ *
+ * GPCCR_EL3 = S3_6_C2_C1_6, GPTBR_EL3 = S3_6_C2_C1_4. */
+#define GPI_NO_ACCESS 0x0
+#define GPI_SECURE 0x8
+#define GPI_NS 0x9
+#define GPI_ROOT 0xA
+#define GPI_REALM 0xB
+#define GPI_ANY 0xF
+#define GPT_L0_BLK_TYPE 0x1 /* block descriptor; GPI in bits[7:4] */
+#define GPT_L0_BLK(gpi) (((uint64_t)(gpi) << 4) | GPT_L0_BLK_TYPE)
+
+#define GPCCR_PPS_SHIFT 0   /* protected PA size (PARange-style)   */
+#define GPCCR_IRGN_SHIFT 8  /* GPT walk inner cacheability         */
+#define GPCCR_ORGN_SHIFT 10 /* GPT walk outer cacheability         */
+#define GPCCR_SH_SHIFT 12   /* GPT walk shareability               */
+#define GPCCR_PGS_SHIFT 14  /* physical granule size (00=4K)       */
+#define GPCCR_GPC_SHIFT 16  /* GPC enable                          */
+#define GPCCR_L0GPTSZ_SHIFT 20 /* size each L0 entry covers (0=1GB)*/
+
+#define GPCCR_PPS_1TB 2  /* 40-bit PA */
+#define GPCCR_PGS_4K 0
+#define GPCCR_WB_WA 1    /* IRGN/ORGN write-back write-allocate */
+#define GPCCR_SH_INNER 3
+#define GPCCR_L0GPTSZ_1GB 0
+
+#define GPT_L0_ENTRIES 1024 /* 1 TiB / 1 GiB */
+__attribute__((aligned(0x4000), section(".hyp_tables"))) static uint64_t gpt_l0[GPT_L0_ENTRIES];
+
+static void el3_build_gpt(void) {
+  for (int i = 0; i < GPT_L0_ENTRIES; i++)
+    gpt_l0[i] = GPT_L0_BLK(GPI_ANY); /* all worlds may access, for now */
+  __asm__ __volatile__("dsb sy");
+}
+
+static void el3_enable_gpc(void) {
+  el3_build_gpt();
+  /* GPTBR_EL3 holds the L0 GPT base as PA[51:12]. */
+  MSR(S3_6_C2_C1_4, ((uint64_t)gpt_l0) >> 12);
+  uint64_t gpccr = ((uint64_t)GPCCR_PPS_1TB << GPCCR_PPS_SHIFT) |
+                   ((uint64_t)GPCCR_WB_WA << GPCCR_IRGN_SHIFT) |
+                   ((uint64_t)GPCCR_WB_WA << GPCCR_ORGN_SHIFT) |
+                   ((uint64_t)GPCCR_SH_INNER << GPCCR_SH_SHIFT) |
+                   ((uint64_t)GPCCR_PGS_4K << GPCCR_PGS_SHIFT) |
+                   ((uint64_t)GPCCR_L0GPTSZ_1GB << GPCCR_L0GPTSZ_SHIFT) |
+                   (1ULL << GPCCR_GPC_SHIFT); /* enable GPC */
+  MSR(S3_6_C2_C1_6, gpccr);
+  __asm__ __volatile__("dsb sy; isb");
+  /* Invalidate any stale GPT info cached by the GPC. */
+  __asm__ __volatile__("tlbi paallos; dsb sy; isb");
+}
+
 /* PL011 UART0 on QEMU virt. With secure=on this UART is reachable from Root. */
 #define UART0 0x09000000UL
 #define U_DR (UART0 + 0x00)
@@ -91,6 +156,14 @@ void el3_init(void) {
   el3_puts("[EL3] GPCCR_EL3 = ");
   el3_puthex(gpccr);
   el3_puts(" (GPC not yet enabled)\n");
+
+  /* Build an all-access GPT and turn on Granule Protection Checks. From here
+   * every physical access is checked by hardware; delegation (E2) will flip
+   * specific granules to the Realm PAS to lock the host out. */
+  el3_enable_gpc();
+  el3_puts("[EL3] GPC enabled, GPCCR_EL3 = ");
+  el3_puthex(MRS(S3_6_C2_C1_6));
+  el3_puts(" (GPT: 1 TiB, all-access)\n");
 
   el3_puts("[EL3] dropping to Non-secure EL2 (Fermi host)...\n");
 }

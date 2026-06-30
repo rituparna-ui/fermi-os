@@ -3,41 +3,83 @@
 
 .equ KERNEL_VA_OFFSET, 0xFFFF000000000000
 .equ EL2_STACK_SIZE,   8192
+.equ EL3_STACK_SIZE,   8192
 .equ SPSR_EL1H_DAIF,   0x3c5   // M=EL1h(0b0101), DAIF masked(0b1111<<6)
+.equ SPSR_EL2H_DAIF,   0x3c9   // M=EL2h(0b1001), DAIF masked(0b1111<<6)
+
+// SCR_EL3 bits used to drop into the Non-secure world running AArch64.
+.equ SCR_NS,  (1 << 0)   // NS=1     -> Non-secure (with NSE=0)
+.equ SCR_SMD, (1 << 7)   // (left 0: SMC enabled)
+.equ SCR_HCE, (1 << 8)   // HVC instruction enabled at EL2/EL1
+.equ SCR_RW,  (1 << 10)  // next lower level is AArch64
 
 _start:
 	// Symbols are linked at upper-half VAs. Before any MMU is on we need
-	// PHYSICAL addresses, so subtract the offset. This sets the stack for
-	// whichever EL we entered at (SP_EL2 if EL2, SP_EL1 if EL1).
+	// PHYSICAL addresses, so subtract the offset. Set a provisional stack
+	// for whichever EL we entered at.
 	ldr x0, =__stack_top
 	ldr x1, =KERNEL_VA_OFFSET
 	sub x0, x0, x1			// physical stack top
 	mov sp, x0
 
-	// With `virt,virtualization=on` QEMU enters the image at EL2. Detect it:
-	// if we're at EL2, bring up the hypervisor and eret down to EL1. If we
-	// entered at EL1 directly (virtualization off), skip straight to the
-	// kernel path — fully backwards compatible.
+	// QEMU entry EL depends on the machine:
+	//   secure=on,virtualization=on  -> EL3 (Root world, FEAT_RME)
+	//   virtualization=on            -> EL2
+	//   (neither)                    -> EL1
 	mrs x0, CurrentEL
 	lsr x0, x0, #2
+	cmp x0, #3
+	b.eq el3_path
 	cmp x0, #2
-	b.ne 1f				// not EL2 -> already EL1, run kernel directly
+	b.eq el2_path
+	b el1_path
 
-	// --- EL2: configure stage-2, vtimer, VBAR_EL2, HCR_EL2.VM ---
-	// hyp_init runs on the current (boot) stack; nothing else is live yet.
-	bl hyp_init
-
-	// Repoint SP_EL2 at a dedicated EL2 stack so future guest->EL2 traps
-	// don't clobber the EL1 kernel stack (which SP_EL1 keeps using).
-	ldr x0, =el2_stack
+// --------------------------------------------------------------------------
+// EL3: Root-world Secure Monitor bring-up. Initialise the monitor (UART, and
+// — added in E0b — the Granule Protection Table + GPC), then ERET down to the
+// Non-secure world to run Fermi (EL2 hypervisor + EL1 kernel) as the host.
+// --------------------------------------------------------------------------
+el3_path:
+	// Dedicated EL3 stack (el3_init may use it). Physical address pre-MMU.
+	ldr x0, =el3_stack
 	ldr x1, =KERNEL_VA_OFFSET
-	sub x0, x0, x1			// physical base of el2_stack
-	add x0, x0, #EL2_STACK_SIZE	// top of EL2 stack
+	sub x0, x0, x1
+	add x0, x0, #EL3_STACK_SIZE
 	mov sp, x0
 
-	// Prepare the drop to EL1: resume at label 1 (physical, PC-relative),
-	// in EL1h with interrupts masked, with SP_EL1 set to the kernel stack.
-	adr x0, 1f
+	bl el3_init			// C monitor init (runs at EL3, MMU off)
+
+	// Prepare the ERET into Non-secure EL2.
+	adr x0, el2_path
+	msr elr_el3, x0
+	mov x0, #SPSR_EL2H_DAIF
+	msr spsr_el3, x0
+	mov x0, #(SCR_NS | SCR_HCE | SCR_RW)
+	msr scr_el3, x0
+	isb
+	eret				// -> el2_path, now at NS-EL2
+
+// --------------------------------------------------------------------------
+// EL2: Non-secure hypervisor bring-up (entered natively at EL2, or via the
+// EL3 ERET above). Configure stage-2 etc. and drop to EL1.
+// --------------------------------------------------------------------------
+el2_path:
+	ldr x0, =__stack_top
+	ldr x1, =KERNEL_VA_OFFSET
+	sub x0, x0, x1
+	mov sp, x0			// re-establish a physical stack at EL2
+
+	bl hyp_init
+
+	// Repoint SP_EL2 at a dedicated EL2 stack so guest->EL2 traps don't
+	// clobber the EL1 kernel stack.
+	ldr x0, =el2_stack
+	ldr x1, =KERNEL_VA_OFFSET
+	sub x0, x0, x1
+	add x0, x0, #EL2_STACK_SIZE
+	mov sp, x0
+
+	adr x0, el1_path
 	msr elr_el2, x0
 	mov x0, #SPSR_EL1H_DAIF
 	msr spsr_el2, x0
@@ -45,11 +87,12 @@ _start:
 	ldr x1, =KERNEL_VA_OFFSET
 	sub x0, x0, x1
 	msr sp_el1, x0
-	eret
+	eret				// -> el1_path at EL1
 
-1:
-	// Running at EL1 now (natively, or via the eret above). Ensure SP points
-	// at the physical kernel stack, then run the existing boot sequence.
+// --------------------------------------------------------------------------
+// EL1: the Fermi kernel proper.
+// --------------------------------------------------------------------------
+el1_path:
 	ldr x0, =__stack_top
 	ldr x1, =KERNEL_VA_OFFSET
 	sub x0, x0, x1			// physical stack top

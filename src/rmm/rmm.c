@@ -1,11 +1,11 @@
-#include "hyp.h"
-#include "hyp/hypercall.h" /* HVC_* ABI */
+#include "rmm.h"
+#include "rmm/hypercall.h" /* HVC_* ABI */
 #include "mm/mmu/mmu.h" /* _1GB, _512GB */
 #include "mm/pmm/pmm.h" /* MEM_START, MEM_SIZE */
 #include "uart/uart.h"  /* UART_BASE / UART_DR / UART_FR */
 
 /* ---------------------------------------------------------------------------
- * hyp.c — EL2 hypervisor core (Milestone 1)
+ * rmm.c — EL2 Realm Management Monitor core (forked from Fermi hyp M3)
  *
  * Responsibilities at this milestone:
  *   1. Log that we entered at EL2 (via a self-contained PL011 writer — the
@@ -63,11 +63,11 @@ extern uint8_t __hyp_end[];
 
 /* The single guest's vCPU control block. In .hyp_tables (NOLOAD), so it is
  * neither zeroed by the guest's zero_bss nor reused by the guest PMM; we
- * initialise its fields explicitly in hyp_init(). */
+ * initialise its fields explicitly in rmm_init(). */
 __attribute__((section(".hyp_tables"))) static vcpu_t g_vcpu;
 
 /* --- self-contained PL011 output (no driver state, safe pre-uart_init) --- */
-static void hyp_putc(char c) {
+static void rmm_putc(char c) {
   volatile uint32_t *fr = (volatile uint32_t *)UART_FR;
   volatile uint32_t *dr = (volatile uint32_t *)UART_DR;
   while (*fr & UART_FR_TXFF) {
@@ -75,19 +75,19 @@ static void hyp_putc(char c) {
   *dr = (uint32_t)c;
 }
 
-static void hyp_puts(const char *s) {
+static void rmm_puts(const char *s) {
   while (*s) {
     if (*s == '\n')
-      hyp_putc('\r');
-    hyp_putc(*s++);
+      rmm_putc('\r');
+    rmm_putc(*s++);
   }
 }
 
-static void hyp_puthex(uint64_t v) {
-  hyp_puts("0x");
+static void rmm_puthex(uint64_t v) {
+  rmm_puts("0x");
   for (int i = 60; i >= 0; i -= 4) {
     uint64_t nib = (v >> i) & 0xF;
-    hyp_putc((char)(nib < 10 ? '0' + nib : 'a' + (nib - 10)));
+    rmm_putc((char)(nib < 10 ? '0' + nib : 'a' + (nib - 10)));
   }
 }
 
@@ -96,7 +96,7 @@ static void hyp_puthex(uint64_t v) {
  *   - everything else (GIC, UART, PCI ECAM/MMIO)     -> Device-nGnRnE
  * Pointers are physical here (PC-relative, MMU off), which is exactly what
  * the descriptors and VTTBR_EL2 must contain. */
-static void hyp_build_stage2(void) {
+static void rmm_build_stage2(void) {
   const uint64_t mem_end = MEM_START + MEM_SIZE;
 
   /* L0: only the first two 512 GiB regions are populated. */
@@ -164,8 +164,8 @@ static void hyp_build_stage2(void) {
   __asm__ __volatile__("dsb ish");
 }
 
-void hyp_init(void) {
-  hyp_puts("\n[HYP] Fermi hypervisor online at EL2\n");
+void rmm_init(void) {
+  rmm_puts("\n[RMM] Fermi RMM online at EL2\n");
 
   /* Initialise the guest vCPU control block (NOLOAD memory => not zeroed). */
   g_vcpu.id = 0;
@@ -175,9 +175,9 @@ void hyp_init(void) {
 
   /* Sanity: confirm we really are at EL2. */
   uint64_t el = (MRS(CurrentEL) >> 2) & 0x3;
-  hyp_puts("[HYP] CurrentEL = ");
-  hyp_puthex(el);
-  hyp_puts("\n");
+  rmm_puts("[RMM] CurrentEL = ");
+  rmm_puthex(el);
+  rmm_puts("\n");
 
   /* Generic timer: zero the virtual offset and let EL1/EL0 use the physical
    * counter and timer registers directly (Fermi drives the timer from EL1). */
@@ -189,12 +189,12 @@ void hyp_init(void) {
   }
 
   /* Stage-2 translation tables (with the hypervisor's own RAM unmapped). */
-  hyp_build_stage2();
-  hyp_puts("[HYP] isolated hyp region [");
-  hyp_puthex((uint64_t)__hyp_start);
-  hyp_puts(", ");
-  hyp_puthex((uint64_t)__hyp_end);
-  hyp_puts(") from guest stage-2\n");
+  rmm_build_stage2();
+  rmm_puts("[RMM] isolated hyp region [");
+  rmm_puthex((uint64_t)__hyp_start);
+  rmm_puts(", ");
+  rmm_puthex((uint64_t)__hyp_end);
+  rmm_puts(") from guest stage-2\n");
 
   /* VTCR_EL2: 4 KiB granule, 48-bit IPA (T0SZ=16, SL0=2 => start at L0),
    * 40-bit PA output (PS=2 => 1 TiB), inner-shareable WB walks. */
@@ -222,7 +222,7 @@ void hyp_init(void) {
   MSR(hcr_el2, HCR_RW | HCR_VM | HCR_TID3);
   __asm__ __volatile__("isb");
 
-  hyp_puts("[HYP] stage-2 enabled (HCR_EL2.VM=1), dropping to EL1 guest...\n");
+  rmm_puts("[RMM] stage-2 enabled (HCR_EL2.VM=1), dropping to EL1 guest...\n");
 }
 
 /* ------------------------------- traps ------------------------------------ */
@@ -244,7 +244,7 @@ static const char *ec_name(uint64_t ec) {
 
 /* HVC hypercall: function ID in x0, args in x1..x3, result back in x0.
  * ELR_EL2 already points past the HVC, so no PC adjustment is needed. */
-static void hyp_handle_hvc(el2_frame_t *f) {
+static void rmm_handle_hvc(el2_frame_t *f) {
   uint64_t fn = f->x[0];
   uint64_t a1 = f->x[1];
   uint64_t ret;
@@ -256,7 +256,7 @@ static void hyp_handle_hvc(el2_frame_t *f) {
     ret = HYP_ABI_VERSION;
     break;
   case HVC_PUTC:
-    hyp_putc((char)a1);
+    rmm_putc((char)a1);
     ret = 0;
     break;
   case HVC_PING:
@@ -275,9 +275,9 @@ static void hyp_handle_hvc(el2_frame_t *f) {
     ret = (uint64_t)__hyp_start;
     break;
   default:
-    hyp_puts("[HYP] unknown hypercall fn=");
-    hyp_puthex(fn);
-    hyp_puts("\n");
+    rmm_puts("[RMM] unknown hypercall fn=");
+    rmm_puthex(fn);
+    rmm_puts("\n");
     ret = HVC_ERR_BADCALL;
     break;
   }
@@ -292,7 +292,7 @@ static void hyp_handle_hvc(el2_frame_t *f) {
  *
  * ISS layout for MSR/MRS: Op0[21:20] Op2[19:17] Op1[16:14] CRn[13:10]
  *                         Rt[9:5] CRm[4:1] Direction[0] (1 = read/MRS). */
-static void hyp_handle_sysreg(el2_frame_t *f) {
+static void rmm_handle_sysreg(el2_frame_t *f) {
   uint64_t esr = MRS(esr_el2);
   uint64_t iss = esr & 0x1FFFFFFULL;
   uint64_t op0 = (iss >> 20) & 0x3;
@@ -311,9 +311,9 @@ static void hyp_handle_sysreg(el2_frame_t *f) {
    * architecturally RES0, so returning 0 is safe. */
   if (op0 == 3 && op1 == 0 && crn == 0 && crm == 4 && op2 == 0) {
     val = MRS(id_aa64pfr0_el1); /* ID_AA64PFR0_EL1 */
-    hyp_puts("[HYP] emulated guest MRS ID_AA64PFR0_EL1 -> ");
-    hyp_puthex(val);
-    hyp_puts("\n");
+    rmm_puts("[RMM] emulated guest MRS ID_AA64PFR0_EL1 -> ");
+    rmm_puthex(val);
+    rmm_puts("\n");
   } else if (op0 == 3 && op1 == 0 && crn == 0 && crm == 6 && op2 == 0) {
     val = MRS(id_aa64isar0_el1); /* ID_AA64ISAR0_EL1 */
   } else if (op0 == 3 && op1 == 0 && crn == 0 && crm == 7 && op2 == 0) {
@@ -333,7 +333,7 @@ static void hyp_handle_sysreg(el2_frame_t *f) {
  * memory, that's our isolation boundary doing its job: report it, poison the
  * destination register on a read, and step over the access so the guest keeps
  * running. Any other abort is an unexpected (real) fault — dump and park. */
-static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
+static void rmm_handle_abort(uint64_t index, el2_frame_t *frame) {
   g_vcpu.abort_count++;
 
   uint64_t esr = MRS(esr_el2);
@@ -350,11 +350,11 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
     uint64_t srt = (esr >> 16) & 0x1F; /* destination register      */
     uint64_t wnr = (esr >> 6) & 1;  /* write (1) vs read (0)         */
 
-    hyp_puts("\n[HYP] ISOLATION: blocked guest ");
-    hyp_puts(wnr ? "write to" : "read from");
-    hyp_puts(" hyp memory IPA=");
-    hyp_puthex(ipa);
-    hyp_puts("\n");
+    rmm_puts("\n[RMM] ISOLATION: blocked guest ");
+    rmm_puts(wnr ? "write to" : "read from");
+    rmm_puts(" hyp memory IPA=");
+    rmm_puthex(ipa);
+    rmm_puts("\n");
 
     if (!wnr && isv && srt != 31)
       frame->x[srt] = 0; /* deliver a poison value for the blocked read */
@@ -363,19 +363,19 @@ static void hyp_handle_abort(uint64_t index, el2_frame_t *frame) {
     return;
   }
 
-  hyp_puts("\n[HYP] *** unexpected lower-EL abort *** vector=");
-  hyp_puthex(index);
-  hyp_puts(" EC=");
-  hyp_puthex((esr >> ESR_EC_SHIFT) & ESR_EC_MASK);
-  hyp_puts("\n      ESR_EL2=");
-  hyp_puthex(esr);
-  hyp_puts(" ELR_EL2=");
-  hyp_puthex(MRS(elr_el2));
-  hyp_puts("\n      FAR_EL2=");
-  hyp_puthex(far);
-  hyp_puts(" faulting IPA=");
-  hyp_puthex(ipa);
-  hyp_puts("\n[HYP] parking CPU for inspection.\n");
+  rmm_puts("\n[RMM] *** unexpected lower-EL abort *** vector=");
+  rmm_puthex(index);
+  rmm_puts(" EC=");
+  rmm_puthex((esr >> ESR_EC_SHIFT) & ESR_EC_MASK);
+  rmm_puts("\n      ESR_EL2=");
+  rmm_puthex(esr);
+  rmm_puts(" ELR_EL2=");
+  rmm_puthex(MRS(elr_el2));
+  rmm_puts("\n      FAR_EL2=");
+  rmm_puthex(far);
+  rmm_puts(" faulting IPA=");
+  rmm_puthex(ipa);
+  rmm_puts("\n[RMM] parking CPU for inspection.\n");
   for (;;)
     __asm__ __volatile__("wfi");
 }
@@ -385,25 +385,25 @@ void el2_dispatch(uint64_t index, el2_frame_t *frame) {
 
   switch (ec) {
   case EC_HVC64:
-    hyp_handle_hvc(frame);
+    rmm_handle_hvc(frame);
     return;
   case EC_SYSREG:
-    hyp_handle_sysreg(frame);
+    rmm_handle_sysreg(frame);
     return;
   case EC_DABT_LOWER:
   case EC_IABT_LOWER:
-    hyp_handle_abort(index, frame);
+    rmm_handle_abort(index, frame);
     return;
   default:
-    hyp_puts("\n[HYP] unhandled EL2 exception: vector=");
-    hyp_puthex(index);
-    hyp_puts(" EC=");
-    hyp_puthex(ec);
-    hyp_puts(" (");
-    hyp_puts(ec_name(ec));
-    hyp_puts(") ELR_EL2=");
-    hyp_puthex(MRS(elr_el2));
-    hyp_puts("\n");
+    rmm_puts("\n[RMM] unhandled EL2 exception: vector=");
+    rmm_puthex(index);
+    rmm_puts(" EC=");
+    rmm_puthex(ec);
+    rmm_puts(" (");
+    rmm_puts(ec_name(ec));
+    rmm_puts(") ELR_EL2=");
+    rmm_puthex(MRS(elr_el2));
+    rmm_puts("\n");
     return;
   }
 }

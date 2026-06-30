@@ -4,7 +4,7 @@
 #include "exception.h"
 #include "fat32/fat32.h"
 #include "gic/gic.h"
-#include "hyp/hypercall.h"
+#include "rmm/hypercall.h"
 #include "mm/heap/heap.h"
 #include "mm/mmu/mmu.h"
 #include "mm/pmm/pmm.h"

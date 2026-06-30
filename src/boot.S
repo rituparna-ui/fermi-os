@@ -24,8 +24,8 @@ _start:
 	b.ne 1f				// not EL2 -> already EL1, run kernel directly
 
 	// --- EL2: configure stage-2, vtimer, VBAR_EL2, HCR_EL2.VM ---
-	// hyp_init runs on the current (boot) stack; nothing else is live yet.
-	bl hyp_init
+	// rmm_init runs on the current (boot) stack; nothing else is live yet.
+	bl rmm_init
 
 	// Repoint SP_EL2 at a dedicated EL2 stack so future guest->EL2 traps
 	// don't clobber the EL1 kernel stack (which SP_EL1 keeps using).

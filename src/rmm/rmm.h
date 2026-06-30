@@ -1,13 +1,13 @@
-#ifndef HYP_HYP_H
-#define HYP_HYP_H
+#ifndef RMM_RMM_H
+#define RMM_RMM_H
 
 #include <stdint.h>
 
 /* ---------------------------------------------------------------------------
- * hyp.h — Fermi EL2 Type-1 hypervisor (Milestone 1)
+ * rmm.h — Fermi EL2 Type-1 hypervisor (Milestone 1)
  *
  * Boot order (see boot.S): QEMU enters the image at EL2 when the machine is
- * started with `virtualization=on`. boot.S detects EL2, calls hyp_init() to
+ * started with `virtualization=on`. boot.S detects EL2, calls rmm_init() to
  * configure the hypervisor, then `eret`s down to EL1 where the existing Fermi
  * kernel continues to run — now as a stage-2-translated guest.
  *
@@ -63,7 +63,7 @@ typedef struct {
 
 /* Configure EL2 and stage-2, install the EL2 vector table. Called once from
  * boot.S while still at EL2, MMU off. boot.S performs the eret to EL1. */
-void hyp_init(void);
+void rmm_init(void);
 
 /* Minimal trap frame pushed by the EL2 vector stubs (x0..x30). */
 typedef struct {
@@ -74,4 +74,4 @@ typedef struct {
  * 8 = sync from a lower EL (AArch64), which is where guest HVC/aborts land. */
 void el2_dispatch(uint64_t index, el2_frame_t *frame);
 
-#endif /* HYP_HYP_H */
+#endif /* RMM_RMM_H */

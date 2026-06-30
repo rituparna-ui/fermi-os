@@ -27,6 +27,7 @@
 #define RSI_PUTC          (RSI_BASE + 0x2) /* (char in x1) paravirt console   */
 #define RSI_HOST_CALL     (RSI_BASE + 0x3) /* (arg in x1) -> exit to host     */
 #define RSI_EXIT          (RSI_BASE + 0x4) /* () realm is done -> exit to host*/
+#define RSI_ATTESTATION_TOKEN (RSI_BASE + 0x5) /* (challenge in x1) -> token lo*/
 
 #ifndef __ASSEMBLER__
 #include <stdint.h>

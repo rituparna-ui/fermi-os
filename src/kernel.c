@@ -5,6 +5,7 @@
 #include "fat32/fat32.h"
 #include "gic/gic.h"
 #include "rmm/rmi.h"
+#include "rmm/measure.h"
 #include "mm/heap/heap.h"
 #include "mm/mmu/mmu.h"
 #include "mm/pmm/pmm.h"
@@ -129,6 +130,19 @@ void early_init() {
   uart_printf("[BOOT] RMI_DATA_CREATE(payload @ipa %x) -> %u\n", entry_ipa,
               rmi_call4(RMI_DATA_CREATE, rd, code, entry_ipa,
                         (uint64_t)realm_payload));
+
+  /* Attestation prep (R5): fetch the realm's RIM and independently recompute
+   * the expected measurement over the payload — a verifier's check that the
+   * realm started with exactly the intended code. */
+  static uint8_t __attribute__((aligned(8))) rim_buf[32];
+  static uint8_t expected_rim[32];
+  rmi_call(RMI_REALM_RIM, rd, (uint64_t)rim_buf, 0);
+  memset(expected_rim, 0, 32);
+  rim_extend(expected_rim, entry_ipa, (void *)realm_payload, 4096);
+  int rim_ok = (memcmp(rim_buf, expected_rim, 32) == 0);
+  uart_printf("[BOOT] realm RIM[0..7]=%x  expected=%x  -> %s\n",
+              *(uint64_t *)rim_buf, *(uint64_t *)expected_rim,
+              rim_ok ? "MATCH (realm identity verified)" : "MISMATCH");
   uart_printf("[BOOT] RMI_REC_CREATE(entry %x) -> %u\n", entry_ipa,
               rmi_call(RMI_REC_CREATE, rd, rec, entry_ipa));
   uart_println("[BOOT] entering realm (run loop until it finishes)...");

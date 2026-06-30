@@ -39,6 +39,7 @@
 #define RMI_REALM_CREATE       (RMI_BASE + 0x20) /* (rd_pa, rtt_base_pa) -> st  */
 #define RMI_RTT_MAP            (RMI_BASE + 0x21) /* (rd, ipa, data_pa) -> st    */
 #define RMI_RTT_READ_ENTRY     (RMI_BASE + 0x22) /* (rd, ipa) -> mapped PA | 0  */
+#define RMI_REALM_RIM          (RMI_BASE + 0x23) /* (rd, out_pa) -> copies RIM  */
 
 /* Realm data load + REC lifecycle / run (R4). */
 #define RMI_DATA_CREATE        (RMI_BASE + 0x30) /* (rd, data, ipa, src) -> st  */

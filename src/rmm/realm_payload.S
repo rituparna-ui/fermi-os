@@ -43,7 +43,19 @@ realm_payload:
 	hvc	#0
 	b	3b
 
-4:	/* done */
+4:	/* request an attestation token bound to a challenge */
+	mov	x0, #RSI_ATTESTATION_TOKEN
+	movz	x1, #0xCAFE
+	hvc	#0
+	/* announce we got it, then finish */
+	adr	x19, msg3
+6:	ldrb	w1, [x19], #1
+	cbz	w1, 7f
+	mov	x0, #RSI_PUTC
+	hvc	#0
+	b	6b
+
+7:	/* done */
 	mov	x0, #RSI_EXIT
 	hvc	#0
 5:	wfi
@@ -52,6 +64,8 @@ realm_payload:
 msg1:
 	.asciz "[realm] phase 1: running under my own stage-2 (RSI_PUTC)\n"
 msg2:
-	.asciz "[realm] phase 2: resumed by host re-entry; exiting\n"
+	.asciz "[realm] phase 2: resumed by host re-entry; requesting attestation\n"
+msg3:
+	.asciz "[realm] received attestation token from RMM; exiting\n"
 .balign 8
 realm_payload_end:

@@ -1,4 +1,5 @@
 #include "rmm.h"
+#include "rmm/measure.h" /* sha256, rim_extend */
 #include "rmm/rmi.h" /* RMI_* host ABI */
 #include "rmm/rsi.h" /* RSI_* realm ABI */
 #include "mm/mmu/mmu.h" /* _1GB, _512GB */
@@ -127,6 +128,7 @@ typedef struct {
   uint64_t *rtt_l0;     /* == rtt_base_pa (physical; EL2 MMU off)           */
   realm_state_t state;
   uint64_t mapped_pages;
+  uint8_t rim[32]; /* Realm Initial Measurement (hash chain) */
 } realm_t;
 #define MAX_REALMS 4
 __attribute__((section(".hyp_tables"))) static realm_t g_realms[MAX_REALMS];
@@ -203,6 +205,15 @@ static void rmm_puthex(uint64_t v) {
   for (int i = 60; i >= 0; i -= 4) {
     uint64_t nib = (v >> i) & 0xF;
     rmm_putc((char)(nib < 10 ? '0' + nib : 'a' + (nib - 10)));
+  }
+}
+
+/* Print an N-byte hash as a bare hex string. */
+static void rmm_puthash(const uint8_t *h, int n) {
+  for (int i = 0; i < n; i++) {
+    uint8_t hi = h[i] >> 4, lo = h[i] & 0xF;
+    rmm_putc((char)(hi < 10 ? '0' + hi : 'a' + hi - 10));
+    rmm_putc((char)(lo < 10 ? '0' + lo : 'a' + lo - 10));
   }
 }
 
@@ -545,6 +556,7 @@ static uint64_t rmi_realm_create(uint64_t rd_pa, uint64_t rtt_base_pa) {
     r->rtt_l0[i] = 0; /* empty realm IPA space */
   r->state = REALM_NEW;
   r->mapped_pages = 0;
+  memset(r->rim, 0, sizeof(r->rim)); /* RIM starts empty; extended by DATA_CREATE */
 
   grd->state = GRANULE_RD;
   grtt->state = GRANULE_RTT;
@@ -701,12 +713,16 @@ static uint64_t rmi_data_create(uint64_t rd_pa, uint64_t data_pa, uint64_t ipa,
     return RMI_ERROR_RTT;
   gd->state = GRANULE_DATA;
   r->mapped_pages++;
+  /* Measure the loaded page into the realm's RIM (binds content + IPA). */
+  rim_extend(r->rim, ipa, (void *)data_pa, 4096);
   rmm_puts("[RMM] DATA_CREATE realm=");
   rmm_puthex(rd_pa);
   rmm_puts(" ipa=");
   rmm_puthex(ipa);
   rmm_puts(" <- src=");
   rmm_puthex(src_pa);
+  rmm_puts("\n[RMM]   RIM now ");
+  rmm_puthash(r->rim, 32);
   rmm_puts("\n");
   return RMI_SUCCESS;
 }
@@ -806,6 +822,36 @@ static int rsi_service(rec_t *rec, el2_frame_t *f, uint64_t *host_reason) {
     rmm_putc((char)f->x[1]); /* realm paravirt console via the RMM */
     f->x[0] = 0;
     return 1;
+  case RSI_ATTESTATION_TOKEN: {
+    /* Produce an attestation token bound to the realm's measured identity and
+     * a caller-supplied challenge: token = SHA-256(RIM || challenge_le64). A
+     * real CCA token is a signed COSE/CBOR structure; this captures the
+     * essential binding. Returns the token's low 64 bits in x0. */
+    uint64_t challenge = f->x[1];
+    uint8_t token[32];
+    sha256_ctx sc;
+    sha256_init(&sc);
+    sha256_update(&sc, rec->realm->rim, 32);
+    uint8_t chb[8];
+    for (int i = 0; i < 8; i++)
+      chb[i] = (uint8_t)(challenge >> (8 * i));
+    sha256_update(&sc, chb, 8);
+    sha256_final(&sc, token);
+    rmm_puts("[RMM] ATTESTATION vmid=");
+    rmm_puthex(rec->realm->vmid);
+    rmm_puts(" challenge=");
+    rmm_puthex(challenge);
+    rmm_puts("\n[RMM]   RIM   ");
+    rmm_puthash(rec->realm->rim, 32);
+    rmm_puts("\n[RMM]   token ");
+    rmm_puthash(token, 32);
+    rmm_puts("\n");
+    uint64_t lo = 0;
+    for (int i = 0; i < 8; i++)
+      lo |= (uint64_t)token[i] << (8 * i);
+    f->x[0] = lo;
+    return 1;
+  }
   case RSI_HOST_CALL:
     rmm_puts("[RMM] realm RSI_HOST_CALL arg=");
     rmm_puthex(f->x[1]);
@@ -870,6 +916,17 @@ static void rmm_handle_realm_trap(el2_frame_t *f) {
   f->x[0] = reason; /* RMI_REC_ENTER's result to the host */
 }
 
+/* RMI_REALM_RIM (introspection): copy the realm's 32-byte RIM into a host
+ * buffer. In real CCA the RIM is delivered inside the signed attestation
+ * token; here we expose it so the host/verifier can recompute and compare. */
+static uint64_t rmi_realm_rim(uint64_t rd_pa, uint64_t out_pa) {
+  realm_t *r = realm_find(rd_pa & ~0xFFFULL);
+  if (!r)
+    return RMI_ERROR_REALM;
+  memcpy((void *)out_pa, r->rim, 32);
+  return RMI_SUCCESS;
+}
+
 /* RMI command: FID in x0, args in x1..x3, status/result back in x0.
  * ELR_EL2 already points past the HVC, so no PC adjustment is needed. This is
  * the Normal-world host driving the monitor. */
@@ -917,6 +974,9 @@ static void rmm_handle_rmi(el2_frame_t *f) {
     break;
   case RMI_RTT_READ_ENTRY:
     ret = rmi_rtt_read_entry(a1, f->x[2]);
+    break;
+  case RMI_REALM_RIM:
+    ret = rmi_realm_rim(a1, f->x[2]);
     break;
   case RMI_DATA_CREATE:
     ret = rmi_data_create(a1, f->x[2], f->x[3], f->x[4]);

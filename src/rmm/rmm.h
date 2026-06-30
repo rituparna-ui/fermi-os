@@ -47,18 +47,33 @@
 #define EC_DABT_LOWER 0x24 /* Data abort from a lower EL (stage-2 fault, etc.) */
 #define EC_IABT_LOWER 0x20 /* Instruction abort from a lower EL               */
 
-/* Per-vCPU control block. For Milestone 2 the single guest is co-resident at
- * EL1, so this mostly tracks statistics and holds the slots that a real
- * world-switch (M5) will save/restore. Lives in hypervisor-private memory
- * (.hyp_tables) so the guest cannot see or zero it. */
+/* CPU context for a world switch: everything needed to suspend an EL1 world
+ * at EL2 and later resume it. Used for both the Normal-world host and each
+ * realm REC. The GP regs come from / go to the EL2 trap frame; pc/pstate are
+ * ELR_EL2/SPSR_EL2; the EL1 system registers are saved from / restored to the
+ * live CPU on each switch. vttbr carries the stage-2 base | (VMID << 48), so
+ * switching worlds also switches the active stage-2 (host vs realm RTT).
+ * Lives in RMM-private memory (.hyp_tables) so no lower EL can see it. */
 typedef struct {
-  uint64_t id;           /* vCPU identifier                                  */
-  uint64_t rmi_count;    /* RMI/RSI calls serviced                              */
+  uint64_t id;
+  /* Statistics. */
+  uint64_t rmi_count;    /* RMI/RSI calls serviced                           */
   uint64_t sysreg_traps; /* emulated MSR/MRS accesses                        */
   uint64_t abort_count;  /* stage-2 / lower-EL aborts seen                   */
-  /* Reserved for M5 world-switch context (guest EL1 sysregs). */
+
+  /* Saved execution state. */
+  uint64_t regs[31]; /* x0..x30                                              */
+  uint64_t pc;       /* resume PC     (ELR_EL2)                              */
+  uint64_t pstate;   /* resume PSTATE (SPSR_EL2)                             */
+  uint64_t vttbr;    /* stage-2 base | (VMID << 48)                          */
+
+  /* Saved EL1 system-register context. */
   uint64_t sp_el1, elr_el1, spsr_el1;
-  uint64_t sctlr_el1, ttbr0_el1, ttbr1_el1, tcr_el1, mair_el1, vbar_el1;
+  uint64_t sctlr_el1, cpacr_el1;
+  uint64_t ttbr0_el1, ttbr1_el1, tcr_el1, mair_el1, amair_el1;
+  uint64_t vbar_el1, contextidr_el1;
+  uint64_t tpidr_el1, tpidrro_el0, tpidr_el0;
+  uint64_t esr_el1, far_el1, par_el1;
 } vcpu_t;
 
 /* Configure EL2 and stage-2, install the EL2 vector table. Called once from

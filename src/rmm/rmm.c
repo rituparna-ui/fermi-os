@@ -2,6 +2,7 @@
 #include "rmm/rmi.h" /* RMI_* host ABI */
 #include "mm/mmu/mmu.h" /* _1GB, _512GB */
 #include "mm/pmm/pmm.h" /* MEM_START, MEM_SIZE */
+#include "strings/strings.h" /* memset, memcpy */
 #include "uart/uart.h"  /* UART_BASE / UART_DR / UART_FR */
 
 /* ---------------------------------------------------------------------------
@@ -86,6 +87,7 @@ typedef enum {
   GRANULE_RD = 2,          /* holds a Realm Descriptor                     */
   GRANULE_RTT = 3,         /* a Realm Translation Table (realm stage-2)    */
   GRANULE_DATA = 4,        /* a data page mapped into a realm's IPA space  */
+  GRANULE_REC = 5,         /* a Realm Execution Context (saved vCPU state) */
 } granule_state_t;
 
 #define MAX_GRANULES 64
@@ -132,6 +134,37 @@ __attribute__((section(".hyp_tables"))) static realm_t g_realms[MAX_REALMS];
 #define RTT_POOL_SIZE 16
 __attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t rtt_pool[RTT_POOL_SIZE][512];
 __attribute__((section(".hyp_tables"))) static uint64_t rtt_pool_used;
+
+/* ---------------------------------------------------------------------------
+ * Realm Execution Context (REC) + world switch (R4)
+ *
+ * A REC is the saved CPU state of one realm vCPU, created from a DELEGATED
+ * granule. RMI_REC_ENTER world-switches from the Normal world into the realm:
+ * it saves the host context, loads the REC, points VTTBR_EL2 at the realm's
+ * RTT (with the realm VMID), and erets to EL1 — now running the realm's code
+ * under the realm's private stage-2. When the realm traps back (HVC/abort),
+ * the RMM saves the REC, restores the host, and RMI_REC_ENTER returns the
+ * exit reason to the host. */
+typedef struct {
+  int valid;
+  uint64_t rec_pa;  /* the REC granule (handle)                              */
+  realm_t *realm;   /* owning realm                                          */
+  vcpu_t ctx;       /* saved realm CPU state                                 */
+  uint64_t exits;   /* number of realm exits observed                        */
+} rec_t;
+#define MAX_RECS 4
+__attribute__((section(".hyp_tables"))) static rec_t g_recs[MAX_RECS];
+
+/* The Normal-world host runs as g_vcpu (declared above); its context is saved
+ * there while a realm runs. g_running_rec is non-NULL exactly when a realm is
+ * executing, so el2_dispatch can tell a host RMI call apart from a realm
+ * exit. */
+__attribute__((section(".hyp_tables"))) static rec_t *g_running_rec;
+
+/* Realm payload blob (linked into the kernel image; the RMM copies its bytes
+ * into a realm DATA granule via RMI_DATA_CREATE). */
+extern uint8_t realm_payload[];
+extern uint8_t realm_payload_end[];
 
 /* Pool of L3 tables used to split a 2 MiB stage-2 block down to 4 KiB pages
  * on demand, so an arbitrary host page can be unmapped (delegated). Each pool
@@ -254,11 +287,13 @@ static void rmm_build_stage2(void) {
 void rmm_init(void) {
   rmm_puts("\n[RMM] Fermi RMM online at EL2\n");
 
-  /* Initialise the guest vCPU control block (NOLOAD memory => not zeroed). */
+  /* Initialise the host context (NOLOAD memory => not zeroed). g_vcpu is the
+   * Normal world (VMID 0); its vttbr is set once stage-2 tables are built. */
   g_vcpu.id = 0;
   g_vcpu.rmi_count = 0;
   g_vcpu.sysreg_traps = 0;
   g_vcpu.abort_count = 0;
+  g_running_rec = 0;
 
   /* Sanity: confirm we really are at EL2. */
   uint64_t el = (MRS(CurrentEL) >> 2) & 0x3;
@@ -523,6 +558,24 @@ static uint64_t rmi_realm_create(uint64_t rd_pa, uint64_t rtt_base_pa) {
   return RMI_SUCCESS;
 }
 
+/* Walk the realm's RTT to `ipa` (allocating intermediate levels) and install a
+ * leaf mapping to `pa`. Returns 0 on success, -1 if the RTT pool is empty. */
+static int realm_map_page(realm_t *r, uint64_t ipa, uint64_t pa) {
+  uint64_t *l1 = rtt_next(r->rtt_l0, (ipa >> 39) & 0x1FF);
+  if (!l1)
+    return -1;
+  uint64_t *l2 = rtt_next(l1, (ipa >> 30) & 0x1FF);
+  if (!l2)
+    return -1;
+  uint64_t *l3 = rtt_next(l2, (ipa >> 21) & 0x1FF);
+  if (!l3)
+    return -1;
+  l3[(ipa >> 12) & 0x1FF] =
+      pa | S2_TABLE | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
+  __asm__ __volatile__("dsb ish");
+  return 0;
+}
+
 /* RMI_RTT_MAP: map data_pa into realm rd_pa at realm IPA `ipa`. data_pa must
  * be DELEGATED; it transitions to DATA. Intermediate RTT levels are allocated
  * from the RMM-private pool. */
@@ -537,18 +590,8 @@ static uint64_t rmi_rtt_map(uint64_t rd_pa, uint64_t ipa, uint64_t data_pa) {
   if (!gd || gd->state != GRANULE_DELEGATED)
     return RMI_ERROR_INPUT;
 
-  uint64_t *l1 = rtt_next(r->rtt_l0, (ipa >> 39) & 0x1FF);
-  if (!l1)
+  if (realm_map_page(r, ipa, data_pa) != 0)
     return RMI_ERROR_RTT;
-  uint64_t *l2 = rtt_next(l1, (ipa >> 30) & 0x1FF);
-  if (!l2)
-    return RMI_ERROR_RTT;
-  uint64_t *l3 = rtt_next(l2, (ipa >> 21) & 0x1FF);
-  if (!l3)
-    return RMI_ERROR_RTT;
-  l3[(ipa >> 12) & 0x1FF] =
-      data_pa | S2_TABLE | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
-  __asm__ __volatile__("dsb ish");
 
   gd->state = GRANULE_DATA;
   r->mapped_pages++;
@@ -582,6 +625,211 @@ static uint64_t rmi_rtt_read_entry(uint64_t rd_pa, uint64_t ipa) {
   if (!(leaf & S2_VALID))
     return 0;
   return (leaf & 0x0000FFFFFFFFF000ULL) | (ipa & 0xFFF);
+}
+
+/* ----------------------- REC / world switch (R4) -------------------------- */
+
+static void rmm_save_el1(vcpu_t *v) {
+  v->sp_el1 = MRS(sp_el1);
+  v->elr_el1 = MRS(elr_el1);
+  v->spsr_el1 = MRS(spsr_el1);
+  v->sctlr_el1 = MRS(sctlr_el1);
+  v->cpacr_el1 = MRS(cpacr_el1);
+  v->ttbr0_el1 = MRS(ttbr0_el1);
+  v->ttbr1_el1 = MRS(ttbr1_el1);
+  v->tcr_el1 = MRS(tcr_el1);
+  v->mair_el1 = MRS(mair_el1);
+  v->amair_el1 = MRS(amair_el1);
+  v->vbar_el1 = MRS(vbar_el1);
+  v->contextidr_el1 = MRS(contextidr_el1);
+  v->tpidr_el1 = MRS(tpidr_el1);
+  v->tpidrro_el0 = MRS(tpidrro_el0);
+  v->tpidr_el0 = MRS(tpidr_el0);
+  v->esr_el1 = MRS(esr_el1);
+  v->far_el1 = MRS(far_el1);
+  v->par_el1 = MRS(par_el1);
+}
+
+static void rmm_restore_el1(vcpu_t *v) {
+  MSR(sp_el1, v->sp_el1);
+  MSR(elr_el1, v->elr_el1);
+  MSR(spsr_el1, v->spsr_el1);
+  MSR(sctlr_el1, v->sctlr_el1);
+  MSR(cpacr_el1, v->cpacr_el1);
+  MSR(ttbr0_el1, v->ttbr0_el1);
+  MSR(ttbr1_el1, v->ttbr1_el1);
+  MSR(tcr_el1, v->tcr_el1);
+  MSR(mair_el1, v->mair_el1);
+  MSR(amair_el1, v->amair_el1);
+  MSR(vbar_el1, v->vbar_el1);
+  MSR(contextidr_el1, v->contextidr_el1);
+  MSR(tpidr_el1, v->tpidr_el1);
+  MSR(tpidrro_el0, v->tpidrro_el0);
+  MSR(tpidr_el0, v->tpidr_el0);
+  MSR(esr_el1, v->esr_el1);
+  MSR(far_el1, v->far_el1);
+  MSR(par_el1, v->par_el1);
+  __asm__ __volatile__("isb");
+}
+
+static rec_t *rec_find(uint64_t rec_pa) {
+  for (int i = 0; i < MAX_RECS; i++)
+    if (g_recs[i].valid && g_recs[i].rec_pa == rec_pa)
+      return &g_recs[i];
+  return 0;
+}
+
+/* RMI_DATA_CREATE: copy a page of host content (src_pa) into a DELEGATED data
+ * granule and map it into the realm at `ipa`. This is how a realm's initial
+ * memory (e.g. its code) is loaded; granule -> DATA. (Measurement of the
+ * loaded page is added in R5.) */
+static uint64_t rmi_data_create(uint64_t rd_pa, uint64_t data_pa, uint64_t ipa,
+                                uint64_t src_pa) {
+  rd_pa &= ~0xFFFULL;
+  data_pa &= ~0xFFFULL;
+  ipa &= ~0xFFFULL;
+  realm_t *r = realm_find(rd_pa);
+  if (!r)
+    return RMI_ERROR_REALM;
+  granule_t *gd = granule_find(data_pa);
+  if (!gd || gd->state != GRANULE_DELEGATED)
+    return RMI_ERROR_INPUT;
+  /* EL2 runs MMU-off: address both pages physically. */
+  memcpy((void *)data_pa, (void *)src_pa, 4096);
+  if (realm_map_page(r, ipa, data_pa) != 0)
+    return RMI_ERROR_RTT;
+  gd->state = GRANULE_DATA;
+  r->mapped_pages++;
+  rmm_puts("[RMM] DATA_CREATE realm=");
+  rmm_puthex(rd_pa);
+  rmm_puts(" ipa=");
+  rmm_puthex(ipa);
+  rmm_puts(" <- src=");
+  rmm_puthex(src_pa);
+  rmm_puts("\n");
+  return RMI_SUCCESS;
+}
+
+/* RMI_REC_CREATE: turn a DELEGATED granule into a Realm Execution Context with
+ * its entry PC set to `entry_ipa`. The REC runs at EL1 with its stage-1 MMU
+ * off (EL1 sysregs zeroed), so it sees its own RTT-mapped IPA space. */
+static uint64_t rmi_rec_create(uint64_t rd_pa, uint64_t rec_pa,
+                               uint64_t entry_ipa) {
+  rd_pa &= ~0xFFFULL;
+  rec_pa &= ~0xFFFULL;
+  realm_t *r = realm_find(rd_pa);
+  if (!r)
+    return RMI_ERROR_REALM;
+  granule_t *gr = granule_find(rec_pa);
+  if (!gr || gr->state != GRANULE_DELEGATED)
+    return RMI_ERROR_INPUT;
+
+  int slot = -1;
+  for (int i = 0; i < MAX_RECS; i++)
+    if (!g_recs[i].valid) {
+      slot = i;
+      break;
+    }
+  if (slot < 0)
+    return RMI_ERROR_REC;
+
+  rec_t *rec = &g_recs[slot];
+  memset(rec, 0, sizeof(*rec));
+  rec->valid = 1;
+  rec->rec_pa = rec_pa;
+  rec->realm = r;
+  rec->ctx.pc = entry_ipa;
+  rec->ctx.pstate = 0x3c5; /* EL1h, DAIF masked */
+  rec->ctx.vttbr = r->rtt_base_pa | (r->vmid << 48);
+  /* EL1 sysregs left 0 => realm runs with its stage-1 MMU off. */
+
+  gr->state = GRANULE_REC;
+  r->state = REALM_ACTIVE;
+  rmm_puts("[RMM] REC_CREATE rec=");
+  rmm_puthex(rec_pa);
+  rmm_puts(" entry_ipa=");
+  rmm_puthex(entry_ipa);
+  rmm_puts(" vmid=");
+  rmm_puthex(r->vmid);
+  rmm_puts("\n");
+  return RMI_SUCCESS;
+}
+
+/* RMI_REC_ENTER: world-switch from the Normal world into the realm. Saves the
+ * host context into g_vcpu, loads the REC into the trap frame + EL1 sysregs,
+ * and points VTTBR_EL2 at the realm's stage-2. el2_common then restores the
+ * (now realm) frame and erets into the realm. Does NOT write f->x[0] — the
+ * realm's x0 must survive into the realm. */
+static void rmi_rec_enter(el2_frame_t *f, uint64_t rec_pa) {
+  rec_t *rec = rec_find(rec_pa & ~0xFFFULL);
+  if (!rec) {
+    f->x[0] = RMI_ERROR_REC;
+    return;
+  }
+
+  /* Save host context (resume point is right after the REC_ENTER hvc). */
+  for (int i = 0; i < 31; i++)
+    g_vcpu.regs[i] = f->x[i];
+  g_vcpu.pc = MRS(elr_el2);
+  g_vcpu.pstate = MRS(spsr_el2);
+  g_vcpu.vttbr = MRS(vttbr_el2);
+  rmm_save_el1(&g_vcpu);
+
+  /* Load the realm REC. */
+  for (int i = 0; i < 31; i++)
+    f->x[i] = rec->ctx.regs[i];
+  MSR(elr_el2, rec->ctx.pc);
+  MSR(spsr_el2, rec->ctx.pstate);
+  MSR(vttbr_el2, rec->ctx.vttbr);
+  rmm_restore_el1(&rec->ctx);
+  g_running_rec = rec;
+
+  rmm_puts("[RMM] REC_ENTER -> entering realm vmid=");
+  rmm_puthex(rec->realm->vmid);
+  rmm_puts("\n");
+}
+
+/* Realm exit: a trap arrived while a realm was running. Save the REC, restore
+ * the host, and hand RMI_REC_ENTER back to the host with an exit reason. */
+static void rmm_handle_realm_exit(el2_frame_t *f) {
+  rec_t *rec = g_running_rec;
+  uint64_t ec = (MRS(esr_el2) >> ESR_EC_SHIFT) & ESR_EC_MASK;
+
+  /* Save realm context (resume PC already past the trapping instruction for
+   * HVC; for an abort ELR points at it). */
+  for (int i = 0; i < 31; i++)
+    rec->ctx.regs[i] = f->x[i];
+  rec->ctx.pc = MRS(elr_el2);
+  rec->ctx.pstate = MRS(spsr_el2);
+  rec->ctx.vttbr = MRS(vttbr_el2);
+  rmm_save_el1(&rec->ctx);
+  rec->exits++;
+
+  uint64_t reason;
+  if (ec == EC_HVC64) {
+    reason = REC_EXIT_RSI; /* realm made an RSI call (serviced in R4b/R5) */
+    rmm_puts("[RMM] realm EXIT: RSI/HVC, realm x0=");
+    rmm_puthex(rec->ctx.regs[0]);
+    rmm_puts("\n");
+  } else {
+    reason = REC_EXIT_ABORT;
+    rmm_puts("[RMM] realm EXIT: fault EC=");
+    rmm_puthex(ec);
+    rmm_puts(" FAR_EL2=");
+    rmm_puthex(MRS(far_el2));
+    rmm_puts("\n");
+  }
+
+  /* Restore the host and return to it. */
+  for (int i = 0; i < 31; i++)
+    f->x[i] = g_vcpu.regs[i];
+  MSR(elr_el2, g_vcpu.pc);
+  MSR(spsr_el2, g_vcpu.pstate);
+  MSR(vttbr_el2, g_vcpu.vttbr);
+  rmm_restore_el1(&g_vcpu);
+  g_running_rec = 0;
+
+  f->x[0] = reason; /* RMI_REC_ENTER's result to the host */
 }
 
 /* RMI command: FID in x0, args in x1..x3, status/result back in x0.
@@ -632,6 +880,17 @@ static void rmm_handle_rmi(el2_frame_t *f) {
   case RMI_RTT_READ_ENTRY:
     ret = rmi_rtt_read_entry(a1, f->x[2]);
     break;
+  case RMI_DATA_CREATE:
+    ret = rmi_data_create(a1, f->x[2], f->x[3], f->x[4]);
+    break;
+  case RMI_REC_CREATE:
+    ret = rmi_rec_create(a1, f->x[2], f->x[3]);
+    break;
+  case RMI_REC_ENTER:
+    /* Performs the world switch and loads the realm frame; must not clobber
+     * the realm's x0 with a status, so return immediately. */
+    rmi_rec_enter(f, a1);
+    return;
   default:
     rmm_puts("[RMM] unknown RMI command=");
     rmm_puthex(cmd);
@@ -743,6 +1002,13 @@ static void rmm_handle_abort(uint64_t index, el2_frame_t *frame) {
 }
 
 void el2_dispatch(uint64_t index, el2_frame_t *frame) {
+  /* If a realm is currently running, any trap is a realm exit, not a host
+   * RMI call. Hand it to the world-switch-out path. */
+  if (g_running_rec) {
+    rmm_handle_realm_exit(frame);
+    return;
+  }
+
   uint64_t ec = (MRS(esr_el2) >> ESR_EC_SHIFT) & ESR_EC_MASK;
 
   switch (ec) {

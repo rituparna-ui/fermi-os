@@ -116,6 +116,26 @@ void early_init() {
   uart_printf("[BOOT]   RTT walk: realm IPA %x -> PA %x (expect %x) %s\n", r_ipa,
               resolved, dat, resolved == dat ? "OK" : "MISMATCH");
 
+  /* REC + run demo (R4a): load the realm payload into the realm, create an
+   * execution context, and enter the realm. The payload computes x0=0x42 then
+   * HVCs back out; the RMM reports the exit and returns control to us. */
+  extern uint8_t realm_payload[];
+  static uint8_t __attribute__((aligned(4096))) code_pg[4096];
+  static uint8_t __attribute__((aligned(4096))) rec_pg[4096];
+  uint64_t code = (uint64_t)code_pg, rec = (uint64_t)rec_pg;
+  uint64_t entry_ipa = 0x0; /* realm IPA at which the payload is mapped/runs */
+  rmi_call(RMI_GRANULE_DELEGATE, code, 0, 0);
+  rmi_call(RMI_GRANULE_DELEGATE, rec, 0, 0);
+  uart_printf("[BOOT] RMI_DATA_CREATE(payload @ipa %x) -> %u\n", entry_ipa,
+              rmi_call4(RMI_DATA_CREATE, rd, code, entry_ipa,
+                        (uint64_t)realm_payload));
+  uart_printf("[BOOT] RMI_REC_CREATE(entry %x) -> %u\n", entry_ipa,
+              rmi_call(RMI_REC_CREATE, rd, rec, entry_ipa));
+  uint64_t exit_reason = rmi_call(RMI_REC_ENTER, rec, 0, 0);
+  uart_printf("[BOOT] RMI_REC_ENTER -> realm exited, reason %u "
+              "(1=RSI/HVC, 2=abort)\n",
+              exit_reason);
+
   exceptions_init();
 
   pmm_init(MEM_START, MEM_SIZE);

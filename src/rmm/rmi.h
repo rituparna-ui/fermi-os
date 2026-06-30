@@ -40,6 +40,15 @@
 #define RMI_RTT_MAP            (RMI_BASE + 0x21) /* (rd, ipa, data_pa) -> st    */
 #define RMI_RTT_READ_ENTRY     (RMI_BASE + 0x22) /* (rd, ipa) -> mapped PA | 0  */
 
+/* Realm data load + REC lifecycle / run (R4). */
+#define RMI_DATA_CREATE        (RMI_BASE + 0x30) /* (rd, data, ipa, src) -> st  */
+#define RMI_REC_CREATE         (RMI_BASE + 0x31) /* (rd, rec, entry_ipa) -> st  */
+#define RMI_REC_ENTER          (RMI_BASE + 0x32) /* (rec) -> REC_EXIT_* reason  */
+
+/* REC exit reasons returned by RMI_REC_ENTER. */
+#define REC_EXIT_RSI           1ULL  /* realm issued an RSI call (HVC)         */
+#define REC_EXIT_ABORT         2ULL  /* realm took an abort / other trap       */
+
 #define RMI_ABI_VERSION      0x00010000ULL    /* 1.0 */
 
 /* RMI status codes. The real RMM defines a richer enum (RMI_ERROR_INPUT,
@@ -48,6 +57,7 @@
 #define RMI_ERROR_INPUT          1ULL          /* bad argument / wrong state    */
 #define RMI_ERROR_REALM          2ULL          /* realm table full / not found  */
 #define RMI_ERROR_RTT            3ULL          /* RTT pool exhausted            */
+#define RMI_ERROR_REC            4ULL          /* REC table full / not found    */
 #define RMI_ERROR_NOT_SUPPORTED  ((uint64_t)-1)
 
 #ifndef __ASSEMBLER__
@@ -62,6 +72,21 @@ static inline uint64_t rmi_call(uint64_t cmd, uint64_t a1, uint64_t a2,
   __asm__ __volatile__("hvc #0"
                        : "+r"(x0)
                        : "r"(x1), "r"(x2), "r"(x3)
+                       : "memory");
+  return x0;
+}
+
+/* 4-argument variant (x1..x4), needed by RMI_DATA_CREATE. */
+static inline uint64_t rmi_call4(uint64_t cmd, uint64_t a1, uint64_t a2,
+                                 uint64_t a3, uint64_t a4) {
+  register uint64_t x0 __asm__("x0") = cmd;
+  register uint64_t x1 __asm__("x1") = a1;
+  register uint64_t x2 __asm__("x2") = a2;
+  register uint64_t x3 __asm__("x3") = a3;
+  register uint64_t x4 __asm__("x4") = a4;
+  __asm__ __volatile__("hvc #0"
+                       : "+r"(x0)
+                       : "r"(x1), "r"(x2), "r"(x3), "r"(x4)
                        : "memory");
   return x0;
 }

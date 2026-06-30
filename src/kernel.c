@@ -4,7 +4,7 @@
 #include "exception.h"
 #include "fat32/fat32.h"
 #include "gic/gic.h"
-#include "rmm/hypercall.h"
+#include "rmm/rmi.h"
 #include "mm/heap/heap.h"
 #include "mm/mmu/mmu.h"
 #include "mm/pmm/pmm.h"
@@ -52,27 +52,27 @@ void early_init() {
   uart_println("Fermi OS - Booting Up...");
   print_current_el();
 
-  /* Hypervisor probe: exercise the hypercall ABI from the EL1 guest. If a
-   * hypervisor is present beneath us these trap to EL2 and return real
-   * values; on a bare boot the HVCs are harmless on QEMU. */
-  uart_println("[BOOT] testing hypervisor calls...");
-  uart_printf("[BOOT]   HVC_VERSION  -> %x\n", hvc_call(HVC_VERSION, 0, 0, 0));
-  uart_printf("[BOOT]   HVC_PING(41) -> %u\n", hvc_call(HVC_PING, 41, 0, 0));
-  uart_puts("[BOOT]   HVC_PUTC ->");
-  hvc_call(HVC_PUTC, ' ', 0, 0);
-  hvc_call(HVC_PUTC, 'h', 0, 0);
-  hvc_call(HVC_PUTC, 'i', 0, 0);
-  hvc_call(HVC_PUTC, '\n', 0, 0);
-  uart_printf("[BOOT]   HVC_VM_INFO  -> %u hypercalls served\n",
-              hvc_call(HVC_VM_INFO, 0, 0, 0));
+  /* Normal-world host probe: drive the RMM through the RMI ABI. If an RMM is
+   * present beneath us these `hvc`s trap to EL2 and return real values; on a
+   * bare boot (no RME/monitor) the HVCs are harmless on QEMU. */
+  uart_println("[BOOT] testing RMI (host -> RMM) calls...");
+  uart_printf("[BOOT]   RMI_VERSION  -> %x\n", rmi_call(RMI_VERSION, 0, 0, 0));
+  uart_printf("[BOOT]   RMI_PING(41) -> %u\n", rmi_call(RMI_PING, 41, 0, 0));
+  uart_puts("[BOOT]   RMI_PUTC ->");
+  rmi_call(RMI_PUTC, ' ', 0, 0);
+  rmi_call(RMI_PUTC, 'h', 0, 0);
+  rmi_call(RMI_PUTC, 'i', 0, 0);
+  rmi_call(RMI_PUTC, '\n', 0, 0);
+  uart_printf("[BOOT]   RMI_MONITOR_INFO -> %u RMI calls served\n",
+              rmi_call(RMI_MONITOR_INFO, 0, 0, 0));
 
-  /* Isolation probe: ask the hypervisor where its private memory lives, then
+  /* Isolation probe: ask the monitor where its private memory lives, then
    * deliberately try to read it. Stage-2 must block this — the read should
-   * trap to EL2 and come back poisoned (0) rather than leaking hyp state. */
-  uint64_t hyp_base = hvc_call(HVC_HYP_BASE, 0, 0, 0);
-  uart_printf("[BOOT] poking hypervisor memory at %x (must be blocked)...\n",
-              hyp_base);
-  volatile uint64_t leaked = *(volatile uint64_t *)hyp_base;
+   * trap to EL2 and come back poisoned (0) rather than leaking RMM state. */
+  uint64_t mon_base = rmi_call(RMI_MONITOR_BASE, 0, 0, 0);
+  uart_printf("[BOOT] poking monitor memory at %x (must be blocked)...\n",
+              mon_base);
+  volatile uint64_t leaked = *(volatile uint64_t *)mon_base;
   uart_printf("[BOOT]   read back %x (0 => stage-2 isolation held)\n", leaked);
 
   exceptions_init();

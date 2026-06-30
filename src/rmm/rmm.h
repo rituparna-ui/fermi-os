@@ -53,7 +53,7 @@
  * (.hyp_tables) so the guest cannot see or zero it. */
 typedef struct {
   uint64_t id;           /* vCPU identifier                                  */
-  uint64_t hvc_count;    /* hypercalls serviced                              */
+  uint64_t rmi_count;    /* RMI/RSI calls serviced                              */
   uint64_t sysreg_traps; /* emulated MSR/MRS accesses                        */
   uint64_t abort_count;  /* stage-2 / lower-EL aborts seen                   */
   /* Reserved for M5 world-switch context (guest EL1 sysregs). */

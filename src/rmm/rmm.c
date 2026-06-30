@@ -1,5 +1,5 @@
 #include "rmm.h"
-#include "rmm/hypercall.h" /* HVC_* ABI */
+#include "rmm/rmi.h" /* RMI_* host ABI */
 #include "mm/mmu/mmu.h" /* _1GB, _512GB */
 #include "mm/pmm/pmm.h" /* MEM_START, MEM_SIZE */
 #include "uart/uart.h"  /* UART_BASE / UART_DR / UART_FR */
@@ -169,7 +169,7 @@ void rmm_init(void) {
 
   /* Initialise the guest vCPU control block (NOLOAD memory => not zeroed). */
   g_vcpu.id = 0;
-  g_vcpu.hvc_count = 0;
+  g_vcpu.rmi_count = 0;
   g_vcpu.sysreg_traps = 0;
   g_vcpu.abort_count = 0;
 
@@ -230,7 +230,7 @@ void rmm_init(void) {
 static const char *ec_name(uint64_t ec) {
   switch (ec) {
   case EC_HVC64:
-    return "HVC (hypercall)";
+    return "HVC (RMI/RSI call)";
   case EC_SYSREG:
     return "trapped MSR/MRS";
   case EC_DABT_LOWER:
@@ -242,43 +242,44 @@ static const char *ec_name(uint64_t ec) {
   }
 }
 
-/* HVC hypercall: function ID in x0, args in x1..x3, result back in x0.
- * ELR_EL2 already points past the HVC, so no PC adjustment is needed. */
-static void rmm_handle_hvc(el2_frame_t *f) {
-  uint64_t fn = f->x[0];
+/* RMI command: FID in x0, args in x1..x3, status/result back in x0.
+ * ELR_EL2 already points past the HVC, so no PC adjustment is needed. This is
+ * the Normal-world host driving the monitor. */
+static void rmm_handle_rmi(el2_frame_t *f) {
+  uint64_t cmd = f->x[0];
   uint64_t a1 = f->x[1];
   uint64_t ret;
 
-  g_vcpu.hvc_count++;
+  g_vcpu.rmi_count++;
 
-  switch (fn) {
-  case HVC_VERSION:
-    ret = HYP_ABI_VERSION;
+  switch (cmd) {
+  case RMI_VERSION:
+    ret = RMI_ABI_VERSION;
     break;
-  case HVC_PUTC:
-    rmm_putc((char)a1);
+  case RMI_FEATURES:
+    /* No optional features advertised yet. */
     ret = 0;
     break;
-  case HVC_PING:
+  case RMI_PUTC:
+    rmm_putc((char)a1);
+    ret = RMI_SUCCESS;
+    break;
+  case RMI_PING:
     ret = a1 + 1;
     break;
-  case HVC_VM_INFO:
-    ret = g_vcpu.hvc_count;
+  case RMI_MONITOR_INFO:
+    ret = g_vcpu.rmi_count;
     break;
-  case HVC_YIELD:
-    /* Cooperative yield is a no-op until the M5 world-switch scheduler. */
-    ret = 0;
-    break;
-  case HVC_HYP_BASE:
-    /* Introspection probe (test build): expose the hyp region base so the
-     * guest can attempt — and be denied — an access to hypervisor memory. */
+  case RMI_MONITOR_BASE:
+    /* Introspection probe: expose the monitor-private base IPA so the host
+     * can attempt — and be denied by stage-2 — an access to RMM memory. */
     ret = (uint64_t)__hyp_start;
     break;
   default:
-    rmm_puts("[RMM] unknown hypercall fn=");
-    rmm_puthex(fn);
+    rmm_puts("[RMM] unknown RMI command=");
+    rmm_puthex(cmd);
     rmm_puts("\n");
-    ret = HVC_ERR_BADCALL;
+    ret = RMI_ERROR_NOT_SUPPORTED;
     break;
   }
 
@@ -385,7 +386,7 @@ void el2_dispatch(uint64_t index, el2_frame_t *frame) {
 
   switch (ec) {
   case EC_HVC64:
-    rmm_handle_hvc(frame);
+    rmm_handle_rmi(frame);
     return;
   case EC_SYSREG:
     rmm_handle_sysreg(frame);

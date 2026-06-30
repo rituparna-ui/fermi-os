@@ -83,6 +83,9 @@ __attribute__((section(".hyp_tables"))) static vcpu_t g_vcpu;
 typedef enum {
   GRANULE_UNDELEGATED = 0, /* owned by the Normal-world host               */
   GRANULE_DELEGATED = 1,   /* owned by the RMM; removed from host stage-2  */
+  GRANULE_RD = 2,          /* holds a Realm Descriptor                     */
+  GRANULE_RTT = 3,         /* a Realm Translation Table (realm stage-2)    */
+  GRANULE_DATA = 4,        /* a data page mapped into a realm's IPA space  */
 } granule_state_t;
 
 #define MAX_GRANULES 64
@@ -92,6 +95,43 @@ typedef struct {
 } granule_t;
 __attribute__((section(".hyp_tables"))) static granule_t g_granules[MAX_GRANULES];
 __attribute__((section(".hyp_tables"))) static uint64_t g_granule_count;
+
+/* ---------------------------------------------------------------------------
+ * Realm Descriptor + RTT (R3)
+ *
+ * A Realm is created from a DELEGATED granule that becomes its Realm
+ * Descriptor (RD) — the monitor's control block for that realm. A second
+ * DELEGATED granule becomes the root of the realm's RTT (Realm Translation
+ * Table): a *separate* stage-2 tree describing the realm's own IPA space,
+ * independent of the Normal world's. Pages are mapped into the realm with
+ * RMI_RTT_MAP, which walks the RTT (allocating intermediate tables) and
+ * installs a leaf descriptor.
+ *
+ * For this milestone the intermediate RTT levels are allocated from an
+ * RMM-private pool; a fuller implementation has the host delegate a granule
+ * per level via RMI_RTT_CREATE. The realm's stage-2 is built here but only
+ * becomes the live VTTBR when we run a REC under it (R4). */
+typedef enum {
+  REALM_NEW = 0,    /* created, RTT being populated         */
+  REALM_ACTIVE = 1, /* runnable (set once a REC exists, R4)  */
+} realm_state_t;
+
+typedef struct {
+  int valid;
+  uint64_t rd_pa;       /* the RD granule — also the realm handle           */
+  uint64_t vmid;        /* stage-2 VMID for this realm                      */
+  uint64_t rtt_base_pa; /* granule backing the realm's stage-2 L0 table     */
+  uint64_t *rtt_l0;     /* == rtt_base_pa (physical; EL2 MMU off)           */
+  realm_state_t state;
+  uint64_t mapped_pages;
+} realm_t;
+#define MAX_REALMS 4
+__attribute__((section(".hyp_tables"))) static realm_t g_realms[MAX_REALMS];
+
+/* Pool of intermediate RTT tables (realm stage-2 L1/L2/L3), RMM-private. */
+#define RTT_POOL_SIZE 16
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint64_t rtt_pool[RTT_POOL_SIZE][512];
+__attribute__((section(".hyp_tables"))) static uint64_t rtt_pool_used;
 
 /* Pool of L3 tables used to split a 2 MiB stage-2 block down to 4 KiB pages
  * on demand, so an arbitrary host page can be unmapped (delegated). Each pool
@@ -409,6 +449,141 @@ static uint64_t rmi_granule_undelegate(uint64_t pa) {
   return RMI_SUCCESS;
 }
 
+/* ----------------------- realm / RTT (R3) --------------------------------- */
+
+static realm_t *realm_find(uint64_t rd_pa) {
+  for (int i = 0; i < MAX_REALMS; i++)
+    if (g_realms[i].valid && g_realms[i].rd_pa == rd_pa)
+      return &g_realms[i];
+  return 0;
+}
+
+static uint64_t *rtt_alloc(void) {
+  if (rtt_pool_used >= RTT_POOL_SIZE)
+    return 0;
+  uint64_t *t = rtt_pool[rtt_pool_used++];
+  for (int i = 0; i < 512; i++)
+    t[i] = 0;
+  return t;
+}
+
+/* Descend one stage-2 level, allocating the next-level RTT if absent. */
+static uint64_t *rtt_next(uint64_t *table, uint64_t idx) {
+  if (!(table[idx] & S2_VALID)) {
+    uint64_t *t = rtt_alloc();
+    if (!t)
+      return 0;
+    table[idx] = ((uint64_t)t) | S2_TABLE | S2_VALID;
+  }
+  return (uint64_t *)(table[idx] & 0x0000FFFFFFFFF000ULL);
+}
+
+/* RMI_REALM_CREATE: consume rd_pa as the Realm Descriptor and rtt_base_pa as
+ * the root of the realm's stage-2. Both must be DELEGATED. */
+static uint64_t rmi_realm_create(uint64_t rd_pa, uint64_t rtt_base_pa) {
+  rd_pa &= ~0xFFFULL;
+  rtt_base_pa &= ~0xFFFULL;
+  granule_t *grd = granule_find(rd_pa);
+  granule_t *grtt = granule_find(rtt_base_pa);
+  if (!grd || grd->state != GRANULE_DELEGATED)
+    return RMI_ERROR_INPUT;
+  if (!grtt || grtt->state != GRANULE_DELEGATED || rtt_base_pa == rd_pa)
+    return RMI_ERROR_INPUT;
+
+  int slot = -1;
+  for (int i = 0; i < MAX_REALMS; i++)
+    if (!g_realms[i].valid) {
+      slot = i;
+      break;
+    }
+  if (slot < 0)
+    return RMI_ERROR_REALM;
+
+  realm_t *r = &g_realms[slot];
+  r->valid = 1;
+  r->rd_pa = rd_pa;
+  r->vmid = (uint64_t)slot + 1; /* VMID 0 is the Normal world */
+  r->rtt_base_pa = rtt_base_pa;
+  r->rtt_l0 = (uint64_t *)rtt_base_pa; /* EL2 MMU off: physical == pointer */
+  for (int i = 0; i < 512; i++)
+    r->rtt_l0[i] = 0; /* empty realm IPA space */
+  r->state = REALM_NEW;
+  r->mapped_pages = 0;
+
+  grd->state = GRANULE_RD;
+  grtt->state = GRANULE_RTT;
+
+  rmm_puts("[RMM] REALM_CREATE rd=");
+  rmm_puthex(rd_pa);
+  rmm_puts(" rtt=");
+  rmm_puthex(rtt_base_pa);
+  rmm_puts(" vmid=");
+  rmm_puthex(r->vmid);
+  rmm_puts("\n");
+  return RMI_SUCCESS;
+}
+
+/* RMI_RTT_MAP: map data_pa into realm rd_pa at realm IPA `ipa`. data_pa must
+ * be DELEGATED; it transitions to DATA. Intermediate RTT levels are allocated
+ * from the RMM-private pool. */
+static uint64_t rmi_rtt_map(uint64_t rd_pa, uint64_t ipa, uint64_t data_pa) {
+  rd_pa &= ~0xFFFULL;
+  ipa &= ~0xFFFULL;
+  data_pa &= ~0xFFFULL;
+  realm_t *r = realm_find(rd_pa);
+  if (!r)
+    return RMI_ERROR_REALM;
+  granule_t *gd = granule_find(data_pa);
+  if (!gd || gd->state != GRANULE_DELEGATED)
+    return RMI_ERROR_INPUT;
+
+  uint64_t *l1 = rtt_next(r->rtt_l0, (ipa >> 39) & 0x1FF);
+  if (!l1)
+    return RMI_ERROR_RTT;
+  uint64_t *l2 = rtt_next(l1, (ipa >> 30) & 0x1FF);
+  if (!l2)
+    return RMI_ERROR_RTT;
+  uint64_t *l3 = rtt_next(l2, (ipa >> 21) & 0x1FF);
+  if (!l3)
+    return RMI_ERROR_RTT;
+  l3[(ipa >> 12) & 0x1FF] =
+      data_pa | S2_TABLE | S2_AF | S2_SH_INNER | S2_AP_RW | S2_MEM_NORMAL;
+  __asm__ __volatile__("dsb ish");
+
+  gd->state = GRANULE_DATA;
+  r->mapped_pages++;
+
+  rmm_puts("[RMM] RTT_MAP realm=");
+  rmm_puthex(rd_pa);
+  rmm_puts(" ipa=");
+  rmm_puthex(ipa);
+  rmm_puts(" -> pa=");
+  rmm_puthex(data_pa);
+  rmm_puts("\n");
+  return RMI_SUCCESS;
+}
+
+/* RMI_RTT_READ_ENTRY (introspection): software-walk the realm's RTT and
+ * return the PA mapped at `ipa`, or 0 if unmapped. */
+static uint64_t rmi_rtt_read_entry(uint64_t rd_pa, uint64_t ipa) {
+  rd_pa &= ~0xFFFULL;
+  realm_t *r = realm_find(rd_pa);
+  if (!r)
+    return 0;
+  uint64_t *t = r->rtt_l0;
+  uint64_t shifts[4] = {39, 30, 21, 12};
+  for (int lvl = 0; lvl < 3; lvl++) {
+    uint64_t e = t[(ipa >> shifts[lvl]) & 0x1FF];
+    if (!(e & S2_VALID))
+      return 0;
+    t = (uint64_t *)(e & 0x0000FFFFFFFFF000ULL);
+  }
+  uint64_t leaf = t[(ipa >> 12) & 0x1FF];
+  if (!(leaf & S2_VALID))
+    return 0;
+  return (leaf & 0x0000FFFFFFFFF000ULL) | (ipa & 0xFFF);
+}
+
 /* RMI command: FID in x0, args in x1..x3, status/result back in x0.
  * ELR_EL2 already points past the HVC, so no PC adjustment is needed. This is
  * the Normal-world host driving the monitor. */
@@ -447,6 +622,15 @@ static void rmm_handle_rmi(el2_frame_t *f) {
     break;
   case RMI_GRANULE_UNDELEGATE:
     ret = rmi_granule_undelegate(a1);
+    break;
+  case RMI_REALM_CREATE:
+    ret = rmi_realm_create(a1, f->x[2]);
+    break;
+  case RMI_RTT_MAP:
+    ret = rmi_rtt_map(a1, f->x[2], f->x[3]);
+    break;
+  case RMI_RTT_READ_ENTRY:
+    ret = rmi_rtt_read_entry(a1, f->x[2]);
     break;
   default:
     rmm_puts("[RMM] unknown RMI command=");
@@ -521,7 +705,7 @@ static void rmm_handle_abort(uint64_t index, el2_frame_t *frame) {
 
   int in_monitor = (ipa_page >= (hs & ~0xFFFULL) && ipa_page < he);
   granule_t *g = granule_find(ipa_page);
-  int delegated = (g && g->state == GRANULE_DELEGATED);
+  int delegated = (g && g->state != GRANULE_UNDELEGATED);
 
   if (in_monitor || delegated) {
     uint64_t isv = (esr >> 24) & 1; /* instruction syndrome valid */

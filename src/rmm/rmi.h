@@ -35,12 +35,19 @@
 #define RMI_GRANULE_DELEGATE   (RMI_BASE + 0x10) /* (pa) -> status; host->RMM   */
 #define RMI_GRANULE_UNDELEGATE (RMI_BASE + 0x11) /* (pa) -> status; RMM->host   */
 
+/* Realm + RTT lifecycle (R3). */
+#define RMI_REALM_CREATE       (RMI_BASE + 0x20) /* (rd_pa, rtt_base_pa) -> st  */
+#define RMI_RTT_MAP            (RMI_BASE + 0x21) /* (rd, ipa, data_pa) -> st    */
+#define RMI_RTT_READ_ENTRY     (RMI_BASE + 0x22) /* (rd, ipa) -> mapped PA | 0  */
+
 #define RMI_ABI_VERSION      0x00010000ULL    /* 1.0 */
 
 /* RMI status codes. The real RMM defines a richer enum (RMI_ERROR_INPUT,
  * RMI_ERROR_REALM, RMI_ERROR_REC, ...); we grow this set as commands land. */
 #define RMI_SUCCESS              0ULL
 #define RMI_ERROR_INPUT          1ULL          /* bad argument / wrong state    */
+#define RMI_ERROR_REALM          2ULL          /* realm table full / not found  */
+#define RMI_ERROR_RTT            3ULL          /* RTT pool exhausted            */
 #define RMI_ERROR_NOT_SUPPORTED  ((uint64_t)-1)
 
 #ifndef __ASSEMBLER__

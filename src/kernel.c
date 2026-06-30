@@ -97,6 +97,25 @@ void early_init() {
               "access restored)\n",
               (uint64_t)gv2);
 
+  /* Realm + RTT demo (R3): build a realm from delegated granules and map a
+   * page into its private IPA space, then read the RTT entry back. Addresses
+   * are physical here (early_init, stage-1 MMU off). */
+  static uint8_t __attribute__((aligned(4096))) rd_pg[4096];
+  static uint8_t __attribute__((aligned(4096))) rtt_pg[4096];
+  static uint8_t __attribute__((aligned(4096))) data_pg[4096];
+  uint64_t rd = (uint64_t)rd_pg, rtt = (uint64_t)rtt_pg, dat = (uint64_t)data_pg;
+  rmi_call(RMI_GRANULE_DELEGATE, rd, 0, 0);
+  rmi_call(RMI_GRANULE_DELEGATE, rtt, 0, 0);
+  rmi_call(RMI_GRANULE_DELEGATE, dat, 0, 0);
+  uart_printf("[BOOT] RMI_REALM_CREATE(rd=%x,rtt=%x) -> %u\n", rd, rtt,
+              rmi_call(RMI_REALM_CREATE, rd, rtt, 0));
+  uint64_t r_ipa = 0x80000000ULL; /* an address in the realm's IPA space */
+  uart_printf("[BOOT] RMI_RTT_MAP(ipa=%x -> pa=%x) -> %u\n", r_ipa, dat,
+              rmi_call(RMI_RTT_MAP, rd, r_ipa, dat));
+  uint64_t resolved = rmi_call(RMI_RTT_READ_ENTRY, rd, r_ipa, 0);
+  uart_printf("[BOOT]   RTT walk: realm IPA %x -> PA %x (expect %x) %s\n", r_ipa,
+              resolved, dat, resolved == dat ? "OK" : "MISMATCH");
+
   exceptions_init();
 
   pmm_init(MEM_START, MEM_SIZE);

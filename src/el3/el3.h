@@ -1,6 +1,8 @@
 #ifndef EL3_EL3_H
 #define EL3_EL3_H
 
+#include <stdint.h>
+
 /* ---------------------------------------------------------------------------
  * el3.h — EL3 Root-world Secure Monitor
  *
@@ -13,5 +15,18 @@
  * --------------------------------------------------------------------------- */
 
 void el3_init(void);
+
+/* RMM <-> EL3 interface (SMC). The RMM stub at Realm-EL2 issues this FID to
+ * tell the monitor it has finished booting; EL3 then enters the Non-secure
+ * world. (Modeled on the real RMM-EL3 boot handshake.) */
+#define RMM_BOOT_COMPLETE 0xC4000010ULL
+
+/* Register frame saved by the EL3 vector stubs (x0..x30). */
+typedef struct {
+  uint64_t x[31];
+} el3_frame_t;
+
+/* C handler for synchronous exceptions taken to EL3 (notably SMC). */
+void el3_sync_handler(el3_frame_t *f);
 
 #endif /* EL3_EL3_H */

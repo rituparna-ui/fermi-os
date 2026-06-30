@@ -4,6 +4,7 @@
 .equ KERNEL_VA_OFFSET, 0xFFFF000000000000
 .equ EL2_STACK_SIZE,   8192
 .equ EL3_STACK_SIZE,   8192
+.equ RMM_STACK_SIZE,   8192
 .equ SPSR_EL1H_DAIF,   0x3c5   // M=EL1h(0b0101), DAIF masked(0b1111<<6)
 .equ SPSR_EL2H_DAIF,   0x3c9   // M=EL2h(0b1001), DAIF masked(0b1111<<6)
 
@@ -49,20 +50,38 @@ el3_path:
 
 	bl el3_init			// C monitor init (runs at EL3, MMU off)
 
-	// Prepare the ERET into Non-secure EL2.
-	adr x0, el2_path
+	// Launch the RMM in the Realm world at Realm-EL2. Set SP_EL2 to the RMM
+	// stack, ELR_EL3 to the RMM entry (physical), SPSR to EL2h, and select
+	// the Realm world via SCR_EL3.{NSE,NS} = 0b11. The RMM will SMC back to
+	// EL3 (RMM_BOOT_COMPLETE), and the EL3 handler then enters Non-secure.
+	ldr x0, =rmm_stack
+	ldr x1, =KERNEL_VA_OFFSET
+	sub x0, x0, x1
+	add x0, x0, #RMM_STACK_SIZE
+	msr sp_el2, x0
+
+	ldr x0, =rmm_realm_main
+	ldr x1, =KERNEL_VA_OFFSET
+	sub x0, x0, x1			// physical entry
 	msr elr_el3, x0
 	mov x0, #SPSR_EL2H_DAIF
 	msr spsr_el3, x0
+
+	// SCR_EL3 = Realm world (NSE=1, NS=1) + HCE + RW.
 	mov x0, #(SCR_NS | SCR_HCE | SCR_RW)
+	mov x1, #1
+	lsl x1, x1, #62			// NSE (bit 62)
+	orr x0, x0, x1
 	msr scr_el3, x0
 	isb
-	eret				// -> el2_path, now at NS-EL2
+	eret				// -> Realm-EL2 (rmm_realm_main)
 
 // --------------------------------------------------------------------------
 // EL2: Non-secure hypervisor bring-up (entered natively at EL2, or via the
-// EL3 ERET above). Configure stage-2 etc. and drop to EL1.
+// EL3 SMC handler's eret after the RMM boots). Configure stage-2 etc. and
+// drop to EL1.
 // --------------------------------------------------------------------------
+.global el2_path
 el2_path:
 	ldr x0, =__stack_top
 	ldr x1, =KERNEL_VA_OFFSET

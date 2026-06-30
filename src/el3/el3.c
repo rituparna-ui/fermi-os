@@ -141,9 +141,58 @@ static void el3_puthex(uint64_t v) {
   }
 }
 
+/* --- EL3 synchronous-exception (SMC) handling (E1) ----------------------- */
+#define ESR_EC_SHIFT 26
+#define EC_SMC64 0x17
+#define KVA_OFFSET 0xFFFF000000000000ULL
+
+extern char el2_path[]; /* boot.S label (Non-secure EL2 entry) */
+
+/* Reconfigure EL3 so the vector's ERET drops into Non-secure EL2 (the host).
+ * el3.c runs at EL3 with the MMU off and -fno-pic, so &el2_path is already a
+ * physical address (PC-relative adrp) — no VA offset to subtract. */
+static void el3_enter_ns(void) {
+  MSR(elr_el3, (uint64_t)el2_path);                       /* physical entry */
+  MSR(spsr_el3, 0x3c9);                                   /* EL2h, DAIF masked */
+  MSR(scr_el3, (1ULL << 0) | (1ULL << 8) | (1ULL << 10)); /* NS|HCE|RW */
+  __asm__ __volatile__("isb");
+}
+
+void el3_sync_handler(el3_frame_t *f) {
+  uint64_t esr = MRS(esr_el3);
+  uint64_t ec = (esr >> ESR_EC_SHIFT) & 0x3f;
+  if (ec == EC_SMC64) {
+    uint64_t fn = f->x[0];
+    if (fn == RMM_BOOT_COMPLETE) {
+      el3_puts("[EL3] RMM_BOOT_COMPLETE; entering Non-secure world\n");
+      el3_enter_ns(); /* el3_common's eret will now land in NS-EL2 */
+      return;
+    }
+    el3_puts("[EL3] unknown SMC fn=");
+    el3_puthex(fn);
+    el3_puts("\n");
+    f->x[0] = (uint64_t)-1;
+    return;
+  }
+  el3_puts("[EL3] *** unexpected EL3 exception EC=");
+  el3_puthex(ec);
+  el3_puts(" ESR=");
+  el3_puthex(esr);
+  el3_puts(" ELR=");
+  el3_puthex(MRS(elr_el3));
+  el3_puts(" — parking\n");
+  for (;;)
+    __asm__ __volatile__("wfi");
+}
+
 void el3_init(void) {
   el3_uart_init();
   el3_puts("\n[EL3] Root-world Secure Monitor online\n");
+
+  /* Install the EL3 vector table so SMCs (from the RMM, and later the host)
+   * trap here. Address is physical (MMU off), which is what VBAR_EL3 needs. */
+  extern char el3_vector_table[];
+  MSR(vbar_el3, (uint64_t)el3_vector_table);
 
   uint64_t el = (MRS(CurrentEL) >> 2) & 0x3;
   el3_puts("[EL3] CurrentEL = ");
@@ -165,5 +214,5 @@ void el3_init(void) {
   el3_puthex(MRS(S3_6_C2_C1_6));
   el3_puts(" (GPT: 1 TiB, all-access)\n");
 
-  el3_puts("[EL3] dropping to Non-secure EL2 (Fermi host)...\n");
+  el3_puts("[EL3] launching RMM in the Realm world (Realm-EL2)...\n");
 }

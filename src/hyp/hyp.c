@@ -269,15 +269,36 @@ void hyp_gpt_demo(void) {
   hyp_puts("[HYP] --- end delegation demo ---\n\n");
 }
 
-/* E3 demo: issue an RMI from the Non-secure host. EL3 world-switches into the
- * RMM at Realm-EL2 to service it, then returns the result to us. */
+/* E3/E4 demo: issue RMIs from the Non-secure host. EL3 world-switches into
+ * the RMM at Realm-EL2 to service them. For granule delegation the RMM calls
+ * back to EL3 (nested SMC) to flip the GPT, so a subsequent NS access faults. */
 void hyp_rmi_demo(void) {
   hyp_puts("[HYP] --- RMI round-trip through the Realm-EL2 RMM ---\n");
   hyp_puts("[HYP] SMC RMI_VERSION (host -> EL3 -> RMM -> EL3 -> host)...\n");
   uint64_t ver = hyp_smc(RMI_VERSION, 0);
   hyp_puts("[HYP] RMI_VERSION -> ");
   hyp_puthex(ver);
-  hyp_puts("\n[HYP] --- end RMI demo ---\n\n");
+  hyp_puts("\n");
+
+  volatile uint64_t *p = (volatile uint64_t *)gpf_test;
+  uint64_t pa = (uint64_t)gpf_test;
+  *p = 0x1234BEEFULL;
+  hyp_puts("[HYP] NS wrote ");
+  hyp_puthex(*p);
+  hyp_puts(" to ");
+  hyp_puthex(pa);
+  hyp_puts("\n[HYP] SMC RMI_GRANULE_DELEGATE (host asks the RMM to take it)...\n");
+  hyp_smc(RMI_GRANULE_DELEGATE, pa);
+
+  hyp_puts("[HYP] NS reads the RMM-delegated page (GPC must block)...\n");
+  uint64_t v = *p;
+  hyp_puts("[HYP] read past GPF (denied): ");
+  hyp_puthex(v);
+  hyp_puts("\n[HYP] SMC RMI_GRANULE_UNDELEGATE (host asks for it back)...\n");
+  hyp_smc(RMI_GRANULE_UNDELEGATE, pa);
+  hyp_puts("[HYP] after RMI undelegate, read = ");
+  hyp_puthex(*p);
+  hyp_puts(" (restored)\n[HYP] --- end RMI demo ---\n\n");
 }
 
 /* ------------------------------- traps ------------------------------------ */

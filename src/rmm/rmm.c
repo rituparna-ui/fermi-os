@@ -35,6 +35,47 @@ static void rmm_puts(const char *s) {
   }
 }
 
+static void rmm_puthex(uint64_t v) {
+  rmm_puts("0x");
+  for (int i = 60; i >= 0; i -= 4) {
+    uint64_t n = (v >> i) & 0xF;
+    rmm_putc((char)(n < 10 ? '0' + n : 'a' + n - 10));
+  }
+}
+
+/* Nested SMC from the RMM (Realm-EL2) to EL3 — used to ask the monitor to
+ * change a granule's GPT ownership, since only EL3 may edit the GPT. */
+static uint64_t rmm_smc(uint64_t fn, uint64_t a1) {
+  register uint64_t x0 __asm__("x0") = fn;
+  register uint64_t x1 __asm__("x1") = a1;
+  __asm__ __volatile__("smc #0" : "+r"(x0) : "r"(x1) : "memory");
+  return x0;
+}
+
+/* The RMM's own granule ownership table (Realm-private state, persists across
+ * RMI calls). Mirrors the GPT ownership the RMM has requested from EL3. */
+typedef enum { G_UNDELEGATED = 0, G_DELEGATED = 1 } gstate_t;
+#define RMM_MAX_GRANULES 64
+static struct {
+  uint64_t pa;
+  gstate_t st;
+} rmm_granules[RMM_MAX_GRANULES];
+static uint64_t rmm_ngranules;
+
+static int rmm_granule_set(uint64_t pa, gstate_t st) {
+  for (uint64_t i = 0; i < rmm_ngranules; i++)
+    if (rmm_granules[i].pa == pa) {
+      rmm_granules[i].st = st;
+      return 0;
+    }
+  if (rmm_ngranules >= RMM_MAX_GRANULES)
+    return -1;
+  rmm_granules[rmm_ngranules].pa = pa;
+  rmm_granules[rmm_ngranules].st = st;
+  rmm_ngranules++;
+  return 0;
+}
+
 void rmm_realm_main(void) {
   rmm_puts("\n[RMM] Realm-world monitor online at Realm-EL2\n");
 
@@ -67,6 +108,26 @@ void rmm_rmi_dispatch(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3) {
     rmm_puts("[RMM] (Realm-EL2) servicing RMI_VERSION\n");
     result = RMI_ABI_VERSION;
     break;
+  case RMI_GRANULE_DELEGATE: {
+    uint64_t pa = a1 & ~0xFFFULL;
+    rmm_puts("[RMM] (Realm-EL2) RMI_GRANULE_DELEGATE pa=");
+    rmm_puthex(pa);
+    rmm_puts("; asking EL3 to flip GPT -> Realm\n");
+    rmm_smc(SMC_GRANULE_DELEGATE, pa); /* nested SMC: only EL3 edits the GPT */
+    rmm_granule_set(pa, G_DELEGATED);
+    result = 0;
+    break;
+  }
+  case RMI_GRANULE_UNDELEGATE: {
+    uint64_t pa = a1 & ~0xFFFULL;
+    rmm_puts("[RMM] (Realm-EL2) RMI_GRANULE_UNDELEGATE pa=");
+    rmm_puthex(pa);
+    rmm_puts("; asking EL3 to flip GPT -> Non-secure\n");
+    rmm_smc(SMC_GRANULE_UNDELEGATE, pa);
+    rmm_granule_set(pa, G_UNDELEGATED);
+    result = 0;
+    break;
+  }
   default:
     rmm_puts("[RMM] (Realm-EL2) unknown RMI FID\n");
     result = (uint64_t)-1;

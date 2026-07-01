@@ -34,6 +34,8 @@ void el3_init(void);
 #define RMI_FID_BASE 0xC4000150ULL
 #define RMI_FID_END 0xC4000250ULL
 #define RMI_VERSION (RMI_FID_BASE + 0x0) /* () -> RMI ABI version */
+#define RMI_GRANULE_DELEGATE (RMI_FID_BASE + 0x1)   /* (pa) NS -> Realm  */
+#define RMI_GRANULE_UNDELEGATE (RMI_FID_BASE + 0x2) /* (pa) Realm -> NS  */
 #define RMI_ABI_VERSION 0x00010000ULL    /* 1.0 */
 #define RMM_RMI_COMPLETE 0xC4000013ULL   /* RMM -> EL3: finish RMI, x1=result */
 

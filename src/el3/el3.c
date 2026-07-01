@@ -203,6 +203,51 @@ static void el3_enter_ns(void) {
   __asm__ __volatile__("isb");
 }
 
+/* Saved Non-secure context while an RMI is serviced in the Realm world. Each
+ * RMI re-enters the RMM fresh at rmm_rmi_dispatch, so only the caller's state
+ * needs preserving (the RMM keeps its own state in Realm-private memory). */
+typedef struct {
+  uint64_t regs[31];
+  uint64_t elr, spsr, sp_el2;
+} world_ctx_t;
+static world_ctx_t g_ns_ctx;
+
+extern uint8_t rmm_stack[]; /* Realm-EL2 RMM stack (rmm.c) */
+#define RMM_STACK_SIZE 8192
+extern char rmm_rmi_dispatch[]; /* Realm-EL2 per-RMI entry (rmm.c) */
+
+/* Forward an RMI SMC into the RMM: save the Non-secure caller, switch VTTBR-
+ * free EL2 state to the RMM's stack, and ERET into the Realm world at the RMI
+ * dispatch entry. The host's GP regs (with the RMI FID in x0) are left in the
+ * frame so the RMM receives the request; el3_common's eret delivers them. */
+static void el3_forward_rmi_to_rmm(el3_frame_t *f) {
+  for (int i = 0; i < 31; i++)
+    g_ns_ctx.regs[i] = f->x[i];
+  g_ns_ctx.elr = MRS(elr_el3);
+  g_ns_ctx.spsr = MRS(spsr_el3);
+  g_ns_ctx.sp_el2 = MRS(sp_el2);
+
+  MSR(sp_el2, (uint64_t)rmm_stack + RMM_STACK_SIZE);
+  MSR(elr_el3, (uint64_t)rmm_rmi_dispatch);
+  MSR(spsr_el3, 0x3c9); /* EL2h, DAIF masked */
+  /* Realm world: NSE=1, NS=1, plus HCE|RW|GPF. */
+  MSR(scr_el3, (1ULL << 0) | (1ULL << 8) | (1ULL << 10) | (1ULL << 48) |
+                   (1ULL << 62));
+  __asm__ __volatile__("isb");
+}
+
+/* Return from the RMM to the Non-secure host with an RMI result in x0. */
+static void el3_return_to_ns_host(el3_frame_t *f, uint64_t result) {
+  for (int i = 0; i < 31; i++)
+    f->x[i] = g_ns_ctx.regs[i];
+  f->x[0] = result;
+  MSR(elr_el3, g_ns_ctx.elr);
+  MSR(spsr_el3, g_ns_ctx.spsr);
+  MSR(sp_el2, g_ns_ctx.sp_el2);
+  MSR(scr_el3, (1ULL << 0) | (1ULL << 8) | (1ULL << 10) | (1ULL << 48));
+  __asm__ __volatile__("isb");
+}
+
 void el3_sync_handler(el3_frame_t *f) {
   uint64_t esr = MRS(esr_el3);
   uint64_t ec = (esr >> ESR_EC_SHIFT) & 0x3f;
@@ -214,6 +259,11 @@ void el3_sync_handler(el3_frame_t *f) {
     case RMM_BOOT_COMPLETE:
       el3_puts("[EL3] RMM_BOOT_COMPLETE; entering Non-secure world\n");
       el3_enter_ns(); /* el3_common's eret will now land in NS-EL2 */
+      return;
+    case RMM_RMI_COMPLETE:
+      /* The RMM finished servicing an RMI. Return to the host with the
+       * result (x1), restoring the saved Non-secure context. */
+      el3_return_to_ns_host(f, f->x[1]);
       return;
     case SMC_GRANULE_DELEGATE:
       f->x[0] = el3_gpt_set_gpi(pa, GPI_REALM) ? (uint64_t)-1 : 0;
@@ -228,6 +278,11 @@ void el3_sync_handler(el3_frame_t *f) {
       el3_puts(" -> all-access (NS restored)\n");
       return;
     default:
+      if (fn >= RMI_FID_BASE && fn < RMI_FID_END) {
+        /* An RMI call from the host: world-switch into the RMM. */
+        el3_forward_rmi_to_rmm(f);
+        return;
+      }
       el3_puts("[EL3] unknown SMC fn=");
       el3_puthex(fn);
       el3_puts("\n");

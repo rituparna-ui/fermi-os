@@ -26,6 +26,17 @@ void el3_init(void);
 #define SMC_GRANULE_DELEGATE 0xC4000011ULL   /* (pa) NS  -> Realm */
 #define SMC_GRANULE_UNDELEGATE 0xC4000012ULL /* (pa) Realm -> NS  */
 
+/* RMI (Realm Management Interface): the Non-secure host issues these SMCs;
+ * EL3 world-switches into the RMM at Realm-EL2 to service them. The RMM
+ * returns its result to EL3 via RMM_RMI_COMPLETE (result in x1), and EL3
+ * returns it to the host. FIDs occupy a dedicated range so EL3 can recognise
+ * an RMI call and forward it. */
+#define RMI_FID_BASE 0xC4000150ULL
+#define RMI_FID_END 0xC4000250ULL
+#define RMI_VERSION (RMI_FID_BASE + 0x0) /* () -> RMI ABI version */
+#define RMI_ABI_VERSION 0x00010000ULL    /* 1.0 */
+#define RMM_RMI_COMPLETE 0xC4000013ULL   /* RMM -> EL3: finish RMI, x1=result */
+
 /* Register frame saved by the EL3 vector stubs (x0..x30). */
 typedef struct {
   uint64_t x[31];

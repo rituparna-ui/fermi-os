@@ -269,6 +269,17 @@ void hyp_gpt_demo(void) {
   hyp_puts("[HYP] --- end delegation demo ---\n\n");
 }
 
+/* E3 demo: issue an RMI from the Non-secure host. EL3 world-switches into the
+ * RMM at Realm-EL2 to service it, then returns the result to us. */
+void hyp_rmi_demo(void) {
+  hyp_puts("[HYP] --- RMI round-trip through the Realm-EL2 RMM ---\n");
+  hyp_puts("[HYP] SMC RMI_VERSION (host -> EL3 -> RMM -> EL3 -> host)...\n");
+  uint64_t ver = hyp_smc(RMI_VERSION, 0);
+  hyp_puts("[HYP] RMI_VERSION -> ");
+  hyp_puthex(ver);
+  hyp_puts("\n[HYP] --- end RMI demo ---\n\n");
+}
+
 /* ------------------------------- traps ------------------------------------ */
 
 static const char *ec_name(uint64_t ec) {

@@ -51,3 +51,32 @@ void rmm_realm_main(void) {
   for (;;)
     __asm__ __volatile__("wfi");
 }
+
+/* Per-RMI dispatch entry. EL3 world-switches here (Realm-EL2) whenever the
+ * Non-secure host issues an RMI SMC, passing the FID in x0 and args in x1..
+ * We service the request and hand the result back to EL3 (which returns it to
+ * the host) via SMC(RMM_RMI_COMPLETE, result). Re-entered fresh per call. */
+void rmm_rmi_dispatch(uint64_t fn, uint64_t a1, uint64_t a2, uint64_t a3) {
+  (void)a1;
+  (void)a2;
+  (void)a3;
+  uint64_t result;
+
+  switch (fn) {
+  case RMI_VERSION:
+    rmm_puts("[RMM] (Realm-EL2) servicing RMI_VERSION\n");
+    result = RMI_ABI_VERSION;
+    break;
+  default:
+    rmm_puts("[RMM] (Realm-EL2) unknown RMI FID\n");
+    result = (uint64_t)-1;
+    break;
+  }
+
+  register uint64_t x0 __asm__("x0") = RMM_RMI_COMPLETE;
+  register uint64_t x1 __asm__("x1") = result;
+  __asm__ __volatile__("smc #0" : "+r"(x0) : "r"(x1) : "memory");
+
+  for (;;)
+    __asm__ __volatile__("wfi");
+}

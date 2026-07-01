@@ -21,6 +21,11 @@ void el3_init(void);
  * world. (Modeled on the real RMM-EL3 boot handshake.) */
 #define RMM_BOOT_COMPLETE 0xC4000010ULL
 
+/* Host/RMM -> EL3 granule delegation (E2): flip a page's GPT ownership (GPI)
+ * between Non-secure and Realm. Only EL3 can edit the GPT. */
+#define SMC_GRANULE_DELEGATE 0xC4000011ULL   /* (pa) NS  -> Realm */
+#define SMC_GRANULE_UNDELEGATE 0xC4000012ULL /* (pa) Realm -> NS  */
+
 /* Register frame saved by the EL3 vector stubs (x0..x30). */
 typedef struct {
   uint64_t x[31];

@@ -1,4 +1,5 @@
 #include "hyp.h"
+#include "el3/el3.h" /* SMC_GRANULE_DELEGATE / UNDELEGATE */
 #include "hyp/hypercall.h" /* HVC_* ABI */
 #include "mm/mmu/mmu.h" /* _1GB, _512GB */
 #include "mm/pmm/pmm.h" /* MEM_START, MEM_SIZE */
@@ -223,6 +224,49 @@ void hyp_init(void) {
   __asm__ __volatile__("isb");
 
   hyp_puts("[HYP] stage-2 enabled (HCR_EL2.VM=1), dropping to EL1 guest...\n");
+}
+
+/* E2 demo: drive real FEAT_RME granule delegation from the Non-secure world.
+ * We own gpf_test (all-access granule); ask EL3 (via SMC) to give it to the
+ * Realm PAS, then prove a Non-secure access now faults in hardware (GPC),
+ * then take it back. The GPF is routed to EL3 (SCR_EL3.GPF), which reports it
+ * and steps over the access. Runs at NS-EL2 with the stage-1 MMU off, so the
+ * symbol address is the physical address == the granule's PA. */
+__attribute__((aligned(4096), section(".hyp_tables"))) static uint8_t gpf_test[4096];
+
+static uint64_t hyp_smc(uint64_t fn, uint64_t a1) {
+  register uint64_t x0 __asm__("x0") = fn;
+  register uint64_t x1 __asm__("x1") = a1;
+  __asm__ __volatile__("smc #0" : "+r"(x0) : "r"(x1) : "memory");
+  return x0;
+}
+
+void hyp_gpt_demo(void) {
+  volatile uint64_t *p = (volatile uint64_t *)gpf_test;
+  uint64_t pa = (uint64_t)gpf_test;
+
+  hyp_puts("\n[HYP] --- FEAT_RME granule delegation demo (hardware GPC) ---\n");
+  *p = 0x00C0FFEEULL;
+  hyp_puts("[HYP] NS wrote test granule PA=");
+  hyp_puthex(pa);
+  hyp_puts(" = 0xc0ffee (allowed)\n");
+
+  hyp_puts("[HYP] SMC GRANULE_DELEGATE -> EL3 flips its GPT entry to Realm\n");
+  hyp_smc(SMC_GRANULE_DELEGATE, pa);
+
+  hyp_puts("[HYP] NS now reads the delegated granule (GPC must block)...\n");
+  uint64_t v = *p; /* -> Granule Protection Fault, routed to EL3, stepped */
+  hyp_puts("[HYP] NS read completed past the GPF (value undefined: ");
+  hyp_puthex(v);
+  hyp_puts(")\n");
+
+  hyp_puts("[HYP] SMC GRANULE_UNDELEGATE -> EL3 returns it to Non-secure\n");
+  hyp_smc(SMC_GRANULE_UNDELEGATE, pa);
+  uint64_t v2 = *p;
+  hyp_puts("[HYP] NS read after undelegate = ");
+  hyp_puthex(v2);
+  hyp_puts(" (access restored, data intact)\n");
+  hyp_puts("[HYP] --- end delegation demo ---\n\n");
 }
 
 /* ------------------------------- traps ------------------------------------ */

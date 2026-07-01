@@ -90,6 +90,8 @@ el2_path:
 
 	bl hyp_init
 
+	// E2: demonstrate real FEAT_RME granule delegation from Non-secure EL2.
+	bl hyp_gpt_demo
 	// Repoint SP_EL2 at a dedicated EL2 stack so guest->EL2 traps don't
 	// clobber the EL1 kernel stack.
 	ldr x0, =el2_stack

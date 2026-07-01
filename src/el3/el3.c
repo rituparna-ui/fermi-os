@@ -90,6 +90,46 @@ static void el3_enable_gpc(void) {
   __asm__ __volatile__("tlbi paallos; dsb sy; isb");
 }
 
+/* --- Per-granule delegation via an L1 GPT (E2) --------------------------- *
+ * To change ownership of a single 4 KiB page, the 1 GiB L0 block covering it
+ * must be expanded into an L1 table with per-granule GPI. For 4 KiB granules
+ * an L1 table covers 1 GiB as 262144 granules, packed 16 GPIs (4 bits each)
+ * per 64-bit entry => 16384 entries (128 KiB). We keep one L1 table, bound to
+ * the first 1 GiB region that gets delegated (the host's RAM region). */
+#define GPT_L0_TBL_TYPE 0x3
+#define GPT_L1_ENTRIES 16384
+__attribute__((aligned(0x20000), section(".hyp_tables"))) static uint64_t gpt_l1[GPT_L1_ENTRIES];
+static uint64_t gpt_l1_gb = ~0ULL; /* which 1 GiB index gpt_l1 backs (unset) */
+
+/* Set the GPI of the 4 KiB granule containing `pa`. Splits the L0 block to the
+ * L1 table on first use. Returns 0 on success, -1 if unsupported. */
+static int el3_gpt_set_gpi(uint64_t pa, uint64_t gpi) {
+  uint64_t gb = pa >> 30; /* 1 GiB index */
+
+  if (gpt_l1_gb == ~0ULL) {
+    /* Bind the single L1 table to this region; fill it with the block's
+     * current GPI (ANY) so existing access is preserved, then splice it in. */
+    uint64_t cur = (gpt_l0[gb] >> 4) & 0xF; /* current block GPI (ANY) */
+    uint64_t fill = 0;
+    for (int n = 0; n < 16; n++)
+      fill |= cur << (4 * n);
+    for (int i = 0; i < GPT_L1_ENTRIES; i++)
+      gpt_l1[i] = fill;
+    gpt_l0[gb] = ((uint64_t)gpt_l1 & 0x0000FFFFFFFFF000ULL) | GPT_L0_TBL_TYPE;
+    gpt_l1_gb = gb;
+    __asm__ __volatile__("dsb sy");
+  }
+  if (gb != gpt_l1_gb)
+    return -1; /* only one region supported in this milestone */
+
+  uint64_t goff = (pa >> 12) & ((1ULL << 18) - 1); /* granule idx within 1 GiB */
+  uint64_t eidx = goff >> 4;                        /* L1 entry (16 GPIs each) */
+  uint64_t nib = goff & 0xF;                        /* which nibble            */
+  gpt_l1[eidx] = (gpt_l1[eidx] & ~(0xFULL << (4 * nib))) | (gpi << (4 * nib));
+  __asm__ __volatile__("dsb sy; tlbi paallos; dsb sy; isb");
+  return 0;
+}
+
 /* PL011 UART0 on QEMU virt. With secure=on this UART is reachable from Root. */
 #define UART0 0x09000000UL
 #define U_DR (UART0 + 0x00)
@@ -144,36 +184,72 @@ static void el3_puthex(uint64_t v) {
 /* --- EL3 synchronous-exception (SMC) handling (E1) ----------------------- */
 #define ESR_EC_SHIFT 26
 #define EC_SMC64 0x17
+#define EC_DABT_LOWER 0x24 /* data abort from a lower EL */
+#define EC_DABT_CUR 0x25   /* data abort from EL3 itself */
+#define EC_GPC 0x1E        /* FEAT_RME Granule Protection Check exception */
 #define KVA_OFFSET 0xFFFF000000000000ULL
 
 extern char el2_path[]; /* boot.S label (Non-secure EL2 entry) */
 
 /* Reconfigure EL3 so the vector's ERET drops into Non-secure EL2 (the host).
  * el3.c runs at EL3 with the MMU off and -fno-pic, so &el2_path is already a
- * physical address (PC-relative adrp) — no VA offset to subtract. */
+ * physical address (PC-relative adrp) — no VA offset to subtract. SCR_EL3.GPF
+ * routes Granule Protection Faults to EL3 so we can report them. */
 static void el3_enter_ns(void) {
-  MSR(elr_el3, (uint64_t)el2_path);                       /* physical entry */
-  MSR(spsr_el3, 0x3c9);                                   /* EL2h, DAIF masked */
-  MSR(scr_el3, (1ULL << 0) | (1ULL << 8) | (1ULL << 10)); /* NS|HCE|RW */
+  MSR(elr_el3, (uint64_t)el2_path);                          /* physical entry */
+  MSR(spsr_el3, 0x3c9);                                      /* EL2h, DAIF masked */
+  MSR(scr_el3, (1ULL << 0) | (1ULL << 8) | (1ULL << 10) |   /* NS|HCE|RW */
+                   (1ULL << 48));                            /* GPF -> EL3 */
   __asm__ __volatile__("isb");
 }
 
 void el3_sync_handler(el3_frame_t *f) {
   uint64_t esr = MRS(esr_el3);
   uint64_t ec = (esr >> ESR_EC_SHIFT) & 0x3f;
+
   if (ec == EC_SMC64) {
     uint64_t fn = f->x[0];
-    if (fn == RMM_BOOT_COMPLETE) {
+    uint64_t pa = f->x[1] & ~0xFFFULL;
+    switch (fn) {
+    case RMM_BOOT_COMPLETE:
       el3_puts("[EL3] RMM_BOOT_COMPLETE; entering Non-secure world\n");
       el3_enter_ns(); /* el3_common's eret will now land in NS-EL2 */
       return;
+    case SMC_GRANULE_DELEGATE:
+      f->x[0] = el3_gpt_set_gpi(pa, GPI_REALM) ? (uint64_t)-1 : 0;
+      el3_puts("[EL3] GRANULE_DELEGATE pa=");
+      el3_puthex(pa);
+      el3_puts(" -> Realm PAS (NS now blocked by GPC)\n");
+      return;
+    case SMC_GRANULE_UNDELEGATE:
+      f->x[0] = el3_gpt_set_gpi(pa, GPI_ANY) ? (uint64_t)-1 : 0;
+      el3_puts("[EL3] GRANULE_UNDELEGATE pa=");
+      el3_puthex(pa);
+      el3_puts(" -> all-access (NS restored)\n");
+      return;
+    default:
+      el3_puts("[EL3] unknown SMC fn=");
+      el3_puthex(fn);
+      el3_puts("\n");
+      f->x[0] = (uint64_t)-1;
+      return;
     }
-    el3_puts("[EL3] unknown SMC fn=");
-    el3_puthex(fn);
+  }
+
+  if (ec == EC_GPC || ec == EC_DABT_LOWER || ec == EC_DABT_CUR) {
+    /* Granule Protection Fault routed to EL3 by SCR_EL3.GPF (reported with
+     * EC=0x1E, the FEAT_RME GPC exception class). Report the blocked PA and
+     * step over the faulting instruction so the offending world keeps running
+     * (the access is denied; no data is returned). */
+    el3_puts("[EL3] *** Granule Protection Fault *** blocked access, FAR_EL3=");
+    el3_puthex(MRS(far_el3));
+    el3_puts(" ESR_EL3=");
+    el3_puthex(esr);
     el3_puts("\n");
-    f->x[0] = (uint64_t)-1;
+    MSR(elr_el3, MRS(elr_el3) + 4);
     return;
   }
+
   el3_puts("[EL3] *** unexpected EL3 exception EC=");
   el3_puthex(ec);
   el3_puts(" ESR=");

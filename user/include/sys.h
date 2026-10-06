@@ -97,6 +97,15 @@ static inline int *__fermi_errno_loc(void) {
 #define ENOTEMPTY  39
 #define EOPNOTSUPP 95
 
+/* open(2) flags — identical to the kernel's, and to Linux's. */
+#define O_RDONLY 0x0000
+#define O_WRONLY 0x0001
+#define O_RDWR   0x0002
+#define O_CREAT  0x0040
+#define O_EXCL   0x0080
+#define O_TRUNC  0x0200
+#define O_APPEND 0x0400
+
 /* MAP_ and PROT_ flags, plus the mmap-family syscall numbers. */
 #define MAP_SHARED    0x01
 #define MAP_PRIVATE   0x02
@@ -144,10 +153,20 @@ static inline ssize_t sys_write(int fd, const void *buf, size_t count) {
   return (ssize_t)x0;
 }
 
-static inline int sys_open(const char *path) {
+/* open(2). Linux arg order: path, flags, mode.
+ *
+ * `mode` is accepted but not enforced by the kernel yet (no ownership model);
+ * it is still passed so the ABI matches and a later umask() has something to
+ * work against. */
+static inline int sys_open(const char *path, int flags, int mode) {
   register const char *x0 __asm__("x0") = path;
+  register long        x1 __asm__("x1") = flags;
+  register long        x2 __asm__("x2") = mode;
   register uint64_t    x8 __asm__("x8") = SYS_OPEN;
-  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+  __asm__ __volatile__("svc #0"
+                       : "+r"(x0)
+                       : "r"(x1), "r"(x2), "r"(x8)
+                       : "memory");
   return (int)(long)x0;
 }
 

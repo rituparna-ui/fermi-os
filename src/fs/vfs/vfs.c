@@ -175,6 +175,23 @@ void fd_table_destroy(fd_table_t *t) {
   kfree(t);
 }
 
+/* Hook installed by the mounted filesystem so open(O_CREAT) can create real
+ * on-disk files. NULL until something registers one, which is why
+ * vfs_create_file() fails cleanly when no filesystem is present. */
+static int (*vfs_create_file_hook)(const char *path);
+
+int vfs_register_create_file(int (*fn)(const char *path)) {
+  vfs_create_file_hook = fn;
+  return 0;
+}
+
+int vfs_create_file(const char *path) {
+  if (!vfs_create_file_hook) {
+    return -1;
+  }
+  return vfs_create_file_hook(path);
+}
+
 static int alloc_fd(fd_table_t *t) {
   for (int i = 0; i < MAX_FDS; i++) {
     if (!t->fds[i]) {
@@ -185,30 +202,70 @@ static int alloc_fd(fd_table_t *t) {
   return -1;
 }
 
-int fd_open(fd_table_t *t, const char *path) {
-  vnode_t *node = vfs_resolve(path);
-
-  if (!node) {
+int fd_open_ex(fd_table_t *t, const char *path, int flags, int mode) {
+  /* Reject a nonsense access mode up front so a caller passing a garbage flags
+   * word gets one clean failure instead of a confusing one later. */
+  if ((flags & O_ACCMODE) > O_RDWR) {
+    return -1;
+  }
+  /* O_EXCL is meaningless without O_CREAT; honouring it anyway would mask a
+   * caller bug. */
+  if ((flags & O_EXCL) && !(flags & O_CREAT)) {
     return -1;
   }
 
-  int fd = alloc_fd(t);
+  vnode_t *node = vfs_resolve(path);
 
+  if (!node) {
+    if (!(flags & O_CREAT)) {
+      return -1;
+    }
+    /* Create an empty file. The VFS layer is filesystem-agnostic, so this goes
+     * through whichever hook the mounted filesystem installed. */
+    if (vfs_create_file(path) < 0) {
+      return -1;
+    }
+    node = vfs_resolve(path);
+    if (!node) {
+      return -1;
+    }
+  } else if ((flags & O_CREAT) && (flags & O_EXCL)) {
+    return -1; /* O_EXCL|O_CREAT must fail when the file exists */
+  }
+
+  /* O_TRUNC clears the contents. Done after resolution so a file that does not
+   * exist yet (O_CREAT) is naturally already empty. */
+  if ((flags & O_TRUNC) && node->ops && node->ops->truncate) {
+    if (node->ops->truncate(node, 0) < 0) {
+      return -1;
+    }
+    node->size = 0;
+  }
+
+  int fd = alloc_fd(t);
   if (fd < 0) {
     return -1;
   }
 
   file_t *f = kmalloc(sizeof(file_t));
-
   if (!f) {
     return -1;
   }
 
   f->vnode = node;
-  f->offset = 0;
+  f->flags = flags & O_ACCMODE;
+  /* O_APPEND means every write goes to the end. That is a property of the
+   * write path, so record the flag and start the descriptor at the end. */
+  f->offset = (flags & O_APPEND) ? node->size : 0;
+
+  (void)mode; /* no ownership model yet: accepted, not enforced */
   t->fds[fd] = f;
 
   return fd;
+}
+
+int fd_open(fd_table_t *t, const char *path) {
+  return fd_open_ex(t, path, O_RDONLY, 0);
 }
 
 int fd_read(fd_table_t *t, int fd, void *buf, size_t count) {
@@ -217,6 +274,13 @@ int fd_read(fd_table_t *t, int fd, void *buf, size_t count) {
   }
 
   file_t *f = t->fds[fd];
+
+  /* A write-only descriptor must not read and vice versa. Enforced here rather
+   * than per-driver so every filesystem reports the same failure instead of
+   * two different ones. */
+  if (f->flags == O_WRONLY) {
+    return -1;
+  }
 
   if (!f->vnode->ops || !f->vnode->ops->read) {
     return -1;
@@ -232,11 +296,22 @@ int fd_write(fd_table_t *t, int fd, const void *buf, size_t count) {
 
   file_t *f = t->fds[fd];
 
+  if (f->flags == O_RDONLY) {
+    return -1;
+  }
+
   if (!f->vnode->ops || !f->vnode->ops->write) {
     return -1;
   }
 
   return f->vnode->ops->write(f->vnode, f, buf, count);
+}
+
+int64_t fd_size(fd_table_t *t, int fd) {
+  if (fd < 0 || fd >= MAX_FDS || !t->fds[fd]) {
+    return -1;
+  }
+  return (int64_t)t->fds[fd]->vnode->size;
 }
 
 int fd_close(fd_table_t *t, int fd) {

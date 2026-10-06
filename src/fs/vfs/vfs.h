@@ -36,6 +36,10 @@ typedef struct file_operations {
   int (*read)(struct vnode *node, struct file *f, void *buf, size_t count);
   int (*write)(struct vnode *node, struct file *f, const void *buf,
                size_t count);
+  /* Resize the file to `size` bytes. Optional: NULL means the filesystem does
+   * not support truncation, and open(O_TRUNC) is rejected rather than silently
+   * ignored. */
+  int (*truncate)(struct vnode *node, uint64_t size);
 } file_operations_t;
 
 /*
@@ -63,6 +67,15 @@ vnode_t *vfs_root(void);
 vnode_t *vfs_create_node(vnode_t *parent, const char *name, vnode_type_t type);
 vnode_t *vfs_resolve(const char *path);
 
+/* Create an empty regular file at `path`, for open(O_CREAT).
+ *
+ * Registered by whichever filesystem is mounted (see fat32_vfs_mount): making a
+ * file needs on-disk knowledge — allocating a cluster chain and a directory
+ * entry — that the filesystem-agnostic VFS layer deliberately does not have.
+ * Returns -1 when no filesystem has registered a handler. */
+int vfs_register_create_file(int (*fn)(const char *path));
+int vfs_create_file(const char *path);
+
 /* Register a char device under /dev/<name>. Creates /dev if missing. */
 vnode_t *vfs_register_chardev(const char *name, file_operations_t *ops);
 
@@ -75,9 +88,25 @@ vnode_t *vfs_register_blockdev(const char *name, file_operations_t *ops);
 #define SEEK_END 2
 
 /* Open file */
+/* open(2) flags — identical to Linux/POSIX values so user space can pass
+ * <fcntl.h> constants straight through with no translation layer. */
+#define O_RDONLY 0x0000
+#define O_WRONLY 0x0001
+#define O_RDWR   0x0002
+#define O_CREAT  0x0040
+#define O_EXCL   0x0080
+#define O_TRUNC  0x0200
+#define O_APPEND 0x0400
+
+#define O_ACCMODE 0x0003
+
 typedef struct file {
   vnode_t *vnode;
-  int64_t offset;
+  int64_t  offset;
+  /* Access mode from open()'s flags (O_RDONLY / O_WRONLY / O_RDWR). Recorded
+   * per descriptor so read/write can reject a call that was never permitted,
+   * instead of failing deep inside a driver. */
+  int flags;
 } file_t;
 
 /* Per-process fd table */
@@ -89,10 +118,24 @@ typedef struct fd_table {
 
 fd_table_t *fd_table_create(void);
 void fd_table_destroy(fd_table_t *t);
+
+/* Open with explicit flags; returns a new fd or -1.
+ *
+ * `mode` is accepted and validated for permission bits but not yet applied:
+ * this kernel has no ownership model. It is recorded so a later umask() has
+ * something to operate on rather than being silently dropped. */
+int fd_open_ex(fd_table_t *t, const char *path, int flags, int mode);
+
+/* Convenience wrapper: fd_open_ex(t, path, O_RDONLY, 0). */
 int fd_open(fd_table_t *t, const char *path);
+
 int fd_read(fd_table_t *t, int fd, void *buf, size_t count);
 int fd_write(fd_table_t *t, int fd, const void *buf, size_t count);
 int fd_close(fd_table_t *t, int fd);
 int64_t fd_seek(fd_table_t *t, int fd, int64_t offset, int whence);
+
+/* Size of an open file in bytes, or -1. Backs stdio's ftell() and lets callers
+ * ask how much is left without a full stat syscall. */
+int64_t fd_size(fd_table_t *t, int fd);
 
 #endif

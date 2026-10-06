@@ -417,8 +417,16 @@ int fat32_create(const char *path, const void *data, uint32_t len) {
   }
 
   /* Allocate clusters for data */
+  /* Always allocate at least one cluster, even for an empty file.
+   *
+   * fat32_write_at() addresses data through the chain starting at
+   * first_cluster and has no way to bootstrap a chain that doesn't exist yet,
+   * so a zero-cluster file could be created but never written — the first
+   * fwrite() to a freshly fopen'd "w" file would fail. Allocating one cluster
+   * up front (what Linux does too) keeps the invariant "a regular file always
+   * has a start cluster", and costs one cluster for an empty file. */
   uint32_t clusters_needed =
-      len == 0 ? 0 : (len + vol.bytes_per_cluster - 1) / vol.bytes_per_cluster;
+      len == 0 ? 1 : (len + vol.bytes_per_cluster - 1) / vol.bytes_per_cluster;
 
   uint32_t first_cluster = 0;
   uint32_t prev_cluster = 0;
@@ -464,6 +472,220 @@ int fat32_create(const char *path, const void *data, uint32_t len) {
     return EERROR;
   }
 
+  return ESUCCESS;
+}
+
+/* Rewrite a directory entry's size field, found by walking `path`.
+ *
+ * FAT32 keeps a file's length in the directory entry, not in the cluster chain,
+ * so extending a file on disk is not enough — the entry must be updated too or
+ * the extra bytes are invisible to the next reader. Clusters are deliberately
+ * NOT freed here: the data past the new size simply becomes unreachable, which
+ * is exactly what truncate means, and reclaiming them needs a chain rewrite
+ * with its own failure modes.
+ */
+int fat32_truncate_path(const char *path, uint32_t new_size) {
+  /* Per-call sector buffer — see fat32_read(). */
+  uint8_t sec_buf[SECTOR] __attribute__((aligned(16)));
+
+  while (*path == '/') {
+    path++;
+  }
+
+  /* Split into parent directory path + final component, mirroring
+   * fat32_create() so both agree on what "path" means. */
+  const char *slash = 0;
+  for (const char *q = path; *q; q++) {
+    if (*q == '/') {
+      slash = q;
+    }
+  }
+
+  char dirpath[256];
+  char namebuf[13];
+
+  if (slash) {
+    size_t n = (size_t)(slash - path);
+    if (n >= sizeof(dirpath)) {
+      return EERROR;
+    }
+    memcpy(dirpath, path, n);
+    dirpath[n] = '\0';
+    const char *base = slash + 1;
+    size_t bl = strlen(base);
+    if (bl >= sizeof(namebuf)) {
+      return EERROR;
+    }
+    memcpy(namebuf, base, bl + 1);
+  } else {
+    dirpath[0] = '\0';
+    size_t bl = strlen(path);
+    if (bl >= sizeof(namebuf)) {
+      return EERROR;
+    }
+    memcpy(namebuf, path, bl + 1);
+  }
+
+  uint32_t dir_cluster = vol.root_cluster;
+  if (dirpath[0]) {
+    if (fat32_find(dirpath, &dir_cluster, 0) != ESUCCESS) {
+      return EERROR;
+    }
+  }
+
+  uint8_t target[11];
+  to_83(namebuf, target);
+
+  /* Walk the directory's sectors looking for the entry, then rewrite just
+   * that entry's size field and flush the containing sector. */
+  uint32_t cluster = dir_cluster;
+  while (cluster < FAT32_EOC) {
+    uint32_t base = cluster_to_sector(cluster);
+    for (uint32_t s = 0; s < vol.sectors_per_cluster; s++) {
+      if (blk_read(base + s, sec_buf) != ESUCCESS) {
+        return EERROR;
+      }
+      for (uint32_t off = 0; off + DIR_ENTRY_SIZE <= SECTOR;
+           off += DIR_ENTRY_SIZE) {
+        struct dir_entry *e = (struct dir_entry *)(sec_buf + off);
+        if (e->name[0] == 0x00 || e->name[0] == 0xE5 || e->attr == ATTR_LFN) {
+          continue;
+        }
+        if (memcmp(e->name, target, 11) == 0) {
+          e->size = new_size;
+          if (blk_write(base + s, sec_buf) != ESUCCESS) {
+            return EERROR;
+          }
+          return ESUCCESS;
+        }
+      }
+    }
+    cluster = fat_next(cluster);
+  }
+
+  return EERROR;
+}
+
+/* Append `count` clusters to the chain ending at `last`, returning the first
+ * newly allocated cluster (0 if none was allocated). Each FAT entry is
+ * written before the next is allocated, so a failure mid-extension leaves a
+ * shorter-but-valid chain rather than a dangling one. */
+static uint32_t fat_extend_chain(uint32_t last, uint32_t count) {
+  uint32_t first_new = 0;
+  uint32_t cur = last;
+
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t nc = fat_alloc_cluster();
+    if (!nc) {
+      return first_new;
+    }
+    if (fat_write(cur, nc) != ESUCCESS) {
+      return first_new;
+    }
+    if (!first_new) {
+      first_new = nc;
+    }
+    cur = nc;
+  }
+
+  if (first_new) {
+    fat_write(cur, FAT32_EOC);
+  }
+  return first_new;
+}
+
+/* Walk to the cluster holding byte `offset`, allocating clusters as needed.
+ * On success stores that cluster in *out_cluster and the byte offset within it
+ * in *out_inner. `create` decides whether a missing cluster is allocated (a
+ * write, which may extend the file) or makes this fail (a read past EOF). */
+static int fat_seek_cluster(uint32_t first_cluster, uint32_t offset,
+                            uint32_t *out_cluster, uint32_t *out_inner,
+                            int create) {
+  uint32_t bytes_per_cluster = vol.sectors_per_cluster * SECTOR;
+  uint32_t want  = offset / bytes_per_cluster;
+  uint32_t cluster = first_cluster;
+
+  for (uint32_t i = 0; i < want; i++) {
+    uint32_t next = fat_next(cluster);
+    if (next >= FAT32_EOC) {
+      if (!create) {
+        return EERROR;
+      }
+      /* fat_extend_chain overwrites last's entry, so no EOC pre-write is
+       * needed (and doing it first would be undone immediately). */
+      uint32_t grown = fat_extend_chain(cluster, 1);
+      if (!grown) {
+        return EERROR;
+      }
+      next = grown;
+    }
+    cluster = next;
+  }
+
+  *out_cluster = cluster;
+  *out_inner   = offset % bytes_per_cluster;
+  return ESUCCESS;
+}
+
+/* Write `len` bytes at byte `offset`, extending the cluster chain as required.
+ * On success *out_new_size (when non-NULL) receives offset + len, which the
+ * caller stores back into the directory entry. */
+int fat32_write_at(uint32_t first_cluster, uint32_t offset, const void *data,
+                   uint32_t len, uint32_t *out_new_size) {
+  /* Per-call sector buffer — see fat32_read() for why this cannot be a
+   * file-scope static. */
+  uint8_t sec_buf[SECTOR] __attribute__((aligned(16)));
+
+  if (!first_cluster) {
+    return EERROR;
+  }
+
+  const uint8_t *src = (const uint8_t *)data;
+  uint32_t remaining = len;
+
+  while (remaining > 0) {
+    uint32_t cluster = 0, inner = 0;
+    if (fat_seek_cluster(first_cluster, offset, &cluster, &inner, 1) !=
+        ESUCCESS) {
+      return EERROR;
+    }
+
+    uint32_t base        = cluster_to_sector(cluster);
+    uint32_t cluster_end = vol.sectors_per_cluster * SECTOR;
+
+    while (inner < cluster_end && remaining > 0) {
+      uint32_t sector_off = inner / SECTOR;
+      uint32_t inner_off  = inner % SECTOR;
+      uint32_t chunk      = SECTOR - inner_off;
+      if (chunk > remaining) {
+        chunk = remaining;
+      }
+
+      if (inner_off != 0 || chunk != SECTOR) {
+        /* Partial sector: read-modify-write so neighbouring bytes survive. */
+        if (blk_read(base + sector_off, sec_buf) != ESUCCESS) {
+          return EERROR;
+        }
+        memcpy(sec_buf + inner_off, src, chunk);
+      } else {
+        /* Whole sector: overwrite directly, skipping the read. */
+        memcpy(sec_buf, src, SECTOR);
+      }
+
+      if (blk_write(base + sector_off, sec_buf) != ESUCCESS) {
+        return EERROR;
+      }
+
+      src += chunk;
+      remaining -= chunk;
+      inner += chunk;
+      offset += chunk;
+    }
+  }
+
+  if (out_new_size) {
+    *out_new_size = offset;
+  }
   return ESUCCESS;
 }
 

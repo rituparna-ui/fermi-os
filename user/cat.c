@@ -12,6 +12,7 @@
  * Only locals + string literals.
  */
 #include "sys.h"
+#include <fcntl.h>
 
 static void cat_fd(int fd) {
   char buf[256];
@@ -31,7 +32,7 @@ int main(int argc, char **argv) {
   }
 
   for (int i = 1; i < argc; i++) {
-    int fd = sys_open(argv[i]);
+    int fd = sys_open(argv[i], O_RDONLY, 0);
     if (fd < 0) {
       u_puts("cat: cannot open ");
       u_puts(argv[i]);

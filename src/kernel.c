@@ -1126,6 +1126,21 @@ static void task_libctest(void) {
   sys_exit();
 }
 
+/* Runs the on-disk STDIO test: a real exec'd program linked against libc.a
+ * that writes a file to the FAT32 disk and reads it back, covering <stdio.h>,
+ * formatted output, libc buffering and the kernel's write path together. */
+static void task_stdiotest(void) {
+  const char *argv[2];
+  argv[0] = "/mnt/fat32/STDIO.ELF";
+  argv[1] = 0;
+
+  if (sys_exec(argv[0], argv) < 0) {
+    t_puts("[STDIO TEST] exec failed (is STDIO.ELF on the disk image?)\n");
+    sys_exit();
+  }
+  sys_exit();
+}
+
 /* ---- fork memory-isolation test ---------------------------------------- */
 
 /* SYS_FORK returns the child pid in x0 (and 0 in the child). The result
@@ -1466,6 +1481,7 @@ void kernel_main() {
   sched_create_task("task_forkmem", task_fork_mem);
   sched_create_task("task_errnotest", task_errnotest);
   sched_create_task("task_libctest", task_libctest);
+  sched_create_task("task_stdiotest", task_stdiotest);
   sched_create_task("task_mmguard", task_mmap_guard);
   sched_create_kernel_task("netd", netd);
 

@@ -14,9 +14,15 @@ typedef struct fat32_priv {
 /* Forward decls */
 static vnode_t *fat32_lookup(vnode_t *dir, const char *name, size_t namelen);
 static int fat32_file_read(vnode_t *n, file_t *f, void *buf, size_t count);
+static int fat32_file_write(vnode_t *n, file_t *f, const void *buf,
+                            size_t count);
+static int fat32_file_truncate(vnode_t *n, uint64_t size);
+static int fat32_rel_path(const char *vpath, char *out, size_t outlen);
 
 static file_operations_t fat32_file_ops = {
-    .read = fat32_file_read, .write = NULL, /* TODO */
+    .read = fat32_file_read,
+    .write = fat32_file_write,
+    .truncate = fat32_file_truncate,
 };
 
 static vnode_operations_t fat32_dir_ops = {
@@ -125,9 +131,177 @@ static int fat32_file_read(vnode_t *n, file_t *f, void *buf, size_t count) {
   return (int)to_read;
 }
 
+/* Reconstruct a vnode's on-disk path by walking parent links.
+ *
+ * Writes and truncates have to update the directory entry, and FAT32 identifies
+ * files by path, not by cluster — so a write op needs the path of the vnode it
+ * is being called on. Rebuilding it here keeps the caller from having to thread
+ * the original open() path down through file_operations_t for every op.
+ *
+ * Returns 0 on success, -1 if the chain is longer than `buflen` or is broken. */
+static int fat32_build_vnode_path(vnode_t *n, char *buf, size_t buflen) {
+  /* Collect vnodes root-first, then emit them leaf-to-root. The tree depth is
+   * tiny (FAT32 paths), so a fixed stack is enough; an over-deep chain is
+   * rejected rather than walked off the end. */
+  vnode_t *chain[16];
+  int      depth = 0;
+
+  for (vnode_t *p = n; p && p->parent; p = p->parent) {
+    if (depth >= (int)(sizeof(chain) / sizeof(chain[0]))) {
+      return -1;
+    }
+    chain[depth++] = p;
+  }
+
+  size_t pos = 0;
+  for (int i = depth - 1; i >= 0; i--) {
+    const char *name = chain[i]->name;
+    size_t      len = strlen(name);
+    if (pos + len + 2 > buflen) {
+      return -1;
+    }
+    buf[pos++] = '/';
+    for (size_t k = 0; k < len; k++) {
+      buf[pos++] = name[k];
+    }
+  }
+  if (pos + 1 > buflen) {
+    return -1;
+  }
+  buf[pos] = '\0';
+  return 0;
+}
+
+/* Write at the descriptor's offset, extending the file.
+ *
+ * fat32_write_at() does the cluster-chain work; the fiddly part here is that a
+ * FAT32 file's length lives in the directory entry, so the in-memory size must
+ * be pushed back to disk after every write. A size that is correct in RAM but
+ * stale on disk produces a file that looks truncated to the next reader —
+ * including this kernel after a reopen. */
+static int fat32_file_write(vnode_t *n, file_t *f, const void *buf,
+                            size_t count) {
+  fat32_priv_t *pd = (fat32_priv_t *)n->private_data;
+  if (!pd || count == 0) {
+    return count == 0 ? 0 : -1;
+  }
+
+  uint32_t new_size = 0;
+  if (fat32_write_at(pd->first_cluster, (uint32_t)f->offset, buf,
+                      (uint32_t)count, &new_size) != ESUCCESS) {
+    return -1;
+  }
+
+  /* Persist the new length. The path is needed, so rebuild it from the vnode
+   * chain rather than duplicating whatever the caller passed in. */
+  char path[256];
+  if (fat32_build_vnode_path(n, path, sizeof(path)) != 0) {
+    return -1;
+  }
+  char rel[128];
+  if (fat32_rel_path(path, rel, sizeof(rel)) < 0) {
+    return -1;
+  }
+  if (fat32_truncate_path(rel, new_size) != ESUCCESS) {
+    return -1;
+  }
+
+  pd->size = new_size;
+  n->size  = new_size;
+  f->offset += (int64_t)count;
+  return (int)count;
+}
+
+/* O_TRUNC / ftruncate support.
+ *
+ * Only shrinking is implemented: a zero-length file needs no cluster work at
+ * all, and it is the case stdio's "wb" mode actually hits. Growing would need a
+ * zero-fill path and is refused rather than half-done. */
+static int fat32_file_truncate(vnode_t *n, uint64_t size) {
+  fat32_priv_t *pd = (fat32_priv_t *)n->private_data;
+  if (!pd) {
+    return -1;
+  }
+  if (size > (uint64_t)pd->size) {
+    return -1; /* growing is not implemented; see the note above */
+  }
+
+  char path[256];
+  if (fat32_build_vnode_path(n, path, sizeof(path)) != 0) {
+    return -1;
+  }
+  char rel[128];
+  if (fat32_rel_path(path, rel, sizeof(rel)) < 0) {
+    return -1;
+  }
+  if (fat32_truncate_path(rel, (uint32_t)size) != ESUCCESS) {
+    return -1;
+  }
+
+  pd->size = (uint32_t)size;
+  n->size  = size;
+  return 0;
+}
+
+/* Where this filesystem is mounted in the VFS tree, e.g. "/mnt/fat32".
+ * Remembered at mount time so paths can be translated between the two views. */
+static char fat32_mount_path[64] = "";
+
+/* Translate a VFS path into one relative to the FAT32 volume root.
+ *
+ * The VFS calls us with "/mnt/fat32/FILE.TXT", but the FAT32 layer addresses
+ * files from the volume root and has no concept of the mount point. Passing the
+ * VFS path straight through made every create and truncate fail with ENOENT:
+ * FAT32 was looking for a subdirectory literally named "mnt".
+ *
+ * Returns 0 on success, -1 if `vpath` is not under this mount point. */
+static int fat32_rel_path(const char *vpath, char *out, size_t outlen) {
+  size_t mlen = strlen(fat32_mount_path);
+  if (mlen == 0) {
+    return -1;
+  }
+  if (strncmp(vpath, fat32_mount_path, mlen) != 0) {
+    return -1; /* not ours */
+  }
+  const char *rest = vpath + mlen;
+  while (*rest == '/') {
+    rest++;
+  }
+  size_t rlen = strlen(rest);
+  if (rlen + 1 > outlen) {
+    return -1;
+  }
+  memcpy(out, rest, rlen + 1);
+  return 0;
+}
+
+/* open(O_CREAT) hook: make an empty file, then let vfs_resolve() build the
+ * vnode for it. Registered at mount time. */
+static int fat32_create_file(const char *path) {
+  char rel[128];
+  if (fat32_rel_path(path, rel, sizeof(rel)) < 0) {
+    return -1;
+  }
+  return fat32_create(rel, 0, 0) == ESUCCESS ? 0 : -1;
+}
+
 /* Mount the FAT32 filesystem root at `path`. `path` must already exist as
  * a directory vnode in the VFS. */
 int fat32_vfs_mount(const char *path) {
+  /* Remember where we live so VFS paths can be translated to volume-relative
+   * ones. fat32_create_file() and the truncate/write paths depend on it. */
+  size_t plen = strlen(path);
+  if (plen < sizeof(fat32_mount_path)) {
+    memcpy(fat32_mount_path, path, plen + 1);
+    /* Normalise: no trailing slash, so path + mlen is an exact prefix. */
+    while (plen > 1 && fat32_mount_path[plen - 1] == '/') {
+      fat32_mount_path[--plen] = '\0';
+    }
+  }
+
+  /* Teach the VFS how to create files on this filesystem. */
+  vfs_register_create_file(fat32_create_file);
+
   vnode_t *mp = vfs_resolve(path);
   if (!mp) {
     uart_printf("[FAT32] Mount point %s does not exist\n", path);

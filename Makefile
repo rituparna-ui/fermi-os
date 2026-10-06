@@ -57,6 +57,7 @@ USER_LIBC       := $(USER_DIR)/lib/libc.a
 # to name the same file and a silent mismatch is a confusing runtime failure.
 DISKNAME_errno    = ERRNO
 DISKNAME_libctest = LIBCT
+DISKNAME_stdiotest = STDIO
 
 # Every user binary's on-disk name, listed explicitly rather than derived from
 # the source name. A derived name is one refactor away from silently breaking

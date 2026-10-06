@@ -58,6 +58,18 @@ int fat32_find(const char *path, uint32_t *out_first_cluster,
 int fat32_read(uint32_t first_cluster, uint32_t size, void *buf,
                uint32_t buf_len);
 
+/* Write `len` bytes at byte `offset`, extending the cluster chain as needed.
+ * Returns ESUCCESS/EERROR. On success *out_new_size (if non-NULL) receives
+ * offset + len, which the caller must store back into the directory entry:
+ * in FAT32 a file's size lives in the entry, not in the cluster chain. */
+int fat32_write_at(uint32_t first_cluster, uint32_t offset, const void *data,
+                   uint32_t len, uint32_t *out_new_size);
+
+/* Set a file's recorded size (for O_TRUNC). Does not free clusters — the data
+ * simply becomes unreachable past the new size, which is what truncate means
+ * here. Returns ESUCCESS/EERROR. */
+int fat32_truncate_path(const char *path, uint32_t new_size);
+
 /* Create a new file at path with given data. Supports subdirectories. */
 int fat32_create(const char *path, const void *data, uint32_t len);
 

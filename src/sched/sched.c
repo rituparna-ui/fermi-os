@@ -422,9 +422,13 @@ int sched_create_task(const char *name, task_entry_t entry) {
   /* Per-task fd table: open /dev/console for fd 0, 1, 2 */
   t->fds = fd_table_create();
   if (t->fds) {
-    fd_open(t->fds, "/dev/console"); /* stdin  = 0 */
-    fd_open(t->fds, "/dev/console"); /* stdout = 1 */
-    fd_open(t->fds, "/dev/console"); /* stderr = 2 */
+    /* O_RDWR, not the O_RDONLY that fd_open() defaults to: the console is
+     * bidirectional, and fd_write() now rejects a descriptor that was never
+     * opened for writing. Opening it read-only would silently break every
+     * printf to stdout. */
+    fd_open_ex(t->fds, "/dev/console", O_RDWR, 0); /* stdin  = 0 */
+    fd_open_ex(t->fds, "/dev/console", O_RDWR, 0); /* stdout = 1 */
+    fd_open_ex(t->fds, "/dev/console", O_RDWR, 0); /* stderr = 2 */
   }
 
   // Insert into circular run queue
@@ -747,9 +751,9 @@ int sched_fork(task_t *parent, struct trap_frame *frame) {
    * /dev/console (same as a brand-new task). */
   t->fds = fd_table_create();
   if (t->fds) {
-    fd_open(t->fds, "/dev/console");
-    fd_open(t->fds, "/dev/console");
-    fd_open(t->fds, "/dev/console");
+    fd_open_ex(t->fds, "/dev/console", O_RDWR, 0);
+    fd_open_ex(t->fds, "/dev/console", O_RDWR, 0);
+    fd_open_ex(t->fds, "/dev/console", O_RDWR, 0);
   }
 
   /* Insert into circular run queue (mask IRQs while we mutate it). */

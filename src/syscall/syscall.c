@@ -792,10 +792,20 @@ void syscall_dispatch(trap_frame_t *frame) {
     break;
 
   case SYS_OPEN:
-    if (fds && user_str_ok(arg0) >= 0) {
-      ret = fd_open(fds, (const char *)arg0);
-    } else {
-      uart_errorln("[SYSCALL] SYS_OPEN rejected: bad user path");
+    /* Linux arg order: path, flags, mode. mode is only meaningful with
+     * O_CREAT/O_TMPFILE and is accepted but not enforced (no ownership model
+     * yet) — same as the VFS layer it calls into. */
+    if (!fds || user_str_ok(arg0) < 0) {
+      ret = fail(EFAULT);
+      break;
+    }
+    ret = fd_open_ex(fds, (const char *)arg0, (int)arg1, (int)arg2);
+    if (ret < 0) {
+      /* Distinguish "no such file" from "exists but not permitted": stdio and
+       * most libc wrappers branch on exactly this distinction when deciding
+       * whether to fall back to creating a file. */
+      vnode_t *probe = vfs_resolve((const char *)arg0);
+      ret = fail(probe ? EACCES : (ENOENT));
     }
     break;
 

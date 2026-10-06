@@ -4,6 +4,7 @@
 #include "syscall/elf.h"  /* elf_image_t for per-task region tracking */
 #include "mm/vma/vma.h"   /* VMA set — user address-space bookkeeping */
 #include <stdint.h>
+#include <stddef.h>
 
 /* forward decl */
 struct fd_table;
@@ -93,6 +94,16 @@ typedef struct task {
    * child keeps its corpse around until its parent collects the status. */
   uint64_t ppid;
   int      exit_code;
+
+  /* User thread-pointer base, set by arch_prctl(ARCH_SET_FS). We already hand
+   * a task a TLS page at exec; this lets a Linux runtime install its own.
+   * Set but not yet dereferenced anywhere in the kernel. */
+  uint64_t clear_tid;
+
+  /* Saved TPIDR_EL0 across arch_prctl(ARCH_SET_FS). context_switch reloads
+   * TPIDR_EL0 from the exec-time TLS page unconditionally, so a foreign
+   * binary's SET_FS would be silently undone on the next context switch. */
+  uint64_t tpidr_el0;
 } task_t;
 
 // switch.S
@@ -149,6 +160,17 @@ const char *task_state_name(task_state_t s);
  * resets the counter so the recycled ASIDs are guaranteed not to alias
  * stale TLB entries. With the current hobby-kernel workloads we never
  * observe a wrap. */
+/* task_t field offsets consumed by switch.S.
+ *
+ * These are hardcoded numbers because the assembly cannot evaluate offsetof.
+ * That is only safe while the static assertions at the bottom of this header
+ * hold: they compare each number against the real layout, so inserting a field
+ * in the middle of task_t breaks the BUILD instead of silently making the
+ * context switch read and write the wrong words. */
+#define TASK_SP        0
+#define TASK_TTBR0     40
+#define TASK_TPIDR_EL0 2568
+
 uint16_t sched_asid_alloc(void);
 
 /* wait / waitpid.
@@ -192,5 +214,15 @@ int sched_try_grow_stack(task_t *t, uint64_t far);
 int sched_try_handle_vma_fault(task_t *t, uint64_t far, int is_write,
                                int is_exec);
 
+/* switch.S reaches task_t fields by hardcoded offset, so inserting a field in
+ * the middle of the struct would make the assembly silently read the wrong
+ * one. These assertions are the only thing standing between a refactor and a
+ * memory-corruption bug that would not show up until a task was switched. */
+_Static_assert(offsetof(task_t, sp) == TASK_SP,
+               "switch.S TASK_SP is out of sync with task_t");
+_Static_assert(offsetof(task_t, ttbr0) == TASK_TTBR0,
+               "switch.S TASK_TTBR0 is out of sync with task_t");
+_Static_assert(offsetof(task_t, tpidr_el0) == TASK_TPIDR_EL0,
+               "switch.S TASK_TPIDR_EL0 is out of sync with task_t");
 
 #endif

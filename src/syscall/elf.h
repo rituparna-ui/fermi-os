@@ -80,6 +80,17 @@ typedef struct {
   uint64_t      entry;          /* virtual address of the program entry */
   int           region_count;   /* number of valid entries in regions[] */
   elf_region_t  regions[ELF_MAX_REGIONS];
+
+  /* Program-header table location and shape, for the Linux auxiliary vector.
+   *
+   * A Linux binary's _start finds AT_PHDR/AT_PHNUM/AT_PHENT on the stack and
+   * uses them to walk its own headers; without them it has no way to reach
+   * AT_BASE, so a dynamically linked one can never find its interpreter.
+   * phdr_va is only filled in when the table is actually covered by a PT_LOAD
+   * we mapped, so 0 reliably means "don't advertise it" rather than "at 0". */
+  uint64_t      phdr_va;
+  uint16_t      phentsize;
+  uint16_t      phnum;
 } elf_image_t;
 
 /* Parse `kbuf` (size `size`) as a static aarch64 ET_EXEC ELF, allocate

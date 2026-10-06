@@ -1155,6 +1155,25 @@ static void task_proctest(void) {
   sys_exit();
 }
 
+/* Runs the on-disk Linux binary (LINHELLO.ELF).
+ *
+ * Deliberately exec'd through exactly the same sys_exec path as our own
+ * programs, because the point is that no special case is needed: the kernel
+ * builds the Linux startup stack *and* sets the AAPCS64 registers, so a binary
+ * built by the Linux toolchain and one linked against libc.a differ only in
+ * what they choose to read. */
+static void task_linuxhello(void) {
+  const char *argv[2];
+  argv[0] = "/mnt/fat32/LINHELLO.ELF";
+  argv[1] = 0;
+
+  if (sys_exec(argv[0], argv) < 0) {
+    t_puts("[LINHELLO] exec failed (is LINHELLO.ELF on the disk image?)\n");
+    sys_exit();
+  }
+  sys_exit();
+}
+
 /* ---- fork memory-isolation test ---------------------------------------- */
 
 /* SYS_FORK returns the child pid in x0 (and 0 in the child). The result
@@ -1497,6 +1516,7 @@ void kernel_main() {
   sched_create_task("task_libctest", task_libctest);
   sched_create_task("task_stdiotest", task_stdiotest);
   sched_create_task("task_proctest", task_proctest);
+  sched_create_task("task_linuxhello", task_linuxhello);
   sched_create_task("task_mmguard", task_mmap_guard);
   sched_create_kernel_task("netd", netd);
 

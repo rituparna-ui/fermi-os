@@ -6,6 +6,7 @@
 #include "uart/uart.h"
 #include "vfs/vfs.h"
 #include "pci/virtio/balloon/balloon.h"
+#include "pci/virtio/rng/rng.h"
 
 #include "mm/heap/heap.h"
 #include "mm/pmm/pmm.h"
@@ -148,6 +149,13 @@ static inline int64_t user_str_ok(uint64_t ptr) {
 #define EXEC_MAX_ARGC 32          /* hard limit on argv count */
 #define EXEC_ARG_BYTES_MAX 1024   /* total string-byte budget for argv */
 
+/* Append one (type, value) pair to a Linux auxiliary vector and advance *idx. */
+static void aux_put(uint64_t *base, int *idx, uint64_t type, uint64_t val) {
+  base[(*idx) * 2]     = type;
+  base[(*idx) * 2 + 1] = val;
+  (*idx)++;
+}
+
 static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
                         trap_frame_t *frame) {
   if (user_str_ok(arg_path) < 0) {
@@ -204,6 +212,44 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
     }
   }
 
+
+  /* ---- Initial stack layout ------------------------------------------
+   *
+   * Computed here, before the address space has been swapped or a single page
+   * freed, so an argv that cannot fit is refused with a clean return instead
+   * of after the task is half-exec'd.
+   *
+   * The user stack is only 16 KiB (USER_STACK_PAGES=4) and this layout grows
+   * with the argument strings, so the bound is checked rather than assumed.
+   *
+   * Low to high, from the address SP_EL0 will hold:
+   *
+   *   [sp]                    argc
+   *   [sp + 8 ...]            argv[0..argc-1], then NULL
+   *   [envp]                  a lone NULL -- this kernel passes no environment
+   *   [envp + 8 ...]          auxiliary vector, terminated by an AT_NULL pair
+   *   <16-byte aligned>
+   *   argv strings, then 16 bytes of randomness for AT_RANDOM
+   */
+  /* AUX_MAX is the WORST CASE, not the actual count: AT_EXECFN is only emitted
+   * when argv is non-empty, so a no-args program writes one fewer pair.
+   * Reserving the maximum keeps the layout fixed and the bounds check above
+   * valid for either case. */
+  const uint64_t aux_max         = 17;
+  const uint64_t aux_random_size = 16; /* AT_RANDOM always points at 16 bytes */
+
+  uint64_t stack_user_lo = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
+  uint64_t envp_off      = 8 + (uint64_t)(argc + 1) * sizeof(uint64_t);
+  uint64_t auxv_off      = envp_off + sizeof(uint64_t);
+  uint64_t auxv_base     = (auxv_off + aux_max * 16 + 15) & ~(uint64_t)15;
+  uint64_t strings_lo    = (USER_STACK_TOP - arg_bytes - aux_random_size) &
+                           ~(uint64_t)15;
+  uint64_t new_sp        = strings_lo - auxv_base;
+
+  if (new_sp < stack_user_lo) {
+    uart_errorln("[EXEC] argv + auxiliary vector do not fit the user stack");
+    return -1;
+  }
 
   /* 1. Open and size the binary. */
   int fd = fd_open(fds, path);
@@ -324,6 +370,7 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
   cur->ttbr0       = new_ttbr0;
   cur->ustack_phys = stack_phys;
   cur->tls_phys    = new_tls;
+  cur->tpidr_el0   = USER_TLS_BASE;
   cur->user_sp     = USER_STACK_TOP;
   cur->exec_image  = img;
 
@@ -353,39 +400,83 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
   /* sp_el0 lives at offset 280 in the 688-byte on-stack trap frame; the
    * C trap_frame_t (sizeof = 280) doesn't expose it. Poke directly. */
   uint64_t *frame_raw = (uint64_t *)frame;
-  uint64_t  new_sp    = USER_STACK_TOP;
+  uintptr_t stack_kbase = PHYS_TO_VIRT(stack_phys);
 
-  if (argc > 0) {
-    /* Build argv on the new user stack. Write through the kernel's TTBR1
-     * mapping of the freshly-allocated stack pages — PHYS_TO_VIRT(stack_phys)
-     * — so we don't depend on TTBR0 already pointing at new_l0. */
-    uintptr_t stack_kbase   = PHYS_TO_VIRT(stack_phys);
-    uint64_t  stack_user_lo = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
+  /* Copy the argv strings and the AT_RANDOM bytes to the top of the stack,
+   * then build the pointer arrays and aux vector below them. Everything is
+   * written through the kernel's alias of the fresh stack pages, so this does
+   * not depend on TTBR0 already pointing at the new address space. */
+  memcpy((void *)(stack_kbase + (strings_lo - stack_user_lo)), arg_kbuf,
+         arg_bytes);
 
-    /* Strings at the very top, growing downward. */
-    uint64_t strings_user_base = USER_STACK_TOP - arg_bytes;
-    memcpy((void *)(stack_kbase + (strings_user_base - stack_user_lo)),
-           arg_kbuf, arg_bytes);
+  uint64_t random_va = strings_lo + arg_bytes;
+  memset((void *)(stack_kbase + (random_va - stack_user_lo)), 0,
+         aux_random_size);
+  /* Best-effort: AT_RANDOM must point at 16 readable bytes, but virtio-rng may
+   * be absent. Falling back to zeros is harmless -- the value is only ever used
+   * for stack-protector canaries and hash seeding, never as a secret. */
+  rng_read((void *)(stack_kbase + (random_va - stack_user_lo)),
+           (uint32_t)aux_random_size);
 
-    /* argv array of (argc + 1) pointers, 16-byte aligned, just below the
-     * strings. argv[i] is the *user VA* of the i-th string. */
-    uint64_t  argv_user_top  = strings_user_base & ~(uint64_t)15;
-    uint64_t  argv_user_base = argv_user_top - (uint64_t)(argc + 1) * 8;
-    uint64_t *argv_kernel    = (uint64_t *)(stack_kbase +
-                                            (argv_user_base - stack_user_lo));
-    for (int i = 0; i < argc; i++) {
-      argv_kernel[i] = strings_user_base + arg_offsets[i];
-    }
-    argv_kernel[argc] = 0;
+  uint64_t *sp_k = (uint64_t *)(stack_kbase + (new_sp - stack_user_lo));
+  sp_k[0] = (uint64_t)argc;
 
-    /* SP_EL0 sits 16-byte aligned below the argv array. */
-    new_sp = argv_user_base & ~(uint64_t)15;
-
-    /* AAPCS64 entry: x0 = argc, x1 = argv, x2 = envp (NULL for now). */
-    frame->regs[0] = (uint64_t)argc;
-    frame->regs[1] = argv_user_base;
-    frame->regs[2] = 0;
+  uint64_t *argv_k = &sp_k[1];
+  for (int i = 0; i < argc; i++) {
+    argv_k[i] = strings_lo + arg_offsets[i];
   }
+  argv_k[argc] = 0; /* argv terminator */
+
+  /* envp is a one-element array holding just NULL: no environment is passed. */
+  uint64_t *envp_k = (uint64_t *)(stack_kbase + (new_sp + envp_off - stack_user_lo));
+  envp_k[0] = 0;
+
+  uint64_t *aux_k = (uint64_t *)(stack_kbase + (new_sp + auxv_off - stack_user_lo));
+  int ai = 0;
+  aux_put(aux_k, &ai, AT_PHDR,   img.phdr_va);
+  aux_put(aux_k, &ai, AT_PHENT,  img.phentsize);
+  aux_put(aux_k, &ai, AT_PHNUM,  img.phnum);
+  aux_put(aux_k, &ai, AT_PAGESZ, PAGE_SIZE);
+  /* AT_BASE is the dynamic loader's base. We load ET_EXEC only and have no
+   * ld.so, so 0 correctly says "there is no interpreter". */
+  aux_put(aux_k, &ai, AT_BASE,   0);
+  aux_put(aux_k, &ai, AT_FLAGS,  0);
+  aux_put(aux_k, &ai, AT_ENTRY,  img.entry);
+  /* No user database exists, so every id is 0. Advertising 0 rather than
+   * omitting them keeps a guest's getuid()/getgid() working. */
+  aux_put(aux_k, &ai, AT_UID,    0);
+  aux_put(aux_k, &ai, AT_EUID,   0);
+  aux_put(aux_k, &ai, AT_GID,    0);
+  aux_put(aux_k, &ai, AT_EGID,   0);
+  /* AT_HWCAP = 0: this CPU is a fixed model with no runtime-detectable
+   * feature bits, so a guest that trusts a non-zero value would assume
+   * instructions we have not verified. */
+  aux_put(aux_k, &ai, AT_HWCAP,  0);
+  aux_put(aux_k, &ai, AT_CLKTCK, 100);
+  aux_put(aux_k, &ai, AT_SECURE, 0);   /* not setuid/setgid */
+  aux_put(aux_k, &ai, AT_RANDOM, random_va);
+  if (argc > 0) {
+    aux_put(aux_k, &ai, AT_EXECFN, strings_lo); /* argv[0], the path as given */
+  }
+  aux_put(aux_k, &ai, AT_NULL, 0);
+
+  /* The AT_NULL pair is what terminates the walk -- a guest stops there, so the
+   * count itself is not part of the contract. Zero any slots the conditional
+   * AT_EXECFN left unused so the whole area is deterministic rather than
+   * whatever was on the stack page. */
+  for (uint64_t i = (uint64_t)ai; i < aux_max; i++) {
+    aux_k[i * 2]     = 0;
+    aux_k[i * 2 + 1] = 0;
+  }
+
+  /* Registers: keep the AAPCS64 convention our own libc's crt0 uses while
+   * ALSO handing the program the Linux stack above. Both entry contracts are
+   * satisfied at once, so Fermi-linked and foreign binaries need no
+   * negotiation to tell them apart. */
+  frame->regs[0] = (uint64_t)argc;
+  frame->regs[1] = new_sp + sizeof(uint64_t); /* &argv[0] */
+  frame->regs[2] = new_sp + envp_off;        /* &envp[0] */
+
   frame_raw[35] = new_sp;
 
 
@@ -754,6 +845,39 @@ static int64_t sys_brk(uint64_t addr) {
 }
 
 
+/* Translate a Linux aarch64 syscall number onto the Fermi number the switch
+ * below dispatches on.
+ *
+ * Two numbering schemes coexist on purpose. Our libc uses small, readable
+ * numbers assigned as syscalls were added; a Linux binary uses the asm-generic
+ * table and can never be made to speak ours. Aliasing keeps one table as the
+ * single place that has to be correct for a foreign binary, which is far easier
+ * to audit than a renumbering spread across every stub and test.
+ *
+ * Only numbers whose argument layout is IDENTICAL are aliased here. Anything
+ * that shifts or reshapes arguments (openat, nanosleep, stat family) gets its
+ * own case below instead, because an alias would silently read the wrong
+ * argument.
+ *
+ * Numbers already equal (brk 214, munmap 215, mmap 222, mprotect 226,
+ * wait4/waitpid 260) need no entry — they pass through unchanged.
+ *
+ * Unlisted Linux numbers fall through untouched and hit the ENOSYS default,
+ * so an unimplemented call reports "not implemented" rather than aliasing onto
+ * an unrelated Fermi syscall that happens to share the number. */
+static uint64_t translate_linux_syscall(uint64_t num) {
+  switch (num) {
+  case LNX_READ:        return SYS_READ;
+  case LNX_WRITE:       return SYS_WRITE;
+  case LNX_CLOSE:       return SYS_CLOSE;
+  case LNX_LSEEK:       return SYS_LSEEK;
+  case LNX_EXIT:        return SYS_EXIT;
+  case LNX_EXIT_GROUP:  return SYS_EXIT;
+  case LNX_GETPID:      return SYS_GETPID;
+  default:              return num;
+  }
+}
+
 void syscall_dispatch(trap_frame_t *frame) {
   /* Allow preemption during the syscall. EL0 had IRQs unmasked, but the
    * synchronous-from-lower-EL vector entry implicitly masks them. Without
@@ -764,6 +888,11 @@ void syscall_dispatch(trap_frame_t *frame) {
 
 
   uint64_t num = frame->regs[8];
+
+  /* A Linux binary's numbers are translated here; our libc's pass through
+   * unchanged because translate_linux_syscall() returns anything it doesn't
+   * know by identity. */
+  num = translate_linux_syscall(num);
   uint64_t arg0 = frame->regs[0];
   uint64_t arg1 = frame->regs[1];
   uint64_t arg2 = frame->regs[2];
@@ -772,7 +901,8 @@ void syscall_dispatch(trap_frame_t *frame) {
   uint64_t arg5 = frame->regs[5];
 
   int64_t ret = -1;
-  fd_table_t *fds = sched_current()->fds;
+  task_t     *cur = sched_current();
+  fd_table_t *fds = cur->fds;
 
   switch (num) {
   case SYS_READ:
@@ -914,6 +1044,83 @@ void syscall_dispatch(trap_frame_t *frame) {
         *statusptr = status;
       }
       ret = pid;
+    }
+    break;
+  }
+
+  /* ---- Linux-only entry points ---------------------------------------
+   *
+   * These are reached before translation (their numbers mean something else to
+   * our own libc, so they must not be aliased) and exist because every Linux
+   * runtime calls them during startup. A binary that got these wrong would
+   * fail before reaching its first line of real code.
+   */
+
+  case LNX_ARCH_PRCTL: {
+    /* arch_prctl(ARCH_SET_FS, addr) is how a Linux aarch64 process installs
+     * its thread pointer. We already give a task a TLS page at exec, but a
+     * foreign binary expects to set FS itself and would otherwise run with a
+     * stale pointer. ARCH_GET_FS reports it back.
+     *
+     * SET_GS is refused rather than ignored: silently accepting a register we
+     * don't implement would let a guest believe it had shadow state. */
+    if (arg0 == ARCH_SET_FS || arg0 == ARCH_GET_FS) {
+      uint64_t *tpidr_el0;
+      __asm__ __volatile__("mrs %0, tpidr_el0" : "=r"(tpidr_el0));
+      if (arg0 == ARCH_SET_FS) {
+        if (arg1 == 0 || (arg1 & 7) != 0) {
+          ret = fail(EINVAL);
+          break;
+        }
+        __asm__ __volatile__("msr tpidr_el0, %0" ::"r"(arg1) : "memory");
+        /* SET_FS returns 0 on success. Returning the register's PREVIOUS value
+         * here looked harmless but every libc startup treats a non-zero return
+         * from arch_prctl as fatal and aborts, so this must be exactly zero.
+         * Only GET_FS reports a value. */
+        ret = 0;
+      } else {
+        ret = (int64_t)(uintptr_t)tpidr_el0;
+      }
+    } else {
+      ret = fail(EINVAL);
+    }
+    break;
+  }
+
+  case LNX_SET_TID_ADDRESS: {
+    /* Every glibc/musl startup calls this to register where a clear_tid may be
+     * written when a thread exits. There are no threads yet, so the address is
+     * remembered as bookkeeping and nothing ever writes through it — but the
+     * call must SUCCEED and return the caller's tid, because startup aborts on
+     * a negative return. */
+    cur->clear_tid = arg1;
+    ret = (int64_t)cur->pid;
+    break;
+  }
+
+  case LNX_OPENAT: {
+    /* openat(dirfd, path, flags, mode) — the path is arg1, not arg0, which is
+     * exactly why this isn't aliased onto SYS_OPEN.
+     *
+     * Only AT_FDCWD is accepted. Resolving a relative path against some other
+     * fd would need per-descriptor working directories, which this VFS does
+     * not track; accepting it and resolving against the wrong directory would
+     * be worse than refusing. */
+    /* Compare the low 32 bits: AT_FDCWD is a negative int, and a guest may
+     * pass it zero-extended. Truncating matches how the kernel actually
+     * interprets the argument. */
+    if ((int32_t)arg0 != (int32_t)AT_FDCWD) {
+      ret = fail(ENOSYS);
+      break;
+    }
+    if (!fds || user_str_ok(arg1) < 0) {
+      ret = fail(EFAULT);
+      break;
+    }
+    ret = fd_open_ex(fds, (const char *)arg1, (int)arg2, (int)arg3);
+    if (ret < 0) {
+      vnode_t *probe = vfs_resolve((const char *)arg1);
+      ret = fail(probe ? EACCES : ENOENT);
     }
     break;
   }

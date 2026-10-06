@@ -406,6 +406,7 @@ int sched_create_task(const char *name, task_entry_t entry) {
   t->kstack_top = kstack_top;
   t->ustack_phys = ustack_phys;
   t->tls_phys    = tls_phys;
+  t->tpidr_el0   = USER_TLS_BASE;
   copy_name(t->name, name);
   vma_init(&t->vmas);
   /* A new process starts with errno == 0. The TLS page is already zeroed,
@@ -745,6 +746,7 @@ int sched_fork(task_t *parent, struct trap_frame *frame) {
   t->kstack_top  = kstack_top;
   t->ustack_phys = ustack_phys;
   t->tls_phys    = child_tls;
+  t->tpidr_el0   = USER_TLS_BASE;
 
   /* Inherit the parent's descriptors, SHARING the open file descriptions.
    *

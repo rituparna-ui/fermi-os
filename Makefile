@@ -47,6 +47,17 @@ USER_LIB_SOURCES := $(wildcard $(USER_DIR)/lib/*.c)
 USER_LIB_OBJECTS := $(USER_LIB_SOURCES:$(USER_DIR)/lib/%.c=$(USER_DIR)/lib/%.o)
 USER_LIBC       := $(USER_DIR)/lib/libc.a
 
+# A static Linux binary, built by the Linux toolchain and linked against NOTHING
+# -- no crt0.o, no libc.a. It speaks Linux syscall numbers and the Linux process
+# startup contract, and exists to prove the kernel can host it. Listed apart
+# from USER_BINS on purpose: the wildcard rules below would link the Fermi libc
+# into it and quietly turn the test into another Fermi binary.
+LINUX_DIR       := $(USER_DIR)/linux
+LINUX_BIN       := $(LINUX_DIR)/linuxhello.elf
+# Stem relative to USER_DIR, because the disk-copy loop builds the path as
+# "$(USER_DIR)/$$stem.elf". A stem (not a filename) is what it expects.
+LINUX_BIN_REL   := linux/linuxhello
+
 # On-disk name overrides, keyed by user-program stem.
 #
 # This kernel's FAT32 has NO long-filename support: mcopy stores any name that
@@ -59,6 +70,9 @@ DISKNAME_errno    = ERRNO
 DISKNAME_libctest = LIBCT
 DISKNAME_stdiotest = STDIO
 DISKNAME_proctest = PROCT
+# Stem "linuxhello" exceeds 8 characters and this FAT32 has no long-filename
+# support, so it ships as LINHELLO.
+DISKNAME_linuxhello = LINHELLO
 
 # Every user binary's on-disk name, listed explicitly rather than derived from
 # the source name. A derived name is one refactor away from silently breaking
@@ -68,7 +82,7 @@ DISKNAME_cat      = CAT
 DISKNAME_counter  = COUNTER
 
 USER_STEMS     := $(USER_BINS:$(USER_DIR)/%.elf=%)
-USER_DISK_PAIRS := $(foreach s,$(USER_STEMS),$(DISKNAME_$s):$s)
+USER_DISK_PAIRS := $(foreach s,$(USER_STEMS),$(DISKNAME_$s):$s) $(DISKNAME_linuxhello):$(LINUX_BIN_REL)
 
 # Flags shared by user-space compilation (crt0, libc members, user programs).
 USER_CFLAGS := -ffreestanding -nostartfiles -nostdlib -fno-pic -static \
@@ -163,6 +177,26 @@ $(USER_DIR)/%.elf: $(USER_DIR)/%.c $(USER_CRT0) $(USER_LIBC)
 		-Wl,-Ttext=0x400000 -Wl,-e,_start -Wl,--build-id=none \
 		-o $@ $(USER_CRT0) $< $(USER_LIBC)
 
+# The foreign Linux binary.
+#
+# Flags that differ from USER_CFLAGS, and why each is needed:
+#   -fno-tree-loop-distribute-patterns  stops GCC rewriting our byte-copy loops
+#                                       into calls to memcpy/memset, which do
+#                                       not exist here. Without it the link
+#                                       fails on undefined memcpy.
+#   -fno-stack-protector               otherwise the canary calls
+#                                       __stack_chk_fail, which does not exist.
+#   -Wl,-e,_start                      the Linux entry point, not Fermi's crt0.
+# No crt0.o and no libc.a on the link line: that is the entire point.
+$(LINUX_BIN): $(LINUX_DIR)/main.c $(LINUX_DIR)/start.S
+	@echo "LINUX GCC $< (static Linux binary, no Fermi libc)"
+	@$(CC) -ffreestanding -nostartfiles -nostdlib -static -fno-pic \
+		-fno-stack-protector -fno-tree-loop-distribute-patterns \
+		-fno-builtin -fno-asynchronous-unwind-tables \
+		-Wall -Wextra -O0 -g \
+		-Wl,-Ttext=0x400000 -Wl,-e,_start -Wl,--build-id=none \
+		-o $@ $(LINUX_DIR)/start.S $(LINUX_DIR)/main.c
+
 $(USER_CRT0): $(USER_DIR)/lib/crt0.S
 	@echo "USER AS $<"
 	@mkdir -p $(dir $@)
@@ -185,7 +219,7 @@ $(USER_LIBC): $(USER_LIB_OBJECTS)
 # rule scaffolding here would reintroduce confusion about which artifact
 # ships on disk.
 
-user_bins: $(USER_BINS)
+user_bins: $(USER_BINS) $(LINUX_BIN)
 
 # Build libc.a on its own, for iterating on the libc without relinking users.
 libc: $(USER_LIBC)
@@ -200,7 +234,10 @@ debug: all disk
 
 disk: $(DISK_IMG)
 
-$(DISK_IMG): $(USER_BINS)
+# Every shipped binary is a prerequisite, including the foreign Linux one.
+# Leaving it out lets `make full` report success while the disk image silently
+# keeps the previous contents -- the exact failure `full` exists to prevent.
+$(DISK_IMG): $(USER_BINS) $(LINUX_BIN)
 	@mkdir -p $(BUILD_DIR)
 	@echo "Creating $(DISK_IMG) ($(DISK_SIZE) sparse, FAT32)"
 	@truncate -s $(DISK_SIZE) $@

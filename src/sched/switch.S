@@ -29,18 +29,25 @@
 //   [sp + 152]  d15
 
 // task_t field offsets — must match sched.h
-.equ TASK_SP,       0
-.equ TASK_TTBR0,    40   // offsetof(task_t, ttbr0)
+// These three numbers must match task_t. sched.h declares the same values and
+// _Static_assert()s them against the real struct layout, so the build fails if
+// task_t ever changes shape -- the failure mode is a compile error, not a
+// context switch that quietly saves the wrong register.
+.equ TASK_SP,        0
+.equ TASK_TTBR0,     40
+.equ TASK_TPIDR_EL0, 2568
                     // NOTE: task_t.tls_phys is deliberately NOT loaded here.
                     // It is a physical address (needed by the kernel to free
-                    // the page on reap), but TPIDR_EL0 must hold the page's
-                    // USER VIRTUAL address. Writing the PA there makes every
-                    // EL0 access to errno dereference a RAM address absent
-                    // from the user page tables — an instant fault. Every task
-                    // maps its TLS page at the same fixed VA, so a constant is
-                    // correct here and immune to struct layout changes.
-
-.equ USER_TLS_BASE, 0x00B00000   // must match mmu.h
+                    // the page on reap), but TPIDR_EL0 must hold a USER
+                    // VIRTUAL address. Writing the PA there makes every EL0
+                    // access to errno dereference a RAM address absent from
+                    // the user page tables — an instant fault.
+                    //
+                    // The value now comes from task->tpidr_el0 rather than a
+                    // constant, because a Linux runtime repoints FS with
+                    // arch_prctl(ARCH_SET_FS) and a constant would undo that
+                    // on the next context switch. Every task initialises it to
+                    // USER_TLS_BASE (see mmu.h) at creation, exec and fork.
 
 // Task trampoline: first code a new task executes after context_switch ret's here.
 // x19 = user entry point (VA in user address space)
@@ -88,6 +95,13 @@ context_switch:
 	stp d12, d13, [sp, #128]
 	stp d14, d15, [sp, #144]
 
+	// Save the outgoing task's TPIDR_EL0 before we overwrite the register.
+	// It can no longer be the fixed USER_TLS_BASE: a Linux runtime installs
+	// its own with arch_prctl(ARCH_SET_FS), and reloading the constant would
+	// silently undo that on the very next context switch.
+	mrs x2, tpidr_el0
+	str x2, [x0, #TASK_TPIDR_EL0]
+
 	// Save current sp into prev->sp
 	mov x2, sp
 	str x2, [x0, #TASK_SP]
@@ -120,10 +134,11 @@ context_switch:
 	// here covers the initial entry (task_trampoline), fork_return, and
 	// every resume through exception_common, since all run after this load.
 	//
-	// Value is the fixed USER_TLS_BASE VA, NOT task->tls_phys (which is a
-	// physical address). EL0 accesses go through TTBR0, so a PA here would
-	// fault immediately.
-	mov x4, #USER_TLS_BASE
+	// Loaded from the incoming task, which defaults to the fixed
+	// USER_TLS_BASE VA but may have been repointed by
+	// arch_prctl(ARCH_SET_FS). NOT task->tls_phys, which is a physical
+	// address: EL0 accesses go through TTBR0, so a PA here would fault.
+	ldr x4, [x1, #TASK_TPIDR_EL0]
 	msr tpidr_el0, x4
 1:
 

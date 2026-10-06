@@ -19,6 +19,78 @@
 #define SYS_KILL 11      /* arg0 = pid; returns 0 or -1 */
 #define SYS_WAITPID 260   /* arg0 = pid, arg1 = &status, arg2 = options */
 
+/* ---- Linux aarch64 syscall numbers -------------------------------------
+ *
+ * Our libc speaks the numbers above. A Linux binary always speaks these, so
+ * the dispatcher translates them onto the same handlers instead of our libc
+ * having to be renumbered. Aliasing rather than renumbering is deliberate:
+ * renumbering 0-14 would touch every stub and every test for no functional
+ * gain, while the translation table is the one place that has to be right for
+ * a foreign binary, and it is easy to read and audit as a unit.
+ *
+ * Numbering follows the Linux aarch64 (asm-generic) table. */
+#define LNX_READ      63
+#define LNX_WRITE     64
+#define LNX_READV     65
+#define LNX_WRITEV    66
+#define LNX_OPENAT    56
+/* openat(2)'s special dirfd meaning "relative to the current directory".
+ * Our VFS has one root, so this is the only value accepted. */
+#define AT_FDCWD       (-100LL)
+#define LNX_CLOSE     57
+#define LNX_LSEEK     62
+#define LNX_IOCTL     29
+#define LNX_NEWFSTATAT 79
+#define LNX_FSTAT     80
+#define LNX_GETDENTS64 61
+#define LNX_UNLINKAT  35
+#define LNX_MKDIRAT   34
+#define LNX_RENAMEAT  38
+#define LNX_FACCESSAT2 439  /* not yet implemented; reserved to avoid reuse */
+#define LNX_EXIT      93
+#define LNX_EXIT_GROUP 94
+#define LNX_SET_TID_ADDRESS 96
+#define LNX_NANOSLEEP 101
+#define LNX_CLOCK_GETTIME 113
+#define LNX_ARCH_PRCTL 158
+#define LNX_GETPID    172
+#define LNX_GETPPID   173
+#define LNX_GETUID    174
+#define LNX_GETEUID   175
+#define LNX_GETGID    176
+#define LNX_GETEGID   177
+#define LNX_GETRANDOM 278
+
+/* Auxiliary vector entry types, Linux aarch64 values. A program finds these on
+ * its initial stack and uses them to learn where its own headers are, what its
+ * entry point is, and what the page size is -- without which a dynamic loader
+ * cannot even find its interpreter. */
+#define AT_NULL     0
+#define AT_PHDR     3
+#define AT_PHENT    4
+#define AT_PHNUM    5
+#define AT_PAGESZ   6
+#define AT_BASE     7
+#define AT_FLAGS    8
+#define AT_ENTRY    9
+#define AT_UID      11
+#define AT_EUID     12
+#define AT_GID      13
+#define AT_EGID     14
+#define AT_HWCAP    16
+#define AT_CLKTCK   17
+#define AT_SECURE   23
+#define AT_RANDOM   25
+#define AT_EXECFN   31
+
+/* arch_prctl(2) subcommands (aarch64). */
+#define ARCH_SET_GS 0x1001
+#define ARCH_SET_FS 0x1002
+#define ARCH_GET_FS 0x1003
+
+/* SYS_WAITPID 260 is Linux wait4(2); the names differ but the arguments and
+ * the status encoding are identical, which is why one number serves both. */
+
 /* Linux waitpid(2) argument forms. */
 #define WNOHANG 1  /* defined in sched.h; repeated here for the syscall layer */
 #define WEXITED  4

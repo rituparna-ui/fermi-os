@@ -178,6 +178,9 @@ int elf_load(const uint8_t *kbuf, size_t size, uint64_t *user_l0,
 
   out->entry        = eh->e_entry;
   out->region_count = 0;
+  out->phdr_va      = 0;
+  out->phentsize    = eh->e_phentsize;
+  out->phnum        = eh->e_phnum;
 
   const Elf64_Phdr *phs = (const Elf64_Phdr *)(kbuf + eh->e_phoff);
 
@@ -275,6 +278,32 @@ int elf_load(const uint8_t *kbuf, size_t size, uint64_t *user_l0,
   if (out->region_count == 0) {
     uart_errorln("[ELF] no PT_LOAD segments \u2014 nothing to run");
     return -1;
+  }
+
+  /* Locate the program-header table for the Linux auxiliary vector (AT_PHDR).
+   *
+   * e_phoff is a FILE offset, and the matching virtual address is not that
+   * number: for a typical static link the first PT_LOAD is offset 0 at
+   * vaddr 0x400000, so the headers land at vaddr + e_phoff. Getting this
+   * wrong hands the guest a pointer into nowhere.
+   *
+   * Only advertise the table if a PT_LOAD we actually mapped covers all of it.
+   * A binary whose headers sit in an unmapped gap must report AT_PHDR = 0, so
+   * the guest's own header walk fails loudly instead of reading whatever
+   * happens to be mapped there. */
+  if (out->phentsize == sizeof(Elf64_Phdr)) {
+    uint64_t tbl_end = eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr);
+    for (int i = 0; i < eh->e_phnum; i++) {
+      const Elf64_Phdr *ph = &phs[i];
+      if (ph->p_type != PT_LOAD) {
+        continue;
+      }
+      if (eh->e_phoff >= ph->p_offset &&
+          tbl_end <= ph->p_offset + ph->p_filesz) {
+        out->phdr_va = ph->p_vaddr + (eh->e_phoff - ph->p_offset);
+        break;
+      }
+    }
   }
 
   /* Entry point must lie inside one of the regions we just mapped. */

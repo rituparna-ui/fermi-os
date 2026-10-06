@@ -72,6 +72,17 @@ static int gen_meminfo(char *buf, size_t buflen) {
   uint64_t heap_free = heap_free_bytes();
   uint64_t heap_total = heap_total_bytes();
 
+  /* User address-space accounting across all live tasks. VMA_Mapped is
+   * reserved-but-not-yet-faulted; VMA_Resident is actually backed by
+   * physical pages. Their gap is the memory mmap/brk has promised but hasn't
+   * committed — the visible cost of demand paging. */
+  uint64_t vma_mapped = 0;
+  uint64_t vma_resident = 0;
+  for (task_t *t = sched_first_task(); t; t = t->next) {
+    vma_mapped += vma_mapped_pages(&t->vmas);
+    vma_resident += vma_resident_pages(&t->vmas);
+  }
+
   return ksnprintf(buf, buflen,
                    "MemTotal:    %u KB\n"
                    "MemUsed:     %u KB\n"
@@ -79,14 +90,18 @@ static int gen_meminfo(char *buf, size_t buflen) {
                    "MemReserved: %u KB\n"
                    "HeapTotal:   %u KB\n"
                    "HeapUsed:    %u KB\n"
-                   "HeapFree:    %u KB\n",
+                   "HeapFree:    %u KB\n"
+                   "VMAMapped:   %u KB\n"
+                   "VMAResident: %u KB\n",
                    (total_pages * 4),     /* 4 KiB pages */
                    (used_pages * 4),
                    (free_pages * 4),
                    (reserved * 4),
                    (heap_total / 1024),
                    (heap_used / 1024),
-                   (heap_free / 1024));
+                   (heap_free / 1024),
+                   (vma_mapped * 4),
+                   (vma_resident * 4));
 }
 
 static int gen_tasks(char *buf, size_t buflen) {

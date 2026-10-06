@@ -127,6 +127,14 @@ static const char *va_classify_user(uint64_t far) {
     return "just below user stack — STACK OVERFLOW likely";
   }
 
+  /* mmap()ed region. Checked before the catch-all wild-pointer case because
+   * mmap hands out addresses above USER_STACK_TOP — without this branch a
+   * fault inside a perfectly valid heap allocation would be misreported as
+   * "above user range". */
+  if (far >= USER_MMAP_BASE && far < USER_VA_TOP) {
+    return "mmap'd user region (unmapped or protected)";
+  }
+
   if (far >= USER_STACK_TOP) {
     return "above user range — wild pointer";
   }
@@ -199,14 +207,29 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
     case EC_DATA_ABORT_LO: {
       task_t *t = sched_current();
       uint8_t dfsc = (uint8_t)ESR_ISS_DFSC(frame->esr);
-      /* Translation fault L1/L2/L3 in the user-stack growth zone =>
-       * demand-paged stack growth. Map a page and resume; if anything
-       * about the request is suspicious (out of zone, cap exhausted,
-       * PMM empty) sched_try_grow_stack returns 0 and we fall through
-       * to the fatal kill below. */
-      if ((dfsc == 0x05 || dfsc == 0x06 || dfsc == 0x07) &&
-          sched_try_grow_stack(t, frame->far)) {
-        break;  /* eret resumes the faulting instruction */
+      /* Translation fault at L1/L2/L3 => a page is missing or its
+       * permissions changed. Two demand-paging mechanisms can satisfy it:
+       *
+       *   1. user-stack growth zone — sched_try_grow_stack() owns the region
+       *      [top - MAX, top - INITIAL) and is checked first because it has
+       *      its own page-count cap that a VMA fault must not consume.
+       *   2. mmap()ed regions — sched_try_handle_vma_fault() handles any VMA.
+       *
+       * Both return 0 when the request is out of zone, hits a cap, violates
+       * the region's protection, or the PMM is empty; we then fall through to
+       * the fatal kill below, which is the correct outcome for a genuine
+       * segfault.
+       *
+       * WnR (bit 6 of the ISS) tells us read vs write so a store to a
+       * PROT_READ VMA faults instead of being quietly satisfied. */
+      if (dfsc == 0x05 || dfsc == 0x06 || dfsc == 0x07) {
+        int wnr = (frame->esr >> 6) & 1;
+        if (sched_try_grow_stack(t, frame->far)) {
+          break;  /* eret resumes the faulting instruction */
+        }
+        if (sched_try_handle_vma_fault(t, frame->far, wnr, 0)) {
+          break;
+        }
       }
       dump_user_abort("data abort", t, frame);
       task_exit();
@@ -220,6 +243,17 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
 
     case EC_INST_ABORT_LO: {
       task_t *t = sched_current();
+      /* An instruction fetch can fault two ways: the page is missing, or it
+       * is present but carries UXN. The latter is NOT recoverable — we must
+       * not fault a PROT_EXEC page into existence on an instruction abort,
+       * since the mapping genuinely forbids execution there. Only attempt a
+       * demand-page when the DFSC is a pure translation fault, which by
+       * definition means no descriptor was present at all. */
+      uint8_t dfsc = (uint8_t)ESR_ISS_DFSC(frame->esr);
+      if ((dfsc == 0x05 || dfsc == 0x06 || dfsc == 0x07) &&
+          sched_try_handle_vma_fault(t, frame->far, 0, 1)) {
+        break;
+      }
       dump_user_abort("instruction abort", t, frame);
       task_exit();
       break;

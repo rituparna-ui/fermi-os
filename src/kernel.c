@@ -609,6 +609,469 @@ static void task_crash(void) {
 }
 
 
+/* ---- mmap test helpers ---------------------------------------------------
+ *
+ * These go through the same inline SVC stubs the user programs use, so
+ * exercising them here validates the syscall ABI itself rather than some
+ * kernel-internal shortcut. */
+
+static inline uint64_t k_mmap(uint64_t addr, uint64_t len, uint64_t prot,
+                              uint64_t flags) {
+  register long      x0 __asm__("x0") = (long)addr;
+  register long      x1 __asm__("x1") = (long)len;
+  register long      x2 __asm__("x2") = (long)prot;
+  register long      x3 __asm__("x3") = (long)flags;
+  register long      x4 __asm__("x4") = -1; /* fd = -1 (anonymous) */
+  register long      x5 __asm__("x5") = 0;  /* offset = 0 */
+  register uint64_t  x8 __asm__("x8") = 222; /* SYS_MMAP */
+  __asm__ __volatile__("svc #0"
+                       : "+r"(x0)
+                       : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8)
+                       : "memory");
+  return (uint64_t)x0;
+}
+
+static inline long k_munmap(uint64_t addr, uint64_t len) {
+  register long      x0 __asm__("x0") = (long)addr;
+  register long      x1 __asm__("x1") = (long)len;
+  register uint64_t  x8 __asm__("x8") = 215; /* SYS_MUNMAP */
+  __asm__ __volatile__("svc #0"
+                       : "+r"(x0)
+                       : "r"(x1), "r"(x8)
+                       : "memory");
+  return (long)x0;
+}
+
+static inline long k_brk(uint64_t addr) {
+  register long      x0 __asm__("x0") = (long)addr;
+  register uint64_t  x8 __asm__("x8") = 214; /* SYS_BRK */
+  __asm__ __volatile__("svc #0" : "+r"(x0) : "r"(x8) : "memory");
+  return (long)x0;
+}
+
+static inline long k_mprotect(uint64_t addr, uint64_t len, uint64_t prot) {
+  register long      x0 __asm__("x0") = (long)addr;
+  register long      x1 __asm__("x1") = (long)len;
+  register long      x2 __asm__("x2") = (long)prot;
+  register uint64_t  x8 __asm__("x8") = 226; /* SYS_MPROTECT */
+  __asm__ __volatile__("svc #0"
+                       : "+r"(x0)
+                       : "r"(x1), "r"(x2), "r"(x8)
+                       : "memory");
+  return (long)x0;
+}
+
+#define TEST_PROT_READ  0x1
+#define TEST_PROT_WRITE 0x2
+#define TEST_MAP_ANON   0x20
+
+/* EL0-safe reporting helpers. An EL0 task cannot call uart_printf (or any
+ * other kernel function) — the kernel .text is mapped into user space
+ * read-only for the task's own trampoline, not as a callable library. All
+ * output therefore goes through sys_write, same as task_a and task_shell.
+ *
+ * Doing this through the SVC path is deliberate: it means the test exercises
+ * the real syscall ABI rather than a kernel-internal shortcut. */
+static void t_puts(const char *s) {
+  size_t n = 0;
+  while (s[n]) n++;
+  sys_write(1, s, n);
+}
+
+static void t_puthex(uint64_t v) {
+  char buf[18];
+  const char *digits = "0123456789abcdef";
+  int p = 0;
+  buf[p++] = '0';
+  buf[p++] = 'x';
+  for (int i = 15; i >= 0; i--) {
+    buf[p++] = digits[(v >> (i * 4)) & 0xF];
+  }
+  sys_write(1, buf, p);
+}
+
+static void t_putdec(uint64_t v) {
+  char buf[24];
+  int n = u_render_uint(buf, sizeof(buf), v);
+  sys_write(1, buf, n);
+}
+
+/* Report one assertion. Returns got == want so the caller can tally. */
+static int mmap_expect(const char *what, long got, long want) {
+  t_puts("  [MM TEST] ");
+  t_puts(what);
+  t_puts(got == want ? "  OK" : "  FAIL  got=");
+  if (got != want) {
+    t_putdec((uint64_t)(long)got);
+    t_puts(" want=");
+    t_putdec((uint64_t)(long)want);
+  }
+  t_puts("\n");
+  return got == want;
+}
+
+/* Exercise the mmap/munmap/mprotect path end to end.
+ *
+ * Everything asserted here is observable from EL0 through the SVC ABI:
+ * returns, memory contents after demand-faulting, and the fact that an
+ * over-protected access kills the task (checked by task_mmap_guard, which
+ * must NOT survive). */
+static void task_mmap(void) {
+  t_puts("[MM TEST] === mmap / munmap / mprotect ===\n");
+
+  int pass = 0, fail = 0;
+
+  /* --- 1. anonymous RW mapping of 3 pages, kernel-picked address --- */
+  uint64_t len  = 3ULL * PAGE_SIZE;
+  uint64_t addr = k_mmap(0, len, TEST_PROT_READ | TEST_PROT_WRITE,
+                         TEST_MAP_ANON);
+  /* MAP_FAILED is (void*)-1. A success address must be page-aligned, above
+   * the stack, and non-zero. */
+  if ((int64_t)addr < 0) {
+    t_puts("  [MM TEST] mmap(3 pages)  FAIL (rejected)\n");
+    fail++;
+    t_puts("[MM TEST] aborting remaining checks\n");
+    sys_exit();
+  }
+  t_puts("  [MM TEST] mmap(3 pages, anon RW)  OK addr=");
+  t_puthex(addr);
+  t_puts("\n");
+  pass++;
+
+  /* --- 2. demand paging: write one byte per page, read them all back --- */
+  /* This is the whole point of the exercise. None of these pages exist until
+   * touched, so every write below takes the EC_DATA_ABORT_LO path into
+   * sched_try_handle_vma_fault(). */
+  volatile uint8_t *p = (volatile uint8_t *)addr;
+  for (uint64_t i = 0; i < 3; i++) {
+    p[i * PAGE_SIZE] = (uint8_t)(0xA0 + i);
+  }
+  int rw_ok = 1;
+  for (uint64_t i = 0; i < 3; i++) {
+    if (p[i * PAGE_SIZE] != (uint8_t)(0xA0 + i)) {
+      rw_ok = 0;
+    }
+  }
+  if (mmap_expect("demand-page RW roundtrip", rw_ok, 1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* --- 3. untouched pages must read as zero (true zero-fill) --- */
+  /* Byte 1 of page 0 was never written. If the demand-fault path forgot to
+   * zero the page, we'd read back PMM garbage here instead of 0. */
+  if (mmap_expect("zero-fill of untouched page", p[1], 0)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* --- 4. second mapping gets a different, non-overlapping address --- */
+  uint64_t addr2 = k_mmap(0, PAGE_SIZE, TEST_PROT_READ | TEST_PROT_WRITE,
+                          TEST_MAP_ANON);
+  if ((int64_t)addr2 < 0 || addr2 == addr) {
+    t_puts("  [MM TEST] second mmap distinct  FAIL\n");
+    fail++;
+  } else {
+    t_puts("  [MM TEST] second mmap distinct  OK ");
+    t_puthex(addr2);
+    t_puts("\n");
+    pass++;
+  }
+
+  /* --- 5. MAP_FIXED onto an occupied range is rejected ---
+   * MAP_FIXED matters here: without it `addr` is only a hint, and the kernel
+   * correctly allocates elsewhere instead of colliding. */
+  long overlap = (long)k_mmap(addr, PAGE_SIZE,
+                              TEST_PROT_READ | TEST_PROT_WRITE,
+                              TEST_MAP_ANON | 0x10 /* MAP_FIXED */);
+  if (mmap_expect("MAP_FIXED overlap rejected", overlap, -1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* --- 6. MAP_FIXED at a page-aligned free address ---
+   * addr2 occupies [addr2, addr2 + PAGE); the next hole starts right above
+   * it. (addr+len is NOT free — addr2 was allocated out of that gap.) */
+  uint64_t fixed = addr2 + PAGE_SIZE;
+  long fr = (long)k_mmap(fixed, PAGE_SIZE, TEST_PROT_READ | TEST_PROT_WRITE,
+                         TEST_MAP_ANON | 0x10 /* MAP_FIXED */);
+  if (mmap_expect("MAP_FIXED at free address", fr, (long)fixed)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* --- 7. mprotect to read-only; reads still work afterwards ---
+   * Must cover the whole VMA — this implementation rejects a partial range
+   * rather than splitting the region (same rule as munmap). The "write now
+   * faults" half lives in task_mmap_guard, since it kills the task. */
+  long pr = k_mprotect(addr, len, TEST_PROT_READ);
+  if (mmap_expect("mprotect -> PROT_READ", pr, 0)) {
+    pass++;
+  } else {
+    fail++;
+  }
+  if (mmap_expect("read still works after mprotect", p[0], 0xA0)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* Re-granting write to a sub-range must split the VMA and restore
+   * writability for exactly that part. (An earlier revision asserted this
+   * was refused; split support made it valid, and test 9b covers the
+   * accept path.) */
+  long pback = k_mprotect(addr, PAGE_SIZE, TEST_PROT_WRITE);
+  if (mmap_expect("partial mprotect re-grant", pback, 0)) {
+    pass++;
+  } else {
+    fail++;
+  }
+  p[0] = 0xA1; /* write now permitted again */
+  if (mmap_expect("write after partial mprotect", p[0], 0xA1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* --- 8. munmap releases; re-mapping the same range succeeds --- */
+  long mu = k_munmap(addr2, PAGE_SIZE);
+  if (mmap_expect("munmap whole VMA", mu, 0)) {
+    pass++;
+  } else {
+    fail++;
+  }
+  long reuse = (long)k_mmap(addr2, PAGE_SIZE,
+                            TEST_PROT_READ | TEST_PROT_WRITE, TEST_MAP_ANON);
+  if (mmap_expect("re-map freed range", reuse, (long)addr2)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* --- 9. partial munmap now WORKS (VMA splitting) ---
+   * The region is 3 pages; unmap just the middle one. Before split support
+   * this returned -1. Now the VMA is cut in two and only the middle page is
+   * released, leaving the outer two mapped and readable. */
+  uint64_t mid = addr + PAGE_SIZE;
+  long partial = k_munmap(mid, PAGE_SIZE);
+  if (mmap_expect("partial munmap accepted", partial, 0)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* The outer pages must survive: p[0] is page 0, still mapped. Expect the
+   * value written by test 7's partial-mprotect re-grant (0xA1), not the
+   * original 0xA0 — that write already happened earlier in this same task. */
+  if (mmap_expect("neighbours survive partial munmap", p[0], 0xA1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* And the middle must be gone: re-mmapping it must succeed at that exact
+   * address, proving the range was really released. */
+  long remix = (long)k_mmap(mid, PAGE_SIZE, TEST_PROT_READ | TEST_PROT_WRITE,
+                            TEST_MAP_ANON | 0x10 /* MAP_FIXED */);
+  if (mmap_expect("split range re-mappable", remix, (long)mid)) {
+    pass++;
+  } else {
+    fail++;
+  }
+  k_munmap(mid, PAGE_SIZE);
+
+  /* --- 9b. splitting creates two separately-protectable regions --- */
+  /* The VMA is now two pieces (page 0, page 2). mprotect on just the first
+   * must succeed and affect only it. */
+  long sp = k_mprotect(addr, PAGE_SIZE, TEST_PROT_READ);
+  if (mmap_expect("partial mprotect accepted", sp, 0)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* --- 9c. VMA merge: free both halves, then re-map across the seam.
+   * munmap(addr, PAGE) then munmap(addr+2*PAGE) removes page 0 and page 2.
+   * The hole between them is the middle page, already unmapped in 9. After
+   * both halves are gone, a MAP_FIXED mapping spanning the whole original
+   * 3-page range must succeed — proving the space really is free and the VMA
+   * bookkeeping didn't leak a phantom region. */
+  long f1 = k_munmap(addr, PAGE_SIZE);
+  long f2 = k_munmap(addr + 2 * PAGE_SIZE, PAGE_SIZE);
+  if (mmap_expect("unmap split halves", f1 == 0 && f2 == 0, 1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+  long full = (long)k_mmap(addr, len, TEST_PROT_READ | TEST_PROT_WRITE,
+                           TEST_MAP_ANON | 0x10 /* MAP_FIXED */);
+  if (mmap_expect("re-map whole original range", full, (long)addr)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* munmap of a hole (never mapped) succeeds, matching Linux. */
+  long hole = k_munmap(0x30000000ULL, PAGE_SIZE);
+  if (mmap_expect("munmap of hole succeeds", hole, 0)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* --- 10. MAP_FIXED above the user ceiling is rejected ---
+   * Must be MAP_FIXED: with addr treated as a hint the kernel is free to
+   * ignore it and place the region lower, which is correct behavior. */
+  long wild = (long)k_mmap(0x70000000ULL, PAGE_SIZE,
+                           TEST_PROT_READ | TEST_PROT_WRITE,
+                           TEST_MAP_ANON | 0x10 /* MAP_FIXED */);
+  if (mmap_expect("wild MAP_FIXED rejected", wild, -1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* --- 11. unaligned MAP_FIXED is rejected --- */
+  long unal = (long)k_mmap(addr + 0x800, PAGE_SIZE,
+                           TEST_PROT_READ | TEST_PROT_WRITE,
+                           TEST_MAP_ANON | 0x10 /* MAP_FIXED */);
+  if (mmap_expect("unaligned MAP_FIXED rejected", unal, -1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* --- 12. file-backed mmap is refused (no page cache yet) ---
+   * Flags of 0 means MAP_ANONYMOUS is clear, i.e. a file-backed request. */
+  long nofile = (long)k_mmap(0, PAGE_SIZE, TEST_PROT_READ | TEST_PROT_WRITE,
+                             0);
+  if (mmap_expect("file-backed mmap refused", nofile, -1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* --- 13. MAP_SHARED is refused rather than silently downgraded --- */
+  long shared = (long)k_mmap(0, PAGE_SIZE, TEST_PROT_READ | TEST_PROT_WRITE,
+                             TEST_MAP_ANON | 0x01 /* MAP_SHARED */);
+  if (mmap_expect("MAP_SHARED refused", shared, -1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* --- 14. brk grows contiguously and is demand-paged --- */
+  long b0 = k_brk(0);
+  if (mmap_expect("brk(0) reports initial break", b0 != 0, 1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* Ask for 4 pages of heap. No physical memory should be allocated until we
+   * write, which is what the following demand-page log lines confirm. */
+  long b1 = k_brk((uint64_t)b0 + 4 * PAGE_SIZE);
+  if (mmap_expect("brk grow succeeds", b1, b0 + (long)(4 * PAGE_SIZE))) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* The heap is below the break but above brk_base: nothing should fault
+   * there before first touch. */
+  volatile uint32_t *heap = (volatile uint32_t *)(uint64_t)b0;
+  heap[0] = 0xFEEDFACEu;
+  heap[3 * (PAGE_SIZE / 4)] = 0xBEEFCAFEu;
+  if (mmap_expect("brk page 0 write/read",
+                  heap[0] == 0xFEEDFACEu, 1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+  if (mmap_expect("brk last page write/read",
+                  heap[3 * (PAGE_SIZE / 4)] == 0xBEEFCAFEu, 1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* Untouched heap byte must be zero. */
+  if (mmap_expect("brk zero-fill", heap[1], 0)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* Growth is monotonic: the break never moves backwards. */
+  long b2 = k_brk((uint64_t)b1 - PAGE_SIZE); /* shrink request */
+  if (mmap_expect("brk does not shrink", b2, b1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* Beyond the arena ceiling must be refused, returning the current break. */
+  long big = k_brk(0x30000000ULL);
+  if (mmap_expect("brk beyond arena refused", big, b1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  /* --- 15. VMA merge: free the brk heap, it should weld back --- */
+  long bm = k_brk(0);
+  k_brk((uint64_t)bm + 8 * PAGE_SIZE);
+  k_brk(bm); /* refused (no shrink), so arena stays grown — grow back */
+  long bchk = k_brk((uint64_t)bm + 8 * PAGE_SIZE);
+  if (mmap_expect("brk regrow after no-op", bchk != 0, 1)) {
+    pass++;
+  } else {
+    fail++;
+  }
+
+  t_puts("[MM TEST] === ");
+  t_putdec(pass);
+  t_puts(" passed, ");
+  t_putdec(fail);
+  t_puts(" failed ===\n");
+  sys_exit();
+}
+
+/* Must die. Writes to a PROT_READ page after mprotect; the demand-fault path
+ * must refuse to satisfy the write, and the EL0 data abort then kills the
+ * task. Reaching the "SURVIVED" line is the failure signal. */
+static void task_mmap_guard(void) {
+  t_puts("[MM TEST] guard: writing to PROT_READ page (expect kill)\n");
+
+  uint64_t len  = 2ULL * PAGE_SIZE;
+  uint64_t addr = k_mmap(0, len, TEST_PROT_READ | TEST_PROT_WRITE,
+                         TEST_MAP_ANON);
+  if ((int64_t)addr < 0) {
+    t_puts("[MM TEST] guard: mmap failed unexpectedly\n");
+    sys_exit();
+  }
+
+  /* Drop write permission across the whole VMA. Nothing has touched any of
+   * these pages yet, so none has a PTE at all; the fault below is what drives
+   * the first one in. The permission check must refuse the write rather than
+   * map the page RW — otherwise a PROT_READ region would be silently
+   * writable, which is the exact bug this task exists to catch.
+   *
+   * Must cover the entire VMA: a partial mprotect is refused by design. */
+  k_mprotect(addr, len, TEST_PROT_READ);
+
+  volatile uint8_t *p = (volatile uint8_t *)addr;
+  p[0] = 0xFF; /* first touch, read-only -> faults here */
+
+  t_puts("[MM TEST] guard: !!! SURVIVED !!! write was allowed\n");
+  sys_exit();
+}
+
+
 /* Task A: open a file from FAT32 and print it through fd=1. */
 static void task_a(void) {
   const char banner[] = "[Task A] reading /mnt/fat32/HELLO.TXT\n";
@@ -818,6 +1281,8 @@ void kernel_main() {
   sched_create_task("task_b", task_b);
   sched_create_task("task_shell", task_shell);
   sched_create_task("task_crash", task_crash);
+  sched_create_task("task_mmap", task_mmap);
+  sched_create_task("task_mmguard", task_mmap_guard);
   sched_create_kernel_task("netd", netd);
 
   timer_init();

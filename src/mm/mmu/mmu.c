@@ -220,6 +220,107 @@ void mmu_map_user_range(uint64_t *l0, uint64_t va, uint64_t pa,
   }
 }
 
+uint64_t mmu_prot_to_flags(uint32_t prot) {
+  uint64_t f = PTE_ATTRIDX(1);
+
+  /* PXN always: the kernel must never execute from a user page, regardless
+   * of what the user asked for. */
+  f |= PTE_PXN;
+
+  if (prot & VMA_PROT_WRITE) {
+    f |= PTE_AP_RW_EL0;
+  } else {
+    /* Read-only and PROT_NONE both deny EL0 writes. For PROT_NONE we go all
+     * the way to AP_EL1RO so EL0 reads fault too, which is the difference
+     * between "no access" and "cannot write" that PROT_NONE is meant to
+     * express. */
+    f |= (prot & VMA_PROT_READ) ? PTE_AP_RO_EL0 : PTE_AP_RO;
+  }
+
+  if (!(prot & VMA_PROT_EXEC)) {
+    f |= PTE_UXN;
+  }
+
+  return f;
+}
+
+/* Invalidate cached translations covering [va, va + pages*PAGE_SIZE).
+ *
+ * Stepping a TLBI per 4 KiB page would mean a DSB+TLBI+DSB+ISB sequence for
+ * every page, which dominates the cost of a large unmap. One `vae1` per 2 MB
+ * granule drops every entry that could reference the range — at a 4 KiB
+ * granule a 2 MB L2 block spans 512 pages, so the stride cannot skip one.
+ *
+ * Deliberately untagged (no ASID in the operand): this runs on whatever task
+ * happens to be current, which need not be the owner of the page tables being
+ * modified. An untagged `vae1` only drops entries for the current ASID, which
+ * is the conservative direction; callers that need to guarantee the owner's
+ * entries are gone must invalidate by ASID explicitly. */
+static void invalidate_user_span(uint64_t va, uint64_t pages) {
+  if (!pages) {
+    return;
+  }
+  uint64_t granule_start = PAGE_ALIGN_DOWN(va);
+  uint64_t granule_end   = PAGE_ALIGN_UP(va + pages * PAGE_SIZE);
+
+  for (uint64_t g = granule_start; g < granule_end; g += _2MB) {
+    __asm__ __volatile__("dsb ish\n\t"
+                         "tlbi vae1, %0\n\t"
+                         "dsb ish\n\t"
+                         "isb"
+                         :: "r"(g >> 12));
+  }
+}
+
+void mmu_unmap_user_range(uint64_t *l0, uint64_t va, uint64_t pages) {
+  if (!l0 || !pages) {
+    return;
+  }
+
+  for (uint64_t i = 0; i < pages; i++) {
+    uint64_t a = va + i * PAGE_SIZE;
+    uint64_t *pte = walk_levels(l0, a, 3, 0);
+    if (pte && pte_valid(*pte)) {
+      *pte = 0;
+    }
+  }
+
+  invalidate_user_span(va, pages);
+}
+
+uint64_t mmu_protect_user_range(uint64_t *l0, uint64_t va, uint64_t pages,
+                                uint64_t flags) {
+  if (!l0 || !pages) {
+    return 0;
+  }
+
+  /* Bits that describe permissions rather than the mapping itself. These are
+   * cleared before the new flags are applied so a stale AP or UXN can't
+   * survive an mprotect.
+   *
+   * AP occupies bits [7:6] only — mask it as 0x3 << 6. Do NOT build this by
+   * OR-ing the PTE_AP_* constants together: AP_EL0RO is 3 << 6, so the naive
+   * OR spills into bit 8 and would silently clear PTE_SH_INNER's low bit,
+   * corrupting shareability on every re-protect. */
+  const uint64_t AP_MASK = 0x3ULL << 6;
+  const uint64_t PERM_MASK = AP_MASK | PTE_UXN | PTE_PXN | PTE_ATTRIDX(3);
+
+  uint64_t changed = 0;
+
+  for (uint64_t i = 0; i < pages; i++) {
+    uint64_t a = va + i * PAGE_SIZE;
+    uint64_t *pte = walk_levels(l0, a, 3, 0);
+    if (!pte || !pte_valid(*pte)) {
+      continue;
+    }
+    *pte = (*pte & ~PERM_MASK) | (flags & PERM_MASK);
+    changed++;
+  }
+
+  invalidate_user_span(va, pages);
+  return changed;
+}
+
 void mmu_free_user_tables(uint64_t *l0_phys) {
   // Walk L0 → L1 → L2 → L3 and free every intermediate table page.
   // L3 page descriptors point to user data pages (text / stack), which are

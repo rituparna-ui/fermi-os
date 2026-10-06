@@ -20,9 +20,17 @@
 //   x0 - x7  = up to 7 arguments
 //   x0       = return value (written back into trap frame)
 
-// User-space layout is [0, USER_STACK_TOP). Anything outside that range is
+// User-space layout is [0, USER_VA_TOP). Anything outside that range is
 // either an unmapped TTBR0 region or — much worse — a kernel pointer the user
 // is trying to trick the syscall path into dereferencing on its behalf.
+//
+// USER_VA_TOP (1 GiB) replaced USER_STACK_TOP (8 MiB) as this bound when
+// mmap() landed. The stack top was only ever correct while the stack was the
+// sole user mapping above text; mmap hands out addresses well past it, so
+// validating against 8 MiB would have rejected every mmap'd buffer as an
+// out-of-range pointer. The security property is preserved because the kernel
+// itself lives at 0xFFFF_0000_4000_0000 — nothing below 1 GiB can alias a
+// kernel pointer.
 //
 // Limitation: these checks only validate the *range*. A user pointer inside
 // the range that points to an unmapped page will still fault the kernel
@@ -43,7 +51,7 @@ static inline int user_buf_ok(uint64_t ptr, size_t len) {
   if (ptr + len < ptr) {
     return 0;
   }
-  if (ptr + len > USER_STACK_TOP) {
+  if (ptr + len > USER_VA_TOP) {
     return 0;
   }
   return 1;
@@ -53,10 +61,10 @@ static inline int user_buf_ok(uint64_t ptr, size_t len) {
 // NUL) on success, or -1 if ptr is out of range or no NUL is found within
 // USER_PATH_MAX bytes.
 static inline int64_t user_str_ok(uint64_t ptr) {
-  if (ptr >= USER_STACK_TOP) {
+  if (ptr >= USER_VA_TOP) {
     return -1;
   }
-  uint64_t bound = USER_STACK_TOP - ptr;
+  uint64_t bound = USER_VA_TOP - ptr;
   if (bound > USER_PATH_MAX) {
     bound = USER_PATH_MAX;
   }
@@ -326,6 +334,321 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
 }
 
 
+/*
+ * mmap helpers
+ *
+ * The address-space policy lives here rather than in vma.c because it's a
+ * policy question (where may user memory live?) and the VMA layer is a generic
+ * bookkeeping structure with no opinions about it.
+ */
+
+/* Highest user VA this kernel will ever map. Anything above is rejected
+ * before it can reach the page-table walk. */
+#define MM_MAX_USER_VA USER_VA_TOP
+
+/* Reject ranges that would escape the user window or wrap the address space.
+ * Returns 1 if [start, end) is acceptable. */
+static int mmap_range_ok(uint64_t start, uint64_t end) {
+  if (start >= end) {
+    return 0; /* zero-length or inverted */
+  }
+  if (end > MM_MAX_USER_VA) {
+    return 0;
+  }
+  return 1;
+}
+
+/* Pick the lowest free aligned range of `len` bytes, scanning the VMA list.
+ *
+ * Bottom-up allocation keeps low addresses (where the kernel maps user text
+ * and the stack) untouched and makes the layout predictable, which matters
+ * when debugging. Returns 0 if no gap large enough exists below
+ * MM_MAX_USER_VA. */
+static uint64_t mmap_find_free(task_t *t, uint64_t len) {
+  uint64_t candidate = USER_MMAP_BASE;
+
+  while (candidate + len <= MM_MAX_USER_VA) {
+    vma_t *hit = vma_find_overlap(&t->vmas, candidate, candidate + len);
+    if (!hit) {
+      return candidate;
+    }
+    /* Jump past the blocking region and re-align (start is already
+     * page-aligned, so the +0 is redundant but keeps the invariant explicit
+     * if USER_MMAP_BASE ever changes). */
+    candidate = PAGE_ALIGN_UP(hit->end);
+  }
+  return 0;
+}
+
+/* SYS_MMAP — create a region. Anonymous only in this first implementation.
+ *
+ * Linux arg order: addr, length, prot, flags, fd, offset.
+ *
+ * Deliberate restrictions, each returning MAP_FAILED rather than pretending:
+ *   - MAP_ANONYMOUS required; file-backed mapping needs a page cache that
+ *     doesn't exist yet.
+ *   - MAP_FIXED honored (with full range + overlap validation), since a libc
+ *     allocator that wants a fixed arena should not be blocked.
+ *   - MAP_SHARED treated as MAP_PRIVATE: with no page cache, a shared anon
+ *     region would need write-back on fault to be observable, so silently
+ *     upgrading it would produce a program that "works" and loses data.
+ */
+static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
+                        uint64_t flags, uint64_t fd, uint64_t offset) {
+  task_t *t = sched_current();
+  if (!t || !t->ttbr0) {
+    return -1; /* MAP_FAILED */
+  }
+
+  /* Only prot bits we understand; anything else means the caller is using a
+   * flag from a newer kernel and we should not guess. */
+  if (prot & ~(uint64_t)(VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC)) {
+    return -1;
+  }
+  if (flags & MAP_SHARED) {
+    return -1;
+  }
+  if (!(flags & MAP_ANONYMOUS)) {
+    return -1;
+  }
+  if (offset != 0 || fd != (uint64_t)-1) {
+    /* Anonymous mappings ignore fd and must have offset 0. */
+    return -1;
+  }
+  if (length == 0) {
+    return -1;
+  }
+
+  /* Page-align the range. Linux rounds the length up; the start is truncated
+   * down unless MAP_FIXED, in which case an unaligned addr is EINVAL. */
+  uint64_t start;
+  uint64_t end;
+
+  if (flags & MAP_FIXED) {
+    if (addr & (PAGE_SIZE - 1)) {
+      return -1;
+    }
+    start = addr;
+    end   = addr + length;
+    if (!mmap_range_ok(start, end)) {
+      return -1;
+    }
+    /* MAP_FIXED replaces whatever was there. For now only an untouched
+     * region is acceptable — unmapping arbitrary overlapping regions means
+     * splitting VMAs, which this implementation doesn't do. */
+    if (vma_find_overlap(&t->vmas, start, end)) {
+      return -1;
+    }
+  } else {
+    uint64_t want = PAGE_ALIGN_UP(length);
+    if (want < length) {
+      return -1; /* overflow */
+    }
+    start = mmap_find_free(t, want);
+    if (!start) {
+      return -1; /* no space */
+    }
+    end = start + want;
+    if (!mmap_range_ok(start, end)) {
+      return -1;
+    }
+  }
+
+  vma_t *vma = vma_add(&t->vmas, start, end, (uint32_t)prot,
+                       VMA_ANONYMOUS | VMA_SHARED);
+  if (!vma) {
+    return -1;
+  }
+
+  /* No page-table work happens here: the region is empty and pages are
+   * faulted in on first touch by sched_try_handle_vma_fault(). For a large
+   * mapping this means mmap() is O(1) in physical memory — pages only exist
+   * once touched. */
+
+  uart_printf("[MM] task %u '%s' mmap %x-%x prot=%u flags=%u -> VMA #%u\n",
+              t->pid, t->name, start, end, prot, flags, vma_count(&t->vmas));
+  return (int64_t)start;
+}
+
+/* SYS_MUNMAP — release a region, splitting VMAs as needed.
+ *
+ * Order matters: the VMA records and their physical pages are released BEFORE
+ * the page-table entries are cleared. If a fault landed between the two we
+ * could find a VMA for an address whose page we were midway through freeing.
+ * The VMA list is authoritative for "may this task touch this address", so
+ * it must be the first thing to change.
+ *
+ * Clearing the L3 descriptors is a pure address-range operation and doesn't
+ * care how VMAs are shaped, which is why splitting can't desynchronize it. */
+static int64_t sys_munmap(uint64_t addr, uint64_t length) {
+  task_t *t = sched_current();
+  if (!t || !t->ttbr0) {
+    return -1;
+  }
+  if (addr & (PAGE_SIZE - 1) || length == 0) {
+    return -1;
+  }
+  if (addr == 0) {
+    return 0; /* POSIX: munmap(0, n) is a no-op */
+  }
+
+  /* Overflow guard before computing the end: a huge length would wrap the
+   * sum into a small value that passes every range check below. */
+  if (length > MM_MAX_USER_VA || addr > MM_MAX_USER_VA - length) {
+    return -1;
+  }
+
+  /* Round to whole pages the Linux way: munmap(p, 1) unmaps the single page
+   * containing p, so the end is derived from the last byte, not the length. */
+  uint64_t end = PAGE_ALIGN_DOWN(addr + length - 1) + PAGE_SIZE;
+  if (end > MM_MAX_USER_VA) {
+    return -1;
+  }
+
+  int64_t released = vma_unmap_range(&t->vmas, addr, end);
+  if (released < 0) {
+    return -1;
+  }
+
+  uint64_t *l0 = (uint64_t *)ttbr_baddr(t->ttbr0);
+  mmu_unmap_user_range(l0, addr, (end - addr) / PAGE_SIZE);
+
+  uart_printf("[MM] task %u '%s' munmap %x-%x (%u pages, %u resident freed)\n",
+              t->pid, t->name, addr, end, (end - addr) / PAGE_SIZE,
+              released);
+  return 0;
+}
+
+/* SYS_MPROTECT — change protection, splitting VMAs as needed. */
+static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot) {
+  task_t *t = sched_current();
+  if (!t || !t->ttbr0) {
+    return -1;
+  }
+  if (addr & (PAGE_SIZE - 1) || length == 0) {
+    return -1;
+  }
+  if (prot & ~(uint64_t)(VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC)) {
+    return -1;
+  }
+  if (addr == 0) {
+    return 0;
+  }
+
+  /* Overflow guard, same reasoning as munmap. */
+  if (length > MM_MAX_USER_VA || addr > MM_MAX_USER_VA - length) {
+    return -1;
+  }
+
+  uint64_t end = PAGE_ALIGN_DOWN(addr + length - 1) + PAGE_SIZE;
+  if (end > MM_MAX_USER_VA) {
+    return -1;
+  }
+
+  /* vma_protect_range splits first so that every VMA intersecting [addr, end)
+   * ends up ENTIRELY inside it. That postcondition is what makes the
+   * address-range PTE rewrite below correct: mmu_protect_user_range can't
+   * know which VMA a given page belonged to, so it can only be trusted once
+   * the range aligns with VMA boundaries.
+   *
+   * Record first, then tables: if the table update is interrupted, pages
+   * keep the OLD (possibly weaker) protection rather than being left mapped
+   * with stronger protection than the VMA records claim. */
+  int touched = vma_protect_range(&t->vmas, addr, end, (uint32_t)prot);
+  if (touched < 0) {
+    return -1;
+  }
+
+  /* Re-protect the already-faulted pages now, and record the new protection
+   * so pages faulted in LATER get it too. Both halves matter: without the
+   * table update a live page keeps its old permissions, and without the VMA
+   * update a later fault reinstates the old permissions. */
+  uint64_t *l0 = (uint64_t *)ttbr_baddr(t->ttbr0);
+  mmu_protect_user_range(l0, addr, (end - addr) / PAGE_SIZE,
+                         mmu_prot_to_flags((uint32_t)prot));
+
+  uart_printf("[MM] task %u '%s' mprotect %x-%x -> prot=%u (%u VMAs)\n",
+              t->pid, t->name, addr, end, prot, touched);
+  return 0;
+}
+
+/* SYS_BRK — resize the program break, a contiguous heap.
+ *
+ * brk is a legacy interface: it hands out a single contiguous region whose
+ * end the program moves with brk(addr). It predates mmap and glibc's default
+ * allocator uses it via sbrk, so a libc still needs it even when mmap works.
+ *
+ * Implemented as a lazily-extended anonymous VMA: brk(0) reports the current
+ * break, and brk(addr) grows the region up to addr (or shrinks it, which is
+ * allowed but discouraged — freeing below the break is what free() is for).
+ * Growth allocates NO physical memory; pages appear on first touch, same as
+ * any other anonymous mapping. That's what makes a large brk affordable.
+ *
+ * The arena has a fixed reservation so growth is always contiguous and needs
+ * no address search. Ceiling is USER_BRK_RESERVE_PAGES (see mmu.h).
+ */
+static int64_t sys_brk(uint64_t addr) {
+  task_t *t = sched_current();
+  if (!t || !t->ttbr0) {
+    return (int64_t)t->brk_cur;
+  }
+
+  uint64_t lo = t->brk_base;
+  uint64_t hi = t->brk_base + USER_BRK_RESERVE_PAGES * PAGE_SIZE;
+
+  /* Linux returns the *current* break on failure rather than an errno, so a
+   * caller can detect failure by comparing. Match that. */
+  if (addr == 0) {
+    return (int64_t)t->brk_cur;
+  }
+  if (addr < lo || addr > hi) {
+    uart_printf("[BRK] task %u brk %x out of range [%x,%x]\n", t->pid, addr,
+                lo, hi);
+    return (int64_t)t->brk_cur;
+  }
+
+  uint64_t new_end = PAGE_ALIGN_UP(addr);
+
+  /* Shrinking below the current break is legal but pointless; the pages stay
+   * mapped so a stale pointer that later reads back doesn't fault. Keep the
+   * break where it is in that case rather than unmapping. */
+  if (new_end < t->brk_cur) {
+    return (int64_t)t->brk_cur;
+  }
+  uint64_t new_cur = new_end;
+
+  /* Grow the VMA to cover the new break. vma_add refuses overlap, so grow
+   * from the current break only when the VMA doesn't already span it. */
+  vma_t *vma = vma_find(&t->vmas, t->brk_cur);
+  if (!vma) {
+    /* No VMA yet — create the initial one. */
+    if (new_end > lo) {
+      vma_add(&t->vmas, lo, new_end, VMA_PROT_READ | VMA_PROT_WRITE,
+              VMA_ANONYMOUS);
+    }
+  } else if (vma->end < new_end) {
+    /* Extend the existing VMA. Rewriting [vma->start, new_end) in place is
+     * simpler than unmap+add and keeps already-faulted pages mapped. */
+    uint64_t grow = new_end - vma->end;
+    uint64_t *bigger =
+        (uintptr_t *)kmalloc(((vma->end - vma->start) / PAGE_SIZE + grow / PAGE_SIZE) *
+                             sizeof(uintptr_t));
+    if (!bigger) {
+      return (int64_t)t->brk_cur; /* growth refused: report current break */
+    }
+    uint64_t old_n = (vma->end - vma->start) / PAGE_SIZE;
+    memcpy(bigger, vma->pages, old_n * sizeof(uintptr_t));
+    memset(bigger + old_n, 0, (grow / PAGE_SIZE) * sizeof(uintptr_t));
+    kfree(vma->pages);
+    vma->pages = bigger;
+    vma->end  = new_end;
+  }
+
+  t->brk_cur = new_cur;
+  return (int64_t)t->brk_cur;
+}
+
+
 void syscall_dispatch(trap_frame_t *frame) {
   /* Allow preemption during the syscall. EL0 had IRQs unmasked, but the
    * synchronous-from-lower-EL vector entry implicitly masks them. Without
@@ -339,6 +662,9 @@ void syscall_dispatch(trap_frame_t *frame) {
   uint64_t arg0 = frame->regs[0];
   uint64_t arg1 = frame->regs[1];
   uint64_t arg2 = frame->regs[2];
+  uint64_t arg3 = frame->regs[3];
+  uint64_t arg4 = frame->regs[4];
+  uint64_t arg5 = frame->regs[5];
 
   int64_t ret = -1;
   fd_table_t *fds = sched_current()->fds;
@@ -448,6 +774,23 @@ void syscall_dispatch(trap_frame_t *frame) {
     /* No arguments. Returns child pid to the caller; the child task,
      * when first scheduled, returns 0 from this same SVC via fork_return. */
     ret = (int64_t)sched_fork(sched_current(), frame);
+    break;
+
+  case SYS_MMAP:
+    /* Linux arg order: addr, length, prot, flags, fd, offset. */
+    ret = sys_mmap(arg0, arg1, arg2, arg3, arg4, arg5);
+    break;
+
+  case SYS_BRK:
+    ret = sys_brk(arg0);
+    break;
+
+  case SYS_MUNMAP:
+    ret = sys_munmap(arg0, arg1);
+    break;
+
+  case SYS_MPROTECT:
+    ret = sys_mprotect(arg0, arg1, arg2);
     break;
 
   case SYS_BALLOON: {

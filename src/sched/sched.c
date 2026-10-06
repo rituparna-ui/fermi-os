@@ -100,6 +100,87 @@ int sched_try_grow_stack(task_t *t, uint64_t far) {
 }
 
 
+/* Demand-fault handler for mmap()ed regions. Mirrors sched_try_grow_stack():
+ * allocate a zeroed page, install it, invalidate, return 1 so the caller
+ * resumes the faulting instruction.
+ *
+ * The difference from stack growth is that we must check the VMA's prot bits
+ * before mapping. Without that check a write to a PROT_READ region would
+ * fault, we'd allocate a fresh zero page, map it with write permission, and
+ * the write would succeed — turning a permissions violation into silent
+ * memory corruption. The access check is the whole reason this is more than a
+ * copy of the stack-growth path. */
+int sched_try_handle_vma_fault(task_t *t, uint64_t far, int is_write,
+                               int is_exec) {
+  if (!t || !t->ttbr0) {
+    return 0;
+  }
+
+  vma_t *vma = vma_find(&t->vmas, far);
+  if (!vma) {
+    return 0; /* not ours — caller will treat as fatal */
+  }
+
+  /* Permission check against the recorded prot. An instruction fetch needs
+   * PROT_EXEC; a store needs PROT_WRITE; a load needs at least PROT_READ
+   * (PROT_NONE denies EL0 entirely, so it fails here). */
+  if (is_exec) {
+    if (!(vma->prot & VMA_PROT_EXEC)) {
+      uart_errorln("[FAULT] instruction fetch on non-exec VMA");
+      return 0;
+    }
+  } else if (is_write) {
+    if (!(vma->prot & VMA_PROT_WRITE)) {
+      uart_errorln("[FAULT] write to non-writable VMA");
+      return 0;
+    }
+  } else {
+    if (!(vma->prot & VMA_PROT_READ)) {
+      uart_errorln("[FAULT] read from PROT_NONE VMA");
+      return 0;
+    }
+  }
+
+  uint64_t va  = far & ~(uint64_t)(PAGE_SIZE - 1);
+  uint64_t idx = (va - vma->start) / PAGE_SIZE;
+
+  /* Already faulted in? Then this is a permission fault on a mapped page, not
+   * a demand-fault — the caller should report it, not remap. */
+  if (idx >= (vma->end - vma->start) / PAGE_SIZE || vma->pages[idx]) {
+    return 0;
+  }
+
+  uintptr_t pa = pmm_allocate_page();
+  if (!pa) {
+    uart_errorln("[FAULT] VMA demand-page: PMM exhausted");
+    return 0;
+  }
+  /* memset via TTBR1 — TTBR0 is this task's table and may not identity-map. */
+  memset((void *)PHYS_TO_VIRT(pa), 0, PAGE_SIZE);
+
+  uint64_t flags = mmu_prot_to_flags(vma->prot);
+  uint64_t *l0 = (uint64_t *)ttbr_baddr(t->ttbr0);
+  mmu_map_user_range(l0, va, pa, 1, flags);
+
+  vma->pages[idx] = pa;
+
+  /* Scope the invalidate to this task's ASID: we're running with its TTBR0
+   * loaded, so an ASID-tagged vae1 is both sufficient and necessary. */
+  uint16_t asid = ttbr_asid(t->ttbr0);
+  uint64_t arg  = ((uint64_t)asid << TTBR_ASID_SHIFT) | (va >> 12);
+  __asm__ __volatile__("dsb ish\n\t"
+                       "tlbi vae1, %0\n\t"
+                       "dsb ish\n\t"
+                       "isb"
+                       :: "r"(arg));
+
+  uart_printf("[MM] task %u '%s' demand-paged VMA page at %x (%s)\n",
+              t->pid, t->name, va,
+              is_exec ? "exec" : is_write ? "write" : "read");
+  return 1;
+}
+
+
 uint16_t sched_asid_alloc(void) {
   uint16_t a = next_asid++;
   if (next_asid == 0) {
@@ -298,6 +379,13 @@ int sched_create_task(const char *name, task_entry_t entry) {
   t->kstack_top = kstack_top;
   t->ustack_phys = ustack_phys;
   copy_name(t->name, name);
+  vma_init(&t->vmas);
+
+  /* Reserve the brk arena base. No VMA is created here — brk() grows it on
+   * first call, and leaving it unmapped until then means the address range
+   * costs nothing while also keeping it out of the VMA table. */
+  t->brk_base = USER_BRK_BASE;
+  t->brk_cur  = USER_BRK_BASE;
 
   /* Per-task fd table: open /dev/console for fd 0, 1, 2 */
   t->fds = fd_table_create();
@@ -434,6 +522,21 @@ int sched_fork(task_t *parent, struct trap_frame *frame) {
   t->pid         = next_pid++;
   t->state       = TASK_READY;
   t->stack_phys  = kstack_phys;
+  /* The child starts with no mmap()ed regions. sched_fork copies .text and
+   * the user stack into the child's tables, but mmap regions are not yet
+   * copied across (see the note in sched_fork's doc comment) — so an empty
+   * VMA set is exactly consistent with what the child's page tables contain.
+   * Once region copying lands, this becomes a deep copy of the parent's set
+   * alongside it. */
+  vma_init(&t->vmas);
+
+  /* The child's break starts empty. fork() copies neither the brk arena nor
+   * mmap regions today (see the note above), so the child gets a fresh,
+   * empty heap rather than a break pointing at memory it doesn't own. Once
+   * region copying lands this becomes a deep copy alongside it. */
+  t->brk_base = USER_BRK_BASE;
+  t->brk_cur  = USER_BRK_BASE;
+
   /* Fresh ASID for the child — separate from parent's so each task has
    * its own TLB context. The parent's TLB entries stay valid under its
    * own ASID until it gets context-switched back in. */
@@ -661,6 +764,12 @@ void sched_reap(void) {
         pmm_free_page(dead->stack_grown_phys[i]);
       }
     }
+
+    /* Release every faulted-in page behind this task's mmap()ed regions.
+     * Same reasoning as the stack pages above: the VMA set records exactly
+     * which physical pages were pmm_allocate'd, so munmap and reap both
+     * return precisely those and nothing else. */
+    vma_destroy(&dead->vmas);
 
 
     /* Invalidate any TLB entries left behind by this task's ASID before we

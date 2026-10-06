@@ -2,6 +2,7 @@
 #define SCHED_H
 
 #include "syscall/elf.h"  /* elf_image_t for per-task region tracking */
+#include "mm/vma/vma.h"   /* VMA set — user address-space bookkeeping */
 #include <stdint.h>
 
 /* forward decl */
@@ -53,6 +54,19 @@ typedef struct task {
    * by switch.S stays put. */
   uintptr_t stack_grown_phys[USER_STACK_GROWN_MAX];
   uint16_t  stack_grown_count;
+
+  /* User address-space regions created by mmap(). Embedded by value so the
+   * list's lifetime is exactly the task's — an allocation that could fail
+   * here would mean mmap() silently losing a region. Placed after the
+   * stack-growth fields to keep the fixed offsets switch.S relies on. */
+  vma_set_t vmas;
+
+  /* Program break for the brk()/sbrk() heap. brk_base is a fixed arena base
+   * reserved per task so growth is always contiguous; brk_cur is the current
+   * break. brk regions are demand-paged like any other anonymous VMA, so the
+   * reservation costs no physical memory until touched. */
+  uint64_t brk_base;
+  uint64_t brk_cur;
 } task_t;
 
 // switch.S
@@ -117,6 +131,21 @@ uint16_t sched_asid_alloc(void);
  * page containing far. Returns 1 on success (caller should resume the user
  * task), 0 on failure (caller should fall through to the fault dump). */
 int sched_try_grow_stack(task_t *t, uint64_t far);
+
+/* Demand-fault handler for mmap()ed regions. Called from the EL0 data-abort
+ * path before the fatal kill.
+ *
+ * If `far` lands inside a VMA on `t` and the requested access is permitted by
+ * that VMA's prot bits, allocate + zero a PMM page, install it in t->ttbr0,
+ * invalidate the TLB, and return 1 so the caller resumes the task. Returns 0
+ * if the address is outside every VMA or the access violates its protection —
+ * in which case the caller must treat it as a genuine fault.
+ *
+ * `is_write` selects write-vs-read (from the ESR WnR bit) so a write to a
+ * PROT_READ mapping still faults instead of being silently satisfied.
+ * `is_exec` is set for instruction aborts, which need UXN clear. */
+int sched_try_handle_vma_fault(task_t *t, uint64_t far, int is_write,
+                               int is_exec);
 
 
 #endif

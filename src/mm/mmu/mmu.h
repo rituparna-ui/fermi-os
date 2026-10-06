@@ -93,6 +93,40 @@ static inline int pte_valid(uint64_t entry) { return entry & PTE_VALID; }
 #define USER_STACK_TOP 0x00800000ULL // 8 MB — top of user stack
 #define USER_STACK_PAGES 4           // 16 KiB user stack
 
+/* Hard ceiling on user virtual addresses.
+ *
+ * This is the range the syscall layer range-checks user pointers against, so
+ * it must be wide enough to hold whatever mmap() hands out. The kernel itself
+ * lives at 0xFFFF_0000_4000_0000, so anything below 1 GB cannot alias a kernel
+ * pointer — that's the property this bound exists to preserve.
+ *
+ * Kept well below the 48-bit T0SZ limit on purpose: a user mapping above this
+ * is rejected before it can ever reach the page-table walk. */
+#define USER_VA_TOP 0x40000000ULL // 1 GB
+
+/* First address mmap() will hand out. Sits above the static image
+ * (USER_TEXT_BASE) and the stack (USER_STACK_TOP) so an mmap can never
+ * collide with them; growth is upward from here. */
+#define USER_MMAP_BASE 0x01000000ULL // 16 MB
+
+/* Base of the per-task brk() heap arena. Parked far above the mmap region so
+ * the two allocators can't collide, and aligned so the arena is a whole
+ * number of pages. The arena is a fixed reservation (demand-paged, so it
+ * costs no physical memory) which is what lets brk() grow contiguously
+ * without searching for a free gap each time. */
+#define USER_BRK_BASE 0x20000000ULL // 512 MB
+
+/* Total size of the brk arena reservation, in pages. 4096 pages = 16 MiB,
+ * a typical small-allocator ceiling. */
+#define USER_BRK_RESERVE_PAGES 4096
+
+// Protection bits, matching the Linux/POSIX PROT_* values so the user-space
+// side passes <sys/mman.h> constants through untouched.
+#define VMA_PROT_NONE  0x0
+#define VMA_PROT_READ  0x1
+#define VMA_PROT_WRITE 0x2
+#define VMA_PROT_EXEC  0x4
+
 uint64_t *mmu_init(void);
 // empty TTBR0 page table for user task
 uint64_t *mmu_create_user_tables(void);
@@ -104,6 +138,33 @@ uint64_t *mmu_create_user_tables(void);
 // internally.
 void mmu_map_user_range(uint64_t *l0, uint64_t va, uint64_t pa,
                         uint64_t pages, uint64_t flags);
+
+/* Remove [va, va + pages*PAGE_SIZE) from the user page table.
+ *
+ * Clears the L3 descriptors and invalidates the affected TLB entries. Does NOT
+ * free the physical pages — the caller owns that decision (a VMA must release
+ * exactly the pages it allocated; other mappings may share them).
+ *
+ * Precondition: va and length are page-aligned. */
+void mmu_unmap_user_range(uint64_t *l0, uint64_t va, uint64_t pages);
+
+/* Re-protect an existing user mapping in place, keeping the backing physical
+ * page. `flags` carries the same AP / UXN / PXN / ATTRIDX bits that
+ * mmu_map_user_range() takes. Used by mprotect().
+ *
+ * Returns the number of pages actually re-protected; a page with no valid L3
+ * descriptor is skipped (it stays absent and will be faulted in later with the
+ * new protection). */
+uint64_t mmu_protect_user_range(uint64_t *l0, uint64_t va, uint64_t pages,
+                                uint64_t flags);
+
+/* Translate PROT_* bits into the stage-1 descriptor bits for EL0 access.
+ *
+ * AP_EL1RO is used for PROT_READ-only rather than AP_EL0RO: the user page
+ * tables are private per task and only ever reached from TTBR0, but keeping
+ * EL1 read-only on user pages means a kernel bug can't scribble over user
+ * memory either. Writes require AP_EL1RW. */
+uint64_t mmu_prot_to_flags(uint32_t prot);
 
 // Free all page table pages (L0, L1, L2, L3) for a user address space
 void mmu_free_user_tables(uint64_t *l0);

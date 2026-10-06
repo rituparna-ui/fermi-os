@@ -159,4 +159,11 @@ int64_t fd_seek(fd_table_t *t, int fd, int64_t offset, int whence);
  * ask how much is left without a full stat syscall. */
 int64_t fd_size(fd_table_t *t, int fd);
 
+/* The vnode behind an open descriptor, or NULL if `fd` is not open.
+ *
+ * Exposed so metadata queries can report a file's type and size without
+ * duplicating the bounds check every accessor here already repeats. The vnode
+ * stays owned by the table; callers must not free it. */
+vnode_t *fd_vnode(fd_table_t *t, int fd);
+
 #endif

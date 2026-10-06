@@ -341,6 +341,13 @@ int fd_write(fd_table_t *t, int fd, const void *buf, size_t count) {
   return f->vnode->ops->write(f->vnode, f, buf, count);
 }
 
+vnode_t *fd_vnode(fd_table_t *t, int fd) {
+  if (fd < 0 || fd >= MAX_FDS || !t->fds[fd]) {
+    return NULL;
+  }
+  return t->fds[fd]->vnode;
+}
+
 int64_t fd_size(fd_table_t *t, int fd) {
   if (fd < 0 || fd >= MAX_FDS || !t->fds[fd]) {
     return -1;

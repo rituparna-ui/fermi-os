@@ -12,6 +12,7 @@
 #include "mm/pmm/pmm.h"
 #include "strings/strings.h"
 #include "elf.h"
+#include "linux_abi.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -845,6 +846,46 @@ static int64_t sys_brk(uint64_t addr) {
 }
 
 
+/* Fill a Linux struct stat for `v`.
+ *
+ * Two things are deliberately absent rather than faked. Timestamps are all
+ * zero because nothing records them: a plausible-looking mtime would be a
+ * lie a program could act on (incremental builds, cache validation). And
+ * st_blocks reports actual bytes, since that is what is on the medium, even
+ * though a real filesystem reports allocated blocks. */
+static void fill_linux_stat(vnode_t *v, struct linux_stat *st) {
+memset(st, 0, sizeof(*st));
+
+uint32_t type;
+switch (v->type) {
+  case VNODE_DIR: type = LNX_S_IFDIR; break;
+  case VNODE_CHR: type = LNX_S_IFCHR; break;
+  case VNODE_BLK: type = LNX_S_IFBLK; break;
+  default:        type = LNX_S_IFREG; break;
+}
+
+/* Directories need the execute bit to be traversable, which every real
+ * filesystem grants; without it a guest cannot descend into one at all. */
+uint32_t perm = LNX_S_IRUSR | LNX_S_IWUSR | LNX_S_IRGRP | LNX_S_IROTH |
+                LNX_S_IWGRP | LNX_S_IWOTH;
+if (v->type == VNODE_DIR) {
+  perm |= LNX_S_IXUSR | LNX_S_IXGRP | LNX_S_IXOTH;
+}
+
+st->st_mode    = type | perm;
+/* One name reaches every vnode: this kernel has no hard links. Claiming more
+ * would let a program believe a file survives an unlink it cannot perform. */
+st->st_nlink   = 1;
+st->st_ino     = (uint64_t)(uintptr_t)v;
+st->st_dev     = 0; /* single filesystem, no device numbering */
+st->st_uid     = 0;
+st->st_gid     = 0;
+st->st_size    = (int64_t)v->size;
+st->st_blksize = PAGE_SIZE;
+/* st_blocks counts 512-byte units on Linux, NOT bytes. */
+st->st_blocks  = ((int64_t)v->size + 511) / 512;
+}
+
 /* Translate a Linux aarch64 syscall number onto the Fermi number the switch
  * below dispatches on.
  *
@@ -1122,6 +1163,136 @@ void syscall_dispatch(trap_frame_t *frame) {
       vnode_t *probe = vfs_resolve((const char *)arg1);
       ret = fail(probe ? EACCES : ENOENT);
     }
+    break;
+  }
+
+  case LNX_CLOCK_GETTIME: {
+    /* clock_gettime(clockid, timespec). */
+    if (arg0 != LNX_CLOCK_REALTIME && arg0 != LNX_CLOCK_MONOTONIC) {
+      ret = fail(EINVAL);
+      break;
+    }
+    if (!user_buf_ok(arg1, sizeof(struct linux_timespec))) {
+      ret = fail(EFAULT);
+      break;
+    }
+    struct linux_timespec ts;
+    /* No wall clock exists yet -- there is no RTC and nothing reads one -- so
+     * both clocks report time since boot. CLOCK_REALTIME naming boot as the
+     * epoch is a limitation the caller cannot detect, so it is documented
+     * rather than dressed up; CLOCK_MONOTONIC is exactly right. */
+    ts.tv_sec  = (int64_t)timer_uptime_seconds();
+    ts.tv_nsec = (int64_t)((timer_uptime_ms() % 1000) * 1000000ull);
+    memcpy((void *)arg1, &ts, sizeof(ts));
+    ret = 0;
+    break;
+  }
+
+  case LNX_NANOSLEEP: {
+    /* nanosleep(request, remaining). */
+    if (!user_buf_ok(arg0, sizeof(struct linux_timespec))) {
+      ret = fail(EFAULT);
+      break;
+    }
+    struct linux_timespec req;
+    memcpy(&req, (void *)arg0, sizeof(req));
+    if (req.tv_sec < 0 || req.tv_nsec < 0 || req.tv_nsec >= 1000000000ll) {
+      ret = fail(EINVAL);
+      break;
+    }
+    /* The timer ticks at 10 ms, so a sub-tick request is rounded UP. Rounding
+     * down would return early and break callers that rely on sleeping at least
+     * the interval asked for (retry backoff, pacing loops). */
+    uint64_t ms = (uint64_t)req.tv_sec * 1000ull +
+                  ((uint64_t)req.tv_nsec + 999999ull) / 1000000ull;
+    if (ms) {
+      sleep_ms(ms);
+    }
+    /* Nothing can interrupt a sleep -- there are no signals -- so the remainder
+     * is always zero. Writing it keeps the contract; a real signal path will
+     * have to fill it in properly. */
+    if (arg1) {
+      if (!user_buf_ok(arg1, sizeof(struct linux_timespec))) {
+        ret = fail(EFAULT);
+        break;
+      }
+      struct linux_timespec zero = {0, 0};
+      memcpy((void *)arg1, &zero, sizeof(zero));
+    }
+    ret = 0;
+    break;
+  }
+
+  case LNX_GETRANDOM: {
+    /* getrandom(buf, buflen, flags). */
+    if (arg1 == 0) {
+      ret = 0;
+      break;
+    }
+    if (!user_buf_ok(arg0, (size_t)arg1)) {
+      ret = fail(EFAULT);
+      break;
+    }
+    /* GRND_NONBLOCK and GRND_RANDOM are accepted and ignored: both only request
+     * behaviour this implementation already has (blocking, any source), so
+     * honouring them by doing nothing is accurate rather than a pretence. */
+    int64_t got = rng_read((void *)arg0, (uint32_t)arg1);
+    if (got < 0) {
+      /* No entropy device. Reporting failure is the right call here: a caller
+       * seeding a key from a silently-zeroed buffer would be far worse off
+       * than one that knows randomness was unavailable. */
+      ret = fail(EIO);
+      break;
+    }
+    ret = got;
+    break;
+  }
+
+  case LNX_FSTAT: {
+    /* fstat(fd, statbuf). */
+    vnode_t *v = fds ? fd_vnode(fds, (int)arg0) : NULL;
+    if (!v) {
+      ret = fail(EBADF);
+      break;
+    }
+    if (!user_buf_ok(arg1, sizeof(struct linux_stat))) {
+      ret = fail(EFAULT);
+      break;
+    }
+    struct linux_stat st;
+    fill_linux_stat(v, &st);
+    memcpy((void *)arg1, &st, sizeof(st));
+    ret = 0;
+    break;
+  }
+
+  case LNX_NEWFSTATAT: {
+    /* newfstatat(dirfd, path, statbuf, flags). */
+    if ((int32_t)arg0 != (int32_t)AT_FDCWD) {
+      ret = fail(ENOSYS);
+      break;
+    }
+    /* AT_SYMLINK_NOFOLLOW (0x100) is accepted and has no effect: this VFS has
+     * no symlinks, so there is nothing to not-follow. Any other flag bit is
+     * rejected instead of ignored, because ignoring one silently could return
+     * the wrong file's metadata. */
+    if (!user_str_ok(arg1) || !user_buf_ok(arg2, sizeof(struct linux_stat))) {
+      ret = fail(EFAULT);
+      break;
+    }
+    if (arg3 & ~(uint64_t)0x100) {
+      ret = fail(EINVAL);
+      break;
+    }
+    vnode_t *v = vfs_resolve((const char *)arg1);
+    if (!v) {
+      ret = fail(ENOENT);
+      break;
+    }
+    struct linux_stat st;
+    fill_linux_stat(v, &st);
+    memcpy((void *)arg2, &st, sizeof(st));
+    ret = 0;
     break;
   }
 

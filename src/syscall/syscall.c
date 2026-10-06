@@ -208,11 +208,14 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
   /* 1. Open and size the binary. */
   int fd = fd_open(fds, path);
   if (fd < 0) {
+    uart_printf("[EXEC] open failed: %s\n", path);
     return -1;
   }
   int64_t size = fd_seek(fds, fd, 0, SEEK_END);
   fd_seek(fds, fd, 0, SEEK_SET);
   if (size <= 0 || (uint64_t)size > EXEC_MAX_BYTES) {
+    uart_printf("[EXEC] bad size %ld for %s (max %u)\n", size, path,
+                EXEC_MAX_BYTES);
     fd_close(fds, fd);
     return -1;
   }
@@ -220,12 +223,14 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
   /* 2. Slurp into a kernel buffer. */
   uint8_t *kbuf = (uint8_t *)kmalloc((size_t)size);
   if (!kbuf) {
+    uart_printf("[EXEC] kmalloc(%ld) failed for %s\n", size, path);
     fd_close(fds, fd);
     return -1;
   }
   int64_t got = fd_read(fds, fd, kbuf, (size_t)size);
   fd_close(fds, fd);
   if (got != size) {
+    uart_printf("[EXEC] short read %ld != %ld for %s\n", got, size, path);
     kfree(kbuf);
     return -1;
   }
@@ -235,6 +240,7 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
    * ELF loader handles only PT_LOAD segments. */
   uintptr_t stack_phys = pmm_allocate_pages(USER_STACK_PAGES);
   if (!stack_phys) {
+    uart_errorln("[EXEC] no PMM for user stack");
     kfree(kbuf);
     return -1;
   }
@@ -677,6 +683,13 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot) {
  *
  * The arena has a fixed reservation so growth is always contiguous and needs
  * no address search. Ceiling is USER_BRK_RESERVE_PAGES (see mmu.h).
+ *
+ * The break is BYTE-granular, matching Linux and POSIX, even though the
+ * backing mapping is page-granular. That distinction is load-bearing: a libc
+ * allocator asks for brk(break + 96) and then checks the returned break equals
+ * what it requested. Returning a page-rounded value instead makes every such
+ * call look like a failure and the allocator never gets off the ground. So the
+ * VMA end is rounded up to a page while brk_cur stays exact.
  */
 static int64_t sys_brk(uint64_t addr) {
   task_t *t = sched_current();
@@ -698,15 +711,16 @@ static int64_t sys_brk(uint64_t addr) {
     return (int64_t)t->brk_cur;
   }
 
-  uint64_t new_end = PAGE_ALIGN_UP(addr);
-
   /* Shrinking below the current break is legal but pointless; the pages stay
    * mapped so a stale pointer that later reads back doesn't fault. Keep the
    * break where it is in that case rather than unmapping. */
-  if (new_end < t->brk_cur) {
+  if (addr < t->brk_cur) {
     return (int64_t)t->brk_cur;
   }
-  uint64_t new_cur = new_end;
+
+  /* Mapping extent is page-rounded; the break itself stays byte-exact. */
+  uint64_t new_end = PAGE_ALIGN_UP(addr);
+  uint64_t new_cur = addr;
 
   /* Grow the VMA to cover the new break. vma_add refuses overlap, so grow
    * from the current break only when the VMA doesn't already span it. */

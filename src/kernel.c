@@ -1110,6 +1110,22 @@ static void task_errnotest(void) {
   sys_exit();
 }
 
+/* Runs the on-disk LIBC test binary: a real exec'd ELF64 program linked
+ * against user/lib/libc.a, exercising malloc, <string.h>, qsort and errno
+ * from actual user space rather than from kernel-internal checks. Named
+ * LIBCT.ELF because FAT32 here has no long-filename support. */
+static void task_libctest(void) {
+  const char *argv[2];
+  argv[0] = "/mnt/fat32/LIBCT.ELF";
+  argv[1] = 0;
+
+  if (sys_exec(argv[0], argv) < 0) {
+    t_puts("[LIBC TEST] exec failed (is LIBCT.ELF on the disk image?)\n");
+    sys_exit();
+  }
+  sys_exit();
+}
+
 /* ---- fork memory-isolation test ---------------------------------------- */
 
 /* SYS_FORK returns the child pid in x0 (and 0 in the child). The result
@@ -1449,6 +1465,7 @@ void kernel_main() {
   sched_create_task("task_mmap", task_mmap);
   sched_create_task("task_forkmem", task_fork_mem);
   sched_create_task("task_errnotest", task_errnotest);
+  sched_create_task("task_libctest", task_libctest);
   sched_create_task("task_mmguard", task_mmap_guard);
   sched_create_kernel_task("netd", netd);
 

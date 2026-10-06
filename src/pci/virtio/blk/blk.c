@@ -12,6 +12,48 @@ static struct virtq_desc blk_desc[VIRTQ_MAX_SIZE]
 static struct virtq_avail blk_avail __attribute__((aligned(4096)));
 static struct virtq_used blk_used __attribute__((aligned(4096)));
 
+/* Single-instance device lock.
+ *
+ * The virtqueue, the request header and the status byte are all shared
+ * instance state, so two tasks issuing I/O at once would interleave descriptor
+ * writes and read each other's status. Serializing is the honest fix here:
+ * this driver submits one synchronous request and polls to completion, so there
+ * is no concurrency to exploit — only corruption to avoid.
+ *
+ * Acquired with interrupts masked, released with DAIF restored, so it cannot
+ * deadlock against a timer interrupt preempting a task mid-request. Each
+ * individual request is one sector, so the masked window stays short even when
+ * a caller streams a whole file.
+ *
+ * Plain volatile accesses rather than an atomic CAS: on this kernel a task can
+ * only be switched out by a timer interrupt, so masking DAIF.I makes the
+ * load/store atomic with respect to every other task. A CAS would only be
+ * needed if the lock could be contended without interrupts being involved —
+ * and no libatomic is linkable here anyway (-nostdlib).
+ */
+static volatile uint32_t blk_busy = 0;
+
+static uint64_t blk_lock_acquire(void) {
+  uint64_t daif;
+  __asm__ __volatile__("mrs %0, daif" : "=r"(daif));
+
+  __asm__ __volatile__("msr daifset, #2" ::: "memory");
+  while (blk_busy) {
+    /* Yield while spinning: the holder is a different task and cannot make
+     * progress at all while interrupts stay masked, so we must briefly
+     * unmask or this loop would never terminate. */
+    __asm__ __volatile__("msr daif, %0" ::"r"(daif) : "memory");
+    __asm__ __volatile__("msr daifset, #2" ::: "memory");
+  }
+  blk_busy = 1;
+  return daif; /* IRQs stay masked for the caller */
+}
+
+static void blk_lock_release(uint64_t daif) {
+  blk_busy = 0;
+  __asm__ __volatile__("msr daif, %0" ::"r"(daif) : "memory");
+}
+
 void pci_virtio_blk_init(void) {
   uart_println("[BLK] Initializing Device");
 
@@ -134,13 +176,19 @@ void pci_virtio_blk_init(void) {
 }
 
 int blk_read(uint64_t sector, void *buf) {
-  static struct virtio_blk_req hdr __attribute__((aligned(16)));
-  static volatile uint8_t status __attribute__((aligned(16)));
+  uint64_t daif = blk_lock_acquire();
 
-  hdr.type = VIRTIO_BLK_T_IN;
+  /* Header and status are stack locals, not function statics: with the lock
+   * held they're safe either way, but stack storage makes it impossible for a
+   * future unlocked path to silently reuse another caller's in-flight
+   * descriptor. The kernel stack is 16 KiB and these are 16 + 1 bytes. */
+  struct virtio_blk_req hdr __attribute__((aligned(16)));
+  volatile uint8_t       status __attribute__((aligned(16)));
+
+  hdr.type     = VIRTIO_BLK_T_IN;
   hdr.reserved = 0;
-  hdr.sector = sector;
-  status = 0xFF;
+  hdr.sector   = sector;
+  status       = 0xFF;
 
   struct virtq_seg segs[3] = {
       {VIRT_TO_PHYS((uint64_t)(uintptr_t)&hdr), sizeof(hdr),
@@ -154,22 +202,27 @@ int blk_read(uint64_t sector, void *buf) {
   virtqueue_notify(&blk_dev.vq);
   virtqueue_poll(&blk_dev.vq);
 
+  int rc = ESUCCESS;
   if (status != VIRTIO_BLK_S_OK) {
     uart_printf("[BLK] read sector %d failed: status=%x\n", sector,
                 (uint32_t)status);
-    return EERROR;
+    rc = EERROR;
   }
-  return ESUCCESS;
+
+  blk_lock_release(daif);
+  return rc;
 }
 
 int blk_write(uint64_t sector, const void *buf) {
-  static struct virtio_blk_req hdr __attribute__((aligned(16)));
-  static volatile uint8_t status __attribute__((aligned(16)));
+  uint64_t daif = blk_lock_acquire();
 
-  hdr.type = VIRTIO_BLK_T_OUT;
+  struct virtio_blk_req hdr __attribute__((aligned(16)));
+  volatile uint8_t       status __attribute__((aligned(16)));
+
+  hdr.type     = VIRTIO_BLK_T_OUT;
   hdr.reserved = 0;
-  hdr.sector = sector;
-  status = 0xFF;
+  hdr.sector   = sector;
+  status       = 0xFF;
 
   struct virtq_seg segs[3] = {
       {VIRT_TO_PHYS((uint64_t)(uintptr_t)&hdr), sizeof(hdr),
@@ -183,10 +236,15 @@ int blk_write(uint64_t sector, const void *buf) {
   virtqueue_notify(&blk_dev.vq);
   virtqueue_poll(&blk_dev.vq);
 
+  int rc = ESUCCESS;
   if (status != VIRTIO_BLK_S_OK) {
     uart_printf("[BLK] write sector %d failed: status=%x\n", sector,
                 (uint32_t)status);
-    return EERROR;
+    rc = EERROR;
   }
-  return ESUCCESS;
+
+  /* Every exit path must release: returning while holding blk_busy would
+   * wedge the whole device for every later task. */
+  blk_lock_release(daif);
+  return rc;
 }

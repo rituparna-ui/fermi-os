@@ -12,13 +12,19 @@ static struct {
   uint32_t bytes_per_cluster;
 } vol;
 
-static uint8_t sec_buf[SECTOR] __attribute__((aligned(16)));
 
 static uint32_t cluster_to_sector(uint32_t cluster) {
   return vol.data_start_sector + (cluster - 2) * vol.sectors_per_cluster;
 }
 
 static uint32_t fat_next(uint32_t cluster) {
+  /* Per-call sector buffer. Deliberately NOT a file-scope static: two
+   * tasks doing FAT32 I/O concurrently would otherwise read their
+   * sectors into the same buffer and silently corrupt each other. A
+   * 512-byte local is well within the 16 KiB kernel stack, and no
+   * function below holds data in it across a call to another
+   * sec_buf user, so shadowing is safe. */
+  uint8_t sec_buf[SECTOR] __attribute__((aligned(16)));
   uint32_t fat_offset = cluster * 4;
   uint32_t sector = vol.fat_start_sector + fat_offset / SECTOR;
   uint32_t offset = fat_offset % SECTOR;
@@ -58,6 +64,13 @@ static void to_83(const char *name, uint8_t out[11]) {
 }
 
 int fat32_mount(void) {
+  /* Per-call sector buffer. Deliberately NOT a file-scope static: two
+   * tasks doing FAT32 I/O concurrently would otherwise read their
+   * sectors into the same buffer and silently corrupt each other. A
+   * 512-byte local is well within the 16 KiB kernel stack, and no
+   * function below holds data in it across a call to another
+   * sec_buf user, so shadowing is safe. */
+  uint8_t sec_buf[SECTOR] __attribute__((aligned(16)));
   if (blk_read(0, sec_buf) != ESUCCESS) {
     uart_errorln("[FS][FAT32] Failed to read BPB");
     return EERROR;
@@ -94,6 +107,13 @@ int fat32_mount(void) {
 static int dir_lookup(uint32_t dir_cluster, const uint8_t target[11],
                       uint32_t *out_cluster, uint32_t *out_size,
                       uint8_t *out_attr) {
+  /* Per-call sector buffer. Deliberately NOT a file-scope static: two
+   * tasks doing FAT32 I/O concurrently would otherwise read their
+   * sectors into the same buffer and silently corrupt each other. A
+   * 512-byte local is well within the 16 KiB kernel stack, and no
+   * function below holds data in it across a call to another
+   * sec_buf user, so shadowing is safe. */
+  uint8_t sec_buf[SECTOR] __attribute__((aligned(16)));
   uint32_t cluster = dir_cluster;
   while (cluster < FAT32_EOC) {
     uint32_t base = cluster_to_sector(cluster);
@@ -195,6 +215,13 @@ int fat32_find(const char *path, uint32_t *out_first_cluster,
 
 /* Write a 32-bit FAT entry for the given cluster. */
 static int fat_write(uint32_t cluster, uint32_t value) {
+  /* Per-call sector buffer. Deliberately NOT a file-scope static: two
+   * tasks doing FAT32 I/O concurrently would otherwise read their
+   * sectors into the same buffer and silently corrupt each other. A
+   * 512-byte local is well within the 16 KiB kernel stack, and no
+   * function below holds data in it across a call to another
+   * sec_buf user, so shadowing is safe. */
+  uint8_t sec_buf[SECTOR] __attribute__((aligned(16)));
   uint32_t fat_offset = cluster * 4;
   uint32_t sector = vol.fat_start_sector + fat_offset / SECTOR;
   uint32_t offset = fat_offset % SECTOR;
@@ -214,6 +241,13 @@ static int fat_write(uint32_t cluster, uint32_t value) {
 
 /* Scan FAT for a free cluster (entry == 0). Returns 0 on failure. */
 static uint32_t fat_alloc_cluster(void) {
+  /* Per-call sector buffer. Deliberately NOT a file-scope static: two
+   * tasks doing FAT32 I/O concurrently would otherwise read their
+   * sectors into the same buffer and silently corrupt each other. A
+   * 512-byte local is well within the 16 KiB kernel stack, and no
+   * function below holds data in it across a call to another
+   * sec_buf user, so shadowing is safe. */
+  uint8_t sec_buf[SECTOR] __attribute__((aligned(16)));
   /* Cluster 0 and 1 are reserved, start scanning from 2 */
   uint32_t total_sectors =
       vol.data_start_sector; /* rough upper bound for FAT scan */
@@ -244,6 +278,13 @@ static uint32_t fat_alloc_cluster(void) {
 /* Find a free directory entry slot (name[0]==0x00 or 0xE5) in the directory
  * starting at dir_cluster. Writes the entry and flushes the sector. */
 static int dir_add_entry(uint32_t dir_cluster, const struct dir_entry *entry) {
+  /* Per-call sector buffer. Deliberately NOT a file-scope static: two
+   * tasks doing FAT32 I/O concurrently would otherwise read their
+   * sectors into the same buffer and silently corrupt each other. A
+   * 512-byte local is well within the 16 KiB kernel stack, and no
+   * function below holds data in it across a call to another
+   * sec_buf user, so shadowing is safe. */
+  uint8_t sec_buf[SECTOR] __attribute__((aligned(16)));
   uint32_t cluster = dir_cluster;
   while (cluster < FAT32_EOC) {
     uint32_t base = cluster_to_sector(cluster);
@@ -270,6 +311,13 @@ static int dir_add_entry(uint32_t dir_cluster, const struct dir_entry *entry) {
 /* Write data to a cluster chain, one sector at a time. */
 static int cluster_write_data(uint32_t first_cluster, const void *data,
                               uint32_t len) {
+  /* Per-call sector buffer. Deliberately NOT a file-scope static: two
+   * tasks doing FAT32 I/O concurrently would otherwise read their
+   * sectors into the same buffer and silently corrupt each other. A
+   * 512-byte local is well within the 16 KiB kernel stack, and no
+   * function below holds data in it across a call to another
+   * sec_buf user, so shadowing is safe. */
+  uint8_t sec_buf[SECTOR] __attribute__((aligned(16)));
   const uint8_t *src = (const uint8_t *)data;
   uint32_t remaining = len;
   uint32_t cluster = first_cluster;
@@ -421,6 +469,13 @@ int fat32_create(const char *path, const void *data, uint32_t len) {
 
 int fat32_read(uint32_t first_cluster, uint32_t size, void *buf,
                uint32_t buf_len) {
+  /* Per-call sector buffer. Deliberately NOT a file-scope static: two
+   * tasks doing FAT32 I/O concurrently would otherwise read their
+   * sectors into the same buffer and silently corrupt each other. A
+   * 512-byte local is well within the 16 KiB kernel stack, and no
+   * function below holds data in it across a call to another
+   * sec_buf user, so shadowing is safe. */
+  uint8_t sec_buf[SECTOR] __attribute__((aligned(16)));
   if (size > buf_len) {
     size = buf_len;
   }

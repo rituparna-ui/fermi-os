@@ -61,6 +61,18 @@ Fermi OS is a bare-metal `aarch64 (ARMv8-A)` kernel built from scratch in `C` an
 - **FAT32 (VFS-backed)** — Mounted at `/mnt/fat32`. Lazy directory traversal: each `lookup` walks on-disk directory entries and creates a vnode on demand with per-vnode `(first_cluster, size)` state. `open`/`read` on regular files goes through the full VFS → fd → `file_operations.read` path. 8.3 short names only — there is no long-filename (LFN) support, so a file whose name exceeds 8 characters plus extension is stored by `mcopy` under a generated short name (`ERRNOT~1`) and looking it up by its full name fails. User binaries shipped on the disk image are named to fit 8.3 for this reason
 - **`/proc` synthetic filesystem** — Mounted at `/proc`, regenerates content per-read from live kernel state. Files: `/proc/uptime`, `/proc/meminfo` (PMM + heap + VMA mapped/resident totals across all tasks), `/proc/tasks` (run-queue snapshot with state names), `/proc/interrupts` (per-INTID counts via the GIC dispatch hook), `/proc/netinfo` (MAC, link, IP, gateway MAC, packet counters), `/proc/cmdline`, `/proc/version`
 
+### Fermi libc (`user/lib/`)
+- **Real archive, not header-only stubs** — `user/lib/*.c` compiles into `libc.a`, which every user program links against (`make libc` builds it alone). Deliberately an archive: a libc needs *one* definition per function, and header-only inline code silently duplicates state — a header-only malloc counter or `errno` would become a per-translation-unit copy rather than one per process
+- **`<string.h>`** — `memcpy`, `memmove`, `memset`, `memcmp`, `memchr`, `strlen`, `strnlen`, `strcmp`, `strncmp`, `strcpy`, `strncpy`, `strcat`, `strchr`, `strrchr`, `strstr`. Comparisons are **unsigned** by contract: a signed `char` comparison inverts the ordering of every byte >= 0x80. `memcpy` delegates to `memmove` because the kernel hands it overlapping user buffers
+- **`<stdlib.h>` allocator** — First-fit free-list over the kernel's `brk()` arena, with block splitting and bidirectional coalescing (blocks form an address-ordered doubly-linked list so `free()` can merge with the previous block). Payloads are 16-byte aligned, and a header-magic check turns a double free into a diagnostic instead of free-list corruption. Provides `malloc`/`calloc`/`realloc`/`free` plus `malloc_usable_size`/`malloc_live_blocks` for testing
+  - `malloc` **zeroes** its payload — stricter than POSIX, which permits indeterminate bytes. Recycled and freshly-`brk`'d memory are indistinguishable at this layer, and zeroing removes any chance of leaking one allocation's stale contents into another. Worth dropping for speed once the allocator tracks which bytes came straight from `brk`
+- **`<errno.h>`** — `strerror()` for the codes this kernel actually produces, falling back to `"Unknown error"` rather than `NULL`
+- **Verification** — `user/libctest.c` (shipped as `LIBCT.ELF`) is a normal exec'd program linked against the real `libc.a`: **54 checks** covering string edge cases (overlapping `memmove` in both directions, unsigned byte ordering, empty-needle `strstr`, `strrchr` last-match), allocator behaviour (alignment, zeroing on reuse, `calloc` size overflow, `realloc` grow/shrink content preservation, 200 alloc/free cycles as a coalescing check), `qsort`, and `errno`
+
+### Device & Filesystem Concurrency
+- **virtio-blk serialization** — The virtqueue, request header, and status byte are single-instance state, so two tasks issuing I/O at once would interleave descriptor writes and read each other's status. `blk_read`/`blk_write` take a device lock acquired with interrupts masked and released with DAIF restored, so it cannot deadlock against a timer interrupt preempting a task mid-request. Spinning briefly unmasks interrupts, since the lock holder is a different task and could not otherwise make progress. Header and status are now stack locals rather than function statics, so no unlocked path can reuse another caller's in-flight descriptor
+- **FAT32 per-call sector buffer** — The sector buffer was a file-scope static, so two tasks reading the disk would land their sectors in the same 512 bytes and silently corrupt each other. It is now a per-call local in each of the eight functions that touch it. This only surfaced once two tasks began doing `exec` concurrently: which of them failed varied run to run, which is the signature of a race rather than a logic bug
+
 ### EL0 Shell (interactive)
 - **`task_shell`** — An EL0 task that loops reading lines from `/dev/console` (with backspace/DEL editing and echo) and dispatches built-ins. Pure user-space — talks to the kernel only via `svc`. Built-ins: `help`, `pid`, `uptime`, `ps`, `free`, `ifconfig`, `irqs`, `version`, `cat <path>`, `kill <pid>`, `top` (5× refresh tasks/mem/net), `ping`, `sleep <ms>`, `clear`, `exit`
 
@@ -97,12 +109,23 @@ ln -sf aarch64-linux-gnu-as /usr/bin/as
 # Build the kernel ELF
 make
 
+# Build kernel + all user programs + the disk image
+make full
+
 # Build and run in QEMU (serial console)
 make run
+
+# Build libc.a alone, without relinking user programs
+make libc
 
 # Clean build artifacts
 make clean
 ```
+
+> **`make` builds only the kernel.** Editing `user/lib/*.c` relinks `libc.a`,
+> but nothing rebuilds the user programs or the disk image unless you ask — so
+> the stale ELF keeps running on the device and a fix appears not to work.
+> Use `make full` when changing anything under `user/`.
 
 To exit QEMU: `Ctrl-A` then `X`
 

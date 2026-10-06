@@ -31,6 +31,16 @@
 // task_t field offsets — must match sched.h
 .equ TASK_SP,       0
 .equ TASK_TTBR0,    40   // offsetof(task_t, ttbr0)
+                    // NOTE: task_t.tls_phys is deliberately NOT loaded here.
+                    // It is a physical address (needed by the kernel to free
+                    // the page on reap), but TPIDR_EL0 must hold the page's
+                    // USER VIRTUAL address. Writing the PA there makes every
+                    // EL0 access to errno dereference a RAM address absent
+                    // from the user page tables — an instant fault. Every task
+                    // maps its TLS page at the same fixed VA, so a constant is
+                    // correct here and immune to struct layout changes.
+
+.equ USER_TLS_BASE, 0x00B00000   // must match mmu.h
 
 // Task trampoline: first code a new task executes after context_switch ret's here.
 // x19 = user entry point (VA in user address space)
@@ -99,6 +109,21 @@ context_switch:
 
 	msr ttbr0_el1, x3
 	isb
+
+	// Reload TPIDR_EL0 (the EL0 software register) for the incoming task.
+	//
+	// This MUST happen on every switch, not just at exception entry. A
+	// syscall that blocks (sleep, read) can context_switch away mid-svc;
+	// when it is later resumed and finally erets, it is this task's turn at
+	// EL0 again — so the register has to be correct at every switch. Doing it
+	// here covers the initial entry (task_trampoline), fork_return, and
+	// every resume through exception_common, since all run after this load.
+	//
+	// Value is the fixed USER_TLS_BASE VA, NOT task->tls_phys (which is a
+	// physical address). EL0 accesses go through TTBR0, so a PA here would
+	// fault immediately.
+	mov x4, #USER_TLS_BASE
+	msr tpidr_el0, x4
 1:
 
 	// Restore callee-saved registers from next's stack

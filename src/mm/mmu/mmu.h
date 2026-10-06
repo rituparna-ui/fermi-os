@@ -120,6 +120,23 @@ static inline int pte_valid(uint64_t entry) { return entry & PTE_VALID; }
  * a typical small-allocator ceiling. */
 #define USER_BRK_RESERVE_PAGES 4096
 
+/* Base of the per-task thread-local storage page.
+ *
+ * Each task gets one page here, mapped read-write, and TPIDR_EL0 points at
+ * it. That single register is the whole TLS story for now: errno lives at a
+ * fixed offset from it, so two tasks can never clobber each other's error
+ * code.
+ *
+ * Parked between the stack (top 8 MiB) and the mmap base (16 MiB) so it
+ * can't collide with either, and low enough that a large mmap won't reach
+ * it. */
+#define USER_TLS_BASE 0x00B00000ULL // 11 MB
+
+/* Offset of `errno` within the TLS page. Linux aarch64 puts the thread
+ * pointer in TPIDR_EL0 with errno at the TCB base, so offset 0 keeps the same
+ * shape — a libc can point __errno_location() at TPIDR_EL0 directly. */
+#define TLS_ERRNO_OFFSET 0
+
 // Protection bits, matching the Linux/POSIX PROT_* values so the user-space
 // side passes <sys/mman.h> constants through untouched.
 #define VMA_PROT_NONE  0x0

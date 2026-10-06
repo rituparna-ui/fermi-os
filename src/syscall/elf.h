@@ -4,6 +4,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Translate an ELF p_flags bitmask (PF_R/PF_W/PF_X) into the stage-1 page
+ * descriptor bits this kernel uses for user mappings. Exposed so sched_fork
+ * can reproduce a parent's segment protections instead of re-deriving the
+ * rule in a second place where it could drift. */
+uint64_t elf_pflags_to_pte(uint32_t pf);
+
 /* Minimal ELF64 definitions sufficient for loading static aarch64 ET_EXEC
  * binaries. We deliberately don't pull in the system <elf.h> \u2014 we want
  * a self-contained vocabulary that's obvious at-a-glance for a kernel
@@ -66,6 +72,8 @@ typedef struct __attribute__((packed)) {
 typedef struct {
   uintptr_t phys;   /* PMM-allocated physical base for this region */
   uint64_t  pages;  /* number of pages allocated (== ceil(memsz / 4 KiB)) */
+  uint64_t  va;     /* virtual base this region is mapped at */
+  uint32_t  flags;  /* PF_* bits from p_flags — needed to re-map on fork() */
 } elf_region_t;
 
 typedef struct {

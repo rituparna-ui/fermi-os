@@ -174,6 +174,15 @@ static void dump_trap_frame(uint64_t type, trap_frame_t *frame) {
 
   uart_printf("  Type : %s\n", exception_type_str(type));
 
+  /* Name the current task. Without this an unclassified exception can only be
+   * attributed by guessing from the faulting address, which is misleading when
+   * several user tasks run the same code. */
+  task_t *cur = sched_current();
+  if (cur) {
+    uart_printf("  Task : %u '%s' (state %s)\n", cur->pid, cur->name,
+                task_state_name(cur->state));
+  }
+
   uint64_t ec = ESR_EC(frame->esr);
   uart_printf("  Class: %s (EC=%x)\n", esr_class_str(ec), ec);
   uart_printf("  ESR_EL1 : %x\n", frame->esr);

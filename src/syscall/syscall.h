@@ -67,7 +67,48 @@
 #define SEEK_CUR 1
 #define SEEK_END 2
 
+/*
+ * errno values — the standard Linux/POSIX numbers, so user space can include
+ * <errno.h> and pass them through unchanged. A syscall that fails returns -1
+ * AND stores one of these in the calling task's TLS page (readable by user
+ * space via TPIDR_EL0), which is the POSIX contract.
+ *
+ * Only as many as the kernel actually produces are listed. Gaps are
+ * intentional rather than filled with guesses.
+ */
+#define EPERM   1
+#define ENOENT  2
+#define ESRCH   3
+#define EINTR   4
+#define EIO     5
+#define ENXIO   6
+#define E2BIG   7
+#define EBADF   9
+#define EAGAIN  11
+#define ENOMEM  12
+#define EACCES  13
+#define EFAULT  14
+#define EEXIST  17
+#define ENODEV  19
+#define ENOTDIR 20
+#define EISDIR  21
+#define EINVAL  22
+#define ENFILE  23
+#define EMFILE  24
+#define ENOSPC  28
+#define ESPIPE  29
+#define EROFS   30
+#define ERANGE  34
+#define ENOSYS  38
+#define ENOTEMPTY 39
+#define EOPNOTSUPP 95
+
 
 void syscall_dispatch(trap_frame_t *frame);
+
+/* Reset a freshly created task's errno to 0. Called from sched when a task is
+ * first entered so it never observes a stale value. */
+struct task;
+void syscall_reset_errno(struct task *t);
 
 #endif

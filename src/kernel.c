@@ -1073,6 +1073,43 @@ static void task_mmap_guard(void) {
 
 
 
+/* Runs the on-disk ERRNO test binary as a real exec'd ELF64 image.
+ *
+ * This is deliberately not the same thing as the in-kernel checks above:
+ * this binary is compiled and linked by the normal user-space rules, uses the
+ * public <sys.h> wrappers, and gets a fresh address space from execve. That
+ * exercises the whole chain — ELF loader, TLS page allocation in exec, and
+ * the user-side TPIDR_EL0 accessor — rather than the kernel's internal view of
+ * errno. */
+/* NOTE: the binary is named ERRNO.ELF, not ERRNOTEST.ELF. This kernel's
+ * FAT32 has no long-filename support, so mcopy stores an over-long name as the
+ * 8.3 short name "ERRNOT~1" and the lookup by full name then fails. "ERRNO"
+ * fits in 8 characters and needs no LFN entry. See the FAT32 note in the
+ * README. */
+static void task_errnotest(void) {
+  /* argv MUST live on the stack. A `static` array would land in .data, which
+   * is kernel-private and deliberately never mapped into a user TTBR0 — the
+   * kernel would then fault dereferencing an address the EL0 task cannot even
+   * read. Local storage sits on the user stack, which IS mapped. This is a
+   * real constraint of the kernel-text-task model, not a workaround. */
+  const char *argv[2];
+  argv[0] = "/mnt/fat32/ERRNO.ELF";
+  argv[1] = 0;
+
+  if (sys_exec(argv[0], argv) < 0) {
+    t_puts("[ERRNO TEST] exec failed (is ERRNO.ELF on the disk image?)\n");
+    /* Must not fall off the end of this function: an EL0 task entry was
+     * reached via a trampoline that has already eret'd, so there is no
+     * return address to come back to. */
+    sys_exit();
+  }
+
+  /* Unreachable when exec succeeds — it rewrites the trap frame so control
+   * never comes back here. Stated explicitly so a reader doesn't wonder
+   * where this goes. */
+  sys_exit();
+}
+
 /* ---- fork memory-isolation test ---------------------------------------- */
 
 /* SYS_FORK returns the child pid in x0 (and 0 in the child). The result
@@ -1411,6 +1448,7 @@ void kernel_main() {
   sched_create_task("task_crash", task_crash);
   sched_create_task("task_mmap", task_mmap);
   sched_create_task("task_forkmem", task_fork_mem);
+  sched_create_task("task_errnotest", task_errnotest);
   sched_create_task("task_mmguard", task_mmap_guard);
   sched_create_kernel_task("netd", netd);
 

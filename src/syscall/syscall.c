@@ -41,6 +41,55 @@
 
 #define USER_PATH_MAX 4096
 
+/*
+ * errno plumbing
+ *
+ * POSIX error reporting is a two-part contract: the syscall returns -1, AND
+ * stores a reason in the caller's `errno`. errno must be per-thread, or two
+ * tasks would overwrite each other's error codes.
+ *
+ * This kernel implements that with the architecture's own mechanism rather
+ * than a kernel-side lookup table: each task owns a TLS page at USER_TLS_BASE
+ * and TPIDR_EL0 points at it. context_switch reloads TPIDR_EL0 on every switch,
+ * so the register is always correct for whichever task is about to run —
+ * including a task resuming from a syscall that blocked mid-way.
+ *
+ * The store goes through PHYS_TO_VIRT rather than the user VA on purpose: the
+ * kernel may be servicing a task whose TTBR0 has already been swapped out
+ * (possible when a reaped task's frame is still on a stack), and the TLS page
+ * is a physical page we own, so the high-half mapping always reaches it.
+ */
+static inline int32_t *task_errno_slot(task_t *t) {
+  if (!t || !t->tls_phys) {
+    return 0;
+  }
+  return (int32_t *)((uintptr_t)PHYS_TO_VIRT(t->tls_phys) + TLS_ERRNO_OFFSET);
+}
+
+/* Record `err` as the calling task's errno and return -1, so every failing
+ * return site reads `return fail(EINVAL);`. */
+static inline int64_t fail(int err) {
+  task_t *t = sched_current();
+  int32_t *slot = task_errno_slot(t);
+  if (slot) {
+    *slot = err;
+  }
+  return -1;
+}
+
+/* Clear errno. POSIX requires a successful call to leave errno alone, so this
+ * is called only where the kernel genuinely wants it reset (task start). */
+static inline void clear_errno(task_t *t) {
+  int32_t *slot = task_errno_slot(t);
+  if (slot) {
+    *slot = 0;
+  }
+}
+
+/* Called from sched when a task is first entered, so a program never observes
+ * a stale errno inherited from whatever ran before it. */
+void syscall_reset_errno(task_t *t) { clear_errno(t); }
+
 // Returns 1 if [ptr, ptr+len) lies entirely inside the user address range.
 // Zero-length buffers are allowed regardless of pointer (matches POSIX).
 static inline int user_buf_ok(uint64_t ptr, size_t len) {
@@ -220,6 +269,29 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
   mmu_map_user_range(new_l0, stack_user_base, stack_phys, USER_STACK_PAGES,
                      stack_flags);
 
+  /* 5b. Give the new image its own TLS page.
+   *
+   * Without this the exec'd program inherits a TPIDR_EL0 pointing into the
+   * OLD address space, which we are about to tear down. Every read and write
+   * of errno would then hit unmapped memory — and since the faulting address
+   * is whatever we wrote errno to, it can land at a wild offset rather than
+   * faulting cleanly at 0. A fresh page is the only correct option: errno is
+   * per-process, and a new image is a new process. */
+  uintptr_t new_tls = pmm_allocate_page();
+  if (!new_tls) {
+    uart_errorln("[EXEC] Failed to allocate TLS page for new image");
+    mmu_free_user_tables(new_l0);
+    pmm_free_pages(stack_phys, USER_STACK_PAGES);
+    for (int i = 0; i < img.region_count; i++) {
+      if (img.regions[i].phys && img.regions[i].pages) {
+        pmm_free_pages(img.regions[i].phys, img.regions[i].pages);
+      }
+    }
+    return -1; /* kbuf was already freed above */
+  }
+  memset((void *)PHYS_TO_VIRT(new_tls), 0, PAGE_SIZE);
+  mmu_map_user_range(new_l0, USER_TLS_BASE, new_tls, 1, stack_flags);
+
   /* Print diagnostic *before* the TTBR0 swap. `path` is a user pointer
    * into the OLD address space, which gets unmapped + freed below. */
   uart_printf("[EXEC] Task %d '%s' loading %s (%d bytes, %d region(s), entry %x)\n",
@@ -232,6 +304,7 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
    * still using them. */
   uint64_t    old_ttbr0       = cur->ttbr0;
   uintptr_t   old_ustack_phys = cur->ustack_phys;
+  uintptr_t   old_tls_phys    = cur->tls_phys;
   elf_image_t old_image       = cur->exec_image;
 
   /* Allocate a fresh ASID for the new VA layout. With ASIDs every TLB
@@ -244,8 +317,19 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
 
   cur->ttbr0       = new_ttbr0;
   cur->ustack_phys = stack_phys;
+  cur->tls_phys    = new_tls;
   cur->user_sp     = USER_STACK_TOP;
   cur->exec_image  = img;
+
+  /* exec replaces the program image but keeps the process, so POSIX says the
+   * address space is wiped and the break resets. VMAs (mmap regions) and the
+   * brk arena belonged to the old image, so drop them here rather than
+   * letting the new program inherit a heap full of the old one's data. */
+  vma_destroy(&cur->vmas);
+  vma_init(&cur->vmas);
+  cur->brk_base = USER_BRK_BASE;
+  cur->brk_cur  = USER_BRK_BASE;
+  cur->stack_grown_count = 0;
 
   __asm__ __volatile__("msr ttbr0_el1, %0\n\t"
                        "isb"
@@ -306,6 +390,10 @@ static int64_t sys_exec(uint64_t arg_path, uint64_t arg_argv,
   if (old_ustack_phys) {
     pmm_free_pages(old_ustack_phys, USER_STACK_PAGES);
   }
+  if (old_tls_phys) {
+    pmm_free_page(old_tls_phys);
+  }
+
   /* Free per-segment regions from the previous exec image (if any). */
   for (int i = 0; i < old_image.region_count; i++) {
     if (old_image.regions[i].phys && old_image.regions[i].pages) {
@@ -389,34 +477,35 @@ static uint64_t mmap_find_free(task_t *t, uint64_t len) {
  *     doesn't exist yet.
  *   - MAP_FIXED honored (with full range + overlap validation), since a libc
  *     allocator that wants a fixed arena should not be blocked.
- *   - MAP_SHARED treated as MAP_PRIVATE: with no page cache, a shared anon
- *     region would need write-back on fault to be observable, so silently
- *     upgrading it would produce a program that "works" and loses data.
+ *   - MAP_SHARED REFUSED, not downgraded to private. With no page cache a
+ *     shared anon region can't be made observable, and silently upgrading it
+ *     would produce a program that appears to work and quietly loses data.
+ *     EOPNOTSUPP is the honest answer: this kernel can't do it.
  */
 static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
                         uint64_t flags, uint64_t fd, uint64_t offset) {
   task_t *t = sched_current();
   if (!t || !t->ttbr0) {
-    return -1; /* MAP_FAILED */
+    return fail(EINVAL); /* MAP_FAILED */
   }
 
   /* Only prot bits we understand; anything else means the caller is using a
    * flag from a newer kernel and we should not guess. */
   if (prot & ~(uint64_t)(VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC)) {
-    return -1;
+    return fail(EINVAL);
   }
   if (flags & MAP_SHARED) {
-    return -1;
+    return fail(EOPNOTSUPP);
   }
   if (!(flags & MAP_ANONYMOUS)) {
-    return -1;
+    return fail(EOPNOTSUPP);
   }
   if (offset != 0 || fd != (uint64_t)-1) {
     /* Anonymous mappings ignore fd and must have offset 0. */
-    return -1;
+    return fail(EINVAL);
   }
   if (length == 0) {
-    return -1;
+    return fail(EINVAL);
   }
 
   /* Page-align the range. Linux rounds the length up; the start is truncated
@@ -426,38 +515,40 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 
   if (flags & MAP_FIXED) {
     if (addr & (PAGE_SIZE - 1)) {
-      return -1;
+      return fail(EINVAL);
     }
     start = addr;
     end   = addr + length;
     if (!mmap_range_ok(start, end)) {
-      return -1;
+      return fail(EINVAL);
     }
     /* MAP_FIXED replaces whatever was there. For now only an untouched
      * region is acceptable — unmapping arbitrary overlapping regions means
      * splitting VMAs, which this implementation doesn't do. */
     if (vma_find_overlap(&t->vmas, start, end)) {
-      return -1;
+      return fail(EINVAL);
     }
   } else {
     uint64_t want = PAGE_ALIGN_UP(length);
     if (want < length) {
-      return -1; /* overflow */
+      return fail(ENOMEM); /* overflow */
     }
     start = mmap_find_free(t, want);
     if (!start) {
-      return -1; /* no space */
+      return fail(ENOMEM); /* no space below USER_VA_TOP */
     }
     end = start + want;
     if (!mmap_range_ok(start, end)) {
-      return -1;
+      return fail(ENOMEM);
     }
   }
 
   vma_t *vma = vma_add(&t->vmas, start, end, (uint32_t)prot,
                        VMA_ANONYMOUS | VMA_SHARED);
   if (!vma) {
-    return -1;
+    /* VMA table full, or kmalloc failed. Either way the constraint is
+     * address space rather than the arguments — ENOMEM, not EINVAL. */
+    return fail(ENOMEM);
   }
 
   /* No page-table work happens here: the region is empty and pages are
@@ -483,10 +574,10 @@ static int64_t sys_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 static int64_t sys_munmap(uint64_t addr, uint64_t length) {
   task_t *t = sched_current();
   if (!t || !t->ttbr0) {
-    return -1;
+    return fail(EINVAL);
   }
   if (addr & (PAGE_SIZE - 1) || length == 0) {
-    return -1;
+    return fail(EINVAL);
   }
   if (addr == 0) {
     return 0; /* POSIX: munmap(0, n) is a no-op */
@@ -495,19 +586,19 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length) {
   /* Overflow guard before computing the end: a huge length would wrap the
    * sum into a small value that passes every range check below. */
   if (length > MM_MAX_USER_VA || addr > MM_MAX_USER_VA - length) {
-    return -1;
+    return fail(EINVAL);
   }
 
   /* Round to whole pages the Linux way: munmap(p, 1) unmaps the single page
    * containing p, so the end is derived from the last byte, not the length. */
   uint64_t end = PAGE_ALIGN_DOWN(addr + length - 1) + PAGE_SIZE;
   if (end > MM_MAX_USER_VA) {
-    return -1;
+    return fail(EINVAL);
   }
 
   int64_t released = vma_unmap_range(&t->vmas, addr, end);
   if (released < 0) {
-    return -1;
+    return fail(ENOMEM); /* only failure is running out of VMA slots */
   }
 
   uint64_t *l0 = (uint64_t *)ttbr_baddr(t->ttbr0);
@@ -523,13 +614,13 @@ static int64_t sys_munmap(uint64_t addr, uint64_t length) {
 static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot) {
   task_t *t = sched_current();
   if (!t || !t->ttbr0) {
-    return -1;
+    return fail(EINVAL);
   }
   if (addr & (PAGE_SIZE - 1) || length == 0) {
-    return -1;
+    return fail(EINVAL);
   }
   if (prot & ~(uint64_t)(VMA_PROT_READ | VMA_PROT_WRITE | VMA_PROT_EXEC)) {
-    return -1;
+    return fail(EINVAL);
   }
   if (addr == 0) {
     return 0;
@@ -537,12 +628,12 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot) {
 
   /* Overflow guard, same reasoning as munmap. */
   if (length > MM_MAX_USER_VA || addr > MM_MAX_USER_VA - length) {
-    return -1;
+    return fail(EINVAL);
   }
 
   uint64_t end = PAGE_ALIGN_DOWN(addr + length - 1) + PAGE_SIZE;
   if (end > MM_MAX_USER_VA) {
-    return -1;
+    return fail(EINVAL);
   }
 
   /* vma_protect_range splits first so that every VMA intersecting [addr, end)
@@ -556,7 +647,7 @@ static int64_t sys_mprotect(uint64_t addr, uint64_t length, uint64_t prot) {
    * with stronger protection than the VMA records claim. */
   int touched = vma_protect_range(&t->vmas, addr, end, (uint32_t)prot);
   if (touched < 0) {
-    return -1;
+    return fail(ENOMEM); /* out of VMA slots to split into */
   }
 
   /* Re-protect the already-faulted pages now, and record the new protection
@@ -839,8 +930,10 @@ void syscall_dispatch(trap_frame_t *frame) {
 
 
   default:
+    /* ENOSYS is what lets a libc feature-probe: a wrapper that returns
+     * ENOSYS knows to fall back, where -1 with no reason is unusable. */
     uart_printf("[SYSCALL] Unknown syscall %u\n", num);
-    ret = -1;
+    ret = fail(ENOSYS);
     break;
   }
   // write return value back into trap frame

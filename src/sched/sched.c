@@ -3,6 +3,8 @@
 #include "mm/mmu/mmu.h"
 #include "mm/pmm/pmm.h"
 #include "strings/strings.h" // IWYU pragma: keep
+#include "syscall/syscall.h" /* syscall_reset_errno */
+#include <stddef.h> /* offsetof, for the TASK_TLS static assert */
 #include "timer/timer.h"
 #include "uart/uart.h"
 #include "vfs/vfs.h"
@@ -16,6 +18,13 @@ extern uint8_t __user_text_end[];
 // switch.S: unmasks IRQs, calls x19, then calls task_exit
 extern void task_trampoline(void);
 extern void kernel_task_trampoline(void);
+
+/* switch.S loads TPIDR_EL0 from the USER_TLS_BASE constant rather than from
+ * task_t.tls_phys, because TPIDR_EL1 needs a virtual address while tls_phys
+ * is physical. Guard the constant here: if mmu.h and switch.S ever disagree,
+ * every EL0 access to errno would fault at a fixed, confusing address. */
+_Static_assert(USER_TLS_BASE == 0x00B00000ULL,
+               "USER_TLS_BASE in switch.S no longer matches mmu.h");
 
 // Idle task is statically allocated, always exists
 static task_t idle_task;
@@ -359,6 +368,22 @@ int sched_create_task(const char *name, task_entry_t entry) {
   mmu_map_user_range(user_l0, ustack_user_base, ustack_phys,
                      USER_STACK_PAGES, stack_flags);
 
+  // Thread-local storage page. Mapped at a fixed VA (USER_TLS_BASE) so
+  // TPIDR_EL0 has a stable value to point at, and so errno is per-task
+  // without any extra indirection.
+  uintptr_t tls_phys = pmm_allocate_page();
+  if (!tls_phys) {
+    uart_errorln("[SCHED] Failed to allocate user TLS page");
+    pmm_free_pages(ustack_phys, USER_STACK_PAGES);
+    mmu_free_user_tables(user_l0);
+    pmm_free_pages(kstack_phys, TASK_STACK_PAGES);
+    kfree(t);
+    return -1;
+  }
+  memset((void *)PHYS_TO_VIRT(tls_phys), 0, PAGE_SIZE);
+  uint64_t tls_flags = PTE_ATTRIDX(1) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN;
+  mmu_map_user_range(user_l0, USER_TLS_BASE, tls_phys, 1, tls_flags);
+
   // Set up initial kernel stack frame for context_switch.
   // Frame size matches the layout in switch.S: 12 GPRs (x19–x30) + 8 SIMD
   // (d8–d15) = 160 bytes. d8–d15 are left zero (a fresh task has no FP
@@ -380,8 +405,13 @@ int sched_create_task(const char *name, task_entry_t entry) {
   t->user_sp = USER_STACK_TOP;
   t->kstack_top = kstack_top;
   t->ustack_phys = ustack_phys;
+  t->tls_phys    = tls_phys;
   copy_name(t->name, name);
   vma_init(&t->vmas);
+  /* A new process starts with errno == 0. The TLS page is already zeroed,
+   * but stating it here makes the invariant explicit and keeps it true if
+   * the page is ever recycled. */
+  syscall_reset_errno(t);
 
   /* Reserve the brk arena base. No VMA is created here — brk() grows it on
    * first call, and leaving it unmapped until then means the address range
@@ -472,15 +502,69 @@ int sched_fork(task_t *parent, struct trap_frame *frame) {
     return -1;
   }
 
-  /* Re-map the shared .text + .rodata window with the same physical pages.
-   * Same flags / shape as sched_create_task; safe because the pages are
-   * read-only at EL0 (PTE_AP_RO_EL0 + PTE_PXN). */
-  uint64_t text_start_pa    = VIRT_TO_PHYS((uint64_t)__text_start);
-  uint64_t user_text_end_pa = VIRT_TO_PHYS((uint64_t)__user_text_end);
-  uint64_t text_pages       = (user_text_end_pa - text_start_pa) / PAGE_SIZE;
-  uint64_t text_flags       = PTE_ATTRIDX(1) | PTE_AP_RO_EL0 | PTE_PXN;
-  mmu_map_user_range(user_l0, USER_TEXT_BASE, text_start_pa, text_pages,
-                     text_flags);
+  /* Program image.
+   *
+   * Two cases, and picking the wrong one is a silent memory-corruption bug
+   * rather than a visible failure:
+   *
+   *   - region_count == 0: the task runs the kernel's own text (created by
+   *     sched_create_task). Re-map the shared __text_start..__user_text_end
+   *     window with the SAME physical pages — safe by permission, since those
+   *     pages are EL0 read-only, so neither side can write them.
+   *
+   *   - region_count > 0: the task was exec'd and runs a real ELF image.
+   *     The kernel text window is NOT what this task is executing. Mapping it
+   *     anyway leaves the child resuming inside ELF code that isn't there, and
+   *     the resulting "unknown exception" is very hard to trace back. Copy the
+   *     parent's PT_LOAD regions instead, each into fresh pages, so the child
+   *     has its own copy and its exec_image owns them for reap.
+   */
+  if (parent->exec_image.region_count > 0) {
+    /* One entry per PT_LOAD, backed by a CONTIGUOUS allocation, matching what
+     * elf_load() produces. Keeping the shape identical is what lets sched_reap
+     * free the child's copy with the same pmm_free_pages(phys, pages) call it
+     * uses for the parent — a per-page entry list would overflow
+     * ELF_MAX_REGIONS and break that contract. */
+    for (int i = 0; i < parent->exec_image.region_count; i++) {
+      const elf_region_t *src = &parent->exec_image.regions[i];
+      uint64_t flags = elf_pflags_to_pte(src->flags);
+
+      uintptr_t dst = pmm_allocate_pages(src->pages);
+      if (!dst) {
+        uart_errorln("[FORK] PMM exhausted copying exec image");
+        /* Unwind: free the segments already copied, then fall into the shared
+         * cleanup below. Falling through with a partial image would leave the
+         * child resuming into code that isn't there. */
+        for (int j = 0; j < t->exec_image.region_count; j++) {
+          pmm_free_pages(t->exec_image.regions[j].phys,
+                         t->exec_image.regions[j].pages);
+        }
+        t->exec_image.region_count = 0;
+        mmu_free_user_tables(user_l0);
+        pmm_free_pages(kstack_phys, TASK_STACK_PAGES);
+        kfree(t);
+        return -1;
+      }
+
+      memcpy((void *)PHYS_TO_VIRT(dst), (const void *)PHYS_TO_VIRT(src->phys),
+             src->pages * PAGE_SIZE);
+      mmu_map_user_range(user_l0, src->va, dst, src->pages, flags);
+
+      t->exec_image.regions[i].phys  = dst;
+      t->exec_image.regions[i].pages = src->pages;
+      t->exec_image.regions[i].va    = src->va;
+      t->exec_image.regions[i].flags = src->flags;
+      t->exec_image.region_count++;
+    }
+    t->exec_image.entry = parent->exec_image.entry;
+  } else {
+    uint64_t text_start_pa    = VIRT_TO_PHYS((uint64_t)__text_start);
+    uint64_t user_text_end_pa = VIRT_TO_PHYS((uint64_t)__user_text_end);
+    uint64_t text_pages = (user_text_end_pa - text_start_pa) / PAGE_SIZE;
+    uint64_t text_flags = PTE_ATTRIDX(1) | PTE_AP_RO_EL0 | PTE_PXN;
+    mmu_map_user_range(user_l0, USER_TEXT_BASE, text_start_pa, text_pages,
+                       text_flags);
+  }
 
   /* Fresh user stack — allocate physical pages and copy parent's contents.
    *
@@ -530,6 +614,20 @@ int sched_fork(task_t *parent, struct trap_frame *frame) {
     grown++;
   }
   t->stack_grown_count = grown;
+
+  /* TLS page for the child: a fresh, zeroed page, so the child starts with
+   * errno == 0 and never inherits the parent's error code. */
+  uintptr_t child_tls = pmm_allocate_page();
+  if (!child_tls) {
+    uart_errorln("[FORK] Failed to allocate child TLS page");
+    pmm_free_pages(ustack_phys, USER_STACK_PAGES);
+    mmu_free_user_tables(user_l0);
+    pmm_free_pages(kstack_phys, TASK_STACK_PAGES);
+    kfree(t);
+    return -1;
+  }
+  memset((void *)PHYS_TO_VIRT(child_tls), 0, PAGE_SIZE);
+  mmu_map_user_range(user_l0, USER_TLS_BASE, child_tls, 1, stack_flags);
 
   /* ---- Lay out child's kstack ---------------------------------------- */
   /* Trap frame: 688 bytes (matches FRAME_SIZE in vector.S — GPRs + sysregs
@@ -642,6 +740,7 @@ int sched_fork(task_t *parent, struct trap_frame *frame) {
   t->user_sp     = parent->user_sp;
   t->kstack_top  = kstack_top;
   t->ustack_phys = ustack_phys;
+  t->tls_phys    = child_tls;
 
   /* Fresh fd table for the child. POSIX-correct fork would dup all fds;
    * for the MVP we give the child a clean stdin/stdout/stderr backed by
@@ -868,6 +967,11 @@ void sched_reap(void) {
      * which physical pages were pmm_allocate'd, so munmap and reap both
      * return precisely those and nothing else. */
     vma_destroy(&dead->vmas);
+
+    /* TLS page (holds errno). */
+    if (dead->tls_phys) {
+      pmm_free_page(dead->tls_phys);
+    }
 
 
     /* Invalidate any TLB entries left behind by this task's ASID before we

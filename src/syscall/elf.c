@@ -64,6 +64,26 @@ static void cpu_sync_icache(uintptr_t va, size_t size) {
 
 #define MAX_PHNUM 32
 
+/* Translate an ELF p_flags value into the stage-1 descriptor bits used for a
+ * user mapping. Exposed (not static) because sched_fork needs to reproduce the
+ * parent's segment protections when copying an exec'd image — deriving them a
+ * second time in the scheduler would be a rule that can drift.
+ *
+ * Rejects nothing here; parse_flags() above does the validation. */
+uint64_t elf_pflags_to_pte(uint32_t pf) {
+  uint64_t f = PTE_ATTRIDX(1) | PTE_PXN;
+
+  if (pf & PF_W) {
+    f |= PTE_AP_RW_EL0;
+  } else {
+    f |= PTE_AP_RO_EL0;
+  }
+  if (!(pf & PF_X)) {
+    f |= PTE_UXN;
+  }
+  return f;
+}
+
 static int parse_flags(uint32_t pf, uint64_t *out) {
   /* PXN is always set (kernel must never execute user pages). UXN is set
    * when PF_X is clear so user-mode can't execute non-text data. */
@@ -238,6 +258,11 @@ int elf_load(const uint8_t *kbuf, size_t size, uint64_t *user_l0,
 
     out->regions[out->region_count].phys  = phys;
     out->regions[out->region_count].pages = pages;
+    /* Record the VA and p_flags alongside the allocation. sched_fork needs
+     * both to reproduce this segment in the child's address space; without
+     * them a forked exec'd task has no way to know what it inherited. */
+    out->regions[out->region_count].va    = va_lo;
+    out->regions[out->region_count].flags = ph->p_flags;
     out->region_count++;
 
     uart_printf("[ELF] PT_LOAD #%d: vaddr=%x filesz=%d memsz=%d flags=%c%c%c\n",

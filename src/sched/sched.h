@@ -72,6 +72,13 @@ typedef struct task {
    * reservation costs no physical memory until touched. */
   uint64_t brk_base;
   uint64_t brk_cur;
+
+  /* Physical page backing this task's TLS block at USER_TLS_BASE. TPIDR_EL0
+   * holds the user VA of that page; errno lives at TLS_ERRNO_OFFSET within
+   * it. Tracked by physical address because that's what reap needs to free
+   * it, and because the kernel writes errno through PHYS_TO_VIRT so the store
+   * works regardless of which task's TTBR0 happens to be loaded. */
+  uintptr_t tls_phys;
 } task_t;
 
 // switch.S

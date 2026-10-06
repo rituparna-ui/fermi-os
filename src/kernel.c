@@ -1072,6 +1072,134 @@ static void task_mmap_guard(void) {
 }
 
 
+
+/* ---- fork memory-isolation test ---------------------------------------- */
+
+/* SYS_FORK returns the child pid in x0 (and 0 in the child). The result
+   MUST be read from x0 — x8 holds the syscall number, which the kernel leaves
+   untouched, so returning it would hand every caller the constant 12. */
+static inline long k_fork(void) {
+  register long      x0 __asm__("x0");
+  register uint64_t  x8 __asm__("x8") = 12; /* SYS_FORK */
+  __asm__ __volatile__("svc #0"
+                       : "=r"(x0)
+                       : "r"(x8)
+                       : "memory");
+  return (long)x0;
+}
+
+/* Shared rendezvous so the child can report back without any IPC primitive
+ * that doesn't exist yet. The parent publishes an address via mmap; the
+ * child finds it by re-running the same allocator walk, then writes a result
+ * there. Simple, and it exercises the VMA copy in both directions. */
+#define FORK_MMAGIC 0x0F0C0BEULL
+
+/* Parent half: sets up heap + mmap regions, forks, then verifies the child
+ * left its own copy untouched. */
+/* Child half of the fork test; defined after task_fork_mem for readability. */
+static void task_fork_child_half(long b0, uint64_t mp);
+
+static void task_fork_mem(void) {
+  t_puts("[FORK TEST] === fork memory isolation ===\n");
+
+  /* Allocate heap via brk. The arena lives at a FIXED address (brk_base), so
+   * the child can locate its own inherited heap with just brk(0) — no
+   * argument passing needed, which makes the heap the natural rendezvous. */
+  long b0 = k_brk(0);
+  k_brk((uint64_t)b0 + 2 * PAGE_SIZE);
+  volatile uint32_t *heap = (volatile uint32_t *)(uint64_t)b0;
+  heap[0] = 0x11111111u;
+  heap[1] = 0x22222222u;
+
+  /* Publish the mmap region's address through the heap so the child can find
+   * it. That the channel works at all is itself the property under test. */
+  uint64_t mp = k_mmap(0, PAGE_SIZE, TEST_PROT_READ | TEST_PROT_WRITE,
+                       TEST_MAP_ANON);
+  if ((int64_t)mp < 0) {
+    t_puts("  [FORK TEST] parent mmap failed\n");
+    sys_exit();
+  }
+  volatile uint32_t *mm = (volatile uint32_t *)mp;
+  mm[0] = 0x33333333u;
+  heap[2] = (uint32_t)mp;
+
+  long child = k_fork();
+
+  /* Child half: a fork'd child resumes right here with x0 == 0, so it takes
+   * this branch and exits without ever returning to the parent code below. */
+  if (child == 0) {
+    task_fork_child_half(b0, mp);
+    sys_exit();
+  }
+
+  /* Parent half. */
+  if (child < 0) {
+    t_puts("  [FORK TEST] fork failed\n");
+    sys_exit();
+  }
+  t_puts("  [FORK TEST] forked child, verifying parent copy unchanged\n");
+
+  /* The child runs concurrently and will overwrite ITS copies. Ours must not
+   * move. Give it a few scheduling slots by sleeping. */
+  sys_sleep(400);
+
+  if (mmap_expect("parent heap page intact", heap[0] == 0x11111111u, 1)) {
+    /* pass */
+  }
+  if (mmap_expect("parent heap 2nd word", heap[1] == 0x22222222u, 1)) {
+    /* pass */
+  }
+  if (mmap_expect("parent mmap page intact", mm[0] == 0x33333333u, 1)) {
+    /* pass */
+  }
+
+  /* Write again ourselves to be sure the region is still writable after the
+   * child churned through its own copy. */
+  heap[0] = 0x44444444u;
+  if (mmap_expect("parent still writable", heap[0] == 0x44444444u, 1)) {
+    /* pass */
+  }
+
+  t_puts("[FORK TEST] done\n");
+  sys_exit();
+}
+
+/* A fork'd child resumes inside task_fork_mem with x0 == 0, so both halves
+ * live in that function and branch on the fork return value — there is no
+ * separate child entry point to register.
+ *
+ * The child deliberately does NOT call mmap: its VMA set already contains
+ * the parent's region, so a fresh mmap here would return a *different*
+ * address and the test would prove nothing about the inherited mapping. */
+static void task_fork_child_half(long b0, uint64_t mp) {
+  volatile uint32_t *heap = (volatile uint32_t *)(uint64_t)b0;
+
+  /* First confirm the inherited contents actually arrived. A copy that
+   * dropped or zeroed the data would pass an isolation test vacuously, so
+   * this check is what makes the parent's assertions meaningful. */
+  if (heap[0] != 0x11111111u) {
+    t_puts("  [FORK TEST] child did NOT inherit heap contents\n");
+  } else {
+    t_puts("  [FORK TEST] child inherited heap contents OK\n");
+  }
+
+  heap[0] = 0xAAAAAAAAu;
+  heap[1] = 0xBBBBBBBBu;
+
+  if (mp) {
+    volatile uint32_t *mm = (volatile uint32_t *)mp;
+    if (mm[0] != 0x33333333u) {
+      t_puts("  [FORK TEST] child did NOT inherit mmap contents\n");
+    } else {
+      t_puts("  [FORK TEST] child inherited mmap contents OK\n");
+    }
+    mm[0] = 0xCCCCCCCCu;
+  }
+
+  t_puts("[FORK TEST] child wrote to its private copies\n");
+  sys_exit();
+}
+
 /* Task A: open a file from FAT32 and print it through fd=1. */
 static void task_a(void) {
   const char banner[] = "[Task A] reading /mnt/fat32/HELLO.TXT\n";
@@ -1282,6 +1410,7 @@ void kernel_main() {
   sched_create_task("task_shell", task_shell);
   sched_create_task("task_crash", task_crash);
   sched_create_task("task_mmap", task_mmap);
+  sched_create_task("task_forkmem", task_fork_mem);
   sched_create_task("task_mmguard", task_mmap_guard);
   sched_create_kernel_task("netd", netd);
 

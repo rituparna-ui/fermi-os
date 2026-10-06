@@ -53,6 +53,11 @@ typedef struct task {
    * Placed at the end of task_t so the existing TASK_TTBR0=40 offset used
    * by switch.S stays put. */
   uintptr_t stack_grown_phys[USER_STACK_GROWN_MAX];
+  /* User VA each entry above is mapped at. Demand growth fills the zone in
+   * whatever order the faults arrive — not top-down — so the VA cannot be
+   * recovered from the array index and has to be recorded. sched_fork needs
+   * it to re-map the child's copies at the same addresses. */
+  uintptr_t stack_grown_va[USER_STACK_GROWN_MAX];
   uint16_t  stack_grown_count;
 
   /* User address-space regions created by mmap(). Embedded by value so the

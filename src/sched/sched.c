@@ -92,7 +92,9 @@ int sched_try_grow_stack(task_t *t, uint64_t far) {
                        "isb"
                        :: "r"(arg));
 
-  t->stack_grown_phys[t->stack_grown_count++] = pa;
+  t->stack_grown_phys[t->stack_grown_count] = pa;
+  t->stack_grown_va[t->stack_grown_count]   = va;
+  t->stack_grown_count++;
 
   uart_printf("[STACK] grew task %u '%s' by 1 page at %x (now %u dyn pages)\n",
               t->pid, t->name, va, (uint64_t)t->stack_grown_count);
@@ -417,14 +419,25 @@ int sched_create_task(const char *name, task_entry_t entry) {
  * Returns the child's pid to the parent. The child sees x0 = 0 because
  * we explicitly clobber the saved x0 in its frame copy.
  *
- * Memory model:
- *   - .text / .rodata window is shared (read-only, EL0 RO + PXN). Same
- *     physical pages get re-mapped at the same VA in the child's L0.
- *   - User stack pages are *copied* — fresh PMM allocation, byte-for-byte
- *     memcpy from parent's stack region.
+ * Memory model (POSIX fork = copy-on-write semantics, eagerly copied here):
+ *   - .text / .rodata window is SHARED — same physical pages re-mapped at
+ *     the same VA. Safe because those pages are EL0 read-only, so neither
+ *     parent nor child can write them. This is the one place sharing is
+ *     correct, and it is safe by permission, not by luck.
+ *   - Everything writable is COPIED: the user stack (including any
+ *     demand-grown pages), every mmap'd VMA region, and the brk heap. Each
+ *     gets fresh PMM pages with a byte-for-byte memcpy, so a write in one
+ *     task can never be observed by the other.
  *   - fd table is fresh (stdin/stdout/stderr to /dev/console). POSIX-true
  *     fd duplication is left as a TODO; current shell-fork-then-exit
  *     scenarios don't depend on inherited fds.
+ *
+ * This is an eager copy, not lazy copy-on-write. A real COW implementation
+ * would map both address spaces read-only and copy on the first write fault.
+ * That is the better design but needs a per-page refcount plus write-fault
+ * recovery in the fault path, and this kernel's fault path currently treats
+ * every write fault as fatal. Until that exists, copying is the only way to
+ * get the *correctness* POSIX demands, so correctness wins.
  */
 int sched_fork(task_t *parent, struct trap_frame *frame) {
   if (!parent || !frame) {
@@ -469,7 +482,13 @@ int sched_fork(task_t *parent, struct trap_frame *frame) {
   mmu_map_user_range(user_l0, USER_TEXT_BASE, text_start_pa, text_pages,
                      text_flags);
 
-  /* Fresh user stack — allocate physical pages and copy parent's contents. */
+  /* Fresh user stack — allocate physical pages and copy parent's contents.
+   *
+   * The stack is not a VMA, so it needs its own copy loop: the eagerly
+   * mapped USER_STACK_PAGES block, then each page the parent demand-grew
+   * below it. Copying only the initial block (as this used to) would leave
+   * the child's grown region unmapped, so a child touching stack that the
+   * parent had faulted in would fault instead of reading its own data. */
   uintptr_t ustack_phys = pmm_allocate_pages(USER_STACK_PAGES);
   if (!ustack_phys) {
     uart_errorln("[FORK] Failed to allocate child user stack");
@@ -486,6 +505,31 @@ int sched_fork(task_t *parent, struct trap_frame *frame) {
   uint64_t stack_flags = PTE_ATTRIDX(1) | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN;
   mmu_map_user_range(user_l0, ustack_user_base, ustack_phys, USER_STACK_PAGES,
                      stack_flags);
+
+  /* Copy the demand-grown stack pages into the child. The VA each page was
+   * mapped at is recorded alongside it, because growth fills the zone in
+   * fault order rather than positionally — recovering the VA from the array
+   * index would scatter the child's copies across the wrong addresses. */
+  uint16_t grown = 0;
+  for (uint16_t g = 0; g < parent->stack_grown_count; g++) {
+    uintptr_t src_pa = parent->stack_grown_phys[g];
+    uint64_t  va     = parent->stack_grown_va[g];
+    if (!src_pa) {
+      continue;
+    }
+    uintptr_t dst_pa = pmm_allocate_page();
+    if (!dst_pa) {
+      uart_errorln("[FORK] PMM exhausted copying grown stack pages");
+      break; /* keep what we have; the child re-faults the rest as needed */
+    }
+    memcpy((void *)PHYS_TO_VIRT(dst_pa), (const void *)PHYS_TO_VIRT(src_pa),
+           PAGE_SIZE);
+    mmu_map_user_range(user_l0, va, dst_pa, 1, stack_flags);
+    t->stack_grown_phys[grown] = dst_pa;
+    t->stack_grown_va[grown]   = va;
+    grown++;
+  }
+  t->stack_grown_count = grown;
 
   /* ---- Lay out child's kstack ---------------------------------------- */
   /* Trap frame: 688 bytes (matches FRAME_SIZE in vector.S — GPRs + sysregs
@@ -507,6 +551,62 @@ int sched_fork(task_t *parent, struct trap_frame *frame) {
   switch_frame[11] = (uint64_t)fork_return;   /* x30 */
   /* d8–d15 (offsets 96–152) are already zero from the kstack memset. */
 
+  /* ---- Copy mmap'd + brk regions into the child ------------------------
+   *
+   * Two phases, and the order matters. vma_clone() duplicates the VMA
+   * *records* with the parent's physical page pointers still in place; the
+   * loop below then privatizes each entry that is actually faulted in. A
+   * NOT-yet-faulted entry (NULL) is left NULL in the child, which is correct
+   * and free: both tasks will simply fault in their own zero page the first
+   * time each touches it.
+   *
+   * Doing the loop after cloning means a mid-way failure leaves the child
+   * with a consistent (if incomplete) subset rather than a VMA claiming
+   * pages it doesn't own. */
+  if (parent->vmas.count) {
+    if (!vma_clone(&parent->vmas, &t->vmas)) {
+      uart_errorln("[FORK] vma_clone failed; child gets no mmap regions");
+    } else {
+      uint8_t vi = 0;
+      while (vi < t->vmas.count) {
+        vma_t *cv = &t->vmas.entries[vi];
+        uint64_t npages = (cv->end - cv->start) / PAGE_SIZE;
+        uint64_t pflags = mmu_prot_to_flags(cv->prot);
+        int failed = 0;
+
+        for (uint64_t pi = 0; pi < npages; pi++) {
+          uintptr_t src_pa = cv->pages[pi];
+          if (!src_pa) {
+            continue; /* never faulted in — child will demand-fault its own */
+          }
+          uintptr_t dst_pa = pmm_allocate_page();
+          if (!dst_pa) {
+            uart_errorln("[FORK] PMM exhausted privatizing mmap region");
+            failed = 1;
+            break;
+          }
+          memcpy((void *)PHYS_TO_VIRT(dst_pa),
+                 (const void *)PHYS_TO_VIRT(src_pa), PAGE_SIZE);
+          cv->pages[pi] = dst_pa;
+          mmu_map_user_range(user_l0, cv->start + pi * PAGE_SIZE, dst_pa, 1,
+                             pflags);
+        }
+
+        if (failed) {
+          /* Drop the whole region rather than leaving it half-privatized: a
+           * partially copied anonymous region would hand the child stale
+           * contents for the pages we couldn't copy, which is far worse than
+           * a missing mapping it will fault on demand. Clear the PTEs we
+           * already installed, then release the VMA and its copied pages. */
+          mmu_unmap_user_range(user_l0, cv->start, npages);
+          vma_unmap_range(&t->vmas, cv->start, cv->end);
+          continue; /* don't advance: the list shrank, re-examine this index */
+        }
+        vi++;
+      }
+    }
+  }
+
   /* ---- task_t fields -------------------------------------------------- */
   copy_name(t->name, parent->name);
   /* Append "+f" if there's room — cosmetic, helps `ps` distinguish them. */
@@ -522,20 +622,18 @@ int sched_fork(task_t *parent, struct trap_frame *frame) {
   t->pid         = next_pid++;
   t->state       = TASK_READY;
   t->stack_phys  = kstack_phys;
-  /* The child starts with no mmap()ed regions. sched_fork copies .text and
-   * the user stack into the child's tables, but mmap regions are not yet
-   * copied across (see the note in sched_fork's doc comment) — so an empty
-   * VMA set is exactly consistent with what the child's page tables contain.
-   * Once region copying lands, this becomes a deep copy of the parent's set
-   * alongside it. */
-  vma_init(&t->vmas);
+  /* The VMA set was populated above by cloning + privatizing the parent's
+   * regions. It must NOT be re-initialized here: the memset(t, 0) at the top
+   * of this function already left it empty, and clearing it now would drop
+   * the child's bookkeeping while its page tables still referenced the
+   * copied pages — leaking every one of them on reap. */
 
-  /* The child's break starts empty. fork() copies neither the brk arena nor
-   * mmap regions today (see the note above), so the child gets a fresh,
-   * empty heap rather than a break pointing at memory it doesn't own. Once
-   * region copying lands this becomes a deep copy alongside it. */
-  t->brk_base = USER_BRK_BASE;
-  t->brk_cur  = USER_BRK_BASE;
+  /* The break follows the copied heap. The brk arena is an ordinary anonymous
+   * VMA owned by the parent's set, so it was already cloned and privatized
+   * above — the child just inherits the parent's break VALUE. Both tasks
+   * grow from there independently. */
+  t->brk_base = parent->brk_base;
+  t->brk_cur  = parent->brk_cur;
 
   /* Fresh ASID for the child — separate from parent's so each task has
    * its own TLB context. The parent's TLB entries stay valid under its

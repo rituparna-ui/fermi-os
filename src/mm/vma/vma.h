@@ -139,6 +139,24 @@ uint64_t vma_resident_pages(const vma_set_t *set);
 /* Total pages spanned by all VMAs, faulted or not. */
 uint64_t vma_mapped_pages(const vma_set_t *set);
 
+/* Deep-copy `src` into `dst`, duplicating every page ARRAY.
+ *
+ * The backing page pointers are copied verbatim — this clones the *record*
+ * shape, not the physical memory. The caller must then decide what to do
+ * about pages:
+ *   - to share, leave them as-is (correct only for MAP_SHARED)
+ *   - to privatize, allocate a fresh page per non-NULL entry, copy contents,
+ *     and overwrite the entry
+ *
+ * `dst` is treated as the destination and is reset first, so calling this on
+ * a live set leaks whatever that set owned. For fork the destination is
+ * always a freshly zeroed task.
+ *
+ * Returns 1 on success. On failure `dst` is left empty — every allocation
+ * made along the way is released, so there is no partial state to clean up.
+ */
+int vma_clone(const vma_set_t *src, vma_set_t *dst);
+
 /* Free every backing page still recorded as allocated and reset the list.
  * Called from sched_reap for the whole task. */
 void vma_destroy(vma_set_t *set);

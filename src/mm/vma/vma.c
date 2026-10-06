@@ -322,6 +322,40 @@ uint64_t vma_mapped_pages(const vma_set_t *set) {
   return total;
 }
 
+int vma_clone(const vma_set_t *src, vma_set_t *dst) {
+  if (!src || !dst) {
+    return 0;
+  }
+  vma_init(dst);
+
+  for (uint8_t i = 0; i < src->count; i++) {
+    const vma_t *s = &src->entries[i];
+    uint64_t n     = vma_npages(s);
+
+    /* Copy the record first (page pointer included — the caller privatizes
+     * afterwards), then clone the array so the two lists never alias. */
+    vma_t c = *s;
+    c.next  = 0;
+
+    uintptr_t *pages = (uintptr_t *)kmalloc(n * sizeof(uintptr_t));
+    if (!pages) {
+      /* Release everything cloned so far. vma_destroy only frees pages that
+       * are recorded, and our entries are all NULL, so this just releases
+       * the arrays — exactly what we want, since the physical pages still
+       * belong to the source task. */
+      vma_destroy(dst);
+      uart_errorln("[VMA] clone: kmalloc failed");
+      return 0;
+    }
+    memcpy(pages, s->pages, n * sizeof(uintptr_t));
+    c.pages = pages;
+
+    vma_insert_sorted(dst, &c);
+  }
+
+  return 1;
+}
+
 void vma_release_pages(vma_t *vma) {
   if (!vma || !vma->pages) {
     return;

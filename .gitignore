@@ -5,7 +5,10 @@ compile_commands.json
 *.swp
 *.o
 *.d
+# User binaries are build artifacts, at any depth under user/ -- user/linux/
+# holds the foreign Linux binary and `user/*.elf` does not match it.
 user/*.elf
+user/**/*.elf
 user/*.bin
 wasabi-toolbag/
 

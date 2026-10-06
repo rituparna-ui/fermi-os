@@ -816,7 +816,9 @@ void syscall_dispatch(trap_frame_t *frame) {
     break;
 
   case SYS_EXIT:
-    task_exit();
+    /* arg0 is the exit status, handed to the parent via
+     * waitpid(). A long's worth of bits keeps the ABI 64-bit clean. */
+    task_exit((int)(long)arg0);
     break;
 
   case SYS_YIELD:
@@ -890,6 +892,31 @@ void syscall_dispatch(trap_frame_t *frame) {
      * when first scheduled, returns 0 from this same SVC via fork_return. */
     ret = (int64_t)sched_fork(sched_current(), frame);
     break;
+
+  case SYS_WAITPID: {
+    /* arg1 points at a user-space int for the status word. Validate it as a
+     * user pointer before writing through it — an unchecked store to a
+     * user-supplied address is an arbitrary-kernel-write primitive. */
+    int   status    = 0;
+    int  *statusptr = 0;
+    if (arg1 != 0) {
+      if (!user_buf_ok(arg1, sizeof(int))) {
+        ret = fail(EFAULT);
+        break;
+      }
+      statusptr = (int *)arg1;
+    }
+    long pid = sched_waitpid((int64_t)(long)arg0, &status, (int)arg2);
+    if (pid < 0) {
+      ret = fail(ECHILD);
+    } else {
+      if (statusptr) {
+        *statusptr = status;
+      }
+      ret = pid;
+    }
+    break;
+  }
 
   case SYS_MMAP:
     /* Linux arg order: addr, length, prot, flags, fd, offset. */

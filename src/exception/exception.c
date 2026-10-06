@@ -241,7 +241,8 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
         }
       }
       dump_user_abort("data abort", t, frame);
-      task_exit();
+      /* -1 marks a fault death so a parent can tell it from a normal exit. */
+      task_exit(-1);
       break;
     }
 
@@ -264,7 +265,7 @@ void exception_dispatch(uint64_t type, trap_frame_t *frame) {
         break;
       }
       dump_user_abort("instruction abort", t, frame);
-      task_exit();
+      task_exit(-1);
       break;
     }
 

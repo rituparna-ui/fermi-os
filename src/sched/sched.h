@@ -23,7 +23,13 @@ typedef enum {
   TASK_READY,
   TASK_RUNNING,
   TASK_SLEEPING,
-  TASK_DEAD
+  TASK_DEAD,
+  /* Exited, but not yet collected by its parent. Holds no runnable state and
+   * no user memory that the parent could still observe — only the exit status
+   * and the identity waitpid() needs to find. A zombie exists precisely so a
+   * parent can learn WHY its child died; freeing it immediately (as this kernel
+   * did before waitpid existed) threw that information away. */
+  TASK_ZOMBIE
 } task_state_t;
 
 typedef void (*task_entry_t)(void);
@@ -79,6 +85,14 @@ typedef struct task {
    * it, and because the kernel writes errno through PHYS_TO_VIRT so the store
    * works regardless of which task's TTBR0 happens to be loaded. */
   uintptr_t tls_phys;
+
+  /* Process relationship + exit status, for wait/waitpid.
+   *
+   * ppid == 0 means "no parent to notify": kernel-mode tasks and any task
+   * created directly by the kernel are reaped automatically, while a forked
+   * child keeps its corpse around until its parent collects the status. */
+  uint64_t ppid;
+  int      exit_code;
 } task_t;
 
 // switch.S
@@ -100,16 +114,19 @@ extern void fork_return(void);
 /* Create an EL1 kernel-mode task. Unlike sched_create_task, no user_l0
  * is allocated and TTBR0 is left at 0 (so context_switch skips the
  * per-task user mapping swap). The entry function runs at EL1 with the
- * kernel's full privileges and is expected to call task_exit() or fall
+ * kernel's full privileges and is expected to call task_exit(0) or fall
  * off the end (kernel_task_trampoline calls task_exit if it returns). */
 int sched_create_kernel_task(const char *name, task_entry_t entry);
 void schedule(void);
 void yield(void);
-void task_exit(void);
+/* Exit the calling task with `code` as its exit status. The status is
+ * delivered to the parent via waitpid(); if the task has no parent it is
+ * simply reaped. Does not return. */
+void task_exit(int code);
 
 /* Kill the task with the given pid. Marks it DEAD, unlinks it from the
  * run queue, and pushes it onto the reaper list. If pid refers to the
- * caller, falls through to task_exit(). Returns 0 on success, -1 if the
+ * caller, falls through to task_exit(-1). Returns 0 on success, -1 if the
  * pid is not found, already dead, or refers to the idle task (pid 0). */
 int sched_kill_task(uint64_t pid);
 void sleep_ms(uint64_t ms);
@@ -133,6 +150,22 @@ const char *task_state_name(task_state_t s);
  * stale TLB entries. With the current hobby-kernel workloads we never
  * observe a wrap. */
 uint16_t sched_asid_alloc(void);
+
+/* wait / waitpid.
+ *
+ * Collects an exited child of the calling task, returning its pid (or -1).
+ * `status_ptr`, when non-NULL, receives the packed status word: the exit code
+ * in bits 8-15, or 0 if the child was killed by a signal (encoded as
+ * signal<<8 | 0x80; only signal 0 is produced today).
+ *
+ * `options` accepts WNOHANG, which returns 0 immediately if no child has
+ * exited yet rather than blocking.
+ *
+ * Returns -1 with no children left to reap (ECHILD semantics), 0 for WNOHANG
+ * with nothing ready, or the reaped child's pid. */
+#define WNOHANG 1
+
+long sched_waitpid(int64_t pid_arg, int *status_ptr, int options);
 
 
 /* Demand-page handler for the user stack. Called from the EL0 data-abort

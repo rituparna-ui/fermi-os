@@ -746,15 +746,25 @@ int sched_fork(task_t *parent, struct trap_frame *frame) {
   t->ustack_phys = ustack_phys;
   t->tls_phys    = child_tls;
 
-  /* Fresh fd table for the child. POSIX-correct fork would dup all fds;
-   * for the MVP we give the child a clean stdin/stdout/stderr backed by
-   * /dev/console (same as a brand-new task). */
-  t->fds = fd_table_create();
-  if (t->fds) {
-    fd_open_ex(t->fds, "/dev/console", O_RDWR, 0);
-    fd_open_ex(t->fds, "/dev/console", O_RDWR, 0);
-    fd_open_ex(t->fds, "/dev/console", O_RDWR, 0);
+  /* Inherit the parent's descriptors, SHARING the open file descriptions.
+   *
+   * A previous version gave the child a fresh table with console on 0/1/2,
+   * silently discarding every file the parent had open — so a child could not
+   * read a file its parent was holding, and no offset sharing was possible.
+   * POSIX requires the descriptors themselves to be inherited and to keep
+   * pointing at one description, so a read in the child advances the parent's
+   * offset too. fd_table_clone() does exactly that via refcounting. */
+  t->fds = fd_table_clone(parent->fds);
+  if (!t->fds) {
+    uart_errorln("[FORK] fd_table_clone failed");
+    mmu_free_user_tables(user_l0);
+    pmm_free_pages(ustack_phys, USER_STACK_PAGES);
+    pmm_free_pages(kstack_phys, TASK_STACK_PAGES);
+    kfree(t);
+    return -1;
   }
+
+  t->ppid = parent->pid;
 
   /* Insert into circular run queue (mask IRQs while we mutate it). */
   uint64_t daif;
@@ -819,8 +829,12 @@ void schedule(void) {
     }
     p->next = prev->next;
 
-    prev->next = dead_list;
-    dead_list = prev;
+    /* Past this point the state no longer drives the run queue, so it can
+     * honestly report "zombie" for an entry a parent hasn't collected yet —
+     * which is what /proc/tasks should show. */
+    prev->state = prev->ppid ? TASK_ZOMBIE : TASK_DEAD;
+    prev->next  = dead_list;
+    dead_list   = prev;
   }
 
   next->state = TASK_RUNNING;
@@ -834,10 +848,17 @@ void yield(void) {
   schedule();
 }
 
-void task_exit(void) {
-  uart_printf("[SCHED] Task %d '%s' exiting\n", current->pid, current->name);
+void task_exit(int code) {
+  uart_printf("[SCHED] Task %d '%s' exiting (status %d)\n", current->pid,
+              current->name, code);
 
-  // Mark dead — schedule() will unlink and push onto dead_list
+  /* Record the status before switching away: schedule() moves us onto
+   * dead_list, and if we have a parent that entry is a zombie the parent may
+   * collect at any moment after this. */
+  current->exit_code = code;
+
+  /* Mark dead — schedule() will unlink and push onto dead_list, where a task
+   * with a parent stays as a zombie until waitpid() collects it. */
   current->state = TASK_DEAD;
 
   // Switch away permanently, the current task is still on the dying task's
@@ -866,7 +887,7 @@ int sched_kill_task(uint64_t pid) {
     if (t == current) {
       /* Killing self — use the existing self-exit path so the trap frame
        * on our own kstack is unwound naturally. */
-      task_exit();
+      task_exit(0);
       return 0;
     }
 
@@ -885,10 +906,14 @@ int sched_kill_task(uint64_t pid) {
     }
     p->next = t->next;
 
-    /* Push onto dead_list for sched_reap to clean up next idle pass. */
+    /* Push onto dead_list for sched_reap / the parent to deal with. */
     t->next   = dead_list;
     dead_list = t;
-    t->state  = TASK_DEAD;
+    t->state  = t->ppid ? TASK_ZOMBIE : TASK_DEAD;
+    /* A killed task's parent learns the death through waitpid; encode it the
+     * way POSIX does for a signalled child so a caller can tell "exited 0"
+     * from "terminated by a signal". */
+    t->exit_code = -1;
 
     __asm__ __volatile__("msr daif, %0" ::"r"(daif));
     return 0;
@@ -927,12 +952,180 @@ void sched_wake_sleepers(void) {
   }
 }
 
-void sched_reap(void) {
-  while (dead_list) {
-    task_t *dead = dead_list;
-    dead_list = dead->next;
+/* Release a task's resources. Shared with sched_waitpid(), which does the same
+ * work but on behalf of a parent that collected the exit status. */
+static void sched_free_task(task_t *dead);
 
-    uart_printf("[SCHED] Reaping task %d '%s'\n", dead->pid, dead->name);
+/* Detach any pending children of `dead`, so they stop waiting for a parent
+ * that will never call waitpid() and become auto-reapable. Called before the
+ * dying task is freed. */
+static void sched_orphan_children(uint64_t ppid) {
+  if (!ppid) {
+    return;
+  }
+  /* Scan both the run queue and the dead list: an orphaned child could be
+   * anywhere. The lists are tiny, so a linear sweep beats bookkeeping that
+   * would have to be updated on every queue mutation. */
+  task_t *head = sched_first_task();
+  task_t *t    = head;
+  do {
+    if (t->ppid == ppid) {
+      t->ppid = 0; /* now auto-reaped by sched_reap() */
+    }
+    t = t->next;
+  } while (t && t != head);
+
+  for (task_t *d = dead_list; d; d = d->next) {
+    if (d->ppid == ppid) {
+      d->ppid = 0;
+    }
+  }
+}
+
+void sched_reap(void) {
+  /* Rebuild dead_list in place: free the parentless tasks, keep the rest.
+   * Done as a single pass that relinks survivors rather than by rotating
+   * entries to the back of the list — rotation is easy to get subtly wrong
+   * when the list has one or two elements, and "is it the only entry?" is
+   * exactly the case a fork-heavy workload hits first. */
+  task_t *prev = 0;
+  task_t *c    = dead_list;
+  dead_list    = 0;
+
+  while (c) {
+    task_t *next = c->next;
+
+    if (c->ppid != 0) {
+      /* A zombie: hold the corpse so waitpid() can still report the exit
+       * status. Only a parentless task is cleaned up here. */
+      if (prev) {
+        prev->next = c;
+      } else {
+        dead_list = c;
+      }
+      prev = c;
+    } else {
+      uart_printf("[SCHED] Reaping task %d '%s'\n", c->pid, c->name);
+      sched_orphan_children(c->pid);
+      sched_free_task(c);
+    }
+
+    c = next;
+  }
+
+  if (prev) {
+    prev->next = 0;
+  }
+}
+
+/* Does `cur` have a child matching `pid_arg`, searching both the run queue and
+ * the dead list?
+ *
+ * This is what separates the two cases POSIX treats completely differently:
+ * "you have no such child" is an immediate ECHILD, while "your child has not
+ * exited yet" means wait() must block. Collapsing them into one answer breaks
+ * the single most common sequence there is, fork() followed by wait(). */
+static int has_matching_child(task_t *cur, int64_t pid_arg) {
+  task_t *head = sched_first_task();
+  task_t *t    = head;
+  do {
+    if (t != cur && t->ppid == cur->pid &&
+        (pid_arg == -1 || (uint64_t)pid_arg == t->pid)) {
+      return 1;
+    }
+    t = t->next;
+  } while (t && t != head);
+
+  /* Already-exited children sit on dead_list, not in the run queue. */
+  for (task_t *d = dead_list; d; d = d->next) {
+    if (d->ppid == cur->pid &&
+        (pid_arg == -1 || (uint64_t)pid_arg == d->pid)) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+long sched_waitpid(int64_t pid_arg, int *status_ptr, int options) {
+  task_t *cur = sched_current();
+  if (!cur) {
+    return -1;
+  }
+
+  /* Only these two pid forms are supported. A negative pid below -1 would mean
+   * "any child in process group -pid", and process groups don't exist yet, so
+   * accepting one would silently mean something else. */
+  if (pid_arg < -1) {
+    return -1;
+  }
+
+  for (;;) {
+    /* Find an exited child matching the request. Anything still running is
+     * absent from dead_list, which is what the loop below is for. */
+    task_t *prev = 0;
+    task_t *c    = dead_list;
+    while (c) {
+      if (c->ppid == cur->pid &&
+          (pid_arg == -1 || (uint64_t)pid_arg == c->pid)) {
+        break;
+      }
+      prev = c;
+      c    = c->next;
+    }
+
+    if (c) {
+      /* Unlink the zombie. */
+      if (prev) {
+        prev->next = c->next;
+      } else {
+        dead_list = c->next;
+      }
+
+      if (status_ptr) {
+        /* POSIX packs a child's termination into one word, and the two cases
+         * are distinguished by the low 7 bits:
+         *   - normal exit: bits 8-15 hold the code, low 7 bits are zero
+         *   - signalled:   bits 0-6 hold the signal, bit 7 (0x80) is set
+         *
+         * A negative exit_code means the child died on a fault. That has to go
+         * through the signalled encoding, not the exit one: packing -1 into
+         * bits 8-15 yields 0xFF00, whose low 7 bits are still zero, so
+         * WIFEXITED() would call a segfault "exited 0 with code 255". There
+         * are no signals yet, but a fault is exactly a SIGSEGV and 11 is the
+         * real SIGSEGV number, so the stock WIFSIGNALED/WTERMSIG macros report
+         * it correctly with no Fermi-specific encoding to teach callers. */
+        *status_ptr = (c->exit_code < 0) ? (0x80 | 11 /* SIGSEGV */)
+                                         : ((c->exit_code & 0xFF) << 8);
+      }
+
+      long pid = (long)c->pid;
+      sched_free_task(c);
+      return pid;
+    }
+
+    /* Nothing ready. If the caller has no such child at all, POSIX requires
+     * ECHILD right now rather than a wait that could never complete. */
+    if (!has_matching_child(cur, pid_arg)) {
+      return -1;
+    }
+
+    if (options & WNOHANG) {
+      return 0;
+    }
+
+    /* Block until the child runs and exits.
+     *
+     * This spins through the normal scheduler rather than parking the task in
+     * TASK_SLEEPING on a wait queue, because nothing can signal that queue yet:
+     * child exit would have to wake the parent, and there is no such
+     * notification path until signals exist. yield() gives the child the times-
+     * lice it needs, so the loop always makes progress; it costs CPU while
+     * waiting, which is the price of not having a wakeup yet. */
+    yield();
+  }
+}
+
+static void sched_free_task(task_t *dead) {
 
     // Free kernel stack
     if (dead->stack_phys) {
@@ -1001,7 +1194,6 @@ void sched_reap(void) {
     }
 
     kfree(dead);
-  }
 }
 
 task_t *sched_current(void) { return current; }

@@ -14,14 +14,27 @@
 #ifndef USER_SYS_H
 #define USER_SYS_H
 
-typedef unsigned long      size_t;
-typedef long               ssize_t;
-typedef long long          int64_t;
-typedef unsigned long long uint64_t;
-typedef unsigned long      uintptr_t; /* needed by __fermi_errno_loc() below */
-typedef unsigned int       uint32_t;
-typedef unsigned short     uint16_t;
-typedef unsigned char      uint8_t;
+/*
+ * Fixed-width types come from GCC's own __INT*_TYPE__ macros rather than being
+ * spelled out here. Spelling them out (`long long int64_t`) disagrees with the
+ * toolchain's <stdint.h>, which on aarch64 LP64 says `long int` — and the
+ * moment a user program pulls in a real header the two definitions collide with
+ * "conflicting types for int64_t". Using the compiler's macros makes ours
+ * identical to the toolchain's by construction.
+ */
+typedef __INT8_TYPE__   int8_t;
+typedef __UINT8_TYPE__  uint8_t;
+typedef __INT16_TYPE__  int16_t;
+typedef __UINT16_TYPE__ uint16_t;
+typedef __INT32_TYPE__  int32_t;
+typedef __UINT32_TYPE__ uint32_t;
+typedef __INT64_TYPE__  int64_t;
+typedef __UINT64_TYPE__ uint64_t;
+typedef __UINTPTR_TYPE__ uintptr_t; /* needed by __fermi_errno_loc() below */
+
+typedef unsigned long size_t;
+typedef long          ssize_t;
+typedef long          ptrdiff_t;
 
 #define SYS_READ    0
 #define SYS_WRITE   1
@@ -78,6 +91,7 @@ static inline int *__fermi_errno_loc(void) {
 #define ENXIO      6
 #define E2BIG      7
 #define EBADF      9
+#define ECHILD     10
 #define EAGAIN     11
 #define ENOMEM     12
 #define EACCES     13

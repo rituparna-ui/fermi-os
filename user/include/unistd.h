@@ -23,4 +23,9 @@ long lseek(int fd, long offset, int whence);
 
 void _exit(int status);
 
+/* fork(): returns 0 in the child, the child's pid in the parent. */
+int fork(void);
+
+int getpid(void);
+
 #endif

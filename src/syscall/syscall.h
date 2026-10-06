@@ -17,6 +17,12 @@
 #define SYS_UPTIME 9
 #define SYS_NET_PING 10  /* arg0 = seq; returns reply TTL or -1 */
 #define SYS_KILL 11      /* arg0 = pid; returns 0 or -1 */
+#define SYS_WAITPID 260   /* arg0 = pid, arg1 = &status, arg2 = options */
+
+/* Linux waitpid(2) argument forms. */
+#define WNOHANG 1  /* defined in sched.h; repeated here for the syscall layer */
+#define WEXITED  4
+
 #define SYS_FORK 12      /* duplicates the calling task; child sees 0, parent sees child pid */
 #define SYS_EXEC 13      /* arg0 = path to flat user binary; replaces caller image */
 #define SYS_BALLOON 14   /* arg0 = op (0=inflate,1=deflate,2=actual,3=target), arg1 = n */
@@ -80,6 +86,7 @@
 #define ENOENT  2
 #define ESRCH   3
 #define EINTR   4
+#define ECHILD  10
 #define EIO     5
 #define ENXIO   6
 #define E2BIG   7

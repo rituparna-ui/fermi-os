@@ -169,7 +169,10 @@ void fd_table_destroy(fd_table_t *t) {
 
   for (int i = 0; i < MAX_FDS; i++) {
     if (t->fds[i]) {
-      kfree(t->fds[i]);
+      /* Release, don't free: a fork'd sibling may still be using the same
+       * open file description. */
+      fd_release(t->fds[i]);
+      t->fds[i] = NULL;
     }
   }
   kfree(t);
@@ -200,6 +203,36 @@ static int alloc_fd(fd_table_t *t) {
   }
 
   return -1;
+}
+
+void fd_release(file_t *f) {
+  if (!f) {
+    return;
+  }
+  if (--f->refcount > 0) {
+    return; /* another task still holds it (e.g. a fork'd child) */
+  }
+  kfree(f);
+}
+
+fd_table_t *fd_table_clone(fd_table_t *src) {
+  if (!src) {
+    return NULL;
+  }
+  fd_table_t *dst = fd_table_create();
+  if (!dst) {
+    return NULL;
+  }
+  for (int i = 0; i < MAX_FDS; i++) {
+    if (!src->fds[i]) {
+      continue;
+    }
+    /* Share the open file description, not a copy of it: that is what makes a
+     * child observe the parent's file offset. */
+    dst->fds[i] = src->fds[i];
+    src->fds[i]->refcount++;
+  }
+  return dst;
 }
 
 int fd_open_ex(fd_table_t *t, const char *path, int flags, int mode) {
@@ -252,8 +285,9 @@ int fd_open_ex(fd_table_t *t, const char *path, int flags, int mode) {
     return -1;
   }
 
-  f->vnode = node;
-  f->flags = flags & O_ACCMODE;
+  f->vnode    = node;
+  f->flags    = flags & O_ACCMODE;
+  f->refcount = 1;
   /* O_APPEND means every write goes to the end. That is a property of the
    * write path, so record the flag and start the descriptor at the end. */
   f->offset = (flags & O_APPEND) ? node->size : 0;
@@ -319,8 +353,11 @@ int fd_close(fd_table_t *t, int fd) {
     return -1;
   }
 
-  kfree(t->fds[fd]);
+  /* Detach from this table first, then release. If a fork'd sibling shares the
+   * description it keeps it alive; only the last close frees. */
+  file_t *f = t->fds[fd];
   t->fds[fd] = NULL;
+  fd_release(f);
 
   return 0;
 }

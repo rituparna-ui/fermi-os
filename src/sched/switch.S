@@ -67,6 +67,7 @@ task_trampoline:
 kernel_task_trampoline:
 	msr daifclr, #2		// unmask IRQs
 	blr x19
+	mov x0, #0
 	bl  task_exit
 1:	b 1b			// unreachable
 

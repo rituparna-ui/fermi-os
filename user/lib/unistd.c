@@ -32,3 +32,11 @@ long write(int fd, const void *buf, unsigned long count) {
 long lseek(int fd, long offset, int whence) {
   return (long)sys_lseek(fd, offset, whence);
 }
+
+int fork(void) {
+  return sys_fork();
+}
+
+int getpid(void) {
+  return sys_getpid();
+}

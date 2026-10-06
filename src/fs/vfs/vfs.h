@@ -107,6 +107,16 @@ typedef struct file {
    * per descriptor so read/write can reject a call that was never permitted,
    * instead of failing deep inside a driver. */
   int flags;
+
+  /* Number of descriptors in ANY task's table that reference this open file.
+   *
+   * This is what makes POSIX fork() correct. A fork'd child does NOT get a
+   * copy of the open file description: parent and child descriptors must share
+   * one, so that a read in the child advances the parent's offset too. Sharing
+   * the file_t pointer and refcounting it is what expresses that; copying it
+   * would silently give each task an independent offset and break any program
+   * that forks with an open file and expects them to stay in step. */
+  int refcount;
 } file_t;
 
 /* Per-process fd table */
@@ -118,6 +128,17 @@ typedef struct fd_table {
 
 fd_table_t *fd_table_create(void);
 void fd_table_destroy(fd_table_t *t);
+
+/* Duplicate a table for fork(), SHARING the underlying open file descriptions.
+ *
+ * Every occupied slot points at the same file_t as the source and bumps its
+ * refcount, so offsets stay shared between parent and child as POSIX requires.
+ * Returns NULL on allocation failure, having changed nothing. */
+fd_table_t *fd_table_clone(fd_table_t *src);
+
+/* Drop one reference to an open file, freeing it when the last goes away.
+ * Safe to call with NULL. */
+void fd_release(file_t *f);
 
 /* Open with explicit flags; returns a new fd or -1.
  *

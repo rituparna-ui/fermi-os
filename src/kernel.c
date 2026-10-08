@@ -1174,6 +1174,22 @@ static void task_linuxhello(void) {
   sys_exit();
 }
 
+/* Runs the on-disk LS.ELF: a real user program, linked against libc.a, using
+ * POSIX readdir(3). Worth exec'ing rather than trusting -- directory
+ * enumeration is only finished once something consumes it, and the listing it
+ * prints here is the visible end of that chain. */
+static void task_ls(void) {
+  const char *argv[2];
+  argv[0] = "/mnt/fat32/LS.ELF";
+  argv[1] = 0;
+
+  if (sys_exec(argv[0], argv) < 0) {
+    t_puts("[LS] exec failed (is LS.ELF on the disk image?)\n");
+    sys_exit();
+  }
+  sys_exit();
+}
+
 /* ---- fork memory-isolation test ---------------------------------------- */
 
 /* SYS_FORK returns the child pid in x0 (and 0 in the child). The result
@@ -1517,6 +1533,7 @@ void kernel_main() {
   sched_create_task("task_stdiotest", task_stdiotest);
   sched_create_task("task_proctest", task_proctest);
   sched_create_task("task_linuxhello", task_linuxhello);
+  sched_create_task("task_ls", task_ls);
   sched_create_task("task_mmguard", task_mmap_guard);
   sched_create_kernel_task("netd", netd);
 

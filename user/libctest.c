@@ -6,6 +6,7 @@
  * anything. Named LIBCT.ELF because FAT32 here has no long-filename support
  * and 8 characters is the limit for the name part.
  */
+#include <dirent.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -256,6 +257,115 @@ static void test_errno(void) {
   *slot = 0;
 }
 
+/* ---- POSIX directory enumeration -------------------------------------
+ *
+ * The raw getdents64 wire format is covered by the LINHELLO suite; this checks
+ * the POSIX layer a real program actually calls.
+ */
+static void test_readdir(void) {
+  say("[LIBC] -- readdir --\n");
+
+  /* The mount root is the interesting directory: it is where every shipped user
+   * binary lives, and it is the one case where "." and ".." are not on disk. */
+  DIR *d = opendir("/mnt/fat32");
+  ok(d != NULL, "opendir(/mnt/fat32) succeeded");
+  if (!d) {
+    return;
+  }
+
+  int saw_dot = 0, saw_dotdot = 0, saw_libct = 0, saw_stdio = 0, saw_dir = 0;
+  int count = 0;
+
+  struct dirent *e;
+  while ((e = readdir(d)) != NULL) {
+    /* POSIX: the returned pointer is valid until the next readdir(). Reading it
+     * after that is the caller's bug, so copy what we need as we go. */
+    if (strcmp(e->d_name, ".") == 0) {
+      saw_dot = 1;
+    } else if (strcmp(e->d_name, "..") == 0) {
+      saw_dotdot = 1;
+    } else if (strcmp(e->d_name, "LIBCT.ELF") == 0) {
+      saw_libct = 1;
+    } else if (strcmp(e->d_name, "STDIO.ELF") == 0) {
+      saw_stdio = 1;
+    }
+    if (e->d_type == DT_DIR) {
+      saw_dir = 1;
+    }
+    count++;
+  }
+  ok(count > 0, "readdir returned entries");
+  ok(saw_dot, "readdir lists \".\" (synthesized at the FAT32 volume root)");
+  ok(saw_dotdot, "readdir lists \"..\"");
+  ok(saw_libct, "readdir finds LIBCT.ELF");
+  ok(saw_stdio, "readdir finds STDIO.ELF");
+  ok(saw_dir, "at least one entry is typed DT_DIR");
+
+  /* End of directory, and it stays there. */
+  ok(readdir(d) == NULL, "readdir returns NULL at end of directory");
+  ok(readdir(d) == NULL, "and keeps returning NULL");
+  ok(closedir(d) == 0, "closedir returned success");
+
+  /* Two streams over the same directory are independent. */
+  DIR *a = opendir("/mnt/fat32");
+  DIR *b = opendir("/mnt/fat32");
+  ok(a && b, "opened two independent streams on the same directory");
+  if (a && b) {
+    struct dirent *ea = readdir(a);
+    struct dirent *eb = readdir(b);
+    ok(ea && eb, "both streams produced a first entry");
+    ok(ea && eb && strcmp(ea->d_name, eb->d_name) == 0,
+       "both streams start at the same entry (independent cursors)");
+    closedir(a);
+    closedir(b);
+  }
+
+  /* rewinddir restarts from the beginning. */
+  DIR *r = opendir("/mnt/fat32");
+  if (r) {
+    struct dirent *first = readdir(r);
+    char saved[64] = {0};
+    if (first) {
+      size_t n = strlen(first->d_name);
+      if (n >= sizeof(saved)) {
+        n = sizeof(saved) - 1;
+      }
+      memcpy(saved, first->d_name, n);
+    }
+    (void)readdir(r);
+    rewinddir(r);
+    struct dirent *again = readdir(r);
+    ok(again && strcmp(again->d_name, saved) == 0,
+       "rewinddir returns to the first entry");
+    closedir(r);
+  }
+
+  /* Failure paths. */
+  ok(opendir("/mnt/fat32/NOPE.XXX") == NULL, "opendir on a missing path fails");
+  ok(opendir("/mnt/fat32/LIBCT.ELF") == NULL,
+     "opendir on a regular file fails (ENOTDIR)");
+
+  /* A subdirectory really does carry "." and ".." on disk, so this also
+   * confirms the volume-root synthesis did not paper over a real bug. */
+  DIR *sub = opendir("/mnt/fat32/SUBDIR");
+  if (sub) {
+    int s_dot = 0, s_dotdot = 0, s_info = 0;
+    struct dirent *se;
+    while ((se = readdir(sub)) != NULL) {
+      if (strcmp(se->d_name, ".") == 0) {
+        s_dot = 1;
+      } else if (strcmp(se->d_name, "..") == 0) {
+        s_dotdot = 1;
+      } else if (strcmp(se->d_name, "INFO.TXT") == 0) {
+        s_info = 1;
+      }
+    }
+    ok(s_dot && s_dotdot, "a subdirectory lists \".\" and \"..\"");
+    ok(s_info, "a subdirectory lists its own file");
+    closedir(sub);
+  }
+}
+
 int main(void) {
   say("[LIBC TEST] === Fermi libc ===\n");
 
@@ -263,6 +373,7 @@ int main(void) {
   test_malloc();
   test_qsort();
   test_errno();
+  test_readdir();
 
   say("[LIBC TEST] === ");
   putn(checks);

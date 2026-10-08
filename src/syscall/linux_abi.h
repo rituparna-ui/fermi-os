@@ -52,6 +52,30 @@ struct linux_stat {
   uint32_t __unused5;
 };
 
+/*
+ * struct linux_dirent64.
+ *
+ * The name is NOT NUL-terminated in the buffer: its length comes from d_reclen
+ * covering the fixed header plus the name, and a NUL is included in that length
+ * so the last entry in a buffer is still safe to treat as a C string. d_reclen
+ * is padded so the next entry stays 8-byte aligned.
+ */
+struct linux_dirent64 {
+  uint64_t d_ino;
+  int64_t  d_off;
+  uint16_t d_reclen;
+  uint8_t  d_type;
+  char     d_name[]; /* offset 19 */
+};
+
+#define LNX_DIRENT64_NAME_OFFSET 19
+#define LNX_DT_UNKNOWN 0
+#define LNX_DT_FIFO    1
+#define LNX_DT_CHR     2
+#define LNX_DT_DIR     4
+#define LNX_DT_BLK     6
+#define LNX_DT_REG     8
+
 /* File type bits, as they appear in st_mode. */
 #define LNX_S_IFMT   0170000
 #define LNX_S_IFREG  0100000
@@ -93,6 +117,13 @@ _Static_assert(offsetof(struct linux_stat, st_blocks) == 64, "st_blocks offset")
 _Static_assert(offsetof(struct linux_stat, st_atime)  == 72, "st_atime offset");
 _Static_assert(offsetof(struct linux_stat, st_mtime)  == 88, "st_mtime offset");
 _Static_assert(offsetof(struct linux_stat, st_ctime)  == 104, "st_ctime offset");
+
+/* d_name must sit at offset 19: 8 + 8 + 2 + 1. */
+_Static_assert(offsetof(struct linux_dirent64, d_name) == LNX_DIRENT64_NAME_OFFSET,
+               "linux_dirent64 d_name must be at offset 19");
+/* NOTE: sizeof() this struct is 24, not 19 -- the flexible array leaves the
+ * struct padded out to its 8-byte alignment. offsetof(d_name) is the number that
+ * defines the wire layout, so that is what gets asserted. */
 
 _Static_assert(sizeof(struct linux_timespec) == 16, "linux_timespec must be 16 bytes");
 _Static_assert(offsetof(struct linux_timespec, tv_sec)  == 0, "tv_sec offset");

@@ -86,3 +86,32 @@ uint32_t fat32_root_cluster(void);
 int fat32_vfs_mount(const char *path);
 
 #endif
+
+/* One entry produced by fat32_dir_iterate. `name` is the 8.3 short name in
+ * "NAME.EXT" form with padding spaces trimmed, matching what a POSIX caller
+ * expects to see from readdir. */
+typedef struct {
+  char     name[13];
+  uint8_t  name_len;
+  uint32_t size;
+  uint32_t first_cluster;
+  uint8_t  attr;
+  uint8_t  is_dir;
+} fat32_dirent_t;
+
+/* Resumable directory iterator.
+ *
+ * `*io_offset` counts 32-byte directory slots already examined and is updated
+ * on return. Keeping the position in a caller-supplied word rather than in
+ * hidden state is what lets getdents64() resume: Linux's d_off field is exactly
+ * this counter, so a program that reads a directory in several small buffers
+ * must be able to come back and continue where it stopped.
+ *
+ * Returns ESUCCESS with *out filled, or EERROR once the directory is
+ * exhausted. Sectors already fully consumed are skipped without any disk I/O.
+ *
+ * "." and ".." are yielded like any other entry. They are real directory slots
+ * and a POSIX caller is entitled to see them; filtering them here would make
+ * this diverge from every other filesystem's readdir. */
+int fat32_dir_iterate(uint32_t dir_cluster, uint64_t *io_offset,
+                      fat32_dirent_t *out);

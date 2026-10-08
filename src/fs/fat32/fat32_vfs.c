@@ -13,6 +13,8 @@ typedef struct fat32_priv {
 
 /* Forward decls */
 static vnode_t *fat32_lookup(vnode_t *dir, const char *name, size_t namelen);
+static int fat32_readdir(vnode_t *dir, uint64_t *offset, vfs_dirent_t *out,
+                         int max, int *eof);
 static int fat32_file_read(vnode_t *n, file_t *f, void *buf, size_t count);
 static int fat32_file_write(vnode_t *n, file_t *f, const void *buf,
                             size_t count);
@@ -26,8 +28,60 @@ static file_operations_t fat32_file_ops = {
 };
 
 static vnode_operations_t fat32_dir_ops = {
-    .lookup = fat32_lookup,
+    .lookup  = fat32_lookup,
+    .readdir = fat32_readdir,
 };
+
+/* Adapt the FAT32 iterator to the VFS's filesystem-agnostic directory callback.
+ *
+ * The cookie handed to us is opaque, and FAT32's own iterator wants a slot
+ * counter. Hiding that mapping here keeps every layer above this one unaware of
+ * FAT32's 32-byte entry layout -- which is the whole point of the v_ops
+ * indirection. */
+static int fat32_readdir(vnode_t *dir, uint64_t *offset, vfs_dirent_t *out,
+                         int max, int *eof) {
+  fat32_priv_t *pd = (fat32_priv_t *)dir->private_data;
+  if (!pd) {
+    if (eof) {
+      *eof = 1;
+    }
+    return -1;
+  }
+
+  uint64_t slot    = *offset;
+  int      written = 0;
+
+  while (written < max) {
+    fat32_dirent_t de;
+    if (fat32_dir_iterate(pd->first_cluster, &slot, &de) != ESUCCESS) {
+      if (eof) {
+        *eof = 1;
+      }
+      break;
+    }
+    /* The FAT32 short name is at most 12 characters, so it always fits the
+     * 256-byte buffer; the copy is still bounded rather than assumed. */
+    size_t n = de.name_len;
+    if (n > sizeof(out[0].name) - 1) {
+      n = sizeof(out[0].name) - 1;
+    }
+    for (size_t i = 0; i < n; i++) {
+      out[written].name[i] = de.name[i];
+    }
+    out[written].name[n] = '\0';
+    out[written].size    = de.size;
+    out[written].is_dir  = de.is_dir;
+    /* The starting cluster identifies the entry for as long as it exists, and
+     * the top bit separates a directory from a file that happens to start at the
+     * same cluster number. */
+    out[written].id = (uint64_t)de.first_cluster |
+                      ((uint64_t)de.is_dir << 63);
+    written++;
+  }
+
+  *offset = slot;
+  return written;
+}
 
 static vnode_t *fat32_lookup(vnode_t *dir, const char *name, size_t namelen) {
   fat32_priv_t *pd = (fat32_priv_t *)dir->private_data;

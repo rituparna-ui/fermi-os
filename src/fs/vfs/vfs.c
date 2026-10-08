@@ -8,6 +8,11 @@
 static vnode_t node_pool[MAX_VNODES];
 static int node_count = 0;
 
+/* Ops for a directory the VFS materialises in memory (the root, /dev, /mnt).
+ * Defined further down, next to the readdir it carries; declared here because
+ * vfs_init() and vfs_create_node() assign it before reaching that point. */
+static vnode_operations_t vfs_builtin_dir_ops;
+
 static vnode_t *alloc_vnode(const char *name, vnode_type_t type) {
   if (node_count >= MAX_VNODES) {
     return NULL;
@@ -27,6 +32,9 @@ static vnode_t *root;
 
 void vfs_init(void) {
   root = alloc_vnode("/", VNODE_DIR);
+  if (root) {
+    root->v_ops = &vfs_builtin_dir_ops;
+  }
   uart_println("[VFS] Initialized");
 }
 
@@ -39,6 +47,12 @@ vnode_t *vfs_create_node(vnode_t *parent, const char *name, vnode_type_t type) {
   }
 
   n->parent = parent;
+
+  /* A directory the VFS materialises in memory needs enumeration; a real
+   * filesystem installs its own readdir immediately afterwards. */
+  if (type == VNODE_DIR) {
+    n->v_ops = &vfs_builtin_dir_ops;
+  }
 
   if (parent) {
     n->next = parent->children;
@@ -106,13 +120,27 @@ static vnode_t *find_child(vnode_t *dir, const char *name, size_t len) {
   return NULL;
 }
 
-vnode_t *vfs_resolve(const char *path) {
-  if (!path || path[0] != '/') {
+vnode_t *vfs_resolve_at(vnode_t *base, const char *path) {
+  if (!path) {
     return NULL;
   }
 
-  vnode_t *cur = root;
-  path++;
+  /* An absolute path starts at the filesystem root and ignores `base`; a
+   * relative one starts at `base`.
+   *
+   * `base` is the filesystem root in every caller today, because this kernel has
+   * no per-process working directory and chdir() is not implemented. It is a
+   * parameter anyway so adding a real cwd later is a change at the call sites
+   * rather than a redesign of the resolver. Concretely: relative paths resolve
+   * from the root, so `ls` with no argument (which asks for ".") lists the
+   * filesystem root. Documented rather than pretended otherwise. */
+  vnode_t *cur;
+  if (path[0] == '/') {
+    cur = root;
+    path++;
+  } else {
+    cur = base ? base : root;
+  }
 
   while (*path) {
     while (*path == '/') {
@@ -150,6 +178,11 @@ vnode_t *vfs_resolve(const char *path) {
   }
 
   return cur;
+}
+
+/* Convenience wrapper: resolve relative to the filesystem root. */
+vnode_t *vfs_resolve(const char *path) {
+  return vfs_resolve_at(root, path);
 }
 
 fd_table_t *fd_table_create(void) {
@@ -339,6 +372,91 @@ int fd_write(fd_table_t *t, int fd, const void *buf, size_t count) {
   }
 
   return f->vnode->ops->write(f->vnode, f, buf, count);
+}
+
+/* Enumerate a directory the VFS holds in memory -- the root, /dev, /mnt and
+ * friends -- by walking its `children` list.
+ *
+ * Real filesystems (FAT32) supply their own readdir that reads on-disk entries;
+ * this covers the synthetic directories, which have no on-disk existence at all.
+ * Without it, `ls` with no argument fails: "." resolves to the VFS root, and the
+ * root is exactly one of these.
+ *
+ * The cookie is an index into the child list, so resuming re-walks from the
+ * head. The lists here are a handful of entries long, so that is cheaper than
+ * the bookkeeping a persistent cursor would need. */
+static int vfs_builtin_readdir(vnode_t *dir, uint64_t *offset,
+                               vfs_dirent_t *out, int max, int *eof) {
+  if (eof) {
+    *eof = 0;
+  }
+  if (!dir || dir->type != VNODE_DIR) {
+    return -1;
+  }
+
+  /* `seen` counts children examined. `*offset` says how many were already
+   * handed out, and becomes the number examined here.
+   *
+   * These are different quantities on purpose: a child that is examined but
+   * cannot fit in a full buffer must NOT be counted, or the next call would skip
+   * it and the entry would vanish. */
+  uint64_t seen = 0;
+  int      n    = 0;
+  int      exhausted = 1; /* cleared if we stop early with entries left */
+
+  for (vnode_t *c = dir->children; c; c = c->next) {
+    if (seen < *offset) {
+      seen++;
+      continue; /* already returned to the caller */
+    }
+    if (n == max) {
+      exhausted = 0; /* buffer full; `c` is unconsumed */
+      break;
+    }
+    seen++;
+
+    size_t len = 0;
+    while (len < sizeof(out[n].name) - 1 && c->name[len] != '\0') {
+      out[n].name[len] = c->name[len];
+      len++;
+    }
+    out[n].name[len] = '\0';
+    out[n].size      = c->size;
+    out[n].is_dir    = (c->type == VNODE_DIR);
+    /* Synthetic nodes have no filesystem identity, so their inode is just their
+     * address. Stable for the node's lifetime, which is all a caller can rely
+     * on; documented as carrying no other meaning. */
+    out[n].id        = (uint64_t)(uintptr_t)c;
+    n++;
+  }
+
+  /* Ran off the end of the list, rather than stopping because the buffer filled. */
+  if (exhausted && eof) {
+    *eof = 1;
+  }
+  *offset = seen;
+  return n;
+}
+
+/* Ops for a directory the VFS itself created. FAT32 children overwrite
+ * v_ops with fat32_dir_ops once it knows they are on-disk. */
+static vnode_operations_t vfs_builtin_dir_ops = {
+    .lookup  = NULL,
+    .readdir = vfs_builtin_readdir,
+};
+
+int vfs_readdir(vnode_t *dir, uint64_t *offset, vfs_dirent_t *out, int max,
+                int *eof) {
+  if (eof) {
+    *eof = 0;
+  }
+  if (!dir || dir->type != VNODE_DIR) {
+    return -1; /* ENOTDIR */
+  }
+  if (!dir->v_ops || !dir->v_ops->readdir) {
+    return -1; /* this filesystem cannot enumerate */
+  }
+  return dir->v_ops->readdir(dir, offset, out, max, eof);
 }
 
 vnode_t *fd_vnode(fd_table_t *t, int fd) {

@@ -1166,6 +1166,102 @@ void syscall_dispatch(trap_frame_t *frame) {
     break;
   }
 
+  case LNX_GETDENTS64: {
+    /* getdents64(dirfd, dirp, count) -- the raw Linux directory-read syscall.
+     *
+     * arg0 is a DIRECTORY DESCRIPTOR, not a path. Linux deprecated the older
+     * getdents(fd, path, count) form that took a path instead, and accepting
+     * that shape here would silently mean something different.
+     *
+     * Returns the number of bytes written, or 0 at end of directory. A short
+     * fill is NOT an error: the caller is expected to call again with a bigger
+     * buffer and resume from the d_off it saw in the last record. */
+    if (arg2 == 0) {
+      ret = 0;
+      break;
+    }
+    vnode_t *dir = fds ? fd_vnode(fds, (int)arg0) : NULL;
+    if (!dir) {
+      ret = fail(EBADF);
+      break;
+    }
+    if (dir->type != VNODE_DIR) {
+      ret = fail(ENOTDIR);
+      break;
+    }
+    if (!user_buf_ok(arg1, (size_t)arg2)) {
+      ret = fail(EFAULT);
+      break;
+    }
+
+    /* The iteration cookie lives in the descriptor's own file offset, which is
+     * where Linux keeps it too. Storing it per-descriptor (rather than per
+     * directory) is what lets two descriptors on the same directory walk it
+     * independently, as POSIX requires. */
+    file_t *f    = fds->fds[(int)arg0];
+    uint64_t off = (uint64_t)f->offset;
+    uint8_t *out = (uint8_t *)arg1;
+    uint64_t used = 0;
+
+    /* An explicit flag, not `ret < 0`. `ret` is initialised to -1 for the whole
+     * dispatcher, so testing it here would be true on every path and this case
+     * would return -1 even after a perfectly successful read. */
+    int failed = 0;
+
+    while (used < arg2) {
+      uint64_t before = off;
+      vfs_dirent_t de;
+      int eof_now = 0;
+      int n = vfs_readdir(dir, &off, &de, 1, &eof_now);
+
+      if (n < 0) {
+        /* ENOTDIR already ruled out, so this is a filesystem that cannot
+         * enumerate -- /proc, or a character device. */
+        ret    = fail(EOPNOTSUPP);
+        failed = 1;
+        break;
+      }
+      if (n == 0 || eof_now) {
+        break; /* end of directory: returns whatever fitted, then 0 next time */
+      }
+
+      size_t namelen = 0;
+      while (namelen < sizeof(de.name) && de.name[namelen] != '\0') {
+        namelen++;
+      }
+      /* reclen = header + name + a NUL, rounded up to 8. Counting the NUL is
+       * what lets a caller treat the last record in a full buffer as a C
+       * string, and the rounding keeps the next record 8-byte aligned. */
+      size_t reclen =
+          (LNX_DIRENT64_NAME_OFFSET + namelen + 1 + 7) & ~(size_t)7;
+
+      if (used + reclen > arg2) {
+        /* Not even one entry fits. Rewind, so this entry is still returned on
+         * the next call rather than being silently skipped -- a caller that
+         * passed a buffer too small for one name must not lose that name. */
+        off = before;
+        break;
+      }
+
+      struct linux_dirent64 d;
+      d.d_ino    = de.id;
+      d.d_off    = (int64_t)off;
+      d.d_reclen = (uint16_t)reclen;
+      d.d_type   = de.is_dir ? LNX_DT_DIR : LNX_DT_REG;
+      memcpy(out + used, &d, LNX_DIRENT64_NAME_OFFSET);
+      memcpy(out + used + LNX_DIRENT64_NAME_OFFSET, de.name, namelen);
+      out[used + LNX_DIRENT64_NAME_OFFSET + namelen] = '\0';
+      used += reclen;
+    }
+
+    if (failed) {
+      break; /* keep the errno already recorded by fail() */
+    }
+    f->offset = (int64_t)off;
+    ret       = (int64_t)used;
+    break;
+  }
+
   case LNX_CLOCK_GETTIME: {
     /* clock_gettime(clockid, timespec). */
     if (arg0 != LNX_CLOCK_REALTIME && arg0 != LNX_CLOCK_MONOTONIC) {

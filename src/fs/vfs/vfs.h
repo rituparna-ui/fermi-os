@@ -46,8 +46,40 @@ typedef struct file_operations {
  * vnode_operations: per-directory vtable for tree traversal.
  * Filesystems fill in `lookup` to resolve a name inside a directory on demand.
  */
+/* One directory entry, in a form no particular filesystem has to match.
+ * A filesystem fills this in and the syscall layer turns it into whatever the
+ * calling ABI needs (a Linux dirent64, a POSIX struct dirent). */
+typedef struct {
+  char     name[256];  /* display name, NUL-terminated */
+  uint64_t size;
+  uint8_t  is_dir;
+  /* Filesystem-supplied identity for this entry.
+   *
+   * There are no real inodes in this kernel, so this is synthetic. It is
+   * defined as "stable for a given entry within a given directory", which is
+   * all a program can actually rely on: that is what lets one match a readdir
+   * result against a later stat of the same name. It is NOT stable across
+   * directories and carries no permission or ownership meaning. */
+  uint64_t id;
+} vfs_dirent_t;
+
+/* Directory iteration callback.
+ *
+ * `*offset` is an opaque resume cookie in and out. Returns the number of
+ * entries written (which may be 0 when the buffer is too small to hold even
+ * one), or <0 on error. `*eof` is set when the directory has been walked to
+ * the end.
+ *
+ * The cookie is caller-owned rather than hidden in the filesystem so that
+ * reading a directory in several small batches works: the caller hands the same
+ * cookie back each time and picks up where it stopped. */
+typedef int (*vnode_readdir_fn)(struct vnode *dir, uint64_t *offset,
+                                vfs_dirent_t *out, int max, int *eof);
+
 typedef struct vnode_operations {
   struct vnode *(*lookup)(struct vnode *dir, const char *name, size_t namelen);
+  /* NULL for filesystems that cannot enumerate (character devices, /proc). */
+  vnode_readdir_fn readdir;
 } vnode_operations_t;
 
 typedef struct vnode {
@@ -66,6 +98,14 @@ void vfs_init(void);
 vnode_t *vfs_root(void);
 vnode_t *vfs_create_node(vnode_t *parent, const char *name, vnode_type_t type);
 vnode_t *vfs_resolve(const char *path);
+
+/* Resolve `path` starting from `base`. An absolute path ignores `base` and
+ * starts at the filesystem root; a relative one starts at `base`.
+ *
+ * `base` is the filesystem root in every current caller, because there is no
+ * per-process working directory yet. It is a parameter so that adding one is a
+ * change at the call sites and not a redesign here. */
+vnode_t *vfs_resolve_at(vnode_t *base, const char *path);
 
 /* Create an empty regular file at `path`, for open(O_CREAT).
  *
@@ -165,5 +205,10 @@ int64_t fd_size(fd_table_t *t, int fd);
  * duplicating the bounds check every accessor here already repeats. The vnode
  * stays owned by the table; callers must not free it. */
 vnode_t *fd_vnode(fd_table_t *t, int fd);
+
+/* Enumerate a directory vnode. Returns the number of entries written to `out`,
+ * or <0 on error. See vnode_readdir_fn for the cookie contract. */
+int vfs_readdir(vnode_t *dir, uint64_t *offset, vfs_dirent_t *out, int max,
+                int *eof);
 
 #endif

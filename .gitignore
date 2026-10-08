@@ -12,3 +12,91 @@ user/**/*.elf
 user/*.bin
 wasabi-toolbag/
 
+
+
+# >>> base ignore (managed by publish.sh) >>>
+# ---------------------------------------------------------------------------
+# Secrets / credentials - NEVER commit these
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+client_secret*.json
+*-creds.json
+creds.json
+credentials*.json
+service-account*.json
+secrets.json
+*.pem
+*.key
+*.p12
+*.keystore
+.netrc
+.gitleaks.json
+
+# ---------------------------------------------------------------------------
+# OS / editor noise
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+*.sublime-workspace
+
+# ---------------------------------------------------------------------------
+# Dependency dirs / caches (regenerable)
+# ---------------------------------------------------------------------------
+node_modules/
+.venv/
+venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.next/
+.cache/
+.parcel-cache/
+.cargo-home/
+.elan/
+.lean/
+.nix-deps/
+
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+dist/
+out/
+target/
+*.o
+*.a
+*.so
+*.dylib
+*.d
+*.dSYM/
+a.out
+*.out
+compile_commands.json
+.cindex/
+.cindex-parts/
+
+# ---------------------------------------------------------------------------
+# Virtualization / disk images - exceed GitHub's 100MB limit
+# ---------------------------------------------------------------------------
+*.qcow2
+*.img
+*.iso
+*.vhd
+*.vmdk
+*.hda
+*.bin
+# <<< #  base ignore (managed by publish.sh)  <<<

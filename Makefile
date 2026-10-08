@@ -73,6 +73,7 @@ DISKNAME_proctest = PROCT
 # Stem "linuxhello" exceeds 8 characters and this FAT32 has no long-filename
 # support, so it ships as LINHELLO.
 DISKNAME_linuxhello = LINHELLO
+DISKNAME_ls = LS
 
 # Every user binary's on-disk name, listed explicitly rather than derived from
 # the source name. A derived name is one refactor away from silently breaking

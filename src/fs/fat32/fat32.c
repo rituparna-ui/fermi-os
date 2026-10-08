@@ -157,6 +157,144 @@ static int dir_lookup(uint32_t dir_cluster, const uint8_t target[11],
   return EERROR;
 }
 
+/* Convert a packed 8.3 field to the "NAME.EXT" form a caller expects, trimming
+ * the padding spaces. Returns the length. */
+static uint8_t shortname_to_display(const uint8_t raw[11], char out[13]) {
+  uint8_t n = 0;
+  for (int i = 0; i < 8; i++) {
+    if (raw[i] == ' ') {
+      break;
+    }
+    out[n++] = (char)raw[i];
+  }
+  if (raw[8] != ' ') {
+    out[n++] = '.';
+    for (int i = 8; i < 11; i++) {
+      if (raw[i] == ' ') {
+        break;
+      }
+      out[n++] = (char)raw[i];
+    }
+  }
+  out[n] = '\0';
+  return n;
+}
+
+/* Emit a synthesized entry. Used only for "." and "..". */
+static void dirent_synth(fat32_dirent_t *out, const char *name,
+                         uint32_t cluster) {
+  uint8_t n = 0;
+  while (name[n]) {
+    out->name[n] = name[n];
+    n++;
+  }
+  out->name[n]      = '\0';
+  out->name_len     = n;
+  out->size         = 0;
+  out->attr         = ATTR_DIRECTORY;
+  out->is_dir       = 1;
+  out->first_cluster = cluster;
+}
+
+int fat32_dir_iterate(uint32_t dir_cluster, uint64_t *io_offset,
+                      fat32_dirent_t *out) {
+  uint8_t sec_buf[SECTOR] __attribute__((aligned(16)));
+
+  /* A subdirectory stores "." and ".." as real on-disk entries, so the generic
+   * slot walk below yields them for free. The FAT32 VOLUME ROOT has no slots to
+   * spare -- the format implies them instead of storing them -- so they are
+   * synthesized here.
+   *
+   * Without this, readdir() on the root would be the one directory on the
+   * filesystem without "." and "..", which quietly breaks anything walking
+   * upwards: chdir("..") loops, `rm -rf .`, find(1), and shell globbing.
+   *
+   * Cookies 0 and 1 are reserved for the synthesized pair so a resume cursor is
+   * never ambiguous; at the root the real slots are therefore numbered from 2.
+   * Both spaces stay consistent: a cursor below 2 is only ever seen while
+   * walking the root. */
+  const int at_root = (dir_cluster == fat32_root_cluster());
+  if (at_root && *io_offset == 0) {
+    dirent_synth(out, ".", dir_cluster);
+    *io_offset = 1;
+    return ESUCCESS;
+  }
+  if (at_root && *io_offset == 1) {
+    /* The parent of the root is the root. */
+    dirent_synth(out, "..", dir_cluster);
+    *io_offset = 2;
+    return ESUCCESS;
+  }
+
+  const uint64_t base  = at_root ? 2u : 0u;
+  const uint64_t start = (*io_offset < base) ? base : *io_offset;
+  uint64_t       slot  = 0;
+  const uint32_t per_sector = SECTOR / DIR_ENTRY_SIZE;
+
+  uint32_t cluster = dir_cluster;
+  while (cluster < FAT32_EOC) {
+    uint32_t base = cluster_to_sector(cluster);
+
+    for (uint32_t s = 0; s < vol.sectors_per_cluster; s++) {
+      uint64_t sec_first = slot + (uint64_t)s * per_sector;
+
+      /* Every slot in this sector was handed to the caller already, so reading
+       * it would be pure waste. Directory reads are the one place that shows:
+       * a caller walking a directory one entry per getdents64() call would
+       * otherwise re-read the whole cluster chain on every single entry. */
+      if (sec_first + per_sector <= start) {
+        continue;
+      }
+
+      if (blk_read(base + s, sec_buf) != ESUCCESS) {
+        *io_offset = sec_first;
+        return EERROR;
+      }
+
+      for (uint32_t off = 0; off < SECTOR; off += DIR_ENTRY_SIZE) {
+        uint64_t this_slot = sec_first + off / DIR_ENTRY_SIZE;
+        if (this_slot < start) {
+          continue;
+        }
+
+        struct dir_entry *e = (struct dir_entry *)(sec_buf + off);
+
+        if (e->name[0] == 0x00) {
+          /* 0x00 means both "end of used entries" and "this slot was never
+           * allocated". Neither this sector nor anything after it can hold a
+           * live entry, so the walk is over. */
+          *io_offset = this_slot;
+          return EERROR;
+        }
+        if (e->name[0] == 0xE5) {
+          continue; /* deleted */
+        }
+        if (e->attr == ATTR_LFN) {
+          continue; /* long-name fragment; this kernel stores no LFN entries */
+        }
+        if (e->attr & ATTR_VOLUME_ID) {
+          continue;
+        }
+
+        out->name_len = shortname_to_display(e->name, out->name);
+        out->size     = e->size;
+        out->attr     = e->attr;
+        out->is_dir   = (e->attr & ATTR_DIRECTORY) ? 1 : 0;
+        out->first_cluster =
+            ((uint32_t)e->first_cluster_hi << 16) | e->first_cluster_lo;
+        *io_offset = this_slot + 1;
+        return ESUCCESS;
+      }
+    }
+
+    slot += (uint64_t)vol.sectors_per_cluster * per_sector;
+    cluster = fat_next(cluster);
+  }
+
+  *io_offset = slot;
+  return EERROR;
+}
+
 int fat32_find(const char *path, uint32_t *out_first_cluster,
                uint32_t *out_size) {
   /* Skip leading slash */

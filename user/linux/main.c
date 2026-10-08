@@ -26,10 +26,14 @@ typedef unsigned long uint64_t;
 typedef long          int64_t;
 typedef unsigned int  uint32_t;
 typedef int           int32_t;
+typedef unsigned short uint16_t;
+typedef unsigned char  uint8_t;
 
 /* ---- Linux aarch64 syscall numbers ---- */
 #define SYS_openat          56
 #define SYS_close            57
+#define SYS_getdents64      61
+#define SYS_lseek            62
 #define SYS_read             63
 #define SYS_write            64
 #define SYS_fstat            80
@@ -98,6 +102,22 @@ STAT_ASSERT(st_size,    48);
 STAT_ASSERT(st_blksize, 56);
 STAT_ASSERT(st_blocks,  64);
 _Static_assert(sizeof(struct stat) == 128, "struct stat must be 128 bytes");
+
+/* Linux struct linux_dirent64. The name is NOT NUL-terminated on the wire:
+ * its length is implied by d_reclen, which covers the 19-byte header plus the
+ * name plus one spare byte. */
+struct linux_dirent64 {
+  uint64_t d_ino;
+  int64_t  d_off;
+  uint16_t d_reclen;
+  uint8_t  d_type;
+  char     d_name[];
+};
+_Static_assert(__builtin_offsetof(struct linux_dirent64, d_name) == 19,
+               "dirent64 d_name must be at offset 19");
+
+#define DT_DIR 4
+#define DT_REG 8
 
 #define S_ISREG(m) (((m) & 0170000) == 0100000)
 #define S_ISDIR(m) (((m) & 0170000) == 0040000)
@@ -230,6 +250,30 @@ static long sys_nanosleep(const struct timespec *req, struct timespec *rem) {
   __asm__ __volatile__("svc #0"
                        : "+r"(x0)
                        : "r"(x1), "r"(x8)
+                       : "memory");
+  return x0;
+}
+
+static long sys_getdents64(int fd, void *buf, unsigned long n) {
+  register long x0 __asm__("x0") = fd;
+  register long x1 __asm__("x1") = (long)buf;
+  register long x2 __asm__("x2") = (long)n;
+  register long x8 __asm__("x8") = SYS_getdents64;
+  __asm__ __volatile__("svc #0"
+                       : "+r"(x0)
+                       : "r"(x1), "r"(x2), "r"(x8)
+                       : "memory");
+  return x0;
+}
+
+static long sys_lseek(int fd, long off, int whence) {
+  register long x0 __asm__("x0") = fd;
+  register long x1 __asm__("x1") = off;
+  register long x2 __asm__("x2") = whence;
+  register long x8 __asm__("x8") = SYS_lseek;
+  __asm__ __volatile__("svc #0"
+                       : "+r"(x0)
+                       : "r"(x1), "r"(x2), "r"(x8)
                        : "memory");
   return x0;
 }
@@ -667,6 +711,82 @@ int main(int argc, char **argv, char **envp) {
        "newfstatat rejects an unrecognised flag bit");
     ok(sys_newfstatat(5, "/mnt/fat32", &sd, 0) < 0,
        "newfstatat refuses a dirfd other than AT_FDCWD");
+  }
+
+  /* ---- 10. Directory enumeration: getdents64 ---- */
+  {
+    long fd = sys_openat(AT_FDCWD, "/mnt/fat32", O_RDONLY, 0);
+    ok(fd >= 0, "openat on a directory succeeded");
+    if (fd >= 0) {
+      /* One batch at a time, resuming from the d_off the kernel hands back. */
+      static unsigned char dbuf[1024];
+      int    total = 0, saw_dot = 0, saw_dotdot = 0, saw_reg = 0, saw_dir = 0;
+      long   bytes;
+
+      while ((bytes = sys_getdents64((int)fd, dbuf, sizeof dbuf)) > 0) {
+        size_t pos = 0;
+        while (pos + 19 <= (size_t)bytes) {
+          struct linux_dirent64 *d =
+              (struct linux_dirent64 *)(dbuf + pos);
+          unsigned short rl = d->d_reclen;
+          if (rl == 0 || pos + rl > (size_t)bytes) {
+            break;
+          }
+          /* The name is not terminated on the wire; bound it by reclen. */
+          const char *nm = d->d_name;
+          size_t      nl = 0;
+          size_t      maxn = (size_t)rl - 19u;
+          while (nl < maxn && nm[nl] != '\0') {
+            nl++;
+          }
+          if (nl == 1 && nm[0] == '.') {
+            saw_dot = 1;
+          } else if (nl == 2 && nm[0] == '.' && nm[1] == '.') {
+            saw_dotdot = 1;
+          } else {
+            if (d->d_type == DT_DIR) {
+              saw_dir = 1;
+            } else if (d->d_type == DT_REG) {
+              saw_reg = 1;
+            }
+          }
+          total++;
+          pos += rl;
+        }
+      }
+      ok(bytes == 0, "getdents64 returned 0 to signal end of directory");
+      ok(total > 0, "getdents64 returned some entries");
+      ok(saw_dot, "the directory lists \".\"");
+      ok(saw_dotdot, "the directory lists \"..\"");
+      ok(saw_reg, "at least one entry is typed DT_REG");
+      ok(saw_dir, "at least one entry is typed DT_DIR");
+
+      /* The cookie really is resumable: rewinding the descriptor must produce
+       * the same number of entries again. */
+      sys_lseek((int)fd, 0, 0 /* SEEK_SET */);
+      long again = sys_getdents64((int)fd, dbuf, sizeof dbuf);
+      ok(again > 0, "a rewound descriptor yields entries again");
+
+      /* A buffer too small for even one entry must not lose that entry: the
+       * kernel is supposed to return 0 bytes and leave the cursor where it
+       * was, so the next full-size call sees it. */
+      sys_lseek((int)fd, 0, 0);
+      unsigned char tiny[8];
+      long t = sys_getdents64((int)fd, tiny, sizeof tiny);
+      ok(t == 0, "getdents64 returns 0 when the buffer cannot hold one entry");
+      long after = sys_getdents64((int)fd, dbuf, sizeof dbuf);
+      ok(after > 0,
+         "the skipped entry was not consumed -- the next call still sees it");
+
+      /* Not a directory. */
+      long rfd = sys_openat(AT_FDCWD, "/mnt/fat32/LINHELLO.DAT", O_RDONLY, 0);
+      if (rfd >= 0) {
+        ok(sys_getdents64((int)rfd, dbuf, sizeof dbuf) < 0,
+           "getdents64 on a regular file fails");
+        sys_close((int)rfd);
+      }
+      sys_close((int)fd);
+    }
   }
 
   emit("[LINHELLO] pid=");
